@@ -1,15 +1,17 @@
 use bloom_triad_protocol::{
-    ApprovalSelector, ApprovalTombstone, Base64UrlBytes, CustodyResult, DecimalU64, Digest32,
-    KeyRef, OperationId, PolicyCommitReceipt, PolicyCompareAndSwapRequest, ProtocolError,
-    ProtocolErrorCode, RevocationState, SealedApprovalTerms, SelectorKind, SignRequest,
-    SignedPolicySnapshot, SignerActivationReceipt, Token, WalletTombstone, WebAuthnCredential,
+    ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalTombstone,
+    Base64UrlBytes, CeremonyPublicStatus, CredentialPublic, CredentialState, CustodyResult,
+    DecimalU64, Digest32, KeyRef, OperationId, OperationPublicStatus, OperationState,
+    PolicyCommitReceipt, PolicyCompareAndSwapRequest, ProtocolError, ProtocolErrorCode,
+    RevocationState, SealedApprovalTerms, SelectorKind, SignRequest, SignedPolicySnapshot,
+    SignerActivationReceipt, SigningResult, Token, WalletTombstone, WebAuthnCredential,
 };
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::{path::Path, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use crate::custody::UnlockedWallet;
 use crate::custody::{WalletCustody, WalletCustodyBackup};
@@ -120,6 +122,7 @@ pub struct OperationStateBackup {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BackupOperationState {
     Reserved,
+    Dispatched,
     Committed,
     Released,
     Quarantined,
@@ -129,6 +132,7 @@ impl BackupOperationState {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Reserved => "RESERVED",
+            Self::Dispatched => "DISPATCHED",
             Self::Committed => "COMMITTED",
             Self::Released => "RELEASED",
             Self::Quarantined => "QUARANTINED",
@@ -138,6 +142,7 @@ impl BackupOperationState {
     fn parse(value: &str) -> Result<Self, ProtocolError> {
         match value {
             "RESERVED" => Ok(Self::Reserved),
+            "DISPATCHED" => Ok(Self::Dispatched),
             "COMMITTED" => Ok(Self::Committed),
             "RELEASED" => Ok(Self::Released),
             "QUARANTINED" => Ok(Self::Quarantined),
@@ -396,10 +401,19 @@ impl SignerEngine {
                     operation_id TEXT PRIMARY KEY,
                     request_jcs TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS policy_commit_receipts (
+                    operation_id TEXT PRIMARY KEY,
+                    request_jcs TEXT NOT NULL,
+                    receipt_jcs TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS ceremony_receipts (
                     operation_id TEXT PRIMARY KEY,
                     receipt_kind TEXT NOT NULL,
                     receipt_jcs TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ceremony_statuses (
+                    operation_id TEXT PRIMARY KEY,
+                    status_jcs TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS ceremony_wallets (
                     wallet_id TEXT PRIMARY KEY,
@@ -408,11 +422,32 @@ impl SignerEngine {
                 CREATE TABLE IF NOT EXISTS webauthn_credentials (
                     credential_id TEXT PRIMARY KEY,
                     wallet_id TEXT NOT NULL,
-                    credential_jcs TEXT NOT NULL
+                    credential_jcs TEXT NOT NULL,
+                    created_at_ms TEXT NOT NULL
                 );
                 ",
             )
             .map_err(storage)?;
+        let has_credential_created_at = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(webauthn_credentials)")
+                .map_err(storage)?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage)?;
+            columns.iter().any(|column| column == "created_at_ms")
+        };
+        if !has_credential_created_at {
+            connection
+                .execute(
+                    "ALTER TABLE webauthn_credentials
+                     ADD COLUMN created_at_ms TEXT NOT NULL DEFAULT '0'",
+                    [],
+                )
+                .map_err(storage)?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
             broker_key_id,
@@ -530,6 +565,26 @@ impl SignerEngine {
                     ],
                 )
                 .map_err(storage)?;
+            let status = CeremonyPublicStatus {
+                ceremony_id: receipt.ceremony_id.clone(),
+                ceremony_kind: bloom_triad_protocol::CeremonyKind::SealedApproval,
+                operation_id: receipt.activation_operation_id.clone(),
+                state: bloom_triad_protocol::CeremonyState::Succeeded,
+                expires_at_ms: receipt.expires_at_ms.clone(),
+                receipt_digest: Some(Digest32::from_bytes(
+                    Sha256::digest(serde_jcs::to_vec(receipt).map_err(malformed)?).into(),
+                )),
+            };
+            transaction
+                .execute(
+                    "INSERT INTO ceremony_statuses(operation_id, status_jcs)
+                     VALUES (?1, ?2)",
+                    params![
+                        status.operation_id.as_str(),
+                        serde_jcs::to_string(&status).map_err(malformed)?
+                    ],
+                )
+                .map_err(storage)?;
         }
         transaction.commit().map_err(storage)?;
         Ok(approval_id)
@@ -635,10 +690,28 @@ impl SignerEngine {
         result: &CustodyResult,
         wallets: &[WalletCustodyBackup],
         credentials: &[(Token, WebAuthnCredential)],
+        committed_at_ms: u64,
+        status: &CeremonyPublicStatus,
         effect: CeremonyDatabaseEffect,
     ) -> Result<(), ProtocolError> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction().map_err(storage)?;
+        let existing_credential_times = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT credential_id, created_at_ms
+                     FROM webauthn_credentials",
+                )
+                .map_err(storage)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage)?;
+            rows.into_iter().collect::<BTreeMap<_, _>>()
+        };
         transaction
             .execute("DELETE FROM ceremony_wallets", [])
             .map_err(storage)?;
@@ -661,12 +734,16 @@ impl SignerEngine {
             transaction
                 .execute(
                     "INSERT INTO webauthn_credentials(
-                        credential_id, wallet_id, credential_jcs
-                     ) VALUES (?1, ?2, ?3)",
+                        credential_id, wallet_id, credential_jcs, created_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4)",
                     params![
                         credential.credential_id.encoded(),
                         wallet_id.as_str(),
-                        serde_jcs::to_string(credential).map_err(malformed)?
+                        serde_jcs::to_string(credential).map_err(malformed)?,
+                        existing_credential_times
+                            .get(credential.credential_id.encoded())
+                            .cloned()
+                            .unwrap_or_else(|| committed_at_ms.to_string())
                     ],
                 )
                 .map_err(storage)?;
@@ -754,6 +831,18 @@ impl SignerEngine {
                         "policy compare-and-swap baseline changed before ceremony commit",
                     ));
                 }
+                transaction
+                    .execute(
+                        "INSERT INTO policy_commit_receipts(
+                            operation_id, request_jcs, receipt_jcs
+                         ) VALUES (?1, ?2, ?3)",
+                        params![
+                            request.operation_id.as_str(),
+                            serde_jcs::to_string(&request).map_err(malformed)?,
+                            serde_jcs::to_string(&receipt).map_err(malformed)?,
+                        ],
+                    )
+                    .map_err(storage)?;
             }
             CeremonyDatabaseEffect::EnrollKey(key_ref) => {
                 transaction
@@ -783,7 +872,54 @@ impl SignerEngine {
                 ],
             )
             .map_err(storage)?;
+        transaction
+            .execute(
+                "INSERT INTO ceremony_statuses(operation_id, status_jcs)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(operation_id) DO UPDATE SET status_jcs = excluded.status_jcs",
+                params![
+                    status.operation_id.as_str(),
+                    serde_jcs::to_string(status).map_err(malformed)?
+                ],
+            )
+            .map_err(storage)?;
         transaction.commit().map_err(storage)
+    }
+
+    pub(crate) fn ceremony_public_status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<CeremonyPublicStatus>, ProtocolError> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT status_jcs FROM ceremony_statuses WHERE operation_id = ?1",
+                [operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?
+            .map(|encoded| serde_json::from_str(&encoded).map_err(malformed))
+            .transpose()
+    }
+
+    pub(crate) fn persist_ceremony_public_status(
+        &self,
+        status: &CeremonyPublicStatus,
+    ) -> Result<(), ProtocolError> {
+        self.connection
+            .lock()
+            .execute(
+                "INSERT INTO ceremony_statuses(operation_id, status_jcs)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(operation_id) DO UPDATE SET status_jcs = excluded.status_jcs",
+                params![
+                    status.operation_id.as_str(),
+                    serde_jcs::to_string(status).map_err(malformed)?
+                ],
+            )
+            .map_err(storage)?;
+        Ok(())
     }
 
     pub fn enroll_key(&self, key_ref: &KeyRef) -> Result<(), ProtocolError> {
@@ -896,11 +1032,27 @@ impl SignerEngine {
                     "operation retry changed stable identity, approval, or forbidden attempt fields",
                 ));
             }
-            if state == "RELEASED" {
-                return Err(error(
-                    ProtocolErrorCode::OperationIdConflict,
-                    "released Signer operation cannot be retried",
-                ));
+            match state.as_str() {
+                "RESERVED" => {}
+                "DISPATCHED" | "QUARANTINED" => {
+                    return Err(error(
+                        ProtocolErrorCode::AmbiguousProviderEffect,
+                        "Signer operation may already have reached its backend",
+                    ));
+                }
+                "COMMITTED" => {}
+                "RELEASED" => {
+                    return Err(error(
+                        ProtocolErrorCode::OperationIdConflict,
+                        "released Signer operation cannot be retried",
+                    ));
+                }
+                _ => {
+                    return Err(error(
+                        ProtocolErrorCode::MalformedFrame,
+                        "Signer operation has unknown durable state",
+                    ));
+                }
             }
             SignAuthorization::SameOperationRetry
         } else {
@@ -977,7 +1129,13 @@ impl SignerEngine {
             transaction.commit().map_err(storage)?;
             return Ok(());
         }
-        if current.0 != "RESERVED" {
+        if current.0 != "RESERVED"
+            && !(current.0 == "DISPATCHED"
+                && matches!(
+                    effect,
+                    SignerOperationEffect::Released | SignerOperationEffect::Quarantined
+                ))
+        {
             return Err(error(
                 ProtocolErrorCode::OperationIdConflict,
                 "Signer operation was already finalized differently",
@@ -1048,7 +1206,7 @@ impl SignerEngine {
             .lock()
             .execute(
                 "UPDATE operations SET state = 'COMMITTED', normalized_result = ?2
-                 WHERE operation_id = ?1 AND state = 'RESERVED'",
+                 WHERE operation_id = ?1 AND state IN ('RESERVED', 'DISPATCHED')",
                 params![operation_id.as_str(), normalized_result.encoded()],
             )
             .map_err(storage)?;
@@ -1059,6 +1217,82 @@ impl SignerEngine {
             ));
         }
         Ok(())
+    }
+
+    /// Durably records the point after which a backend call may occur. A
+    /// restart from this state is ambiguous and must never automatically
+    /// dispatch the operation again.
+    pub fn mark_operation_dispatched(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<(), ProtocolError> {
+        let changed = self
+            .connection
+            .lock()
+            .execute(
+                "UPDATE operations SET state = 'DISPATCHED'
+                 WHERE operation_id = ?1 AND state = 'RESERVED'",
+                [operation_id.as_str()],
+            )
+            .map_err(storage)?;
+        if changed != 1 {
+            return Err(error(
+                ProtocolErrorCode::OperationIdConflict,
+                "operation is absent or was already dispatched",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn operation_status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<OperationPublicStatus, ProtocolError> {
+        let row: (String, String, Option<String>) = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT operation_digest, state, normalized_result
+                 FROM operations WHERE operation_id = ?1",
+                [operation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(storage)?
+            .ok_or_else(|| {
+                error(
+                    ProtocolErrorCode::ApprovalNotFound,
+                    "Signer operation not found",
+                )
+            })?;
+        let state = match row.1.as_str() {
+            "RESERVED" => OperationState::Reserved,
+            "DISPATCHED" => OperationState::Dispatched,
+            "COMMITTED" => OperationState::Succeeded,
+            "RELEASED" => OperationState::Denied,
+            "QUARANTINED" => OperationState::Quarantined,
+            _ => {
+                return Err(error(
+                    ProtocolErrorCode::MalformedFrame,
+                    "Signer operation has unknown durable state",
+                ));
+            }
+        };
+        let result = row
+            .2
+            .map(|encoded| {
+                Base64UrlBytes::parse(encoded).and_then(|bytes| {
+                    serde_json::from_slice::<SigningResult>(&bytes.decode()).map_err(malformed)
+                })
+            })
+            .transpose()?;
+        Ok(OperationPublicStatus {
+            operation_id: operation_id.clone(),
+            operation_digest: Digest32::new(row.0)?,
+            state,
+            result,
+            error: None,
+        })
     }
 
     pub fn stored_operation_result(
@@ -1077,6 +1311,144 @@ impl SignerEngine {
             .optional()
             .map_err(storage)?;
         result.flatten().map(Base64UrlBytes::parse).transpose()
+    }
+
+    pub fn approval_public_status(
+        &self,
+        approval_id: &Digest32,
+        now_ms: u64,
+    ) -> Result<ApprovalPublicStatus, ProtocolError> {
+        let (terms_jcs, active): (String, bool) = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT terms_jcs, active FROM approvals WHERE approval_id = ?1",
+                [approval_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(storage)?
+            .ok_or_else(|| error(ProtocolErrorCode::ApprovalNotFound, "approval not found"))?;
+        let terms: SealedApprovalTerms = serde_json::from_str(&terms_jcs).map_err(malformed)?;
+        let state = if !active {
+            ApprovalLifecycleState::Revoked
+        } else if terms.expires_at_ms.get() <= now_ms {
+            ApprovalLifecycleState::Expired
+        } else {
+            ApprovalLifecycleState::Active
+        };
+        Ok(ApprovalPublicStatus {
+            approval_id: approval_id.clone(),
+            wallet_id: terms.wallet_id,
+            state,
+            effective_claim_assurance: None,
+            ceremony_url: None,
+            ceremony_expires_at_ms: None,
+        })
+    }
+
+    pub fn policy_snapshot(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<SignedPolicySnapshot, ProtocolError> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT snapshot_jcs FROM policies WHERE wallet_id = ?1",
+                [wallet_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?
+            .ok_or_else(|| {
+                error(
+                    ProtocolErrorCode::ApprovalNotFound,
+                    "wallet policy not found",
+                )
+            })
+            .and_then(|encoded| serde_json::from_str(&encoded).map_err(malformed))
+    }
+
+    pub fn policy_commit_receipt(
+        &self,
+        request: &PolicyCompareAndSwapRequest,
+    ) -> Result<PolicyCommitReceipt, ProtocolError> {
+        let row: (String, String) = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT request_jcs, receipt_jcs FROM policy_commit_receipts
+                 WHERE operation_id = ?1",
+                [request.operation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(storage)?
+            .ok_or_else(|| {
+                error(
+                    ProtocolErrorCode::ApprovalNotFound,
+                    "policy ceremony has not committed",
+                )
+            })?;
+        if row.0 != serde_jcs::to_string(request).map_err(malformed)? {
+            return Err(error(
+                ProtocolErrorCode::OperationIdConflict,
+                "policy operation ID was committed for different request terms",
+            ));
+        }
+        serde_json::from_str(&row.1).map_err(malformed)
+    }
+
+    pub fn enrolled_key_refs(&self, wallet_id: &Token) -> Result<Vec<KeyRef>, ProtocolError> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT key_ref_jcs FROM enrolled_keys
+                 WHERE available = 1 ORDER BY key_fingerprint",
+            )
+            .map_err(storage)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage)?;
+        let mut keys = Vec::new();
+        for row in rows {
+            let key: KeyRef = serde_json::from_str(&row.map_err(storage)?).map_err(malformed)?;
+            if &key.backend_instance == wallet_id {
+                keys.push(key);
+            }
+        }
+        Ok(keys)
+    }
+
+    pub fn credential_public(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<Vec<CredentialPublic>, ProtocolError> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT credential_jcs, created_at_ms FROM webauthn_credentials
+                 WHERE wallet_id = ?1 ORDER BY credential_id",
+            )
+            .map_err(storage)?;
+        let rows = statement
+            .query_map([wallet_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(storage)?;
+        let mut credentials = Vec::new();
+        for row in rows {
+            let (encoded, created_at_ms) = row.map_err(storage)?;
+            let credential: WebAuthnCredential =
+                serde_json::from_str(&encoded).map_err(malformed)?;
+            credentials.push(CredentialPublic {
+                credential_id: credential.credential_id,
+                wallet_id: wallet_id.clone(),
+                created_at_ms: DecimalU64::new(created_at_ms.parse().map_err(malformed)?),
+                state: CredentialState::Active,
+            });
+        }
+        Ok(credentials)
     }
 
     pub fn revoke_approval(

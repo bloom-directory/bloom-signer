@@ -12,6 +12,8 @@ aws-kms = ["dep:bloom-signer-backend-aws-kms"]
 
 [dependencies]
 bloom-triad-protocol.workspace = true
+bloom-triad-local-transport.workspace = true
+bloom-service-activation.workspace = true
 bloom-signer-backend-api = { path = "../bloom-signer-backend-api" }
 bloom-signer-backend-local = { path = "../bloom-signer-backend-local", optional = true }
 bloom-signer-backend-aws-kms = { path = "../bloom-signer-backend-aws-kms", optional = true }
@@ -21,6 +23,7 @@ futures.workspace = true
 hex.workspace = true
 hpke.workspace = true
 hkdf.workspace = true
+k256.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 rusqlite.workspace = true
@@ -28,6 +31,8 @@ serde.workspace = true
 serde_jcs.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sha3.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 zeroize.workspace = true
 
 [dev-dependencies]

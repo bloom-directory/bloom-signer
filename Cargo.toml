@@ -15,6 +15,8 @@ license = "MIT"
 
 [workspace.dependencies]
 bloom-triad-protocol = { path = "../bloom/crates/bloom-triad-protocol" }
+bloom-triad-local-transport = { path = "../bloom/crates/bloom-triad-local-transport" }
+bloom-service-activation = { path = "../bloom/crates/bloom-service-activation" }
 aws-config = { version = "=1.8.1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-credential-types = "1"
 # Exact AWS service pins preserve the workspace's declared Rust 1.85 floor.
@@ -42,4 +44,4 @@ serde_jcs = "0.2"
 serde_json = "1"
 sha2 = "0.10"
 sha3 = "0.10"
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }

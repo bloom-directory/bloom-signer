@@ -1,13 +1,13 @@
 use bloom_signer_backend_api::SecretBytes;
 use bloom_triad_protocol::{
     ActivationMode, Base64UrlBytes, CeremonyChallenge, CeremonyCompleteRequest, CeremonyKind,
-    CeremonyPhase, CeremonyPrepareRequest, CeremonyState, CeremonyWebAuthnOptions,
-    CredentialPrfInput, CredentialSummary, CryptoSuite, CustodyCompleteRequest, CustodyHpkeAad,
-    CustodyOutputHpkeAad, CustodyPrepareRequest, CustodyResult, CustodySignerContribution,
-    DecimalU64, Digest32, LocalPrfHpkeAad, OperationId, PolicyCompareAndSwapRequest, ProtocolError,
-    ProtocolErrorCode, SignerActivationReceipt, SignerCeremonyContribution, Token,
-    WebAuthnCeremonyProof, WebAuthnCredential, verify_webauthn_assertion,
-    verify_webauthn_attestation,
+    CeremonyPhase, CeremonyPrepareRequest, CeremonyPublicStatus, CeremonyState,
+    CeremonyWebAuthnOptions, CredentialPrfInput, CredentialSummary, CryptoSuite,
+    CustodyCompleteRequest, CustodyHpkeAad, CustodyOutputHpkeAad, CustodyPrepareRequest,
+    CustodyResult, CustodySignerContribution, DecimalU64, Digest32, LocalPrfHpkeAad, OperationId,
+    PolicyCompareAndSwapRequest, ProtocolError, ProtocolErrorCode, SignerActivationReceipt,
+    SignerCeremonyContribution, Token, WebAuthnCeremonyProof, WebAuthnCredential,
+    verify_webauthn_assertion, verify_webauthn_attestation,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use futures::lock::Mutex as AsyncMutex;
@@ -92,7 +92,11 @@ struct BoundCredential {
 
 enum CompletedCeremony {
     Approval(Box<SignerActivationReceipt>),
-    Custody(Box<CustodyResult>),
+    Custody {
+        result: Box<CustodyResult>,
+        ceremony_id: Digest32,
+        expires_at_ms: DecimalU64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -690,7 +694,7 @@ impl SignerCeremonyService {
         now_ms: u64,
     ) -> Result<CustodyResult, ProtocolError> {
         let _completion_barrier = self.custody_completion_barrier.lock();
-        if let Some(CompletedCeremony::Custody(result)) =
+        if let Some(CompletedCeremony::Custody { result, .. }) =
             self.completed.lock().get(&request.custody_operation_id)
         {
             return Ok((**result).clone());
@@ -812,10 +816,20 @@ impl SignerCeremonyService {
         };
         result.signer_signature = self.sign_receipt(&result.unsigned_canonical_bytes()?);
         let after = self.custody_snapshot();
+        let durable_status = CeremonyPublicStatus {
+            ceremony_id: contribution.ceremony_id.clone(),
+            ceremony_kind: request.ceremony_kind,
+            operation_id: request.custody_operation_id.clone(),
+            state: result.public_status,
+            expires_at_ms: contribution.expires_at_ms.clone(),
+            receipt_digest: Some(result.receipt_digest.clone()),
+        };
         if let Err(error) = self.engine.commit_custody_snapshot_with_effect(
             &result,
             &after.0,
             &after.1,
+            now_ms,
+            &durable_status,
             apply_outcome.database_effect,
         ) {
             self.rollback_derived_key(apply_outcome.rollback_derived_key.as_ref())?;
@@ -831,7 +845,11 @@ impl SignerCeremonyService {
         }
         self.completed.lock().insert(
             request.custody_operation_id,
-            CompletedCeremony::Custody(Box::new(result.clone())),
+            CompletedCeremony::Custody {
+                result: Box::new(result.clone()),
+                ceremony_id: contribution.ceremony_id.clone(),
+                expires_at_ms: contribution.expires_at_ms.clone(),
+            },
         );
         Ok(result)
     }
@@ -843,10 +861,29 @@ impl SignerCeremonyService {
                 "committed ceremony cannot be cancelled",
             ));
         }
-        self.pending
-            .lock()
-            .remove(operation_id)
-            .ok_or_else(|| protocol(ProtocolErrorCode::ApprovalNotFound, "ceremony not found"))?;
+        let pending =
+            self.pending.lock().remove(operation_id).ok_or_else(|| {
+                protocol(ProtocolErrorCode::ApprovalNotFound, "ceremony not found")
+            })?;
+        let status = match pending.contribution {
+            PendingContribution::Approval(contribution) => CeremonyPublicStatus {
+                ceremony_id: contribution.ceremony_id,
+                ceremony_kind: CeremonyKind::SealedApproval,
+                operation_id: operation_id.clone(),
+                state: CeremonyState::Cancelled,
+                expires_at_ms: contribution.expires_at_ms,
+                receipt_digest: None,
+            },
+            PendingContribution::Custody(contribution) => CeremonyPublicStatus {
+                ceremony_id: contribution.ceremony_id,
+                ceremony_kind: contribution.ceremony_kind,
+                operation_id: operation_id.clone(),
+                state: CeremonyState::Cancelled,
+                expires_at_ms: contribution.expires_at_ms,
+                receipt_digest: None,
+            },
+        };
+        self.engine.persist_ceremony_public_status(&status)?;
         Ok(())
     }
 
@@ -859,7 +896,7 @@ impl SignerCeremonyService {
                 CompletedCeremony::Approval(receipt) => {
                     SignerCeremonyStatus::CompletedApproval(Box::new((**receipt).clone()))
                 }
-                CompletedCeremony::Custody(result) => {
+                CompletedCeremony::Custody { result, .. } => {
                     SignerCeremonyStatus::CompletedCustody(result.clone())
                 }
             });
@@ -875,6 +912,63 @@ impl SignerCeremonyService {
         } else {
             SignerCeremonyStatus::Missing
         })
+    }
+
+    pub fn public_status(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CeremonyPublicStatus, ProtocolError> {
+        if let Some(completed) = self.completed.lock().get(operation_id) {
+            return match completed {
+                CompletedCeremony::Approval(receipt) => Ok(CeremonyPublicStatus {
+                    ceremony_id: receipt.ceremony_id.clone(),
+                    ceremony_kind: CeremonyKind::SealedApproval,
+                    operation_id: operation_id.clone(),
+                    state: CeremonyState::Succeeded,
+                    expires_at_ms: receipt.expires_at_ms.clone(),
+                    receipt_digest: Some(canonical_digest(receipt.as_ref())?),
+                }),
+                CompletedCeremony::Custody {
+                    result,
+                    ceremony_id,
+                    expires_at_ms,
+                } => Ok(CeremonyPublicStatus {
+                    ceremony_id: ceremony_id.clone(),
+                    ceremony_kind: result.ceremony_kind,
+                    operation_id: operation_id.clone(),
+                    state: result.public_status,
+                    expires_at_ms: expires_at_ms.clone(),
+                    receipt_digest: Some(result.receipt_digest.clone()),
+                }),
+            };
+        }
+        if let Some(pending) = self.pending.lock().get(operation_id) {
+            return Ok(match &pending.contribution {
+                PendingContribution::Approval(contribution) => CeremonyPublicStatus {
+                    ceremony_id: contribution.ceremony_id.clone(),
+                    ceremony_kind: CeremonyKind::SealedApproval,
+                    operation_id: operation_id.clone(),
+                    state: CeremonyState::AwaitingUser,
+                    expires_at_ms: contribution.expires_at_ms.clone(),
+                    receipt_digest: None,
+                },
+                PendingContribution::Custody(contribution) => CeremonyPublicStatus {
+                    ceremony_id: contribution.ceremony_id.clone(),
+                    ceremony_kind: contribution.ceremony_kind,
+                    operation_id: operation_id.clone(),
+                    state: CeremonyState::AwaitingUser,
+                    expires_at_ms: contribution.expires_at_ms.clone(),
+                    receipt_digest: None,
+                },
+            });
+        }
+        if let Some(status) = self.engine.ceremony_public_status(operation_id)? {
+            return Ok(status);
+        }
+        Err(protocol(
+            ProtocolErrorCode::ApprovalNotFound,
+            "ceremony not found",
+        ))
     }
 
     pub fn credential(

@@ -5,3 +5,4 @@ pub mod custody;
 pub mod engine;
 pub mod hpke;
 pub mod registry;
+pub mod service;
