@@ -9,7 +9,7 @@ use bloom_signer_backend_api::{
 };
 use bloom_triad_protocol::{
     Base64UrlBytes, CryptoInputKind, CryptoSuite, DecimalU64, DerivationRef, Digest32, KeyRef,
-    KeySpec, SignatureEncoding, Token,
+    KeySpec, OperationId, SignatureEncoding, Token,
 };
 use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
@@ -37,6 +37,10 @@ const DERIVATION_AUTHORITY_DOMAIN: &[u8] = b"bloom-key-derive-authority/v1";
 #[serde(deny_unknown_fields)]
 pub struct EncryptedLocalBackup {
     pub root_key_id: Token,
+    #[serde(default)]
+    pub root_material_kind: LocalRootMaterialKind,
+    #[serde(default)]
+    pub pinned_root: Option<KeyRef>,
     pub wrap_format_version: u32,
     pub nonce: Base64UrlBytes,
     pub encrypted_seed: Base64UrlBytes,
@@ -44,6 +48,16 @@ pub struct EncryptedLocalBackup {
     pub derivation_registry: Vec<KeyRef>,
     pub derivation_namespaces: Vec<DerivationNamespace>,
     pub derivation_tombstones: Vec<String>,
+    #[serde(default)]
+    pub pending_derivations: BTreeMap<String, KeyRef>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalRootMaterialKind {
+    #[default]
+    Bip32Seed,
+    Secp256k1Scalar,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -99,9 +113,50 @@ impl LocalSignerBackend {
         kek: SecretBytes,
         authority_verifying_key: VerifyingKey,
     ) -> Result<Self, BackendError> {
-        if !(16..=64).contains(&seed.expose_to_backend().len())
-            || kek.expose_to_backend().len() != 32
-        {
+        Self::provision_material(
+            backend_instance_id,
+            root_key_id,
+            seed,
+            kek,
+            authority_verifying_key,
+            LocalRootMaterialKind::Bip32Seed,
+        )
+    }
+
+    pub fn provision_imported_secp256k1(
+        backend_instance_id: Token,
+        root_key_id: Token,
+        private_key: SecretBytes,
+        kek: SecretBytes,
+        authority_verifying_key: VerifyingKey,
+    ) -> Result<Self, BackendError> {
+        Self::provision_material(
+            backend_instance_id,
+            root_key_id,
+            private_key,
+            kek,
+            authority_verifying_key,
+            LocalRootMaterialKind::Secp256k1Scalar,
+        )
+    }
+
+    fn provision_material(
+        backend_instance_id: Token,
+        root_key_id: Token,
+        material: SecretBytes,
+        kek: SecretBytes,
+        authority_verifying_key: VerifyingKey,
+        root_material_kind: LocalRootMaterialKind,
+    ) -> Result<Self, BackendError> {
+        let valid_material = match root_material_kind {
+            LocalRootMaterialKind::Bip32Seed => {
+                (16..=64).contains(&material.expose_to_backend().len())
+            }
+            LocalRootMaterialKind::Secp256k1Scalar => {
+                SigningKey::from_slice(material.expose_to_backend()).is_ok()
+            }
+        };
+        if !valid_material || kek.expose_to_backend().len() != 32 {
             return Err(BackendError::InvalidRequest);
         }
         let mut nonce = [0_u8; 24];
@@ -112,16 +167,18 @@ impl LocalSignerBackend {
             .encrypt(
                 XNonce::from_slice(&nonce),
                 Payload {
-                    msg: seed.expose_to_backend(),
+                    msg: material.expose_to_backend(),
                     aad: &aad,
                 },
             )
             .map_err(|_| BackendError::DefinitiveRejected)?;
-        Ok(Self {
+        let backend = Self {
             backend_instance_id,
             state: RwLock::new(LocalState {
                 backup: Some(EncryptedLocalBackup {
                     root_key_id,
+                    root_material_kind,
+                    pinned_root: None,
                     wrap_format_version: WRAP_FORMAT_VERSION,
                     nonce: Base64UrlBytes::from_bytes(&nonce),
                     encrypted_seed: Base64UrlBytes::from_bytes(&encrypted_seed),
@@ -131,12 +188,22 @@ impl LocalSignerBackend {
                     derivation_registry: vec![],
                     derivation_namespaces: vec![],
                     derivation_tombstones: vec![],
+                    pending_derivations: BTreeMap::new(),
                 }),
                 active_kek: Some(kek),
                 registry: BTreeMap::new(),
                 storage_path: None,
             }),
-        })
+        };
+        let root = backend.root_key_ref()?;
+        backend
+            .state
+            .write()
+            .backup
+            .as_mut()
+            .ok_or(BackendError::DefinitiveRejected)?
+            .pinned_root = Some(root);
+        Ok(backend)
     }
 
     pub fn provision_at(
@@ -187,6 +254,13 @@ impl LocalSignerBackend {
         if backup.wrap_format_version != WRAP_FORMAT_VERSION
             || backup.nonce.decode().len() != 24
             || backup.authority_verifying_key.decode().len() != 32
+            || backup.pinned_root.as_ref().is_some_and(|root| {
+                root.backend.as_str() != "local"
+                    || root.backend_instance != backend_instance_id
+                    || root.key_spec != KeySpec::Secp256k1
+                    || root.locator != format!("root:{}", backup.root_key_id.as_str())
+                    || root.derivation.is_some()
+            })
             || backup.derivation_registry.iter().any(|key| {
                 !matches!(
                     &key.derivation,
@@ -237,7 +311,8 @@ impl LocalSignerBackend {
     }
 
     pub fn key_is_registered(&self, key_ref: &KeyRef) -> bool {
-        self.state.read().registry.get(&key_ref.locator) == Some(key_ref)
+        self.root_key_ref().is_ok_and(|root| &root == key_ref)
+            || self.state.read().registry.get(&key_ref.locator) == Some(key_ref)
     }
 
     pub fn key_is_available(&self, key_ref: &KeyRef) -> Result<bool, BackendError> {
@@ -254,6 +329,9 @@ impl LocalSignerBackend {
             .backup
             .clone()
             .ok_or(BackendError::DefinitiveRejected)?;
+        if let Some(root) = backup.pinned_root {
+            return Ok(root);
+        }
         let description = self.describe_path("m")?;
         Ok(KeyRef {
             backend: self.backend_id(),
@@ -266,6 +344,11 @@ impl LocalSignerBackend {
     }
 
     pub fn configure_namespace(&self, authority: &DerivationAuthority) -> Result<(), BackendError> {
+        if self.state.read().backup.as_ref().is_some_and(|backup| {
+            backup.root_material_kind == LocalRootMaterialKind::Secp256k1Scalar
+        }) {
+            return Err(BackendError::Unsupported);
+        }
         let authority_digest = self.verify_derivation_authority(authority)?;
         let grant = &authority.grant;
         validate_namespace_prefix(&grant.canonical_prefix)?;
@@ -306,6 +389,26 @@ impl LocalSignerBackend {
         namespace_id: &Token,
         authority: &DerivationAuthority,
     ) -> Result<KeyDescription, BackendError> {
+        self.allocate_derived_key_inner(root, namespace_id, authority, None)
+    }
+
+    pub fn allocate_derived_key_for_operation(
+        &self,
+        root: &KeyRef,
+        namespace_id: &Token,
+        authority: &DerivationAuthority,
+        operation_id: &OperationId,
+    ) -> Result<KeyDescription, BackendError> {
+        self.allocate_derived_key_inner(root, namespace_id, authority, Some(operation_id))
+    }
+
+    fn allocate_derived_key_inner(
+        &self,
+        root: &KeyRef,
+        namespace_id: &Token,
+        authority: &DerivationAuthority,
+        operation_id: Option<&OperationId>,
+    ) -> Result<KeyDescription, BackendError> {
         let authority_digest = self.verify_derivation_authority(authority)?;
         if self.root_key_ref()? != *root {
             return Err(BackendError::InvalidRequest);
@@ -316,6 +419,14 @@ impl LocalSignerBackend {
             .backup
             .clone()
             .ok_or(BackendError::DefinitiveRejected)?;
+        if let Some(existing) = operation_id
+            .and_then(|operation_id| snapshot.pending_derivations.get(operation_id.as_str()))
+        {
+            let Some(DerivationRef::Bip32Secp256k1 { path, .. }) = &existing.derivation else {
+                return Err(BackendError::DefinitiveRejected);
+            };
+            return self.describe_path(path);
+        }
         let namespace = snapshot
             .derivation_namespaces
             .iter()
@@ -369,12 +480,53 @@ impl LocalSignerBackend {
                 .ok_or(BackendError::DefinitiveRejected)?,
         );
         next.derivation_registry.push(description.key_ref.clone());
+        if let Some(operation_id) = operation_id {
+            next.pending_derivations.insert(
+                operation_id.as_str().to_owned(),
+                description.key_ref.clone(),
+            );
+        }
         commit_backup(&mut state, next)?;
         state.registry.insert(
             description.key_ref.locator.clone(),
             description.key_ref.clone(),
         );
         Ok(description)
+    }
+
+    pub fn pending_derivations(&self) -> Vec<(OperationId, KeyRef)> {
+        self.state
+            .read()
+            .backup
+            .as_ref()
+            .map(|backup| {
+                backup
+                    .pending_derivations
+                    .iter()
+                    .filter_map(|(operation_id, key_ref)| {
+                        OperationId::new(operation_id.clone())
+                            .ok()
+                            .map(|operation_id| (operation_id, key_ref.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn finalize_derived_key(&self, operation_id: &OperationId) -> Result<(), BackendError> {
+        let mut state = self.state.write();
+        let mut next = state
+            .backup
+            .clone()
+            .ok_or(BackendError::DefinitiveRejected)?;
+        if next
+            .pending_derivations
+            .remove(operation_id.as_str())
+            .is_none()
+        {
+            return Err(BackendError::InvalidRequest);
+        }
+        commit_backup(&mut state, next)
     }
 
     pub fn tombstone_derived_key(&self, key_ref: &KeyRef) -> Result<(), BackendError> {
@@ -391,6 +543,8 @@ impl LocalSignerBackend {
             .clone()
             .ok_or(BackendError::DefinitiveRejected)?;
         next.derivation_registry.retain(|key| key != key_ref);
+        next.pending_derivations
+            .retain(|_, pending| pending != key_ref);
         if !next.derivation_tombstones.contains(&path) {
             next.derivation_tombstones.push(path);
         }
@@ -464,7 +618,32 @@ impl LocalSignerBackend {
             .map_err(|_| BackendError::DefinitiveRejected)
     }
 
+    fn root_signing_key(&self) -> Result<SigningKey, BackendError> {
+        let material_kind = self
+            .state
+            .read()
+            .backup
+            .as_ref()
+            .map(|backup| backup.root_material_kind)
+            .ok_or(BackendError::DefinitiveRejected)?;
+        let material = self.active_seed()?;
+        match material_kind {
+            LocalRootMaterialKind::Bip32Seed => {
+                let path =
+                    DerivationPath::from_str("m").map_err(|_| BackendError::InvalidRequest)?;
+                XPrv::derive_from_path(material.as_slice(), &path)
+                    .map(SigningKey::from)
+                    .map_err(|_| BackendError::DefinitiveRejected)
+            }
+            LocalRootMaterialKind::Secp256k1Scalar => SigningKey::from_slice(material.as_slice())
+                .map_err(|_| BackendError::InvalidRequest),
+        }
+    }
+
     fn derive_signing_key(&self, key_ref: &KeyRef) -> Result<SigningKey, BackendError> {
+        if self.root_key_ref()? == *key_ref {
+            return self.root_signing_key();
+        }
         let registered = self
             .state
             .read()
@@ -485,6 +664,11 @@ impl LocalSignerBackend {
     }
 
     fn validate_registered_derivations(&self) -> Result<(), BackendError> {
+        let root = self.root_key_ref()?;
+        let root_description = self.describe_path("m")?;
+        if root.public_key_fingerprint != root_description.public_key_fingerprint {
+            return Err(BackendError::DefinitiveRejected);
+        }
         let registered: Vec<KeyRef> = self.state.read().registry.values().cloned().collect();
         for key_ref in registered {
             let DerivationRef::Bip32Secp256k1 { path, .. } = key_ref
@@ -510,10 +694,17 @@ impl LocalSignerBackend {
         if path.to_string() != canonical_path {
             return Err(BackendError::InvalidRequest);
         }
-        let seed = self.active_seed()?;
-        let signing_key = XPrv::derive_from_path(seed.as_slice(), &path)
-            .map(SigningKey::from)
-            .map_err(|_| BackendError::DefinitiveRejected)?;
+        let signing_key = if canonical_path == "m" {
+            self.root_signing_key()?
+        } else {
+            if backup.root_material_kind == LocalRootMaterialKind::Secp256k1Scalar {
+                return Err(BackendError::Unsupported);
+            }
+            let seed = self.active_seed()?;
+            XPrv::derive_from_path(seed.as_slice(), &path)
+                .map(SigningKey::from)
+                .map_err(|_| BackendError::DefinitiveRejected)?
+        };
         let public_key = k256::PublicKey::from_sec1_bytes(
             signing_key
                 .verifying_key()
@@ -563,6 +754,10 @@ impl SignerBackend for LocalSignerBackend {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
+        let supports_derivation =
+            self.state.read().backup.as_ref().is_some_and(|backup| {
+                backup.root_material_kind == LocalRootMaterialKind::Bip32Seed
+            });
         BackendCapabilities {
             backend_id: self.backend_id(),
             backend_instance_id: self.backend_instance_id.clone(),
@@ -571,11 +766,14 @@ impl SignerBackend for LocalSignerBackend {
                 CryptoSuite::Secp256k1Keccak256Recoverable,
                 CryptoSuite::Secp256k1Sha256Recoverable,
             ],
-            supported_derivation: vec![DerivationCapability {
-                scheme: Token::new("bip32-secp256k1").expect("static token"),
-                maximum_depth: 10,
-                maximum_index: 0x7fff_ffff,
-            }],
+            supported_derivation: supports_derivation
+                .then(|| DerivationCapability {
+                    scheme: Token::new("bip32-secp256k1").expect("static token"),
+                    maximum_depth: 10,
+                    maximum_index: 0x7fff_ffff,
+                })
+                .into_iter()
+                .collect(),
             input_kinds: vec![CryptoInputKind::Digest32],
             output_encodings: vec![SignatureEncoding::Secp256k1Recoverable65],
             maximum_input_bytes: DecimalU64::new(32),
@@ -596,6 +794,11 @@ impl SignerBackend for LocalSignerBackend {
         key: &'a KeyRef,
     ) -> BackendFuture<'a, Result<KeyDescription, BackendError>> {
         Box::pin(async move {
+            if self.root_key_ref()? == *key {
+                let mut description = self.describe_path("m")?;
+                description.key_ref = key.clone();
+                return Ok(description);
+            }
             let registered = self
                 .state
                 .read()

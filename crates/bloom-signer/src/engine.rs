@@ -1,8 +1,8 @@
 use bloom_triad_protocol::{
-    ApprovalSelector, ApprovalTombstone, Base64UrlBytes, DecimalU64, Digest32, KeyRef, OperationId,
-    PolicyCommitReceipt, PolicyCompareAndSwapRequest, ProtocolError, ProtocolErrorCode,
-    RevocationState, SealedApprovalTerms, SelectorKind, SignRequest, SignedPolicySnapshot, Token,
-    WalletTombstone,
+    ApprovalSelector, ApprovalTombstone, Base64UrlBytes, CustodyResult, DecimalU64, Digest32,
+    KeyRef, OperationId, PolicyCommitReceipt, PolicyCompareAndSwapRequest, ProtocolError,
+    ProtocolErrorCode, RevocationState, SealedApprovalTerms, SelectorKind, SignRequest,
+    SignedPolicySnapshot, SignerActivationReceipt, Token, WalletTombstone, WebAuthnCredential,
 };
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use parking_lot::Mutex;
@@ -34,6 +34,25 @@ type StoredOperationTuple = (
     String,
     Option<String>,
 );
+
+pub(crate) type PersistedCeremonyCustody =
+    (Vec<WalletCustodyBackup>, Vec<(Token, WebAuthnCredential)>);
+
+pub(crate) enum CeremonyDatabaseEffect {
+    None,
+    InitialPolicy {
+        snapshot: SignedPolicySnapshot,
+        policy_verifying_key: Base64UrlBytes,
+        backend_enrollment: Option<BackendEnrollmentBackup>,
+    },
+    PolicyUpdate(Box<CeremonyPolicyUpdate>),
+    EnrollKey(KeyRef),
+}
+
+pub(crate) struct CeremonyPolicyUpdate {
+    request: PolicyCompareAndSwapRequest,
+    receipt: PolicyCommitReceipt,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SignAuthorization {
@@ -252,6 +271,10 @@ pub struct SignerEngine {
 }
 
 impl SignerEngine {
+    pub(crate) fn backend_registry(&self) -> &Arc<BackendRegistry> {
+        &self.backend_registry
+    }
+
     pub fn open(
         path: impl AsRef<Path>,
         broker_key_id: Token,
@@ -319,6 +342,10 @@ impl SignerEngine {
                     key_ref_jcs TEXT NOT NULL,
                     available INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ceremony_backend_enrollments (
+                    backend_instance TEXT PRIMARY KEY,
+                    enrollment_jcs TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS attempts (
                     attempt_id TEXT PRIMARY KEY,
                     attempt_digest TEXT NOT NULL,
@@ -369,6 +396,20 @@ impl SignerEngine {
                     operation_id TEXT PRIMARY KEY,
                     request_jcs TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ceremony_receipts (
+                    operation_id TEXT PRIMARY KEY,
+                    receipt_kind TEXT NOT NULL,
+                    receipt_jcs TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ceremony_wallets (
+                    wallet_id TEXT PRIMARY KEY,
+                    custody_jcs TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS webauthn_credentials (
+                    credential_id TEXT PRIMARY KEY,
+                    wallet_id TEXT NOT NULL,
+                    credential_jcs TEXT NOT NULL
+                );
                 ",
             )
             .map_err(storage)?;
@@ -383,7 +424,38 @@ impl SignerEngine {
         })
     }
 
-    pub fn install_approval(&self, terms: &SealedApprovalTerms) -> Result<Digest32, ProtocolError> {
+    pub(crate) fn activate_approval_from_ceremony(
+        &self,
+        terms: &SealedApprovalTerms,
+        receipt: &SignerActivationReceipt,
+        _proof: crate::ceremony::VerifiedCeremonyActivation,
+    ) -> Result<Digest32, ProtocolError> {
+        if receipt.approval_id != terms.approval_id()?
+            || receipt.activation_operation_id.as_str().is_empty()
+        {
+            return Err(error(
+                ProtocolErrorCode::CeremonyKindMismatch,
+                "activation receipt does not match approval terms",
+            ));
+        }
+        self.persist_approval(terms, Some(receipt))
+    }
+
+    /// Debug-build setup seam for lower-layer W3 tests. This symbol is absent
+    /// from release artifacts; production activation is ceremony-only.
+    #[cfg(debug_assertions)]
+    pub fn install_approval_for_test(
+        &self,
+        terms: &SealedApprovalTerms,
+    ) -> Result<Digest32, ProtocolError> {
+        self.persist_approval(terms, None)
+    }
+
+    fn persist_approval(
+        &self,
+        terms: &SealedApprovalTerms,
+        receipt: Option<&SignerActivationReceipt>,
+    ) -> Result<Digest32, ProtocolError> {
         terms.validate()?;
         if terms
             .expires_at_ms
@@ -446,8 +518,272 @@ impl SignerEngine {
                 params![approval_id.as_str(), terms.wallet_id.as_str(), terms_jcs],
             )
             .map_err(storage)?;
+        if let Some(receipt) = receipt {
+            transaction
+                .execute(
+                    "INSERT INTO ceremony_receipts(
+                        operation_id, receipt_kind, receipt_jcs
+                     ) VALUES (?1, 'sealed_approval', ?2)",
+                    params![
+                        receipt.activation_operation_id.as_str(),
+                        serde_jcs::to_string(receipt).map_err(malformed)?
+                    ],
+                )
+                .map_err(storage)?;
+        }
         transaction.commit().map_err(storage)?;
         Ok(approval_id)
+    }
+
+    pub(crate) fn activation_receipt(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<SignerActivationReceipt>, ProtocolError> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT receipt_jcs FROM ceremony_receipts
+                 WHERE operation_id = ?1 AND receipt_kind = 'sealed_approval'",
+                [operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?
+            .map(|encoded| serde_json::from_str(&encoded).map_err(malformed))
+            .transpose()
+    }
+
+    pub(crate) fn custody_receipt(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<CustodyResult>, ProtocolError> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT receipt_jcs FROM ceremony_receipts
+                 WHERE operation_id = ?1 AND receipt_kind = 'custody'",
+                [operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?
+            .map(|encoded| serde_json::from_str(&encoded).map_err(malformed))
+            .transpose()
+    }
+
+    pub(crate) fn load_ceremony_custody(&self) -> Result<PersistedCeremonyCustody, ProtocolError> {
+        let connection = self.connection.lock();
+        let mut wallets_statement = connection
+            .prepare("SELECT custody_jcs FROM ceremony_wallets ORDER BY wallet_id")
+            .map_err(storage)?;
+        let wallets = wallets_statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?
+            .into_iter()
+            .map(|encoded| serde_json::from_str(&encoded).map_err(malformed))
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(wallets_statement);
+
+        let mut credentials_statement = connection
+            .prepare(
+                "SELECT wallet_id, credential_jcs
+                 FROM webauthn_credentials ORDER BY credential_id",
+            )
+            .map_err(storage)?;
+        let credentials = credentials_statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?
+            .into_iter()
+            .map(|(wallet_id, encoded)| {
+                Ok((
+                    Token::new(wallet_id)?,
+                    serde_json::from_str(&encoded).map_err(malformed)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?;
+        Ok((wallets, credentials))
+    }
+
+    pub(crate) fn load_ceremony_backend_enrollments(
+        &self,
+    ) -> Result<Vec<BackendEnrollmentBackup>, ProtocolError> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT enrollment_jcs FROM ceremony_backend_enrollments
+                 ORDER BY backend_instance",
+            )
+            .map_err(storage)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?
+            .into_iter()
+            .map(|encoded| serde_json::from_str(&encoded).map_err(malformed))
+            .collect()
+    }
+
+    pub(crate) fn commit_custody_snapshot_with_effect(
+        &self,
+        result: &CustodyResult,
+        wallets: &[WalletCustodyBackup],
+        credentials: &[(Token, WebAuthnCredential)],
+        effect: CeremonyDatabaseEffect,
+    ) -> Result<(), ProtocolError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage)?;
+        transaction
+            .execute("DELETE FROM ceremony_wallets", [])
+            .map_err(storage)?;
+        for wallet in wallets {
+            transaction
+                .execute(
+                    "INSERT INTO ceremony_wallets(wallet_id, custody_jcs)
+                     VALUES (?1, ?2)",
+                    params![
+                        wallet.wallet_id.as_str(),
+                        serde_jcs::to_string(wallet).map_err(malformed)?
+                    ],
+                )
+                .map_err(storage)?;
+        }
+        transaction
+            .execute("DELETE FROM webauthn_credentials", [])
+            .map_err(storage)?;
+        for (wallet_id, credential) in credentials {
+            transaction
+                .execute(
+                    "INSERT INTO webauthn_credentials(
+                        credential_id, wallet_id, credential_jcs
+                     ) VALUES (?1, ?2, ?3)",
+                    params![
+                        credential.credential_id.encoded(),
+                        wallet_id.as_str(),
+                        serde_jcs::to_string(credential).map_err(malformed)?
+                    ],
+                )
+                .map_err(storage)?;
+        }
+        match effect {
+            CeremonyDatabaseEffect::None => {}
+            CeremonyDatabaseEffect::InitialPolicy {
+                snapshot,
+                policy_verifying_key,
+                backend_enrollment,
+            } => {
+                transaction
+                    .execute(
+                        "INSERT INTO policies(
+                            wallet_id, version, digest, canonical_policy, snapshot_jcs,
+                            policy_signing_key_id, policy_verifying_key
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            snapshot.wallet_id.as_str(),
+                            snapshot.version.get().to_string(),
+                            snapshot.policy_digest.as_str(),
+                            snapshot.canonical_policy.encoded(),
+                            serde_jcs::to_string(&snapshot).map_err(malformed)?,
+                            snapshot.policy_signing_key_id.as_str(),
+                            policy_verifying_key.encoded(),
+                        ],
+                    )
+                    .map_err(storage)?;
+                if let Some(enrollment) = backend_enrollment {
+                    if enrollment.pinned_keys.len() != 1
+                        || enrollment.pinned_keys[0].backend != enrollment.backend
+                        || enrollment.pinned_keys[0].backend_instance != enrollment.backend_instance
+                    {
+                        return Err(error(
+                            ProtocolErrorCode::KeyrefMismatch,
+                            "registration backend enrollment is not bound to one root KeyRef",
+                        ));
+                    }
+                    let key_ref = &enrollment.pinned_keys[0];
+                    transaction
+                        .execute(
+                            "INSERT INTO enrolled_keys(
+                                key_fingerprint, key_ref_jcs, available
+                             ) VALUES (?1, ?2, 1)",
+                            params![
+                                key_ref.public_key_fingerprint.as_str(),
+                                serde_jcs::to_string(key_ref).map_err(malformed)?,
+                            ],
+                        )
+                        .map_err(storage)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO ceremony_backend_enrollments(
+                                backend_instance, enrollment_jcs
+                             ) VALUES (?1, ?2)",
+                            params![
+                                enrollment.backend_instance.as_str(),
+                                serde_jcs::to_string(&enrollment).map_err(malformed)?,
+                            ],
+                        )
+                        .map_err(storage)?;
+                }
+            }
+            CeremonyDatabaseEffect::PolicyUpdate(update) => {
+                let CeremonyPolicyUpdate { request, receipt } = *update;
+                let changed = transaction
+                    .execute(
+                        "UPDATE policies SET version = ?4, digest = ?5,
+                            canonical_policy = ?6, snapshot_jcs = ?7
+                         WHERE wallet_id = ?1 AND version = ?2 AND digest = ?3",
+                        params![
+                            request.wallet_id.as_str(),
+                            request.baseline_version.get().to_string(),
+                            request.baseline_digest.as_str(),
+                            receipt.committed.version.get().to_string(),
+                            receipt.committed.policy_digest.as_str(),
+                            receipt.committed.canonical_policy.encoded(),
+                            serde_jcs::to_string(&receipt.committed).map_err(malformed)?,
+                        ],
+                    )
+                    .map_err(storage)?;
+                if changed != 1 {
+                    return Err(error(
+                        ProtocolErrorCode::PolicyBaselineStale,
+                        "policy compare-and-swap baseline changed before ceremony commit",
+                    ));
+                }
+            }
+            CeremonyDatabaseEffect::EnrollKey(key_ref) => {
+                transaction
+                    .execute(
+                        "INSERT INTO enrolled_keys(key_fingerprint, key_ref_jcs, available)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(key_fingerprint) DO UPDATE SET
+                            key_ref_jcs = excluded.key_ref_jcs,
+                            available = excluded.available",
+                        params![
+                            key_ref.public_key_fingerprint.as_str(),
+                            serde_jcs::to_string(&key_ref).map_err(malformed)?,
+                            true,
+                        ],
+                    )
+                    .map_err(storage)?;
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO ceremony_receipts(
+                    operation_id, receipt_kind, receipt_jcs
+                 ) VALUES (?1, 'custody', ?2)",
+                params![
+                    result.custody_operation_id.as_str(),
+                    serde_jcs::to_string(result).map_err(malformed)?
+                ],
+            )
+            .map_err(storage)?;
+        transaction.commit().map_err(storage)
     }
 
     pub fn enroll_key(&self, key_ref: &KeyRef) -> Result<(), ProtocolError> {
@@ -1072,6 +1408,111 @@ impl SignerEngine {
             )
             .map_err(storage)?;
         Ok(())
+    }
+
+    pub(crate) fn prepare_initial_policy_effect(
+        &self,
+        wallet_id: &Token,
+        canonical_policy: Base64UrlBytes,
+        policy_signing_key_id: Token,
+        unlocked: &UnlockedWallet,
+    ) -> Result<CeremonyDatabaseEffect, ProtocolError> {
+        if unlocked.wallet_id() != wallet_id {
+            return Err(error(
+                ProtocolErrorCode::KeyrefMismatch,
+                "unlocked policy key belongs to a different wallet",
+            ));
+        }
+        Ok(CeremonyDatabaseEffect::InitialPolicy {
+            snapshot: sign_policy_snapshot(
+                wallet_id,
+                1,
+                canonical_policy,
+                &policy_signing_key_id,
+                unlocked,
+            )?,
+            policy_verifying_key: Base64UrlBytes::from_bytes(&unlocked.policy_verifying_key()?),
+            backend_enrollment: None,
+        })
+    }
+
+    pub(crate) fn prepare_policy_update_effect(
+        &self,
+        request: &PolicyCompareAndSwapRequest,
+        unlocked: &UnlockedWallet,
+        _verified: crate::ceremony::VerifiedCeremonyActivation,
+    ) -> Result<(PolicyCommitReceipt, CeremonyDatabaseEffect), ProtocolError> {
+        if unlocked.wallet_id() != &request.wallet_id {
+            return Err(error(
+                ProtocolErrorCode::KeyrefMismatch,
+                "unlocked policy key belongs to a different wallet",
+            ));
+        }
+        let proposed_digest =
+            Digest32::from_bytes(Sha256::digest(request.proposed_canonical_policy.decode()).into());
+        if proposed_digest != request.proposed_policy_digest {
+            return Err(error(
+                ProtocolErrorCode::PolicyBaselineStale,
+                "proposed policy digest mismatch",
+            ));
+        }
+        let current: (String, String, String, String) = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT version, digest, policy_signing_key_id, policy_verifying_key
+                 FROM policies WHERE wallet_id = ?1",
+                [request.wallet_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(storage)?;
+        if current.0 != request.baseline_version.get().to_string()
+            || current.1 != request.baseline_digest.as_str()
+        {
+            return Err(error(
+                ProtocolErrorCode::PolicyBaselineStale,
+                "policy compare-and-swap baseline is stale",
+            ));
+        }
+        if current.3 != Base64UrlBytes::from_bytes(&unlocked.policy_verifying_key()?).encoded() {
+            return Err(error(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "unlocked per-wallet policy key does not match installed policy",
+            ));
+        }
+        let next_version = request
+            .baseline_version
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| error(ProtocolErrorCode::PolicyBaselineStale, "version overflow"))?;
+        let policy_signing_key_id = Token::new(current.2).map_err(malformed)?;
+        let snapshot = sign_policy_snapshot(
+            &request.wallet_id,
+            next_version,
+            request.proposed_canonical_policy.clone(),
+            &policy_signing_key_id,
+            unlocked,
+        )?;
+        let mut receipt = PolicyCommitReceipt {
+            operation_id: request.operation_id.clone(),
+            wallet_id: request.wallet_id.clone(),
+            previous_version: request.baseline_version.clone(),
+            committed: snapshot,
+            authority_diff_digest: request.authority_diff_digest.clone(),
+            signer_key_id: policy_signing_key_id,
+            signer_signature: Base64UrlBytes::from_bytes(&[]),
+        };
+        let mut message = POLICY_RECEIPT_DOMAIN.to_vec();
+        message.extend_from_slice(&serde_jcs::to_vec(&receipt).map_err(malformed)?);
+        receipt.signer_signature =
+            Base64UrlBytes::from_bytes(&unlocked.sign_policy_message(&message)?);
+        Ok((
+            receipt.clone(),
+            CeremonyDatabaseEffect::PolicyUpdate(Box::new(CeremonyPolicyUpdate {
+                request: request.clone(),
+                receipt,
+            })),
+        ))
     }
 
     pub fn install_initial_policy(
@@ -2197,7 +2638,21 @@ fn derivation_registry_from_enrollments(
     {
         let backup: bloom_signer_backend_local::EncryptedLocalBackup =
             serde_json::from_slice(&enrollment.encrypted_record.decode()).map_err(malformed)?;
-        if backup.derivation_registry != enrollment.pinned_keys {
+        let pinned_derived = enrollment
+            .pinned_keys
+            .iter()
+            .filter(|key| key.derivation.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        let pinned_root = enrollment
+            .pinned_keys
+            .iter()
+            .find(|key| key.derivation.is_none());
+        if backup.derivation_registry != pinned_derived
+            || pinned_root
+                .zip(backup.pinned_root.as_ref())
+                .is_some_and(|(enrollment_root, backup_root)| enrollment_root != backup_root)
+        {
             return Err(error(
                 ProtocolErrorCode::KeyrefMismatch,
                 "local encrypted registry differs from pinned enrollment keys",

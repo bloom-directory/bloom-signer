@@ -246,7 +246,7 @@ fn ac11_replay_retry_revocation_and_structural_failures_are_closed() {
         duration_ms: DecimalU64::new(10_000),
     }];
     let engine = new_engine(&broker);
-    let approval_id = engine.install_approval(&terms).unwrap();
+    let approval_id = engine.install_approval_for_test(&terms).unwrap();
     let request = signed(&broker, unsigned_request(&terms, "01"));
     assert_eq!(
         engine.authorize_sign(&request, 2_500).unwrap(),
@@ -318,7 +318,7 @@ fn ac11_forged_expired_wrong_key_unsupported_and_excessive_requests_fail() {
     let terms = exact_terms();
 
     let engine = new_engine(&broker);
-    engine.install_approval(&terms).unwrap();
+    engine.install_approval_for_test(&terms).unwrap();
     let mut forged = signed(&broker, unsigned_request(&terms, "02"));
     forged.broker_signature = Base64UrlBytes::from_bytes(&[0; 64]);
     assert_eq!(
@@ -327,7 +327,7 @@ fn ac11_forged_expired_wrong_key_unsupported_and_excessive_requests_fail() {
     );
 
     let engine = new_engine(&broker);
-    engine.install_approval(&terms).unwrap();
+    engine.install_approval_for_test(&terms).unwrap();
     let expired = signed(&broker, unsigned_request(&terms, "03"));
     assert_eq!(
         engine.authorize_sign(&expired, 3_001).unwrap_err().code,
@@ -335,7 +335,7 @@ fn ac11_forged_expired_wrong_key_unsupported_and_excessive_requests_fail() {
     );
 
     let engine = new_engine(&broker);
-    engine.install_approval(&terms).unwrap();
+    engine.install_approval_for_test(&terms).unwrap();
     let mut wrong_key = signed(&broker, unsigned_request(&terms, "04"));
     wrong_key.unsigned.key_ref.locator = "other-key".into();
     resign(&broker, &mut wrong_key);
@@ -345,7 +345,7 @@ fn ac11_forged_expired_wrong_key_unsupported_and_excessive_requests_fail() {
     );
 
     let engine = new_engine(&broker);
-    engine.install_approval(&terms).unwrap();
+    engine.install_approval_for_test(&terms).unwrap();
     let mut unsupported = signed(&broker, unsigned_request(&terms, "05"));
     unsupported.unsigned.crypto_suite = CryptoSuite::Secp256k1Keccak256Recoverable;
     resign(&broker, &mut unsupported);
@@ -356,7 +356,7 @@ fn ac11_forged_expired_wrong_key_unsupported_and_excessive_requests_fail() {
 
     let petal = petal_terms();
     let engine = new_engine(&broker);
-    engine.install_approval(&petal).unwrap();
+    engine.install_approval_for_test(&petal).unwrap();
     let mut excessive = signed(&broker, unsigned_request(&petal, "06"));
     excessive
         .unsigned
@@ -380,7 +380,10 @@ fn ac11_approval_ceiling_selector_issuer_key_state_retry_and_release_are_closed(
         DecimalU64::new(too_long.not_before_ms.get() + 90 * 24 * 60 * 60 * 1_000 + 1);
     let engine = new_engine(&broker);
     assert_eq!(
-        engine.install_approval(&too_long).unwrap_err().code,
+        engine
+            .install_approval_for_test(&too_long)
+            .unwrap_err()
+            .code,
         ProtocolErrorCode::ApprovalExpired
     );
 
@@ -394,7 +397,7 @@ fn ac11_approval_ceiling_selector_issuer_key_state_retry_and_release_are_closed(
         duration_ms: DecimalU64::new(10_000),
     }];
     let engine = new_engine(&broker);
-    engine.install_approval(&terms).unwrap();
+    engine.install_approval_for_test(&terms).unwrap();
     let mut wrong_issuer = signed(&broker, unsigned_request(&terms, "0a"));
     wrong_issuer.unsigned.issuer_service_id = Token::new("machine").unwrap();
     resign(&broker, &mut wrong_issuer);
@@ -433,7 +436,7 @@ fn ac11_approval_ceiling_selector_issuer_key_state_retry_and_release_are_closed(
     )
     .unwrap();
     inactive_engine.enroll_key(&terms.key_ref).unwrap();
-    inactive_engine.install_approval(&terms).unwrap();
+    inactive_engine.install_approval_for_test(&terms).unwrap();
     let inactive = signed(&broker, unsigned_request(&terms, "0c"));
     assert_eq!(
         inactive_engine
@@ -606,7 +609,7 @@ fn ac32_backup_restore_refuses_missing_registry_for_derivation_and_lower_state()
     let broker = SigningKey::from_bytes(&[7; 32]);
     let terms = exact_terms();
     let engine = new_engine(&broker);
-    let approval_id = engine.install_approval(&terms).unwrap();
+    let approval_id = engine.install_approval_for_test(&terms).unwrap();
     let request = signed(&broker, unsigned_request(&terms, "07"));
     engine.authorize_sign(&request, 2_500).unwrap();
     let missing = SignerBackupSet {
@@ -653,7 +656,7 @@ fn signed_revocation_state_and_revoke_all_are_monotonic() {
     let broker = SigningKey::from_bytes(&[7; 32]);
     let terms = exact_terms();
     let engine = new_engine(&broker);
-    engine.install_approval(&terms).unwrap();
+    engine.install_approval_for_test(&terms).unwrap();
     let revoke_all_operation = OperationId::new("e1".repeat(32)).unwrap();
     let state = engine
         .revoke_all(&terms.wallet_id, revoke_all_operation.clone(), 2_700)
@@ -705,7 +708,7 @@ fn ac32_export_contains_custody_policy_registry_and_monotonic_counters() {
     let broker = SigningKey::from_bytes(&[7; 32]);
     let terms = exact_terms();
     let engine = new_engine(&broker);
-    engine.install_approval(&terms).unwrap();
+    engine.install_approval_for_test(&terms).unwrap();
     let custody = WalletCustody::register(
         terms.wallet_id.clone(),
         SecretBytes::new(vec![1; 32]),

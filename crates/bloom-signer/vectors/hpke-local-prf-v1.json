@@ -1,0 +1,12 @@
+{
+  "name": "rfc9180-x25519-hkdf-sha256-chacha20poly1305-v1",
+  "recipient_private_key": "Wl-4T8jX-wMRylqgoM_4B6npTd3rDKrU_yqEf9xD0X4",
+  "recipient_public_key": "-MQY3HmzSjCeb3gX3ABv6JXmBbs6pKc85Z1Fl9q4xkI",
+  "info": "Ymxvb20tbG9jYWwtcHJmL3Yx",
+  "aad": "eyJjZXJlbW9ueV9pZCI6IjAxMDEiLCJzaWduZXJfbm9uY2UiOiIwMzAzIn0",
+  "plaintext": "ZGV0ZXJtaW5pc3RpYyBicm93c2VyIFBSRiBvdXRwdXQ",
+  "envelope": {
+    "kem_output": "f9OQO05DZbCpBuloiIklLw1NJArMsZfq6SSxjoYbvDQ",
+    "ciphertext": "_xVzV5zI_V4DUPACkJdO9XHHm_rERhPQzW6yq9_UHxMHlK0zWleExagibMdqwxdA"
+  }
+}
