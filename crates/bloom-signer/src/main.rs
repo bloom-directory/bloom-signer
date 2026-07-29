@@ -71,6 +71,12 @@ impl Drop for SignerConfig {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args_os().len() == 2
+        && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--version"))
+    {
+        println!("bloom-signer {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let identity_path = env_path(
         "BLOOM_SIGNER_IDENTITY",
         "/var/run/bloom/signer-identity.json",

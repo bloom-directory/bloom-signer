@@ -2,6 +2,19 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
+fn production_signer_reports_its_semantic_version_without_starting_services() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bloom-signer"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        format!("bloom-signer {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
 fn production_signer_dependency_graph_has_no_machine_broker_or_debug_driver() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
