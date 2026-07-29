@@ -1,0 +1,9 @@
+{
+  "name": "secp256k1-sha256-recoverable-v1",
+  "crypto_suite": "secp256k1-sha256-recoverable",
+  "input_kind": "digest32",
+  "digest_hex": "2d5cd4bfeda13045ee61490c5e648ef7d745ee0e3dcc86a013097cfd1690c16b",
+  "compressed_public_key_hex": "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+  "encoding": "secp256k1_recoverable65",
+  "normalized_signature_hex": "20a075f974f8c52d20bda6419d9fe14988a2999f3a7dd2117673535ee5c89e437630af53a41c10e5ed039c3113e00a4d916463f358c6931dc2b4738be0001a9701"
+}

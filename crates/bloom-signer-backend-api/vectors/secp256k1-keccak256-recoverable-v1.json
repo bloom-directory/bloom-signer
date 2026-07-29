@@ -1,0 +1,10 @@
+{
+  "name": "secp256k1-keccak256-recoverable-v1",
+  "crypto_suite": "secp256k1-keccak256-recoverable",
+  "input_kind": "digest32",
+  "message_hex": "626c6f6f6d207472696164206261636b656e6420636f6e666f726d616e6365207631",
+  "digest_hex": "67bbfeeaf9dabd438b7d460a1e1f066229294cecc45a9222ef1c32cbdeee0528",
+  "compressed_public_key_hex": "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+  "encoding": "secp256k1_recoverable65",
+  "normalized_signature_hex": "a27c07963797bca396c4ae4d276408ee5b19bd47d2b68c86eb25e2b5ee67ae4d7a9603df6ad2409c67e8b497eb4569b6cb331823589530cc0aae107e4e0e53c601"
+}

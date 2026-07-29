@@ -1,0 +1,18 @@
+[package]
+name = "bloom-signer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["local"]
+local = ["dep:bloom-signer-backend-local"]
+aws-kms = ["dep:bloom-signer-backend-aws-kms"]
+
+[dependencies]
+bloom-triad-protocol.workspace = true
+bloom-signer-backend-api = { path = "../bloom-signer-backend-api" }
+bloom-signer-backend-local = { path = "../bloom-signer-backend-local", optional = true }
+bloom-signer-backend-aws-kms = { path = "../bloom-signer-backend-aws-kms", optional = true }
+

@@ -1,0 +1,9 @@
+{
+  "name": "ed25519-message-v1",
+  "crypto_suite": "ed25519-message",
+  "input_kind": "message",
+  "message_hex": "626c6f6f6d207472696164206261636b656e6420636f6e666f726d616e6365207631",
+  "public_key_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+  "encoding": "ed25519_raw64",
+  "normalized_signature_hex": "5dcd68a6353c3ab5f920d4e863ece52cddd27be651f70e28eec413bae3f7328e0c3a29fc3bed5d5b764568beda196398bf01d1b29ba9488ce2e76fee4f72b007"
+}

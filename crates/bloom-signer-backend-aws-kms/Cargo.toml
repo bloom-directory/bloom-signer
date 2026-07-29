@@ -1,0 +1,10 @@
+[package]
+name = "bloom-signer-backend-aws-kms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bloom-signer-backend-api = { path = "../bloom-signer-backend-api" }
+
