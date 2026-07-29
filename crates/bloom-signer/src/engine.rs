@@ -2,7 +2,8 @@ use bloom_triad_protocol::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalTombstone,
     Base64UrlBytes, CeremonyPublicStatus, CredentialPublic, CredentialState, CustodyResult,
     DecimalU64, Digest32, KeyRef, OperationId, OperationPublicStatus, OperationState,
-    PolicyCommitReceipt, PolicyCompareAndSwapRequest, ProtocolError, ProtocolErrorCode,
+    PolicyCommitReceipt, PolicyCompareAndSwapRequest, PolicyUpdateCeremonyPrepareRequest,
+    PolicyUpdateRequest, PolicyValidationReceipt, ProtocolError, ProtocolErrorCode,
     RevocationState, SealedApprovalTerms, SelectorKind, SignRequest, SignedPolicySnapshot,
     SignerActivationReceipt, SigningResult, Token, WalletTombstone, WebAuthnCredential,
 };
@@ -19,7 +20,7 @@ use crate::registry::BackendRegistry;
 
 const POLICY_SIGNATURE_DOMAIN: &[u8] = b"bloom-policy-snapshot/v1";
 const POLICY_RECEIPT_DOMAIN: &[u8] = b"bloom-policy-commit-receipt/v1";
-const POLICY_CEREMONY_DOMAIN: &[u8] = b"bloom-policy-ceremony-authorization/v1";
+const POLICY_VALIDATION_DOMAIN: &[u8] = b"bloom-policy-validation-receipt/v1";
 const APPROVAL_TOMBSTONE_DOMAIN: &[u8] = b"bloom-approval-tombstone/v1";
 const WALLET_TOMBSTONE_DOMAIN: &[u8] = b"bloom-wallet-tombstone/v1";
 const REVOCATION_STATE_DOMAIN: &[u8] = b"bloom-revocation-state/v1";
@@ -47,13 +48,23 @@ pub(crate) enum CeremonyDatabaseEffect {
         policy_verifying_key: Base64UrlBytes,
         backend_enrollment: Option<BackendEnrollmentBackup>,
     },
-    PolicyUpdate(Box<CeremonyPolicyUpdate>),
+    PolicyUpdatePending(Box<CeremonyPolicyUpdate>),
     EnrollKey(KeyRef),
 }
 
 pub(crate) struct CeremonyPolicyUpdate {
-    request: PolicyCompareAndSwapRequest,
+    update: PolicyUpdateRequest,
+    validation: PolicyValidationReceipt,
     receipt: PolicyCommitReceipt,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingPolicyAuthorization {
+    update: PolicyUpdateRequest,
+    validation: PolicyValidationReceipt,
+    ceremony_receipt: CustodyResult,
+    commit_receipt: PolicyCommitReceipt,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -269,7 +280,6 @@ pub struct SignerEngine {
     connection: Mutex<Connection>,
     broker_key_id: Token,
     broker_public_key: VerifyingKey,
-    ceremony_public_key: VerifyingKey,
     revocation_key_id: Token,
     revocation_signing_key: Arc<SigningKey>,
     backend_registry: Arc<BackendRegistry>,
@@ -284,7 +294,7 @@ impl SignerEngine {
         path: impl AsRef<Path>,
         broker_key_id: Token,
         broker_public_key: VerifyingKey,
-        ceremony_public_key: VerifyingKey,
+        _ceremony_public_key: VerifyingKey,
         revocation_key_id: Token,
         revocation_signing_key: SigningKey,
         backend_registry: Arc<BackendRegistry>,
@@ -293,7 +303,7 @@ impl SignerEngine {
             Connection::open(path).map_err(storage)?,
             broker_key_id,
             broker_public_key,
-            ceremony_public_key,
+            _ceremony_public_key,
             revocation_key_id,
             revocation_signing_key,
             backend_registry,
@@ -303,7 +313,7 @@ impl SignerEngine {
     pub fn open_in_memory(
         broker_key_id: Token,
         broker_public_key: VerifyingKey,
-        ceremony_public_key: VerifyingKey,
+        _ceremony_public_key: VerifyingKey,
         revocation_key_id: Token,
         revocation_signing_key: SigningKey,
         backend_registry: Arc<BackendRegistry>,
@@ -312,7 +322,7 @@ impl SignerEngine {
             Connection::open_in_memory().map_err(storage)?,
             broker_key_id,
             broker_public_key,
-            ceremony_public_key,
+            _ceremony_public_key,
             revocation_key_id,
             revocation_signing_key,
             backend_registry,
@@ -323,7 +333,7 @@ impl SignerEngine {
         connection: Connection,
         broker_key_id: Token,
         broker_public_key: VerifyingKey,
-        ceremony_public_key: VerifyingKey,
+        _ceremony_public_key: VerifyingKey,
         revocation_key_id: Token,
         revocation_signing_key: SigningKey,
         backend_registry: Arc<BackendRegistry>,
@@ -452,7 +462,6 @@ impl SignerEngine {
             connection: Mutex::new(connection),
             broker_key_id,
             broker_public_key,
-            ceremony_public_key,
             revocation_key_id,
             revocation_signing_key: Arc::new(revocation_signing_key),
             backend_registry,
@@ -571,6 +580,7 @@ impl SignerEngine {
                 operation_id: receipt.activation_operation_id.clone(),
                 state: bloom_triad_protocol::CeremonyState::Succeeded,
                 expires_at_ms: receipt.expires_at_ms.clone(),
+                ceremony_url: None,
                 receipt_digest: Some(Digest32::from_bytes(
                     Sha256::digest(serde_jcs::to_vec(receipt).map_err(malformed)?).into(),
                 )),
@@ -807,39 +817,25 @@ impl SignerEngine {
                         .map_err(storage)?;
                 }
             }
-            CeremonyDatabaseEffect::PolicyUpdate(update) => {
-                let CeremonyPolicyUpdate { request, receipt } = *update;
-                let changed = transaction
-                    .execute(
-                        "UPDATE policies SET version = ?4, digest = ?5,
-                            canonical_policy = ?6, snapshot_jcs = ?7
-                         WHERE wallet_id = ?1 AND version = ?2 AND digest = ?3",
-                        params![
-                            request.wallet_id.as_str(),
-                            request.baseline_version.get().to_string(),
-                            request.baseline_digest.as_str(),
-                            receipt.committed.version.get().to_string(),
-                            receipt.committed.policy_digest.as_str(),
-                            receipt.committed.canonical_policy.encoded(),
-                            serde_jcs::to_string(&receipt.committed).map_err(malformed)?,
-                        ],
-                    )
-                    .map_err(storage)?;
-                if changed != 1 {
-                    return Err(error(
-                        ProtocolErrorCode::PolicyBaselineStale,
-                        "policy compare-and-swap baseline changed before ceremony commit",
-                    ));
-                }
+            CeremonyDatabaseEffect::PolicyUpdatePending(update) => {
+                let CeremonyPolicyUpdate {
+                    update,
+                    validation,
+                    receipt,
+                } = *update;
+                let authorization = PendingPolicyAuthorization {
+                    update,
+                    validation,
+                    ceremony_receipt: result.clone(),
+                    commit_receipt: receipt,
+                };
                 transaction
                     .execute(
-                        "INSERT INTO policy_commit_receipts(
-                            operation_id, request_jcs, receipt_jcs
-                         ) VALUES (?1, ?2, ?3)",
+                        "INSERT INTO policy_authorizations(operation_id, request_jcs)
+                         VALUES (?1, ?2)",
                         params![
-                            request.operation_id.as_str(),
-                            serde_jcs::to_string(&request).map_err(malformed)?,
-                            serde_jcs::to_string(&receipt).map_err(malformed)?,
+                            authorization.update.operation_id.as_str(),
+                            serde_jcs::to_string(&authorization).map_err(malformed)?,
                         ],
                     )
                     .map_err(storage)?;
@@ -1369,36 +1365,6 @@ impl SignerEngine {
             .and_then(|encoded| serde_json::from_str(&encoded).map_err(malformed))
     }
 
-    pub fn policy_commit_receipt(
-        &self,
-        request: &PolicyCompareAndSwapRequest,
-    ) -> Result<PolicyCommitReceipt, ProtocolError> {
-        let row: (String, String) = self
-            .connection
-            .lock()
-            .query_row(
-                "SELECT request_jcs, receipt_jcs FROM policy_commit_receipts
-                 WHERE operation_id = ?1",
-                [request.operation_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(storage)?
-            .ok_or_else(|| {
-                error(
-                    ProtocolErrorCode::ApprovalNotFound,
-                    "policy ceremony has not committed",
-                )
-            })?;
-        if row.0 != serde_jcs::to_string(request).map_err(malformed)? {
-            return Err(error(
-                ProtocolErrorCode::OperationIdConflict,
-                "policy operation ID was committed for different request terms",
-            ));
-        }
-        serde_json::from_str(&row.1).map_err(malformed)
-    }
-
     pub fn enrolled_key_refs(&self, wallet_id: &Token) -> Result<Vec<KeyRef>, ProtocolError> {
         let connection = self.connection.lock();
         let mut statement = connection
@@ -1750,36 +1716,73 @@ impl SignerEngine {
         Ok(state)
     }
 
-    pub fn authorize_policy_update(
+    pub fn approval_tombstones(
         &self,
-        request: &PolicyCompareAndSwapRequest,
-        ceremony_signature: &Base64UrlBytes,
-    ) -> Result<(), ProtocolError> {
-        let request_jcs = serde_jcs::to_string(request).map_err(malformed)?;
-        let signature: [u8; 64] = ceremony_signature.decode().try_into().map_err(|_| {
-            error(
-                ProtocolErrorCode::UnauthenticatedPeer,
-                "policy ceremony signature must contain 64 bytes",
+        wallet_id: &Token,
+    ) -> Result<Vec<ApprovalTombstone>, ProtocolError> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT tombstone_jcs FROM approval_tombstones
+                 WHERE wallet_id = ?1 ORDER BY approval_id",
             )
-        })?;
-        let mut message = POLICY_CEREMONY_DOMAIN.to_vec();
-        message.extend_from_slice(request_jcs.as_bytes());
-        self.ceremony_public_key
+            .map_err(storage)?;
+        let rows = statement
+            .query_map([wallet_id.as_str()], |row| row.get::<_, String>(0))
+            .map_err(storage)?;
+        let mut tombstones = Vec::new();
+        for row in rows {
+            tombstones.push(
+                serde_json::from_str::<ApprovalTombstone>(&row.map_err(storage)?)
+                    .map_err(malformed)?,
+            );
+        }
+        Ok(tombstones)
+    }
+
+    pub fn validate_policy_ceremony_prepare(
+        &self,
+        request: &PolicyUpdateCeremonyPrepareRequest,
+    ) -> Result<(), ProtocolError> {
+        if request.custody.ceremony_kind != bloom_triad_protocol::CeremonyKind::PolicyUpdate
+            || request.custody.custody_operation_id != request.update.operation_id
+            || request.custody.wallet_id.as_ref() != Some(&request.update.wallet_id)
+            || request.custody.key_ref.is_some()
+            || request.custody.exact_terms_digest != request.update.terms_digest()?
+            || request.broker_validation_receipt.update_terms_digest
+                != request.custody.exact_terms_digest
+            || request.broker_validation_receipt.broker_key_id != self.broker_key_id
+        {
+            return Err(error(
+                ProtocolErrorCode::CeremonyKindMismatch,
+                "policy ceremony preparation bindings differ",
+            ));
+        }
+        let signature: [u8; 64] = request
+            .broker_validation_receipt
+            .broker_signature
+            .decode()
+            .try_into()
+            .map_err(|_| {
+                error(
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "policy validation signature must contain 64 bytes",
+                )
+            })?;
+        let mut message = POLICY_VALIDATION_DOMAIN.to_vec();
+        message.extend_from_slice(
+            &request
+                .broker_validation_receipt
+                .unsigned_canonical_bytes()?,
+        );
+        self.broker_public_key
             .verify(&message, &Signature::from_bytes(&signature))
             .map_err(|_| {
                 error(
                     ProtocolErrorCode::UnauthenticatedPeer,
-                    "independent policy ceremony authorization is invalid",
+                    "Broker policy validation receipt signature is invalid",
                 )
-            })?;
-        self.connection
-            .lock()
-            .execute(
-                "INSERT INTO policy_authorizations(operation_id, request_jcs) VALUES (?1, ?2)",
-                params![request.operation_id.as_str(), request_jcs],
-            )
-            .map_err(storage)?;
-        Ok(())
+            })
     }
 
     pub(crate) fn prepare_initial_policy_effect(
@@ -1810,19 +1813,20 @@ impl SignerEngine {
 
     pub(crate) fn prepare_policy_update_effect(
         &self,
-        request: &PolicyCompareAndSwapRequest,
+        request: &PolicyUpdateCeremonyPrepareRequest,
         unlocked: &UnlockedWallet,
         _verified: crate::ceremony::VerifiedCeremonyActivation,
     ) -> Result<(PolicyCommitReceipt, CeremonyDatabaseEffect), ProtocolError> {
-        if unlocked.wallet_id() != &request.wallet_id {
+        let update = &request.update;
+        if unlocked.wallet_id() != &update.wallet_id {
             return Err(error(
                 ProtocolErrorCode::KeyrefMismatch,
                 "unlocked policy key belongs to a different wallet",
             ));
         }
         let proposed_digest =
-            Digest32::from_bytes(Sha256::digest(request.proposed_canonical_policy.decode()).into());
-        if proposed_digest != request.proposed_policy_digest {
+            Digest32::from_bytes(Sha256::digest(update.proposed_canonical_policy.decode()).into());
+        if proposed_digest != update.proposed_policy_digest {
             return Err(error(
                 ProtocolErrorCode::PolicyBaselineStale,
                 "proposed policy digest mismatch",
@@ -1834,12 +1838,12 @@ impl SignerEngine {
             .query_row(
                 "SELECT version, digest, policy_signing_key_id, policy_verifying_key
                  FROM policies WHERE wallet_id = ?1",
-                [request.wallet_id.as_str()],
+                [update.wallet_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .map_err(storage)?;
-        if current.0 != request.baseline_version.get().to_string()
-            || current.1 != request.baseline_digest.as_str()
+        if current.0 != update.baseline_version.get().to_string()
+            || current.1 != update.baseline_digest.as_str()
         {
             return Err(error(
                 ProtocolErrorCode::PolicyBaselineStale,
@@ -1852,25 +1856,25 @@ impl SignerEngine {
                 "unlocked per-wallet policy key does not match installed policy",
             ));
         }
-        let next_version = request
+        let next_version = update
             .baseline_version
             .get()
             .checked_add(1)
             .ok_or_else(|| error(ProtocolErrorCode::PolicyBaselineStale, "version overflow"))?;
         let policy_signing_key_id = Token::new(current.2).map_err(malformed)?;
         let snapshot = sign_policy_snapshot(
-            &request.wallet_id,
+            &update.wallet_id,
             next_version,
-            request.proposed_canonical_policy.clone(),
+            update.proposed_canonical_policy.clone(),
             &policy_signing_key_id,
             unlocked,
         )?;
         let mut receipt = PolicyCommitReceipt {
-            operation_id: request.operation_id.clone(),
-            wallet_id: request.wallet_id.clone(),
-            previous_version: request.baseline_version.clone(),
+            operation_id: update.operation_id.clone(),
+            wallet_id: update.wallet_id.clone(),
+            previous_version: update.baseline_version.clone(),
             committed: snapshot,
-            authority_diff_digest: request.authority_diff_digest.clone(),
+            authority_diff_digest: update.authority_diff_digest.clone(),
             signer_key_id: policy_signing_key_id,
             signer_signature: Base64UrlBytes::from_bytes(&[]),
         };
@@ -1880,8 +1884,9 @@ impl SignerEngine {
             Base64UrlBytes::from_bytes(&unlocked.sign_policy_message(&message)?);
         Ok((
             receipt.clone(),
-            CeremonyDatabaseEffect::PolicyUpdate(Box::new(CeremonyPolicyUpdate {
-                request: request.clone(),
+            CeremonyDatabaseEffect::PolicyUpdatePending(Box::new(CeremonyPolicyUpdate {
+                update: update.clone(),
+                validation: request.broker_validation_receipt.clone(),
                 receipt,
             })),
         ))
@@ -1931,17 +1936,11 @@ impl SignerEngine {
     pub fn compare_and_swap_policy(
         &self,
         request: &PolicyCompareAndSwapRequest,
-        unlocked: &UnlockedWallet,
     ) -> Result<PolicyCommitReceipt, ProtocolError> {
-        if unlocked.wallet_id() != &request.wallet_id {
-            return Err(error(
-                ProtocolErrorCode::KeyrefMismatch,
-                "unlocked policy key belongs to a different wallet",
-            ));
-        }
+        let update = &request.update;
         let proposed_digest =
-            Digest32::from_bytes(Sha256::digest(request.proposed_canonical_policy.decode()).into());
-        if proposed_digest != request.proposed_policy_digest {
+            Digest32::from_bytes(Sha256::digest(update.proposed_canonical_policy.decode()).into());
+        if proposed_digest != update.proposed_policy_digest {
             return Err(error(
                 ProtocolErrorCode::PolicyBaselineStale,
                 "proposed policy digest mismatch",
@@ -1949,89 +1948,105 @@ impl SignerEngine {
         }
         let mut connection = self.connection.lock();
         let transaction = connection.transaction().map_err(storage)?;
+        let committed: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT request_jcs, receipt_jcs FROM policy_commit_receipts
+                 WHERE operation_id = ?1",
+                [update.operation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(storage)?;
+        if let Some((request_jcs, receipt_jcs)) = committed {
+            if request_jcs != serde_jcs::to_string(request).map_err(malformed)? {
+                return Err(error(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "policy operation ID was committed for different terms",
+                ));
+            }
+            return serde_json::from_str(&receipt_jcs).map_err(malformed);
+        }
         let authorization: Option<String> = transaction
             .query_row(
                 "SELECT request_jcs FROM policy_authorizations WHERE operation_id = ?1",
-                [request.operation_id.as_str()],
+                [update.operation_id.as_str()],
                 |row| row.get(0),
             )
             .optional()
             .map_err(storage)?;
-        if authorization.as_deref()
-            != Some(serde_jcs::to_string(request).map_err(malformed)?.as_str())
+        let authorization: PendingPolicyAuthorization = authorization
+            .ok_or_else(|| {
+                error(
+                    ProtocolErrorCode::PolicyBaselineStale,
+                    "policy ceremony has not completed",
+                )
+            })
+            .and_then(|encoded| serde_json::from_str(&encoded).map_err(malformed))?;
+        if authorization.update != request.update
+            || authorization.validation != request.broker_validation_receipt
+            || authorization.ceremony_receipt != request.ceremony_receipt
+            || request.ceremony_receipt.ceremony_kind
+                != bloom_triad_protocol::CeremonyKind::PolicyUpdate
+            || request.ceremony_receipt.custody_operation_id != update.operation_id
         {
             return Err(error(
-                ProtocolErrorCode::PolicyBaselineStale,
+                ProtocolErrorCode::OperationIdConflict,
                 "policy ceremony authorization binding mismatch",
             ));
         }
-        let current: (String, String, String, String) = transaction
+        let current: (String, String) = transaction
             .query_row(
-                "SELECT version, digest, policy_signing_key_id, policy_verifying_key
-                 FROM policies WHERE wallet_id = ?1",
-                [request.wallet_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                "SELECT version, digest FROM policies WHERE wallet_id = ?1",
+                [update.wallet_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(storage)?;
-        if current.0 != request.baseline_version.get().to_string()
-            || current.1 != request.baseline_digest.as_str()
+        if current.0 != update.baseline_version.get().to_string()
+            || current.1 != update.baseline_digest.as_str()
         {
             return Err(error(
                 ProtocolErrorCode::PolicyBaselineStale,
                 "policy compare-and-swap baseline is stale",
             ));
         }
-        if current.3 != Base64UrlBytes::from_bytes(&unlocked.policy_verifying_key()?).encoded() {
+        let receipt = authorization.commit_receipt;
+        let changed = transaction
+            .execute(
+                "UPDATE policies SET version = ?4, digest = ?5,
+                    canonical_policy = ?6, snapshot_jcs = ?7
+                 WHERE wallet_id = ?1 AND version = ?2 AND digest = ?3",
+                params![
+                    update.wallet_id.as_str(),
+                    update.baseline_version.get().to_string(),
+                    update.baseline_digest.as_str(),
+                    receipt.committed.version.get().to_string(),
+                    receipt.committed.policy_digest.as_str(),
+                    receipt.committed.canonical_policy.encoded(),
+                    serde_jcs::to_string(&receipt.committed).map_err(malformed)?
+                ],
+            )
+            .map_err(storage)?;
+        if changed != 1 {
             return Err(error(
-                ProtocolErrorCode::UnauthenticatedPeer,
-                "unlocked per-wallet policy key does not match installed policy",
+                ProtocolErrorCode::PolicyBaselineStale,
+                "policy baseline changed before compare-and-swap commit",
             ));
         }
-        let next_version = request
-            .baseline_version
-            .get()
-            .checked_add(1)
-            .ok_or_else(|| error(ProtocolErrorCode::PolicyBaselineStale, "version overflow"))?;
-        let policy_signing_key_id = Token::new(current.2).map_err(malformed)?;
-        let snapshot = sign_policy_snapshot(
-            &request.wallet_id,
-            next_version,
-            request.proposed_canonical_policy.clone(),
-            &policy_signing_key_id,
-            unlocked,
-        )?;
-        let mut receipt = PolicyCommitReceipt {
-            operation_id: request.operation_id.clone(),
-            wallet_id: request.wallet_id.clone(),
-            previous_version: request.baseline_version.clone(),
-            committed: snapshot,
-            authority_diff_digest: request.authority_diff_digest.clone(),
-            signer_key_id: policy_signing_key_id,
-            signer_signature: Base64UrlBytes::from_bytes(&[]),
-        };
-        let receipt_preimage = serde_jcs::to_vec(&receipt).map_err(malformed)?;
-        let mut message = POLICY_RECEIPT_DOMAIN.to_vec();
-        message.extend_from_slice(&receipt_preimage);
-        receipt.signer_signature =
-            Base64UrlBytes::from_bytes(&unlocked.sign_policy_message(&message)?);
         transaction
             .execute(
-                "UPDATE policies SET version = ?2, digest = ?3,
-                    canonical_policy = ?4, snapshot_jcs = ?5
-                 WHERE wallet_id = ?1",
+                "INSERT INTO policy_commit_receipts(operation_id, request_jcs, receipt_jcs)
+                 VALUES (?1, ?2, ?3)",
                 params![
-                    request.wallet_id.as_str(),
-                    next_version.to_string(),
-                    request.proposed_policy_digest.as_str(),
-                    request.proposed_canonical_policy.encoded(),
-                    serde_jcs::to_string(&receipt.committed).map_err(malformed)?
+                    update.operation_id.as_str(),
+                    serde_jcs::to_string(request).map_err(malformed)?,
+                    serde_jcs::to_string(&receipt).map_err(malformed)?,
                 ],
             )
             .map_err(storage)?;
         transaction
             .execute(
                 "DELETE FROM policy_authorizations WHERE operation_id = ?1",
-                [request.operation_id.as_str()],
+                [update.operation_id.as_str()],
             )
             .map_err(storage)?;
         transaction.commit().map_err(storage)?;
@@ -2827,6 +2842,7 @@ fn sign_policy_snapshot(
         canonical_policy,
         policy_digest,
         policy_signing_key_id: policy_signing_key_id.clone(),
+        policy_verifying_key: Base64UrlBytes::from_bytes(&unlocked.policy_verifying_key()?),
         signer_signature: Base64UrlBytes::from_bytes(&[]),
     };
     let mut message = POLICY_SIGNATURE_DOMAIN.to_vec();

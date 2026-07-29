@@ -122,34 +122,6 @@ fn new_engine(broker: &SigningKey) -> SignerEngine {
     engine
 }
 
-fn authorize_policy_ceremony(
-    engine: &SignerEngine,
-    request: &PolicyCompareAndSwapRequest,
-) -> Result<(), ProtocolError> {
-    let mut message = b"bloom-policy-ceremony-authorization/v1".to_vec();
-    message.extend_from_slice(&serde_jcs::to_vec(request).unwrap());
-    let signature = SigningKey::from_bytes(&[6; 32]).sign(&message);
-    engine.authorize_policy_update(request, &Base64UrlBytes::from_bytes(&signature.to_bytes()))
-}
-
-fn unlocked_wallet() -> bloom_signer::custody::UnlockedWallet {
-    let custody = WalletCustody::register(
-        Token::new("wallet-1").unwrap(),
-        SecretBytes::new(vec![1; 32]),
-        SecretBytes::new(vec![8; 32]),
-        SecretBytes::new(vec![2; 32]),
-        Base64UrlBytes::from_bytes(b"credential-1"),
-        SecretBytes::new(vec![3; 32]),
-    )
-    .unwrap();
-    custody
-        .unlock_with_credential(
-            &Base64UrlBytes::from_bytes(b"credential-1"),
-            &SecretBytes::new(vec![3; 32]),
-        )
-        .unwrap()
-}
-
 fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> UnsignedSignRequest {
     let (payloads, hashes, selector_kind) = match &terms.selector {
         ApprovalSelector::Exact {
@@ -473,133 +445,44 @@ fn ac11_approval_ceiling_selector_issuer_key_state_retry_and_release_are_closed(
 }
 
 #[test]
-fn policy_cas_binds_baseline_bytes_authority_and_ceremony() {
+fn policy_cas_fails_before_a_completed_policy_ceremony() {
     let broker = SigningKey::from_bytes(&[7; 32]);
     let engine = new_engine(&broker);
-    let wallet = Token::new("wallet-1").unwrap();
-    let unlocked = unlocked_wallet();
-    assert_eq!(
-        engine
-            .install_initial_policy(
-                &Token::new("wallet-2").unwrap(),
-                Base64UrlBytes::from_bytes(br#"{"limit":1}"#),
-                Token::new("policy-key-1").unwrap(),
-                &unlocked,
-            )
-            .unwrap_err()
-            .code,
-        ProtocolErrorCode::KeyrefMismatch
-    );
-    let initial = engine
-        .install_initial_policy(
-            &wallet,
-            Base64UrlBytes::from_bytes(br#"{"limit":1}"#),
-            Token::new("policy-key-1").unwrap(),
-            &unlocked,
-        )
-        .unwrap();
     let proposed = Base64UrlBytes::from_bytes(br#"{"limit":2}"#);
-    let proposed_digest = Digest32::from_bytes(Sha256::digest(proposed.decode()).into());
+    let operation_id = OperationId::new("aa".repeat(32)).unwrap();
     let request = PolicyCompareAndSwapRequest {
-        operation_id: OperationId::new("aa".repeat(32)).unwrap(),
-        wallet_id: wallet,
-        baseline_version: initial.version,
-        baseline_digest: initial.policy_digest,
-        proposed_canonical_policy: proposed,
-        proposed_policy_digest: proposed_digest,
-        authority_diff_digest: digest("bb"),
-        ceremony_receipt_digest: digest("cc"),
-        broker_validation_receipt_digest: digest("dd"),
+        update: PolicyUpdateRequest {
+            operation_id: operation_id.clone(),
+            wallet_id: Token::new("wallet-1").unwrap(),
+            baseline_version: DecimalU64::new(1),
+            baseline_digest: digest("aa"),
+            proposed_policy_digest: Digest32::from_bytes(Sha256::digest(proposed.decode()).into()),
+            proposed_canonical_policy: proposed,
+            authority_diff_digest: digest("bb"),
+            assurance_level: Token::new("user_verified").unwrap(),
+        },
+        ceremony_receipt: CustodyResult {
+            ceremony_kind: CeremonyKind::PolicyUpdate,
+            custody_operation_id: operation_id,
+            public_status: CeremonyState::Completed,
+            wallet_id: Some(Token::new("wallet-1").unwrap()),
+            public_key_refs: Vec::new(),
+            credential_summaries: Vec::new(),
+            initial_policy: None,
+            receipt_digest: digest("cc"),
+            encrypted_browser_result: None,
+            signer_key_id: Token::new("signer-ceremony-key").unwrap(),
+            signer_signature: Base64UrlBytes::from_bytes(&[1; 64]),
+        },
+        broker_validation_receipt: PolicyValidationReceipt {
+            update_terms_digest: digest("dd"),
+            review_manifest_digest: digest("ee"),
+            broker_key_id: Token::new("broker-app-1").unwrap(),
+            broker_signature: Base64UrlBytes::from_bytes(&[2; 64]),
+        },
     };
     assert_eq!(
-        engine
-            .authorize_policy_update(&request, &Base64UrlBytes::from_bytes(&[0; 64]))
-            .unwrap_err()
-            .code,
-        ProtocolErrorCode::UnauthenticatedPeer
-    );
-    authorize_policy_ceremony(&engine, &request).unwrap();
-
-    let mut changed = request.clone();
-    changed.authority_diff_digest = digest("bc");
-    assert_eq!(
-        engine
-            .compare_and_swap_policy(&changed, &unlocked)
-            .unwrap_err()
-            .code,
-        ProtocolErrorCode::PolicyBaselineStale
-    );
-    let mut changed = request.clone();
-    changed.ceremony_receipt_digest = digest("cd");
-    assert_eq!(
-        engine
-            .compare_and_swap_policy(&changed, &unlocked)
-            .unwrap_err()
-            .code,
-        ProtocolErrorCode::PolicyBaselineStale
-    );
-    let mut changed = request.clone();
-    changed.proposed_canonical_policy = Base64UrlBytes::from_bytes(br#"{"limit":3}"#);
-    assert_eq!(
-        engine
-            .compare_and_swap_policy(&changed, &unlocked)
-            .unwrap_err()
-            .code,
-        ProtocolErrorCode::PolicyBaselineStale
-    );
-    let mut changed = request.clone();
-    changed.wallet_id = Token::new("wallet-2").unwrap();
-    assert_eq!(
-        engine
-            .compare_and_swap_policy(&changed, &unlocked)
-            .unwrap_err()
-            .code,
-        ProtocolErrorCode::KeyrefMismatch
-    );
-    let mut changed = request.clone();
-    changed.baseline_version = DecimalU64::new(2);
-    assert_eq!(
-        engine
-            .compare_and_swap_policy(&changed, &unlocked)
-            .unwrap_err()
-            .code,
-        ProtocolErrorCode::PolicyBaselineStale
-    );
-    let mut changed = request.clone();
-    changed.baseline_digest = digest("be");
-    assert_eq!(
-        engine
-            .compare_and_swap_policy(&changed, &unlocked)
-            .unwrap_err()
-            .code,
-        ProtocolErrorCode::PolicyBaselineStale
-    );
-    let mut changed = request.clone();
-    changed.proposed_policy_digest = digest("bf");
-    assert_eq!(
-        engine
-            .compare_and_swap_policy(&changed, &unlocked)
-            .unwrap_err()
-            .code,
-        ProtocolErrorCode::PolicyBaselineStale
-    );
-    let mut changed = request.clone();
-    changed.broker_validation_receipt_digest = digest("de");
-    assert_eq!(
-        engine
-            .compare_and_swap_policy(&changed, &unlocked)
-            .unwrap_err()
-            .code,
-        ProtocolErrorCode::PolicyBaselineStale
-    );
-    let receipt = engine.compare_and_swap_policy(&request, &unlocked).unwrap();
-    assert_eq!(receipt.committed.version.get(), 2);
-    assert_eq!(receipt.signer_key_id.as_str(), "policy-key-1");
-    assert_eq!(
-        engine
-            .compare_and_swap_policy(&request, &unlocked)
-            .unwrap_err()
-            .code,
+        engine.compare_and_swap_policy(&request).unwrap_err().code,
         ProtocolErrorCode::PolicyBaselineStale
     );
 }

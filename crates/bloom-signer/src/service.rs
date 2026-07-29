@@ -11,7 +11,9 @@ use bloom_triad_protocol::{
     BrokerSignerResponse, BrokerSignerService, ControlRequest, ControlResponse, CryptoInputKind,
     DecimalU64, Digest32, KeyPublic, OperationId, ProtocolError, ProtocolErrorCode,
     RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState, RevocationControlService,
-    ServiceCapabilities, ServiceFuture, SignRequest, SigningResult, Token,
+    ServiceCapabilities, ServiceFuture, SignRequest, SignerCeremonyCompleteRequest,
+    SignerCeremonyCompleteResponse, SignerCeremonyPrepareRequest, SignerCeremonyPrepareResponse,
+    SignerPreparedApproval, SignerPreparedCustody, SigningResult, Token,
 };
 use k256::pkcs8::DecodePublicKey;
 use sha2::{Digest as _, Sha256};
@@ -19,12 +21,60 @@ use sha3::Keccak256;
 use tokio::sync::Mutex;
 
 use crate::{
-    ceremony::SignerCeremonyService,
+    ceremony::{PreparedApprovalCeremony, PreparedCustodyCeremony, SignerCeremonyService},
     engine::{SignAuthorization, SignerEngine, SignerOperationEffect},
 };
 
 const PROVIDER_ATTEMPT_DOMAIN: &[u8] = b"bloom-provider-attempt/v1";
 const SIGNER_RECEIPT_DOMAIN: &[u8] = b"bloom-signer-signing-receipt/v1";
+
+fn prepared_approval(
+    ceremony: &SignerCeremonyService,
+    wallet_id: &Token,
+    prepared: PreparedApprovalCeremony,
+) -> Result<SignerPreparedApproval, ProtocolError> {
+    Ok(SignerPreparedApproval {
+        verification_credentials: verification_credentials(
+            ceremony,
+            Some(wallet_id),
+            &prepared.webauthn_options,
+        )?,
+        contribution: prepared.contribution,
+        challenges: prepared.challenges,
+        webauthn_options: prepared.webauthn_options,
+    })
+}
+
+fn prepared_custody(
+    ceremony: &SignerCeremonyService,
+    prepared: PreparedCustodyCeremony,
+) -> Result<SignerPreparedCustody, ProtocolError> {
+    Ok(SignerPreparedCustody {
+        verification_credentials: verification_credentials(
+            ceremony,
+            prepared.contribution.wallet_id.as_ref(),
+            &prepared.webauthn_options,
+        )?,
+        contribution: prepared.contribution,
+        challenges: prepared.challenges,
+        webauthn_options: prepared.webauthn_options,
+    })
+}
+
+fn verification_credentials(
+    ceremony: &SignerCeremonyService,
+    wallet_id: Option<&Token>,
+    options: &bloom_triad_protocol::CeremonyWebAuthnOptions,
+) -> Result<Vec<bloom_triad_protocol::WebAuthnCredential>, ProtocolError> {
+    let Some(wallet_id) = wallet_id else {
+        return Ok(Vec::new());
+    };
+    options
+        .allowed_credentials
+        .iter()
+        .map(|allowed| ceremony.credential(wallet_id, &allowed.credential_id))
+        .collect()
+}
 
 pub struct SignerRpcService {
     engine: Arc<SignerEngine>,
@@ -106,27 +156,51 @@ impl SignerRpcService {
                 }
                 Ok(Response::KeyListDerived(keys))
             }
-            Request::KeyDerivePrepare(request) => Ok(Response::KeyDerivePrepare(
-                self.ceremony.prepare_custody(request, now_ms)?.contribution,
-            )),
-            Request::KeyEnrollPrepare(request) => Ok(Response::KeyEnrollPrepare(
-                self.ceremony.prepare_custody(request, now_ms)?.contribution,
-            )),
+            Request::KeyDerivePrepare(request) => Ok(Response::KeyDerivePrepare(prepared_custody(
+                &self.ceremony,
+                self.ceremony.prepare_custody(request, now_ms)?,
+            )?)),
+            Request::KeyEnrollPrepare(request) => Ok(Response::KeyEnrollPrepare(prepared_custody(
+                &self.ceremony,
+                self.ceremony.prepare_custody(request, now_ms)?,
+            )?)),
             Request::KeyEnrollStatus(request) => Ok(Response::KeyEnrollStatus(
                 self.ceremony.public_status(&request.operation_id)?,
             )),
-            Request::CeremonyPrepare(request) => Ok(Response::CeremonyPrepare(
-                self.ceremony
-                    .prepare_approval(request, now_ms)?
-                    .contribution,
-            )),
-            Request::CeremonyComplete(request) => Ok(Response::CeremonyComplete(
-                self.ceremony.complete_approval(request, now_ms).await?,
-            )),
-            Request::CeremonyStatus(request) => Ok(Response::CeremonyStatus(
-                self.ceremony
-                    .public_status(&OperationId::new(request.id.as_str().to_owned())?)?,
-            )),
+            Request::CeremonyPrepare(request) => Ok(Response::CeremonyPrepare(match request {
+                SignerCeremonyPrepareRequest::SealedApproval(request) => {
+                    let wallet_id = request.terms.wallet_id.clone();
+                    SignerCeremonyPrepareResponse::SealedApproval(prepared_approval(
+                        &self.ceremony,
+                        &wallet_id,
+                        self.ceremony.prepare_approval(*request, now_ms)?,
+                    )?)
+                }
+                SignerCeremonyPrepareRequest::PolicyUpdate(request) => {
+                    SignerCeremonyPrepareResponse::PolicyUpdate(prepared_custody(
+                        &self.ceremony,
+                        self.ceremony.prepare_policy_update(*request, now_ms)?,
+                    )?)
+                }
+            })),
+            Request::CeremonyComplete(request) => Ok(Response::CeremonyComplete(match request {
+                SignerCeremonyCompleteRequest::SealedApproval(request) => {
+                    SignerCeremonyCompleteResponse::SealedApproval(Box::new(
+                        self.ceremony.complete_approval(*request, now_ms).await?,
+                    ))
+                }
+                SignerCeremonyCompleteRequest::PolicyUpdate(request) => {
+                    SignerCeremonyCompleteResponse::PolicyUpdate(Box::new(
+                        self.ceremony.complete_policy_update(*request, now_ms)?,
+                    ))
+                }
+            })),
+            Request::CeremonyStatus(request) => {
+                Ok(Response::CeremonyStatus(signer_ceremony_status(
+                    self.ceremony
+                        .status(&OperationId::new(request.id.as_str().to_owned())?)?,
+                )))
+            }
             Request::CeremonyCancel(request) => {
                 let operation_id = OperationId::new(request.id.as_str().to_owned())?;
                 let mut status = self.ceremony.public_status(&operation_id)?;
@@ -154,7 +228,10 @@ impl SignerRpcService {
                     .revoke_all(&request.wallet_id, request.operation_id, now_ms)?,
             )),
             Request::RevocationState(request) => Ok(Response::RevocationState(
-                self.engine.revocation_state(&request.wallet_id, now_ms)?,
+                bloom_triad_protocol::RevocationSnapshot {
+                    state: self.engine.revocation_state(&request.wallet_id, now_ms)?,
+                    approval_tombstones: self.engine.approval_tombstones(&request.wallet_id)?,
+                },
             )),
             Request::SignerSign(request) => {
                 require_signature_count(&request, false)?;
@@ -171,41 +248,76 @@ impl SignerRpcService {
                 self.engine.policy_snapshot(&request.wallet_id)?,
             )),
             Request::PolicyCompareAndSwap(request) => Ok(Response::PolicyCompareAndSwap(
-                self.engine.policy_commit_receipt(&request)?,
+                self.engine.compare_and_swap_policy(&request)?,
             )),
-            Request::WalletRegistrationPrepare(request) => Ok(Response::WalletRegistrationPrepare(
-                self.ceremony.prepare_custody(request, now_ms)?.contribution,
-            )),
+            Request::WalletRegistrationPrepare(request) => {
+                Ok(Response::WalletRegistrationPrepare(prepared_custody(
+                    &self.ceremony,
+                    self.ceremony.prepare_custody(request, now_ms)?,
+                )?))
+            }
             Request::WalletRegistrationStatus(request) => Ok(Response::WalletRegistrationStatus(
                 self.ceremony.public_status(&request.operation_id)?,
             )),
-            Request::WalletUnlockPrepare(request) => Ok(Response::WalletUnlockPrepare(
-                self.ceremony.prepare_custody(request, now_ms)?.contribution,
-            )),
-            Request::WalletImportPrepare(request) => Ok(Response::WalletImportPrepare(
-                self.ceremony.prepare_custody(request, now_ms)?.contribution,
-            )),
-            Request::WalletExportPrepare(request) => Ok(Response::WalletExportPrepare(
-                self.ceremony.prepare_custody(request, now_ms)?.contribution,
-            )),
-            Request::WalletDeletePrepare(request) => Ok(Response::WalletDeletePrepare(
-                self.ceremony.prepare_custody(request, now_ms)?.contribution,
-            )),
+            Request::WalletUnlockPrepare(request) => {
+                Ok(Response::WalletUnlockPrepare(prepared_custody(
+                    &self.ceremony,
+                    self.ceremony.prepare_custody(request, now_ms)?,
+                )?))
+            }
+            Request::WalletImportPrepare(request) => {
+                Ok(Response::WalletImportPrepare(prepared_custody(
+                    &self.ceremony,
+                    self.ceremony.prepare_custody(request, now_ms)?,
+                )?))
+            }
+            Request::WalletExportPrepare(request) => {
+                Ok(Response::WalletExportPrepare(prepared_custody(
+                    &self.ceremony,
+                    self.ceremony.prepare_custody(request, now_ms)?,
+                )?))
+            }
+            Request::WalletDeletePrepare(request) => {
+                Ok(Response::WalletDeletePrepare(prepared_custody(
+                    &self.ceremony,
+                    self.ceremony.prepare_custody(request, now_ms)?,
+                )?))
+            }
             Request::CredentialListPublic(request) => Ok(Response::CredentialListPublic(
                 self.engine.credential_public(&request.wallet_id)?,
             )),
-            Request::CredentialAddPrepare(request) => Ok(Response::CredentialAddPrepare(
-                self.ceremony.prepare_custody(request, now_ms)?.contribution,
-            )),
-            Request::CredentialRemovePrepare(request) => Ok(Response::CredentialRemovePrepare(
-                self.ceremony.prepare_custody(request, now_ms)?.contribution,
-            )),
-            Request::CredentialReplacePrepare(request) => Ok(Response::CredentialReplacePrepare(
-                self.ceremony.prepare_custody(request, now_ms)?.contribution,
-            )),
-            Request::RecoveryPrepare(request) => Ok(Response::RecoveryPrepare(
-                self.ceremony.prepare_custody(request, now_ms)?.contribution,
-            )),
+            Request::CredentialAddPrepare(request) => {
+                Ok(Response::CredentialAddPrepare(prepared_custody(
+                    &self.ceremony,
+                    self.ceremony.prepare_custody(request, now_ms)?,
+                )?))
+            }
+            Request::CredentialRemovePrepare(request) => {
+                Ok(Response::CredentialRemovePrepare(prepared_custody(
+                    &self.ceremony,
+                    self.ceremony.prepare_custody(request, now_ms)?,
+                )?))
+            }
+            Request::CredentialReplacePrepare(request) => {
+                Ok(Response::CredentialReplacePrepare(prepared_custody(
+                    &self.ceremony,
+                    self.ceremony.prepare_custody(request, now_ms)?,
+                )?))
+            }
+            Request::RecoveryPrepare(request) => Ok(Response::RecoveryPrepare(prepared_custody(
+                &self.ceremony,
+                self.ceremony.prepare_custody(request, now_ms)?,
+            )?)),
+            Request::CustodyBindOutputRecipient(request) => {
+                Ok(Response::CustodyBindOutputRecipient(prepared_custody(
+                    &self.ceremony,
+                    self.ceremony.bind_custody_output_recipient(
+                        &request.operation_id,
+                        request.recipient_key,
+                        now_ms,
+                    )?,
+                )?))
+            }
             Request::CustodyComplete(request) => Ok(Response::CustodyComplete(
                 self.ceremony.complete_custody(request, now_ms)?,
             )),
@@ -513,6 +625,25 @@ fn ethereum_address(
     let point = public_key.to_sec1_bytes();
     let digest = Keccak256::digest(&point[1..]);
     Ok(vec![format!("0x{}", hex::encode(&digest[12..]))])
+}
+
+fn signer_ceremony_status(
+    status: crate::ceremony::SignerCeremonyStatus,
+) -> bloom_triad_protocol::SignerCeremonyStatus {
+    match status {
+        crate::ceremony::SignerCeremonyStatus::Pending => {
+            bloom_triad_protocol::SignerCeremonyStatus::Pending
+        }
+        crate::ceremony::SignerCeremonyStatus::CompletedApproval(receipt) => {
+            bloom_triad_protocol::SignerCeremonyStatus::CompletedApproval(receipt)
+        }
+        crate::ceremony::SignerCeremonyStatus::CompletedCustody(result) => {
+            bloom_triad_protocol::SignerCeremonyStatus::CompletedCustody(result)
+        }
+        crate::ceremony::SignerCeremonyStatus::Missing => {
+            bloom_triad_protocol::SignerCeremonyStatus::Missing
+        }
+    }
 }
 
 fn map_backend_error(error: BackendError) -> ProtocolError {

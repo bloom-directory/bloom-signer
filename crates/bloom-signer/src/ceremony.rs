@@ -5,9 +5,10 @@ use bloom_triad_protocol::{
     CeremonyWebAuthnOptions, CredentialPrfInput, CredentialSummary, CryptoSuite,
     CustodyCompleteRequest, CustodyHpkeAad, CustodyOutputHpkeAad, CustodyPrepareRequest,
     CustodyResult, CustodySignerContribution, DecimalU64, Digest32, LocalPrfHpkeAad, OperationId,
-    PolicyCompareAndSwapRequest, ProtocolError, ProtocolErrorCode, SignerActivationReceipt,
-    SignerCeremonyContribution, Token, WebAuthnCeremonyProof, WebAuthnCredential,
-    verify_webauthn_assertion, verify_webauthn_attestation,
+    PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest, ProtocolError,
+    ProtocolErrorCode, SignerActivationReceipt, SignerCeremonyContribution, Token,
+    WebAuthnCeremonyProof, WebAuthnCredential, verify_webauthn_assertion,
+    verify_webauthn_attestation,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use futures::lock::Mutex as AsyncMutex;
@@ -51,6 +52,7 @@ pub struct PreparedCustodyCeremony {
 enum PendingRequest {
     Approval(Box<CeremonyPrepareRequest>),
     Custody(Box<CustodyPrepareRequest>),
+    PolicyUpdate(Box<PolicyUpdateCeremonyPrepareRequest>),
 }
 
 enum PendingContribution {
@@ -491,6 +493,62 @@ impl SignerCeremonyService {
         Ok(prepared)
     }
 
+    pub fn prepare_policy_update(
+        &self,
+        request: PolicyUpdateCeremonyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<PreparedCustodyCeremony, ProtocolError> {
+        self.engine.validate_policy_ceremony_prepare(&request)?;
+        let request_digest = canonical_digest(&request)?;
+        if let Some(existing) = self.pending.lock().get(&request.update.operation_id) {
+            if existing.request_digest != request_digest {
+                return Err(operation_conflict());
+            }
+            if let (PendingRequest::PolicyUpdate(_), PendingContribution::Custody(contribution)) =
+                (&existing.request, &existing.contribution)
+            {
+                return Ok(PreparedCustodyCeremony {
+                    contribution: contribution.clone(),
+                    challenges: existing.challenges.clone(),
+                    webauthn_options: self.options_for_pending(existing),
+                });
+            }
+            return Err(kind_mismatch());
+        }
+        self.prepare_custody(request.custody.clone(), now_ms)?;
+        let mut pending = self.pending.lock();
+        let entry = pending
+            .get_mut(&request.update.operation_id)
+            .ok_or_else(replay)?;
+        entry.request_digest = request_digest;
+        entry.request = PendingRequest::PolicyUpdate(Box::new(request));
+        let review_manifest_digest = match &entry.request {
+            PendingRequest::PolicyUpdate(policy) => policy
+                .broker_validation_receipt
+                .review_manifest_digest
+                .clone(),
+            _ => return Err(kind_mismatch()),
+        };
+        let contribution = match &mut entry.contribution {
+            PendingContribution::Custody(contribution) => contribution,
+            _ => return Err(kind_mismatch()),
+        };
+        contribution.review_manifest_digest = review_manifest_digest;
+        contribution.signer_signature = Base64UrlBytes::from_bytes(&[]);
+        contribution.signer_signature =
+            self.sign_contribution(&contribution.unsigned_canonical_bytes()?);
+        let contribution_digest = contribution.digest()?;
+        for challenge in &mut entry.challenges {
+            challenge.review_manifest_digest = contribution.review_manifest_digest.clone();
+            challenge.signer_contribution_digest = contribution_digest.clone();
+        }
+        Ok(PreparedCustodyCeremony {
+            contribution: contribution.clone(),
+            challenges: entry.challenges.clone(),
+            webauthn_options: self.options_for_pending(entry),
+        })
+    }
+
     pub fn bind_custody_output_recipient(
         &self,
         operation_id: &OperationId,
@@ -523,7 +581,6 @@ impl SignerCeremonyService {
                 | CeremonyKind::WalletImport
                 | CeremonyKind::WalletExport
                 | CeremonyKind::KeyDerive
-                | CeremonyKind::PolicyUpdate
         ) || contribution.expires_at_ms.get() <= now_ms
         {
             return Err(kind_mismatch());
@@ -693,6 +750,26 @@ impl SignerCeremonyService {
         request: CustodyCompleteRequest,
         now_ms: u64,
     ) -> Result<CustodyResult, ProtocolError> {
+        self.complete_custody_inner(request, now_ms, false)
+    }
+
+    pub fn complete_policy_update(
+        &self,
+        request: PolicyUpdateCeremonyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, ProtocolError> {
+        self.complete_custody_inner(request.custody, now_ms, true)
+    }
+
+    fn complete_custody_inner(
+        &self,
+        request: CustodyCompleteRequest,
+        now_ms: u64,
+        policy_update: bool,
+    ) -> Result<CustodyResult, ProtocolError> {
+        if policy_update != (request.ceremony_kind == CeremonyKind::PolicyUpdate) {
+            return Err(kind_mismatch());
+        }
         let _completion_barrier = self.custody_completion_barrier.lock();
         if let Some(CompletedCeremony::Custody { result, .. }) =
             self.completed.lock().get(&request.custody_operation_id)
@@ -710,12 +787,20 @@ impl SignerCeremonyService {
             .lock()
             .remove(&request.custody_operation_id)
             .ok_or_else(replay)?;
-        let (prepare, contribution) = match (&pending.request, &pending.contribution) {
-            (PendingRequest::Custody(prepare), PendingContribution::Custody(contribution)) => {
-                (prepare, contribution)
-            }
-            _ => return Err(kind_mismatch()),
-        };
+        let (prepare, policy_prepare, contribution) =
+            match (&pending.request, &pending.contribution) {
+                (PendingRequest::Custody(prepare), PendingContribution::Custody(contribution)) => {
+                    (prepare.as_ref(), None, contribution)
+                }
+                (
+                    PendingRequest::PolicyUpdate(policy),
+                    PendingContribution::Custody(contribution),
+                ) => (&policy.custody, Some(policy.as_ref()), contribution),
+                _ => return Err(kind_mismatch()),
+            };
+        if policy_update != policy_prepare.is_some() {
+            return Err(kind_mismatch());
+        }
         if request.ceremony_kind != prepare.ceremony_kind
             || request.ceremony_id != contribution.ceremony_id
             || contribution.expires_at_ms.get() <= now_ms
@@ -733,6 +818,7 @@ impl SignerCeremonyService {
             contribution,
             &pending.challenges,
             &request,
+            policy_prepare,
             CustodyApplyContext {
                 recipient: pending.hpke_recipient.take(),
                 registration: pending.registration.take(),
@@ -802,6 +888,10 @@ impl SignerCeremonyService {
                     .collect()
             })
             .unwrap_or_default();
+        let initial_policy = match &apply_outcome.database_effect {
+            CeremonyDatabaseEffect::InitialPolicy { snapshot, .. } => Some(snapshot.clone()),
+            _ => None,
+        };
         let mut result = CustodyResult {
             ceremony_kind: request.ceremony_kind,
             custody_operation_id: request.custody_operation_id.clone(),
@@ -809,6 +899,7 @@ impl SignerCeremonyService {
             wallet_id,
             public_key_refs: apply_outcome.public_key_refs,
             credential_summaries,
+            initial_policy,
             receipt_digest,
             encrypted_browser_result,
             signer_key_id: self.signer_key_id.clone(),
@@ -822,6 +913,7 @@ impl SignerCeremonyService {
             operation_id: request.custody_operation_id.clone(),
             state: result.public_status,
             expires_at_ms: contribution.expires_at_ms.clone(),
+            ceremony_url: None,
             receipt_digest: Some(result.receipt_digest.clone()),
         };
         if let Err(error) = self.engine.commit_custody_snapshot_with_effect(
@@ -872,6 +964,7 @@ impl SignerCeremonyService {
                 operation_id: operation_id.clone(),
                 state: CeremonyState::Cancelled,
                 expires_at_ms: contribution.expires_at_ms,
+                ceremony_url: None,
                 receipt_digest: None,
             },
             PendingContribution::Custody(contribution) => CeremonyPublicStatus {
@@ -880,6 +973,7 @@ impl SignerCeremonyService {
                 operation_id: operation_id.clone(),
                 state: CeremonyState::Cancelled,
                 expires_at_ms: contribution.expires_at_ms,
+                ceremony_url: None,
                 receipt_digest: None,
             },
         };
@@ -926,6 +1020,7 @@ impl SignerCeremonyService {
                     operation_id: operation_id.clone(),
                     state: CeremonyState::Succeeded,
                     expires_at_ms: receipt.expires_at_ms.clone(),
+                    ceremony_url: None,
                     receipt_digest: Some(canonical_digest(receipt.as_ref())?),
                 }),
                 CompletedCeremony::Custody {
@@ -938,6 +1033,7 @@ impl SignerCeremonyService {
                     operation_id: operation_id.clone(),
                     state: result.public_status,
                     expires_at_ms: expires_at_ms.clone(),
+                    ceremony_url: None,
                     receipt_digest: Some(result.receipt_digest.clone()),
                 }),
             };
@@ -950,6 +1046,7 @@ impl SignerCeremonyService {
                     operation_id: operation_id.clone(),
                     state: CeremonyState::AwaitingUser,
                     expires_at_ms: contribution.expires_at_ms.clone(),
+                    ceremony_url: None,
                     receipt_digest: None,
                 },
                 PendingContribution::Custody(contribution) => CeremonyPublicStatus {
@@ -958,6 +1055,7 @@ impl SignerCeremonyService {
                     operation_id: operation_id.clone(),
                     state: CeremonyState::AwaitingUser,
                     expires_at_ms: contribution.expires_at_ms.clone(),
+                    ceremony_url: None,
                     receipt_digest: None,
                 },
             });
@@ -985,6 +1083,7 @@ impl SignerCeremonyService {
         contribution: &CustodySignerContribution,
         challenges: &[CeremonyChallenge],
         complete: &CustodyCompleteRequest,
+        policy_prepare: Option<&PolicyUpdateCeremonyPrepareRequest>,
         mut context: CustodyApplyContext,
     ) -> Result<CustodyApplyOutcome, ProtocolError> {
         let mut sensitive_output = None;
@@ -1057,9 +1156,18 @@ impl SignerCeremonyService {
                     credential_wrap_key(&prf, &registration.wallet_id, &credential.credential_id)?;
                 let unlocked =
                     wallet.unlock_with_credential(&credential.credential_id, &unlock_key)?;
+                let initial_policy = bloom_triad_protocol::CanonicalWalletPolicy {
+                    wallet_id: registration.wallet_id.clone(),
+                    maximum_approval_lifetime_ms: 30 * 24 * 60 * 60 * 1_000,
+                    allowed_petal_packages: Vec::new(),
+                    allowed_destinations: Vec::new(),
+                    required_verifiers: Vec::new(),
+                };
                 database_effect = self.engine.prepare_initial_policy_effect(
                     &registration.wallet_id,
-                    Base64UrlBytes::from_bytes(br#"{"version":1}"#),
+                    Base64UrlBytes::from_bytes(
+                        &serde_jcs::to_vec(&initial_policy).map_err(malformed)?,
+                    ),
                     Token::new("wallet-policy-key-v1").expect("static token"),
                     &unlocked,
                 )?;
@@ -1302,8 +1410,27 @@ impl SignerCeremonyService {
                 let unlocked = self
                     .wallet(wallet_id)?
                     .unlock_with_credential(&assertion.credential_id, &credential_key)?;
-                let generic =
-                    self.apply_generic_custody_effect(prepare, input.effect, &unlocked)?;
+                let generic = if prepare.ceremony_kind == CeremonyKind::PolicyUpdate {
+                    if !matches!(input.effect, GenericCustodyEffect::PolicyUpdate) {
+                        return Err(kind_mismatch());
+                    }
+                    let (_, database_effect) = self.engine.prepare_policy_update_effect(
+                        policy_prepare.ok_or_else(kind_mismatch)?,
+                        &unlocked,
+                        VerifiedCeremonyActivation(()),
+                    )?;
+                    GenericCustodyOutcome {
+                        sensitive_output: None,
+                        database_effect,
+                        rollback_derived_key: None,
+                        public_key_refs: Vec::new(),
+                    }
+                } else {
+                    if policy_prepare.is_some() {
+                        return Err(kind_mismatch());
+                    }
+                    self.apply_generic_custody_effect(prepare, input.effect, &unlocked)?
+                };
                 sensitive_output = generic.sensitive_output;
                 database_effect = generic.database_effect;
                 rollback_derived_key = generic.rollback_derived_key;
@@ -1327,7 +1454,7 @@ impl SignerCeremonyService {
         &self,
         prepare: &CustodyPrepareRequest,
         effect: GenericCustodyEffect,
-        unlocked: &UnlockedWallet,
+        _unlocked: &UnlockedWallet,
     ) -> Result<GenericCustodyOutcome, ProtocolError> {
         let wallet_id = prepare.wallet_id.as_ref().ok_or_else(kind_mismatch)?;
         match (prepare.ceremony_kind, effect) {
@@ -1419,23 +1546,8 @@ impl SignerCeremonyService {
                     ))
                 }
             }
-            (CeremonyKind::PolicyUpdate, GenericCustodyEffect::PolicyUpdate { request }) => {
-                if request.wallet_id != *wallet_id
-                    || request.operation_id != prepare.custody_operation_id
-                {
-                    return Err(kind_mismatch());
-                }
-                let (receipt, effect) = self.engine.prepare_policy_update_effect(
-                    &request,
-                    unlocked,
-                    VerifiedCeremonyActivation(()),
-                )?;
-                Ok(GenericCustodyOutcome {
-                    sensitive_output: Some(serde_jcs::to_vec(&receipt).map_err(malformed)?),
-                    database_effect: effect,
-                    rollback_derived_key: None,
-                    public_key_refs: Vec::new(),
-                })
+            (CeremonyKind::PolicyUpdate, GenericCustodyEffect::PolicyUpdate) => {
+                Err(kind_mismatch())
             }
             _ => Err(kind_mismatch()),
         }
@@ -1602,6 +1714,7 @@ impl SignerCeremonyService {
             .any(|pending| match &pending.request {
                 PendingRequest::Approval(request) => &request.terms.wallet_id == wallet_id,
                 PendingRequest::Custody(request) => request.wallet_id.as_ref() == Some(wallet_id),
+                PendingRequest::PolicyUpdate(request) => &request.update.wallet_id == wallet_id,
             })
         {
             return Err(protocol(
@@ -1655,6 +1768,9 @@ impl SignerCeremonyService {
                         PendingRequest::Custody(request) => {
                             self.options_for_wallet(request.wallet_id.as_ref())
                         }
+                        PendingRequest::PolicyUpdate(request) => {
+                            self.options_for_wallet(Some(&request.update.wallet_id))
+                        }
                     };
                     options.registration_user_handle = Some(creation.user_handle.clone());
                     options.registration_prf_salt = Some(creation.prf_salt.clone());
@@ -1667,6 +1783,9 @@ impl SignerCeremonyService {
                 }
                 PendingRequest::Custody(request) => {
                     self.options_for_wallet(request.wallet_id.as_ref())
+                }
+                PendingRequest::PolicyUpdate(request) => {
+                    self.options_for_wallet(Some(&request.update.wallet_id))
                 }
             })
     }
@@ -1786,9 +1905,7 @@ enum GenericCustodyEffect {
         grant: DerivationGrantInput,
         authority_signature: Base64UrlBytes,
     },
-    PolicyUpdate {
-        request: PolicyCompareAndSwapRequest,
-    },
+    PolicyUpdate,
 }
 
 #[derive(Deserialize)]

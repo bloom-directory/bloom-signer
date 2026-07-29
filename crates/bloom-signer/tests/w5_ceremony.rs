@@ -355,6 +355,96 @@ fn complete_generic(
     Ok((result, prepared.contribution))
 }
 
+fn complete_policy_update(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    wallet_id: &Token,
+    update: PolicyUpdateRequest,
+    now_ms: u64,
+) -> Result<(CustodyResult, PolicyUpdateCeremonyPrepareRequest), ProtocolError> {
+    let review_manifest_digest = digest("c3");
+    let mut validation = PolicyValidationReceipt {
+        update_terms_digest: update.terms_digest()?,
+        review_manifest_digest,
+        broker_key_id: Token::new("broker-app-1").unwrap(),
+        broker_signature: Base64UrlBytes::from_bytes(&[]),
+    };
+    let mut validation_message = b"bloom-policy-validation-receipt/v1".to_vec();
+    validation_message.extend_from_slice(&validation.unsigned_canonical_bytes()?);
+    validation.broker_signature = Base64UrlBytes::from_bytes(
+        &SigningKey::from_bytes(&[7; 32])
+            .sign(&validation_message)
+            .to_bytes(),
+    );
+    let request = PolicyUpdateCeremonyPrepareRequest {
+        custody: CustodyPrepareRequest {
+            ceremony_kind: CeremonyKind::PolicyUpdate,
+            custody_operation_id: update.operation_id.clone(),
+            wallet_id: Some(wallet_id.clone()),
+            key_ref: None,
+            exact_terms_digest: update.terms_digest()?,
+            expected_input_class: Token::new("policy_update_credential_prf").unwrap(),
+            browser_output_recipient_key: None,
+        },
+        update,
+        broker_validation_receipt: validation,
+    };
+    let mut forged = request.clone();
+    forged.broker_validation_receipt.broker_signature = Base64UrlBytes::from_bytes(&[0_u8; 64]);
+    assert_eq!(
+        service
+            .prepare_policy_update(forged, now_ms)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::UnauthenticatedPeer
+    );
+    let prepared = service.prepare_policy_update(request.clone(), now_ms)?;
+    assert_eq!(
+        prepared.contribution.review_manifest_digest,
+        request.broker_validation_receipt.review_manifest_digest
+    );
+    let assertion =
+        authenticator.assertion(&prepared.challenges[0].canonical_bytes()?, now_ms as u32);
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::PolicyUpdate,
+        custody_operation_id: request.update.operation_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest()?,
+        wallet_id: Some(wallet_id.clone()),
+        key_ref: None,
+        credential_id: Some(assertion.credential_id.clone()),
+        expected_input_class: Token::new("policy_update_credential_prf").unwrap(),
+    }
+    .canonical_bytes()?;
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "effect": {"kind": "policy_update"},
+    }))
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    let result = service.complete_policy_update(
+        PolicyUpdateCeremonyCompleteRequest {
+            custody: CustodyCompleteRequest {
+                ceremony_kind: CeremonyKind::PolicyUpdate,
+                custody_operation_id: request.update.operation_id.clone(),
+                ceremony_id: prepared.contribution.ceremony_id,
+                proof: WebAuthnCeremonyProof::Assertion { assertion },
+                encrypted_input: Some(encrypted_input),
+                public_binding_digest: request.custody.exact_terms_digest.clone(),
+            },
+        },
+        now_ms + 100,
+    )?;
+    Ok((result, request))
+}
+
 #[test]
 fn raw_webauthn_assertion_and_attestation_are_independently_verified() {
     let authenticator = VirtualAuthenticator::generate();
@@ -1039,7 +1129,7 @@ fn restart_tombstones_a_derived_key_allocated_before_custody_commit() {
 #[test]
 fn generic_custody_export_policy_and_delete_apply_exact_typed_effects() {
     let authenticator = VirtualAuthenticator::generate();
-    let (service, _, _, _) = service(&authenticator);
+    let (service, _, engine, _) = service(&authenticator);
     let (wallet_id, credential) = register_wallet(&service, &authenticator, operation("b0"), 5_000);
 
     let export_effect = serde_json::json!({"kind": "wallet_export"});
@@ -1076,40 +1166,75 @@ fn generic_custody_export_policy_and_delete_apply_exact_typed_effects() {
     assert_eq!(bundle["wallet"]["wallet_id"], wallet_id.as_str());
     assert_eq!(bundle["credentials"].as_array().unwrap().len(), 1);
 
-    let proposed = Base64UrlBytes::from_bytes(br#"{"version":2}"#);
+    let baseline_snapshot = engine.policy_snapshot(&wallet_id).unwrap();
+    let mut proposed_policy: CanonicalWalletPolicy =
+        serde_json::from_slice(&baseline_snapshot.canonical_policy.decode()).unwrap();
+    proposed_policy.maximum_approval_lifetime_ms += 1;
+    let proposed = Base64UrlBytes::from_bytes(&serde_jcs::to_vec(&proposed_policy).unwrap());
     let policy_operation = operation("b3");
-    let policy_output_recipient = HpkeRecipient::generate();
-    let (policy_result, _) = complete_generic(
-        &service,
-        &authenticator,
-        &wallet_id,
-        (
-            CeremonyKind::PolicyUpdate,
-            policy_operation.clone(),
-            serde_json::json!({
-                "kind": "policy_update",
-                "request": PolicyCompareAndSwapRequest {
-                    operation_id: policy_operation,
-                    wallet_id: wallet_id.clone(),
-                    baseline_version: DecimalU64::new(1),
-                    baseline_digest: Digest32::from_bytes(
-                        sha2::Sha256::digest(br#"{"version":1}"#).into()
-                    ),
-                    proposed_canonical_policy: proposed.clone(),
-                    proposed_policy_digest: Digest32::from_bytes(
-                        sha2::Sha256::digest(proposed.decode()).into()
-                    ),
-                    authority_diff_digest: digest("c1"),
-                    ceremony_receipt_digest: digest("c2"),
-                    broker_validation_receipt_digest: digest("c3"),
-                }
-            }),
+    let update = PolicyUpdateRequest {
+        operation_id: policy_operation,
+        wallet_id: wallet_id.clone(),
+        baseline_version: DecimalU64::new(1),
+        baseline_digest: baseline_snapshot.policy_digest,
+        proposed_canonical_policy: proposed.clone(),
+        proposed_policy_digest: Digest32::from_bytes(
+            sha2::Sha256::digest(proposed.decode()).into(),
         ),
-        Some(&policy_output_recipient),
-        8_000,
-    )
-    .unwrap();
-    assert!(policy_result.encrypted_browser_result.is_some());
+        authority_diff_digest: digest("c1"),
+        assurance_level: Token::new("user_verified").unwrap(),
+    };
+    let (policy_result, prepared) =
+        complete_policy_update(&service, &authenticator, &wallet_id, update, 8_000).unwrap();
+    assert!(policy_result.encrypted_browser_result.is_none());
+    assert_eq!(engine.policy_snapshot(&wallet_id).unwrap().version.get(), 1);
+    let compare = PolicyCompareAndSwapRequest {
+        update: prepared.update,
+        ceremony_receipt: policy_result,
+        broker_validation_receipt: prepared.broker_validation_receipt,
+    };
+    let mut altered = Vec::new();
+    let mut changed = compare.clone();
+    changed.update.baseline_version = DecimalU64::new(2);
+    altered.push(changed);
+    let mut changed = compare.clone();
+    changed.update.baseline_digest = digest("c2");
+    altered.push(changed);
+    let mut changed = compare.clone();
+    changed.update.proposed_canonical_policy = Base64UrlBytes::from_bytes(br#"{"version":3}"#);
+    altered.push(changed);
+    let mut changed = compare.clone();
+    changed.update.proposed_policy_digest = digest("c4");
+    altered.push(changed);
+    let mut changed = compare.clone();
+    changed.update.authority_diff_digest = digest("c5");
+    altered.push(changed);
+    let mut changed = compare.clone();
+    changed.update.assurance_level = Token::new("machine_asserted").unwrap();
+    altered.push(changed);
+    let mut changed = compare.clone();
+    changed.ceremony_receipt.receipt_digest = digest("c6");
+    altered.push(changed);
+    let mut changed = compare.clone();
+    changed.broker_validation_receipt.review_manifest_digest = digest("c7");
+    altered.push(changed);
+    for changed in altered {
+        assert!(
+            engine.compare_and_swap_policy(&changed).is_err(),
+            "every altered policy, baseline, receipt, and review binding must fail"
+        );
+    }
+    let receipt = engine.compare_and_swap_policy(&compare).unwrap();
+    assert_eq!(receipt.committed.version.get(), 2);
+    assert_eq!(
+        engine.policy_snapshot(&wallet_id).unwrap(),
+        receipt.committed
+    );
+    assert_eq!(
+        engine.compare_and_swap_policy(&compare).unwrap(),
+        receipt,
+        "same-operation replay returns the identical commit receipt"
+    );
 
     let mismatch = complete_generic(
         &service,
