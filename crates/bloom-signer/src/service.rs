@@ -1,19 +1,16 @@
 //! Production typed Broker→Signer RPC adapter.
 
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::Arc;
 
 use bloom_signer_backend_api::{BackendError, BackendInput, BackendSignRequest};
 use bloom_triad_protocol::{
     BackendPublicCapability, Base64UrlBytes, BootEpoch, BrokerSignerMethod, BrokerSignerRequest,
     BrokerSignerResponse, BrokerSignerService, ControlRequest, ControlResponse, CryptoInputKind,
     DecimalU64, Digest32, KeyPublic, OperationId, ProtocolError, ProtocolErrorCode,
-    RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState, RevocationControlService,
-    ServiceCapabilities, ServiceFuture, SignRequest, SignerCeremonyCompleteRequest,
-    SignerCeremonyCompleteResponse, SignerCeremonyPrepareRequest, SignerCeremonyPrepareResponse,
-    SignerPreparedApproval, SignerPreparedCustody, SigningResult, Token,
+    RPC_ENVELOPE_SCHEMA_V1, Readiness, RevocationControlService, ServiceCapabilities,
+    ServiceFuture, SignRequest, SignerCeremonyCompleteRequest, SignerCeremonyCompleteResponse,
+    SignerCeremonyPrepareRequest, SignerCeremonyPrepareResponse, SignerPreparedApproval,
+    SignerPreparedCustody, SigningResult, Token,
 };
 use k256::pkcs8::DecodePublicKey;
 use sha2::{Digest as _, Sha256};
@@ -22,6 +19,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     ceremony::{PreparedApprovalCeremony, PreparedCustodyCeremony, SignerCeremonyService},
+    clock::SignerClock,
     engine::{SignAuthorization, SignerEngine, SignerOperationEffect},
 };
 
@@ -79,6 +77,7 @@ fn verification_credentials(
 pub struct SignerRpcService {
     engine: Arc<SignerEngine>,
     ceremony: Arc<SignerCeremonyService>,
+    clock: Arc<SignerClock>,
     boot_epoch: BootEpoch,
     build_digest: Digest32,
     service_version: String,
@@ -89,6 +88,7 @@ impl SignerRpcService {
     pub fn new(
         engine: Arc<SignerEngine>,
         ceremony: Arc<SignerCeremonyService>,
+        clock: Arc<SignerClock>,
         boot_epoch: BootEpoch,
         build_digest: Digest32,
         service_version: impl Into<String>,
@@ -96,6 +96,7 @@ impl SignerRpcService {
         Self {
             engine,
             ceremony,
+            clock,
             boot_epoch,
             build_digest,
             service_version: service_version.into(),
@@ -110,13 +111,13 @@ impl SignerRpcService {
         use BrokerSignerRequest as Request;
         use BrokerSignerResponse as Response;
 
-        let now_ms = now_ms()?;
+        let now_ms = self.clock.now_ms(false)?;
         match request {
             Request::SystemHello(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::UnknownMethod,
                 "system.hello is consumed by the authenticated transport",
             )),
-            Request::SignerReadiness(_) => Ok(Response::SignerReadiness(self.readiness())),
+            Request::SignerReadiness(_) => Ok(Response::SignerReadiness(self.readiness()?)),
             Request::SignerCapabilities(_) => {
                 Ok(Response::SignerCapabilities(self.capabilities()?))
             }
@@ -341,7 +342,7 @@ impl SignerRpcService {
         &self,
         request: ControlRequest,
     ) -> Result<ControlResponse, ProtocolError> {
-        let now_ms = now_ms()?;
+        let now_ms = self.clock.now_ms(false)?;
         match request {
             ControlRequest::Revoke(request) => {
                 let approval_id = request.approval_id.clone();
@@ -365,15 +366,16 @@ impl SignerRpcService {
         }
     }
 
-    fn readiness(&self) -> Readiness {
-        Readiness {
+    fn readiness(&self) -> Result<Readiness, ProtocolError> {
+        let (state, conditions) = self.clock.readiness()?;
+        Ok(Readiness {
             service_id: Token::new("bloom-signer").expect("static service ID"),
             service_version: self.service_version.clone(),
             build_digest: self.build_digest.clone(),
             boot_epoch: self.boot_epoch.clone(),
-            state: ReadinessState::Ready,
-            conditions: Vec::new(),
-        }
+            state,
+            conditions,
+        })
     }
 
     fn capabilities(&self) -> Result<ServiceCapabilities, ProtocolError> {
@@ -445,8 +447,11 @@ impl SignerRpcService {
 
     async fn sign(&self, request: SignRequest) -> Result<SigningResult, ProtocolError> {
         let _gate = self.signing_gate.lock().await;
-        let now_ms = now_ms()?;
-        let authorization = self.engine.authorize_sign(&request, now_ms)?;
+        let trusted_time_required = self
+            .engine
+            .approval_requires_trusted_time(&request.unsigned.approval_id)?;
+        let clock = self.clock.observe(trusted_time_required)?;
+        let authorization = self.engine.authorize_sign(&request, &clock)?;
         if authorization == SignAuthorization::SameOperationRetry {
             if let Some(stored) = self
                 .engine
@@ -658,9 +663,10 @@ fn map_backend_error(error: BackendError) -> ProtocolError {
     ProtocolError::new(code, format!("Signer backend failed: {error}"))
 }
 
+#[cfg(test)]
 fn now_ms() -> Result<u64, ProtocolError> {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| {
             ProtocolError::new(
                 ProtocolErrorCode::ClockRollback,
@@ -687,6 +693,15 @@ mod tests {
         UnsignedSignRequest,
     };
     use ed25519_dalek::{Signer as _, SigningKey};
+
+    fn test_time_source() -> &'static str {
+        #[cfg(target_os = "linux")]
+        return "linux-chrony-nts";
+        #[cfg(target_os = "macos")]
+        return "macos-managed-timed";
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        panic!("Signer service tests require a reviewed trusted-time platform");
+    }
 
     async fn fixture() -> (SignerRpcService, SigningKey, SealedApprovalTerms) {
         let broker_key = SigningKey::from_bytes(&[7; 32]);
@@ -764,10 +779,19 @@ mod tests {
             )
             .unwrap(),
         );
+        let clock = Arc::new(
+            SignerClock::new(
+                engine.clone(),
+                test_time_source(),
+                BootEpoch::from_bytes([3; 16]),
+            )
+            .unwrap(),
+        );
         (
             SignerRpcService::new(
                 engine,
                 ceremony,
+                clock,
                 BootEpoch::from_bytes([3; 16]),
                 Digest32::from_bytes([2; 32]),
                 "test",
@@ -866,10 +890,8 @@ mod tests {
     async fn dispatched_restart_state_never_calls_backend_again() {
         let (service, broker_key, terms) = fixture().await;
         let first = sign_request(&broker_key, &terms, 3);
-        service
-            .engine
-            .authorize_sign(&first, now_ms().unwrap())
-            .unwrap();
+        let clock = service.clock.observe(false).unwrap();
+        service.engine.authorize_sign(&first, &clock).unwrap();
         service
             .engine
             .mark_operation_dispatched(&first.unsigned.operation_id)

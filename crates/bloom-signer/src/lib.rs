@@ -1,6 +1,7 @@
 //! Signer service domain implementation.
 
 pub mod ceremony;
+pub mod clock;
 pub mod custody;
 pub mod engine;
 pub mod hpke;

@@ -1,3 +1,4 @@
+use bloom_signer::clock::{ClockCondition, ClockDecision};
 use bloom_signer::custody::WalletCustody;
 use bloom_signer::engine::{
     ApprovalCounterBackup, BackendEnrollmentBackup, SignAuthorization, SignerBackupSet,
@@ -13,6 +14,16 @@ use std::sync::Arc;
 
 fn digest(byte: &str) -> Digest32 {
     Digest32::new(byte.repeat(32)).unwrap()
+}
+
+fn clock(effective_now_ms: u64) -> ClockDecision {
+    ClockDecision {
+        effective_now_ms,
+        condition: ClockCondition::Healthy,
+        observed_utc_ms: Some(effective_now_ms),
+        monotonic_anchor_ns: 1_000_000,
+        boot_epoch: BootEpoch::from_bytes([1; 16]),
+    }
 }
 
 fn key_ref() -> KeyRef {
@@ -221,11 +232,14 @@ fn ac11_replay_retry_revocation_and_structural_failures_are_closed() {
     let approval_id = engine.install_approval_for_test(&terms).unwrap();
     let request = signed(&broker, unsigned_request(&terms, "01"));
     assert_eq!(
-        engine.authorize_sign(&request, 2_500).unwrap(),
+        engine.authorize_sign(&request, &clock(2_500)).unwrap(),
         SignAuthorization::NewOperation
     );
     assert_eq!(
-        engine.authorize_sign(&request, 2_500).unwrap_err().code,
+        engine
+            .authorize_sign(&request, &clock(2_500))
+            .unwrap_err()
+            .code,
         ProtocolErrorCode::CeremonyReplay
     );
 
@@ -235,7 +249,7 @@ fn ac11_replay_retry_revocation_and_structural_failures_are_closed() {
     retry.unsigned.expires_at_ms = DecimalU64::new(3_100);
     resign(&broker, &mut retry);
     assert_eq!(
-        engine.authorize_sign(&retry, 2_500).unwrap(),
+        engine.authorize_sign(&retry, &clock(2_500)).unwrap(),
         SignAuthorization::SameOperationRetry
     );
 
@@ -277,7 +291,7 @@ fn ac11_replay_retry_revocation_and_structural_failures_are_closed() {
     resign(&broker, &mut after_revoke);
     assert_eq!(
         engine
-            .authorize_sign(&after_revoke, 2_500)
+            .authorize_sign(&after_revoke, &clock(2_500))
             .unwrap_err()
             .code,
         ProtocolErrorCode::ApprovalRevoked
@@ -294,7 +308,10 @@ fn ac11_forged_expired_wrong_key_unsupported_and_excessive_requests_fail() {
     let mut forged = signed(&broker, unsigned_request(&terms, "02"));
     forged.broker_signature = Base64UrlBytes::from_bytes(&[0; 64]);
     assert_eq!(
-        engine.authorize_sign(&forged, 2_500).unwrap_err().code,
+        engine
+            .authorize_sign(&forged, &clock(2_500))
+            .unwrap_err()
+            .code,
         ProtocolErrorCode::UnauthenticatedPeer
     );
 
@@ -302,7 +319,10 @@ fn ac11_forged_expired_wrong_key_unsupported_and_excessive_requests_fail() {
     engine.install_approval_for_test(&terms).unwrap();
     let expired = signed(&broker, unsigned_request(&terms, "03"));
     assert_eq!(
-        engine.authorize_sign(&expired, 3_001).unwrap_err().code,
+        engine
+            .authorize_sign(&expired, &clock(3_001))
+            .unwrap_err()
+            .code,
         ProtocolErrorCode::ApprovalExpired
     );
 
@@ -312,7 +332,10 @@ fn ac11_forged_expired_wrong_key_unsupported_and_excessive_requests_fail() {
     wrong_key.unsigned.key_ref.locator = "other-key".into();
     resign(&broker, &mut wrong_key);
     assert_eq!(
-        engine.authorize_sign(&wrong_key, 2_500).unwrap_err().code,
+        engine
+            .authorize_sign(&wrong_key, &clock(2_500))
+            .unwrap_err()
+            .code,
         ProtocolErrorCode::KeyrefMismatch
     );
 
@@ -322,7 +345,10 @@ fn ac11_forged_expired_wrong_key_unsupported_and_excessive_requests_fail() {
     unsupported.unsigned.crypto_suite = CryptoSuite::Secp256k1Keccak256Recoverable;
     resign(&broker, &mut unsupported);
     assert_eq!(
-        engine.authorize_sign(&unsupported, 2_500).unwrap_err().code,
+        engine
+            .authorize_sign(&unsupported, &clock(2_500))
+            .unwrap_err()
+            .code,
         ProtocolErrorCode::SuiteNotAllowed
     );
 
@@ -338,7 +364,10 @@ fn ac11_forged_expired_wrong_key_unsupported_and_excessive_requests_fail() {
     excessive.unsigned.signature_count = DecimalU64::new(2);
     resign(&broker, &mut excessive);
     assert_eq!(
-        engine.authorize_sign(&excessive, 2_500).unwrap_err().code,
+        engine
+            .authorize_sign(&excessive, &clock(2_500))
+            .unwrap_err()
+            .code,
         ProtocolErrorCode::LimitExceededSignatures
     );
 }
@@ -375,7 +404,7 @@ fn ac11_approval_ceiling_selector_issuer_key_state_retry_and_release_are_closed(
     resign(&broker, &mut wrong_issuer);
     assert_eq!(
         engine
-            .authorize_sign(&wrong_issuer, 2_500)
+            .authorize_sign(&wrong_issuer, &clock(2_500))
             .unwrap_err()
             .code,
         ProtocolErrorCode::UnauthenticatedPeer
@@ -388,7 +417,7 @@ fn ac11_approval_ceiling_selector_issuer_key_state_retry_and_release_are_closed(
     resign(&broker, &mut wrong_selector);
     assert_eq!(
         engine
-            .authorize_sign(&wrong_selector, 2_500)
+            .authorize_sign(&wrong_selector, &clock(2_500))
             .unwrap_err()
             .code,
         ProtocolErrorCode::SelectorMismatch
@@ -412,20 +441,23 @@ fn ac11_approval_ceiling_selector_issuer_key_state_retry_and_release_are_closed(
     let inactive = signed(&broker, unsigned_request(&terms, "0c"));
     assert_eq!(
         inactive_engine
-            .authorize_sign(&inactive, 2_500)
+            .authorize_sign(&inactive, &clock(2_500))
             .unwrap_err()
             .code,
         ProtocolErrorCode::KeyrefMismatch
     );
 
     let accepted = signed(&broker, unsigned_request(&terms, "0d"));
-    engine.authorize_sign(&accepted, 2_500).unwrap();
+    engine.authorize_sign(&accepted, &clock(2_500)).unwrap();
     let mut drifted = accepted.clone();
     drifted.unsigned.attempt_id = digest("8b");
     drifted.unsigned.validation_receipt_digest = digest("ad");
     resign(&broker, &mut drifted);
     assert_eq!(
-        engine.authorize_sign(&drifted, 2_500).unwrap_err().code,
+        engine
+            .authorize_sign(&drifted, &clock(2_500))
+            .unwrap_err()
+            .code,
         ProtocolErrorCode::OperationIdConflict
     );
 
@@ -439,7 +471,7 @@ fn ac11_approval_ceiling_selector_issuer_key_state_retry_and_release_are_closed(
     replacement.unsigned.attempt_id = digest("8c");
     resign(&broker, &mut replacement);
     assert_eq!(
-        engine.authorize_sign(&replacement, 2_500).unwrap(),
+        engine.authorize_sign(&replacement, &clock(2_500)).unwrap(),
         SignAuthorization::NewOperation
     );
 }
@@ -494,7 +526,7 @@ fn ac32_backup_restore_refuses_missing_registry_for_derivation_and_lower_state()
     let engine = new_engine(&broker);
     let approval_id = engine.install_approval_for_test(&terms).unwrap();
     let request = signed(&broker, unsigned_request(&terms, "07"));
-    engine.authorize_sign(&request, 2_500).unwrap();
+    engine.authorize_sign(&request, &clock(2_500)).unwrap();
     let missing = SignerBackupSet {
         wallet_id: terms.wallet_id.clone(),
         wallet_revocation_epoch: terms.wallet_revocation_epoch.clone(),
@@ -579,7 +611,10 @@ fn signed_revocation_state_and_revoke_all_are_monotonic() {
     assert_eq!(next.wallet_revocation_epoch.get(), 9);
     assert_eq!(
         engine
-            .authorize_sign(&signed(&broker, unsigned_request(&terms, "0f")), 2_500,)
+            .authorize_sign(
+                &signed(&broker, unsigned_request(&terms, "0f")),
+                &clock(2_500)
+            )
             .unwrap_err()
             .code,
         ProtocolErrorCode::ApprovalRevoked
@@ -616,7 +651,7 @@ fn ac32_export_contains_custody_policy_registry_and_monotonic_counters() {
         )
         .unwrap();
     let authorized = signed(&broker, unsigned_request(&terms, "09"));
-    engine.authorize_sign(&authorized, 2_500).unwrap();
+    engine.authorize_sign(&authorized, &clock(2_500)).unwrap();
     engine
         .commit_operation_result(
             &authorized.unsigned.operation_id,
@@ -651,6 +686,20 @@ fn ac32_export_contains_custody_policy_registry_and_monotonic_counters() {
         Some(Base64UrlBytes::from_bytes(b"normalized-signature-result"))
     );
     assert_eq!(exported.approval_counters[0].committed_operations.get(), 1);
+    let mut legacy_backup_json = serde_json::to_value(&exported).unwrap();
+    for operation in legacy_backup_json["operations"].as_array_mut().unwrap() {
+        let operation = operation.as_object_mut().unwrap();
+        operation.remove("observed_utc_ms");
+        operation.remove("monotonic_anchor_ns");
+        operation.remove("clock_boot_epoch");
+    }
+    let legacy_backup: SignerBackupSet = serde_json::from_value(legacy_backup_json).unwrap();
+    assert_eq!(legacy_backup.operations[0].observed_utc_ms, None);
+    assert_eq!(legacy_backup.operations[0].monotonic_anchor_ns.get(), 0);
+    assert_eq!(
+        legacy_backup.operations[0].clock_boot_epoch,
+        BootEpoch::from_bytes([0; 16])
+    );
 
     let restored_backend = Arc::new(
         exported
@@ -683,7 +732,7 @@ fn ac32_export_contains_custody_policy_registry_and_monotonic_counters() {
         restored.restore_backup(&inconsistent).unwrap_err().code,
         ProtocolErrorCode::MalformedFrame
     );
-    restored.restore_backup(&exported).unwrap();
+    restored.restore_backup(&legacy_backup).unwrap();
     let round_trip = restored
         .export_backup(
             &terms.wallet_id,
@@ -692,6 +741,7 @@ fn ac32_export_contains_custody_policy_registry_and_monotonic_counters() {
         )
         .unwrap();
     assert_eq!(round_trip.approval_counters, exported.approval_counters);
+    assert_eq!(round_trip.operations[0].monotonic_anchor_ns.get(), 0);
     assert_eq!(
         restored.derivation_status(&terms.wallet_id).unwrap(),
         WalletDerivationStatus::Ready
@@ -702,7 +752,7 @@ fn ac32_export_contains_custody_policy_registry_and_monotonic_counters() {
     retry.unsigned.issuer_boot_epoch = BootEpoch::new("97".repeat(16)).unwrap();
     resign(&broker, &mut retry);
     assert_eq!(
-        restored.authorize_sign(&retry, 2_500).unwrap(),
+        restored.authorize_sign(&retry, &clock(2_500)).unwrap(),
         SignAuthorization::SameOperationRetry
     );
     assert_eq!(

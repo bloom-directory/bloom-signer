@@ -10,8 +10,8 @@ use std::{
 };
 
 use bloom_signer::{
-    ceremony::SignerCeremonyService, engine::SignerEngine, registry::BackendRegistry,
-    registry::CompiledBackend, service::SignerRpcService,
+    ceremony::SignerCeremonyService, clock::SignerClock, engine::SignerEngine,
+    registry::BackendRegistry, registry::CompiledBackend, service::SignerRpcService,
 };
 #[cfg(feature = "aws-kms")]
 use bloom_signer_backend_api::SecretBytes;
@@ -21,6 +21,7 @@ use bloom_triad_local_transport::{
 use bloom_triad_protocol::{Digest32, ProtocolError, ProtocolErrorCode, Token};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use tokio::{net::UnixListener, sync::Semaphore};
 use zeroize::Zeroize;
 
@@ -83,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (identity, manifest) =
         load_identity_and_manifest(&identity_path, &manifest_path, "bloom-signer")?;
+    let trusted_time_source = manifest.trusted_time_source.clone();
     let broker_acl = manifest.broker.into_acl()?;
     let revoke_client_acl = manifest.revoke_client.into_acl()?;
     if broker_acl.service_id.as_str() != "bloom-broker" {
@@ -114,9 +116,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Token::new(config.ceremony_key_id.clone())?,
         ceremony_signing_key,
     )?);
+    let clock = Arc::new(SignerClock::new(
+        engine.clone(),
+        &trusted_time_source,
+        identity.boot_epoch.clone(),
+    )?);
+    if let Some(accepted_utc_ms) = clock_repair_request()? {
+        let expiring = engine.active_approvals_expiring_by(accepted_utc_ms)?;
+        require_clock_repair_confirmation(accepted_utc_ms, &expiring)?;
+        let decision = engine.repair_clock(accepted_utc_ms)?;
+        eprintln!(
+            "Bloom Signer clock repair accepted: effective_utc_ms={}, condition={:?}, expiring_live_approvals={}",
+            decision.effective_now_ms,
+            decision.condition,
+            serde_json::to_string(&expiring)?
+        );
+        return Ok(());
+    }
     let service = Arc::new(SignerRpcService::new(
         engine,
         ceremony,
+        clock,
         identity.boot_epoch.clone(),
         build_digest,
         env!("CARGO_PKG_VERSION"),
@@ -164,6 +184,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     )?;
     Ok(())
+}
+
+fn require_clock_repair_confirmation(
+    accepted_utc_ms: u64,
+    expiring: &[Digest32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if expiring.is_empty() {
+        return Ok(());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"bloom-clock-repair-confirmation/v1");
+    hasher.update(accepted_utc_ms.to_be_bytes());
+    hasher.update(serde_jcs::to_vec(expiring)?);
+    let expected = Digest32::from_bytes(hasher.finalize().into());
+    let supplied = std::env::var("BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST").ok();
+    if supplied.as_deref() != Some(expected.as_str()) {
+        eprintln!(
+            "Bloom Signer clock repair requires confirmation before mutation: accepted_utc_ms={}, expiring_live_approvals={}, confirmation_digest={}",
+            accepted_utc_ms,
+            serde_json::to_string(expiring)?,
+            expected
+        );
+        return Err(
+            "clock repair not committed; set BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST to the reported digest"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn clock_repair_request() -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    std::env::var("BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS")
+        .ok()
+        .map(|value| {
+            value.parse::<u64>().map_err(|error| {
+                format!("invalid BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS: {error}").into()
+            })
+        })
+        .transpose()
 }
 
 async fn serve_rpc(

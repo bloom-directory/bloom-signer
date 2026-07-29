@@ -14,6 +14,7 @@ aws-kms = ["dep:bloom-signer-backend-aws-kms"]
 bloom-triad-protocol.workspace = true
 bloom-triad-local-transport.workspace = true
 bloom-service-activation.workspace = true
+bloom-trusted-time.workspace = true
 bloom-signer-backend-api = { path = "../bloom-signer-backend-api" }
 bloom-signer-backend-local = { path = "../bloom-signer-backend-local", optional = true }
 bloom-signer-backend-aws-kms = { path = "../bloom-signer-backend-aws-kms", optional = true }
@@ -36,5 +37,6 @@ tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 zeroize.workspace = true
 
 [dev-dependencies]
+tempfile = "3"
 bloom-broker-debug-driver = { path = "../../../bloom-broker/crates/bloom-broker-debug-driver" }
 k256.workspace = true

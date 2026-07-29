@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
+use crate::clock::{ClockCondition, ClockDecision};
 use crate::custody::UnlockedWallet;
 use crate::custody::{WalletCustody, WalletCustodyBackup};
 use crate::registry::BackendRegistry;
@@ -26,6 +27,8 @@ const WALLET_TOMBSTONE_DOMAIN: &[u8] = b"bloom-wallet-tombstone/v1";
 const REVOCATION_STATE_DOMAIN: &[u8] = b"bloom-revocation-state/v1";
 const REVOCATION_OPERATION_DOMAIN: &[u8] = b"bloom-revocation-operation/v1";
 const SIGNER_RETRY_BINDING_DOMAIN: &[u8] = b"bloom-signer-retry-binding/v1";
+const AUDIT_DOMAIN: &[u8] = b"bloom-signer-audit-entry/v1";
+const AUDIT_SIGNATURE_DOMAIN: &[u8] = b"bloom-signer-audit-signature/v1";
 const MAX_APPROVAL_LIFETIME_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
 
 type StoredOperationTuple = (
@@ -125,8 +128,22 @@ pub struct OperationStateBackup {
     pub approval_id: Digest32,
     pub signature_count: DecimalU64,
     pub accepted_at_ms: DecimalU64,
+    #[serde(default)]
+    pub observed_utc_ms: Option<DecimalU64>,
+    #[serde(default = "zero_decimal_u64")]
+    pub monotonic_anchor_ns: DecimalU64,
+    #[serde(default = "zero_boot_epoch")]
+    pub clock_boot_epoch: bloom_triad_protocol::BootEpoch,
     pub state: BackupOperationState,
     pub normalized_result: Option<Base64UrlBytes>,
+}
+
+fn zero_decimal_u64() -> DecimalU64 {
+    DecimalU64::new(0)
+}
+
+fn zero_boot_epoch() -> bloom_triad_protocol::BootEpoch {
+    bloom_triad_protocol::BootEpoch::from_bytes([0; 16])
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -352,6 +369,14 @@ impl SignerEngine {
                     committed_operations TEXT NOT NULL,
                     committed_signatures TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS clock_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    last_effective_ms TEXT NOT NULL,
+                    condition TEXT NOT NULL,
+                    observed_utc_ms TEXT,
+                    monotonic_anchor_ns TEXT NOT NULL,
+                    boot_epoch TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS enrolled_keys (
                     key_fingerprint TEXT PRIMARY KEY,
                     key_ref_jcs TEXT NOT NULL,
@@ -375,6 +400,22 @@ impl SignerEngine {
                     accepted_at_ms TEXT NOT NULL,
                     state TEXT NOT NULL,
                     normalized_result TEXT
+                );
+                CREATE TABLE IF NOT EXISTS operation_clock_anchors (
+                    operation_id TEXT PRIMARY KEY,
+                    observed_utc_ms TEXT,
+                    monotonic_anchor_ns TEXT NOT NULL,
+                    boot_epoch TEXT NOT NULL,
+                    FOREIGN KEY (operation_id) REFERENCES operations(operation_id)
+                );
+                CREATE TABLE IF NOT EXISTS audit_chain (
+                    sequence INTEGER PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    payload_jcs TEXT NOT NULL,
+                    previous_hash TEXT NOT NULL,
+                    entry_hash TEXT NOT NULL,
+                    signing_key_id TEXT NOT NULL,
+                    signature TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS wallet_state (
                     wallet_id TEXT PRIMARY KEY,
@@ -458,6 +499,37 @@ impl SignerEngine {
                 )
                 .map_err(storage)?;
         }
+        ensure_column(&connection, "clock_state", "observed_utc_ms", "TEXT")?;
+        ensure_column(
+            &connection,
+            "clock_state",
+            "monotonic_anchor_ns",
+            "TEXT NOT NULL DEFAULT '0'",
+        )?;
+        ensure_column(
+            &connection,
+            "clock_state",
+            "boot_epoch",
+            "TEXT NOT NULL DEFAULT '00000000000000000000000000000000'",
+        )?;
+        connection
+            .execute(
+                "INSERT INTO operation_clock_anchors(
+                    operation_id, observed_utc_ms, monotonic_anchor_ns, boot_epoch
+                 )
+                 SELECT operation_id, NULL, '0', '00000000000000000000000000000000'
+                 FROM operations
+                 WHERE operation_id NOT IN (
+                    SELECT operation_id FROM operation_clock_anchors
+                 )",
+                [],
+            )
+            .map_err(storage)?;
+        verify_clock_audit_chain(
+            &connection,
+            &revocation_key_id,
+            &revocation_signing_key.verifying_key(),
+        )?;
         Ok(Self {
             connection: Mutex::new(connection),
             broker_key_id,
@@ -466,6 +538,270 @@ impl SignerEngine {
             revocation_signing_key: Arc::new(revocation_signing_key),
             backend_registry,
         })
+    }
+
+    pub(crate) fn observe_time(
+        &self,
+        reading: bloom_trusted_time::PlatformTimeReading,
+        boot_epoch: bloom_triad_protocol::BootEpoch,
+        max_forward_step_ms: u64,
+        rate_limited_mutation: bool,
+    ) -> Result<ClockDecision, ProtocolError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage)?;
+        let decision = |effective_now_ms, condition| ClockDecision {
+            effective_now_ms,
+            condition,
+            observed_utc_ms: reading.utc_ms,
+            monotonic_anchor_ns: reading.monotonic_anchor_ns,
+            boot_epoch: boot_epoch.clone(),
+        };
+        let stored: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT last_effective_ms, condition FROM clock_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(storage)?;
+        let stored_condition = stored.as_ref().map(|(_, condition)| condition.as_str());
+        let Some(utc_ms) = reading.utc_ms else {
+            let effective_now_ms = stored
+                .as_ref()
+                .map(|(value, _)| value.parse().map_err(malformed))
+                .transpose()?
+                .unwrap_or(0);
+            write_clock_state(
+                &transaction,
+                effective_now_ms,
+                ClockCondition::Untrusted,
+                &reading,
+                &boot_epoch,
+            )?;
+            if stored_condition != Some("UNTRUSTED") {
+                append_clock_audit(
+                    &transaction,
+                    "clock.untrusted",
+                    &serde_json::json!({
+                        "effective_now_ms": effective_now_ms.to_string(),
+                        "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                        "boot_epoch": boot_epoch
+                    }),
+                    &self.revocation_key_id,
+                    self.revocation_signing_key.as_ref(),
+                )?;
+            }
+            transaction.commit().map_err(storage)?;
+            if rate_limited_mutation {
+                return Err(error(
+                    ProtocolErrorCode::ClockUntrusted,
+                    "trusted platform time source is unavailable",
+                ));
+            }
+            return Ok(decision(effective_now_ms, ClockCondition::Untrusted));
+        };
+        let Some(last_effective_ms) = stored
+            .as_ref()
+            .map(|(value, _)| value.parse::<u64>().map_err(malformed))
+            .transpose()?
+        else {
+            write_clock_state(
+                &transaction,
+                utc_ms,
+                ClockCondition::Healthy,
+                &reading,
+                &boot_epoch,
+            )?;
+            transaction.commit().map_err(storage)?;
+            return Ok(decision(utc_ms, ClockCondition::Healthy));
+        };
+        let monotonic_now = last_effective_ms
+            .checked_add(reading.monotonic_elapsed_ms)
+            .ok_or_else(|| {
+                error(
+                    ProtocolErrorCode::ClockUntrusted,
+                    "monotonic clock arithmetic overflow",
+                )
+            })?;
+        if utc_ms < last_effective_ms {
+            write_clock_state(
+                &transaction,
+                last_effective_ms,
+                ClockCondition::RollbackFrozen,
+                &reading,
+                &boot_epoch,
+            )?;
+            if stored_condition != Some("ROLLBACK_FROZEN") {
+                append_clock_audit(
+                    &transaction,
+                    "clock.rollback",
+                    &serde_json::json!({
+                        "observed_utc_ms": utc_ms.to_string(),
+                        "effective_now_ms": last_effective_ms.to_string(),
+                        "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                        "boot_epoch": boot_epoch
+                    }),
+                    &self.revocation_key_id,
+                    self.revocation_signing_key.as_ref(),
+                )?;
+            }
+            transaction.commit().map_err(storage)?;
+            if rate_limited_mutation {
+                return Err(error(
+                    ProtocolErrorCode::ClockRollback,
+                    "UTC rollback detected; effective time is frozen",
+                ));
+            }
+            return Ok(decision(last_effective_ms, ClockCondition::RollbackFrozen));
+        }
+        if utc_ms > monotonic_now.saturating_add(max_forward_step_ms) {
+            write_clock_state(
+                &transaction,
+                monotonic_now,
+                ClockCondition::ForwardJumpRejected,
+                &reading,
+                &boot_epoch,
+            )?;
+            if stored_condition != Some("FORWARD_JUMP_REJECTED") {
+                append_clock_audit(
+                    &transaction,
+                    "clock.forward_jump",
+                    &serde_json::json!({
+                        "observed_utc_ms": utc_ms.to_string(),
+                        "effective_now_ms": monotonic_now.to_string(),
+                        "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                        "boot_epoch": boot_epoch
+                    }),
+                    &self.revocation_key_id,
+                    self.revocation_signing_key.as_ref(),
+                )?;
+            }
+            transaction.commit().map_err(storage)?;
+            return Ok(decision(monotonic_now, ClockCondition::ForwardJumpRejected));
+        }
+        let effective_now_ms = utc_ms.max(monotonic_now);
+        write_clock_state(
+            &transaction,
+            effective_now_ms,
+            ClockCondition::Healthy,
+            &reading,
+            &boot_epoch,
+        )?;
+        transaction.commit().map_err(storage)?;
+        Ok(decision(effective_now_ms, ClockCondition::Healthy))
+    }
+
+    pub fn repair_clock(&self, accepted_utc_ms: u64) -> Result<ClockDecision, ProtocolError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage)?;
+        let prior: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT last_effective_ms, monotonic_anchor_ns, boot_epoch
+                 FROM clock_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(storage)?;
+        let (prior, monotonic_anchor_ns, boot_epoch) = prior.ok_or_else(|| {
+            error(
+                ProtocolErrorCode::ClockUntrusted,
+                "clock repair requires initialized durable clock state",
+            )
+        })?;
+        let prior = prior.parse::<u64>().map_err(malformed)?;
+        if accepted_utc_ms < prior {
+            return Err(error(
+                ProtocolErrorCode::ClockRollback,
+                "clock repair cannot move effective time backwards",
+            ));
+        }
+        let monotonic_anchor_ns = monotonic_anchor_ns.parse::<u64>().map_err(malformed)?;
+        let boot_epoch: bloom_triad_protocol::BootEpoch = boot_epoch.parse().map_err(malformed)?;
+        let reading = bloom_trusted_time::PlatformTimeReading {
+            utc_ms: Some(accepted_utc_ms),
+            monotonic_elapsed_ms: 0,
+            monotonic_anchor_ns,
+        };
+        write_clock_state(
+            &transaction,
+            accepted_utc_ms,
+            ClockCondition::Repaired,
+            &reading,
+            &boot_epoch,
+        )?;
+        append_clock_audit(
+            &transaction,
+            "clock.repaired",
+            &serde_json::json!({
+                "prior_effective_ms": prior.to_string(),
+                "accepted_utc_ms": accepted_utc_ms.to_string(),
+                "monotonic_anchor_ns": monotonic_anchor_ns.to_string(),
+                "boot_epoch": boot_epoch
+            }),
+            &self.revocation_key_id,
+            self.revocation_signing_key.as_ref(),
+        )?;
+        transaction.commit().map_err(storage)?;
+        Ok(ClockDecision {
+            effective_now_ms: accepted_utc_ms,
+            condition: ClockCondition::Repaired,
+            observed_utc_ms: Some(accepted_utc_ms),
+            monotonic_anchor_ns,
+            boot_epoch,
+        })
+    }
+
+    pub fn active_approvals_expiring_by(
+        &self,
+        accepted_utc_ms: u64,
+    ) -> Result<Vec<Digest32>, ProtocolError> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT approval_id, terms_jcs FROM approvals
+                 WHERE active = 1 ORDER BY approval_id",
+            )
+            .map_err(storage)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(storage)?;
+        let mut expiring = Vec::new();
+        for row in rows {
+            let (approval_id, terms_jcs) = row.map_err(storage)?;
+            let terms: SealedApprovalTerms = serde_json::from_str(&terms_jcs).map_err(malformed)?;
+            if terms.expires_at_ms.get() <= accepted_utc_ms {
+                expiring.push(Digest32::new(approval_id).map_err(malformed)?);
+            }
+        }
+        Ok(expiring)
+    }
+
+    pub(crate) fn approval_requires_trusted_time(
+        &self,
+        approval_id: &Digest32,
+    ) -> Result<bool, ProtocolError> {
+        let terms_jcs: String = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT terms_jcs FROM approvals WHERE approval_id = ?1",
+                [approval_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?
+            .ok_or_else(|| error(ProtocolErrorCode::ApprovalNotFound, "approval not found"))?;
+        let terms: SealedApprovalTerms = serde_json::from_str(&terms_jcs).map_err(malformed)?;
+        Ok(!terms.limits.operation_rate_limits.is_empty()
+            || !terms.limits.signature_rate_limits.is_empty()
+            || terms
+                .limits
+                .value_limits
+                .iter()
+                .any(|limit| !limit.rolling_windows.is_empty()))
     }
 
     pub(crate) fn activate_approval_from_ceremony(
@@ -947,8 +1283,9 @@ impl SignerEngine {
     pub fn authorize_sign(
         &self,
         request: &SignRequest,
-        effective_now_ms: u64,
+        clock: &ClockDecision,
     ) -> Result<SignAuthorization, ProtocolError> {
+        let effective_now_ms = clock.effective_now_ms;
         request.validate_shape()?;
         self.verify_broker_signature(request)?;
         if request.unsigned.not_before_ms.get() > effective_now_ms
@@ -1067,6 +1404,19 @@ impl SignerEngine {
                         request.unsigned.approval_id.as_str(),
                         request.unsigned.signature_count.get().to_string(),
                         effective_now_ms.to_string()
+                    ],
+                )
+                .map_err(storage)?;
+            transaction
+                .execute(
+                    "INSERT INTO operation_clock_anchors(
+                         operation_id, observed_utc_ms, monotonic_anchor_ns, boot_epoch
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        request.unsigned.operation_id.as_str(),
+                        clock.observed_utc_ms.map(|value| value.to_string()),
+                        clock.monotonic_anchor_ns.to_string(),
+                        clock.boot_epoch.as_str()
                     ],
                 )
                 .map_err(storage)?;
@@ -2451,6 +2801,46 @@ impl SignerEngine {
                     ],
                 )
                 .map_err(storage)?;
+            let expected_anchor = (
+                operation
+                    .observed_utc_ms
+                    .as_ref()
+                    .map(|value| value.get().to_string()),
+                operation.monotonic_anchor_ns.get().to_string(),
+                operation.clock_boot_epoch.to_string(),
+            );
+            let existing_anchor: Option<(Option<String>, String, String)> = transaction
+                .query_row(
+                    "SELECT observed_utc_ms, monotonic_anchor_ns, boot_epoch
+                     FROM operation_clock_anchors WHERE operation_id = ?1",
+                    [operation.operation_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(storage)?;
+            if existing_anchor
+                .as_ref()
+                .is_some_and(|stored| stored != &expected_anchor)
+            {
+                return Err(error(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "backup operation conflicts with its durable clock anchor",
+                ));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO operation_clock_anchors(
+                        operation_id, observed_utc_ms, monotonic_anchor_ns, boot_epoch
+                     ) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(operation_id) DO NOTHING",
+                    params![
+                        operation.operation_id.as_str(),
+                        expected_anchor.0,
+                        expected_anchor.1,
+                        expected_anchor.2,
+                    ],
+                )
+                .map_err(storage)?;
         }
         for attempt in &backup.attempts {
             if !backup
@@ -2649,9 +3039,14 @@ impl SignerEngine {
             .transpose()?;
         let mut operation_statement = connection
             .prepare(
-                "SELECT operation_id, operation_digest, retry_binding_digest, approval_id,
-                        signature_count, accepted_at_ms, state, normalized_result
-                 FROM operations WHERE approval_id IN (
+                "SELECT operations.operation_id, operation_digest, retry_binding_digest,
+                        approval_id, signature_count, accepted_at_ms, state, normalized_result,
+                        operation_clock_anchors.observed_utc_ms,
+                        operation_clock_anchors.monotonic_anchor_ns,
+                        operation_clock_anchors.boot_epoch
+                 FROM operations
+                 LEFT JOIN operation_clock_anchors USING(operation_id)
+                 WHERE approval_id IN (
                     SELECT approval_id FROM approvals WHERE wallet_id = ?1
                  ) ORDER BY operation_id",
             )
@@ -2667,6 +3062,9 @@ impl SignerEngine {
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             })
             .map_err(storage)?;
@@ -2681,7 +3079,13 @@ impl SignerEngine {
                 accepted_at_ms,
                 state,
                 normalized_result,
+                observed_utc_ms,
+                monotonic_anchor_ns,
+                clock_boot_epoch,
             ) = row.map_err(storage)?;
+            let monotonic_anchor_ns = monotonic_anchor_ns.unwrap_or_else(|| "0".into());
+            let clock_boot_epoch =
+                clock_boot_epoch.unwrap_or_else(|| zero_boot_epoch().to_string());
             operations.push(OperationStateBackup {
                 operation_id: OperationId::new(operation_id).map_err(malformed)?,
                 operation_digest: Digest32::new(operation_digest).map_err(malformed)?,
@@ -2689,6 +3093,13 @@ impl SignerEngine {
                 approval_id: Digest32::new(approval_id).map_err(malformed)?,
                 signature_count: DecimalU64::new(signature_count.parse().map_err(malformed)?),
                 accepted_at_ms: DecimalU64::new(accepted_at_ms.parse().map_err(malformed)?),
+                observed_utc_ms: observed_utc_ms
+                    .map(|value| value.parse().map(DecimalU64::new).map_err(malformed))
+                    .transpose()?,
+                monotonic_anchor_ns: DecimalU64::new(
+                    monotonic_anchor_ns.parse().map_err(malformed)?,
+                ),
+                clock_boot_epoch: clock_boot_epoch.parse().map_err(malformed)?,
                 state: BackupOperationState::parse(&state)?,
                 normalized_result: normalized_result.map(Base64UrlBytes::parse).transpose()?,
             });
@@ -2826,6 +3237,32 @@ impl SignerEngine {
                 )
             })
     }
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), ProtocolError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(storage)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage)?;
+    drop(statement);
+    if !columns.iter().any(|candidate| candidate == column) {
+        connection
+            .execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                [],
+            )
+            .map_err(storage)?;
+    }
+    Ok(())
 }
 
 fn sign_policy_snapshot(
@@ -3315,6 +3752,267 @@ fn wallet_epoch(transaction: &Transaction<'_>, wallet_id: &Token) -> Result<u64,
         .map(|value| value.unwrap_or(0))
 }
 
+fn write_clock_state(
+    transaction: &Transaction<'_>,
+    effective_now_ms: u64,
+    condition: ClockCondition,
+    reading: &bloom_trusted_time::PlatformTimeReading,
+    boot_epoch: &bloom_triad_protocol::BootEpoch,
+) -> Result<(), ProtocolError> {
+    let condition = match condition {
+        ClockCondition::Healthy => "HEALTHY",
+        ClockCondition::ForwardJumpRejected => "FORWARD_JUMP_REJECTED",
+        ClockCondition::Untrusted => "UNTRUSTED",
+        ClockCondition::RollbackFrozen => "ROLLBACK_FROZEN",
+        ClockCondition::Repaired => "REPAIRED",
+    };
+    transaction
+        .execute(
+            "INSERT INTO clock_state(
+                 singleton, last_effective_ms, condition, observed_utc_ms,
+                 monotonic_anchor_ns, boot_epoch
+             )
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(singleton) DO UPDATE SET
+                 last_effective_ms = excluded.last_effective_ms,
+                 condition = excluded.condition,
+                 observed_utc_ms = excluded.observed_utc_ms,
+                 monotonic_anchor_ns = excluded.monotonic_anchor_ns,
+                 boot_epoch = excluded.boot_epoch",
+            params![
+                effective_now_ms.to_string(),
+                condition,
+                reading.utc_ms.map(|value| value.to_string()),
+                reading.monotonic_anchor_ns.to_string(),
+                boot_epoch.as_str()
+            ],
+        )
+        .map_err(storage)?;
+    Ok(())
+}
+
+fn append_clock_audit(
+    transaction: &Transaction<'_>,
+    event_type: &str,
+    payload: &impl Serialize,
+    signing_key_id: &Token,
+    signing_key: &SigningKey,
+) -> Result<(), ProtocolError> {
+    verify_clock_audit_head(transaction, signing_key_id, &signing_key.verifying_key())?;
+    let (sequence, previous_hash) = transaction
+        .query_row(
+            "SELECT sequence, entry_hash FROM audit_chain ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)? + 1, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(storage)?
+        .unwrap_or((0, "00".repeat(32)));
+    let sequence = u64::try_from(sequence).map_err(malformed)?;
+    let previous_hash = Digest32::new(previous_hash).map_err(malformed)?;
+    let payload_jcs =
+        String::from_utf8(serde_jcs::to_vec(payload).map_err(malformed)?).map_err(malformed)?;
+    let mut hasher = Sha256::new();
+    hasher.update(AUDIT_DOMAIN);
+    hasher.update(sequence.to_be_bytes());
+    hasher.update(previous_hash.as_str().as_bytes());
+    hasher.update(event_type.as_bytes());
+    hasher.update(payload_jcs.as_bytes());
+    let entry_hash = Digest32::from_bytes(hasher.finalize().into());
+    let signature =
+        signing_key.sign(&[AUDIT_SIGNATURE_DOMAIN, entry_hash.as_str().as_bytes()].concat());
+    transaction
+        .execute(
+            "INSERT INTO audit_chain(
+                sequence, event_type, payload_jcs, previous_hash, entry_hash,
+                signing_key_id, signature
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                i64::try_from(sequence).map_err(malformed)?,
+                event_type,
+                payload_jcs,
+                previous_hash.as_str(),
+                entry_hash.as_str(),
+                signing_key_id.as_str(),
+                Base64UrlBytes::from_bytes(&signature.to_bytes()).encoded(),
+            ],
+        )
+        .map_err(storage)?;
+    Ok(())
+}
+
+fn verify_clock_audit_chain(
+    connection: &Connection,
+    expected_key_id: &Token,
+    verifying_key: &VerifyingKey,
+) -> Result<(), ProtocolError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, event_type, payload_jcs, previous_hash, entry_hash,
+                    signing_key_id, signature
+             FROM audit_chain ORDER BY sequence",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(storage)?;
+    let mut expected_sequence = 0_u64;
+    let mut expected_previous_hash = Digest32::from_bytes([0; 32]);
+    for row in rows {
+        let (
+            sequence,
+            event_type,
+            payload_jcs,
+            previous_hash,
+            entry_hash,
+            signing_key_id,
+            signature,
+        ) = row.map_err(storage)?;
+        let sequence = u64::try_from(sequence).map_err(malformed)?;
+        if sequence != expected_sequence
+            || previous_hash != expected_previous_hash.as_str()
+            || signing_key_id != expected_key_id.as_str()
+        {
+            return Err(error(
+                ProtocolErrorCode::ServiceUnavailable,
+                "Signer clock audit chain sequence, predecessor, or key identity is invalid",
+            ));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(AUDIT_DOMAIN);
+        hasher.update(sequence.to_be_bytes());
+        hasher.update(expected_previous_hash.as_str().as_bytes());
+        hasher.update(event_type.as_bytes());
+        hasher.update(payload_jcs.as_bytes());
+        let computed = Digest32::from_bytes(hasher.finalize().into());
+        if computed.as_str() != entry_hash {
+            return Err(error(
+                ProtocolErrorCode::ServiceUnavailable,
+                "Signer clock audit entry hash is invalid",
+            ));
+        }
+        let signature_bytes: [u8; 64] = Base64UrlBytes::parse(signature)?
+            .decode()
+            .try_into()
+            .map_err(|_| {
+                error(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "Signer clock audit signature length is invalid",
+                )
+            })?;
+        let signature = Signature::from_bytes(&signature_bytes);
+        verifying_key
+            .verify(
+                &[AUDIT_SIGNATURE_DOMAIN, computed.as_str().as_bytes()].concat(),
+                &signature,
+            )
+            .map_err(|_| {
+                error(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "Signer clock audit signature is invalid",
+                )
+            })?;
+        expected_previous_hash = computed;
+        expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+            error(
+                ProtocolErrorCode::ServiceUnavailable,
+                "Signer clock audit sequence overflow",
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn verify_clock_audit_head(
+    connection: &Connection,
+    expected_key_id: &Token,
+    verifying_key: &VerifyingKey,
+) -> Result<(), ProtocolError> {
+    let head: Option<(i64, String, String, String, String, String, String)> = connection
+        .query_row(
+            "SELECT sequence, event_type, payload_jcs, previous_hash, entry_hash,
+                    signing_key_id, signature
+             FROM audit_chain ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage)?;
+    let Some((
+        sequence,
+        event_type,
+        payload_jcs,
+        previous_hash,
+        entry_hash,
+        signing_key_id,
+        signature,
+    )) = head
+    else {
+        return Ok(());
+    };
+    let sequence = u64::try_from(sequence).map_err(malformed)?;
+    if signing_key_id != expected_key_id.as_str() {
+        return Err(error(
+            ProtocolErrorCode::ServiceUnavailable,
+            "Signer clock audit head key identity is invalid",
+        ));
+    }
+    let previous_hash = Digest32::new(previous_hash).map_err(malformed)?;
+    let mut hasher = Sha256::new();
+    hasher.update(AUDIT_DOMAIN);
+    hasher.update(sequence.to_be_bytes());
+    hasher.update(previous_hash.as_str().as_bytes());
+    hasher.update(event_type.as_bytes());
+    hasher.update(payload_jcs.as_bytes());
+    let computed = Digest32::from_bytes(hasher.finalize().into());
+    if computed.as_str() != entry_hash {
+        return Err(error(
+            ProtocolErrorCode::ServiceUnavailable,
+            "Signer clock audit head hash is invalid",
+        ));
+    }
+    let signature_bytes: [u8; 64] = Base64UrlBytes::parse(signature)?
+        .decode()
+        .try_into()
+        .map_err(|_| {
+            error(
+                ProtocolErrorCode::ServiceUnavailable,
+                "Signer clock audit head signature length is invalid",
+            )
+        })?;
+    verifying_key
+        .verify(
+            &[AUDIT_SIGNATURE_DOMAIN, computed.as_str().as_bytes()].concat(),
+            &Signature::from_bytes(&signature_bytes),
+        )
+        .map_err(|_| {
+            error(
+                ProtocolErrorCode::ServiceUnavailable,
+                "Signer clock audit head signature is invalid",
+            )
+        })
+}
+
 fn retry_binding_digest(
     request: &bloom_triad_protocol::UnsignedSignRequest,
 ) -> Result<Digest32, ProtocolError> {
@@ -3357,4 +4055,240 @@ fn malformed(cause: impl std::fmt::Display) -> ProtocolError {
         ProtocolErrorCode::MalformedFrame,
         format!("canonical value failure: {cause}"),
     )
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use bloom_trusted_time::PlatformTimeReading;
+
+    fn engine() -> SignerEngine {
+        SignerEngine::open_in_memory(
+            Token::new("broker-key").unwrap(),
+            SigningKey::from_bytes(&[1; 32]).verifying_key(),
+            SigningKey::from_bytes(&[2; 32]).verifying_key(),
+            Token::new("revocation-key").unwrap(),
+            SigningKey::from_bytes(&[3; 32]),
+            Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn signer_clock_denies_untrusted_and_rollback_rate_windows() {
+        let engine = engine();
+        let initialized = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000,
+                },
+                bloom_triad_protocol::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                true,
+            )
+            .unwrap();
+        assert_eq!(initialized.effective_now_ms, 10_000);
+
+        let rollback = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(9_999),
+                    monotonic_elapsed_ms: 100,
+                    monotonic_anchor_ns: 101_000_000,
+                },
+                bloom_triad_protocol::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(rollback.code, ProtocolErrorCode::ClockRollback);
+
+        let untrusted = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: None,
+                    monotonic_elapsed_ms: 100,
+                    monotonic_anchor_ns: 201_000_000,
+                },
+                bloom_triad_protocol::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(untrusted.code, ProtocolErrorCode::ClockUntrusted);
+    }
+
+    #[test]
+    fn signer_clock_bounds_a_forward_jump_by_monotonic_elapsed() {
+        let engine = engine();
+        engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000,
+                },
+                bloom_triad_protocol::BootEpoch::from_bytes([1; 16]),
+                1_000,
+                false,
+            )
+            .unwrap();
+        let forward = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(20_000),
+                    monotonic_elapsed_ms: 125,
+                    monotonic_anchor_ns: 126_000_000,
+                },
+                bloom_triad_protocol::BootEpoch::from_bytes([1; 16]),
+                1_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(forward.effective_now_ms, 10_125);
+        assert_eq!(forward.condition, ClockCondition::ForwardJumpRejected);
+        let repeated = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(20_001),
+                    monotonic_elapsed_ms: 1,
+                    monotonic_anchor_ns: 127_000_000,
+                },
+                bloom_triad_protocol::BootEpoch::from_bytes([1; 16]),
+                1_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(repeated.condition, ClockCondition::ForwardJumpRejected);
+        let repaired = engine.repair_clock(20_000).unwrap();
+        assert_eq!(repaired.condition, ClockCondition::Repaired);
+        let events: Vec<String> = {
+            let connection = engine.connection.lock();
+            let mut statement = connection
+                .prepare("SELECT event_type FROM audit_chain ORDER BY sequence")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(events, ["clock.forward_jump", "clock.repaired"]);
+    }
+
+    #[test]
+    fn signer_clock_schema_migrates_an_existing_database() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("signer.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE clock_state (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    last_effective_ms TEXT NOT NULL,
+                    condition TEXT NOT NULL
+                );
+                INSERT INTO clock_state(singleton, last_effective_ms, condition)
+                VALUES (1, '1000', 'HEALTHY');
+                CREATE TABLE operations (
+                    operation_id TEXT PRIMARY KEY,
+                    operation_digest TEXT NOT NULL,
+                    retry_binding_digest TEXT NOT NULL,
+                    approval_id TEXT NOT NULL,
+                    signature_count TEXT NOT NULL,
+                    accepted_at_ms TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    normalized_result TEXT
+                );
+                INSERT INTO operations(
+                    operation_id, operation_digest, retry_binding_digest, approval_id,
+                    signature_count, accepted_at_ms, state, normalized_result
+                ) VALUES (
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                    'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                    'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                    '1', '1000', 'COMMITTED', NULL
+                );
+                ",
+            )
+            .unwrap();
+        drop(connection);
+        let engine = SignerEngine::open(
+            &path,
+            Token::new("broker-key").unwrap(),
+            SigningKey::from_bytes(&[1; 32]).verifying_key(),
+            SigningKey::from_bytes(&[2; 32]).verifying_key(),
+            Token::new("revocation-key").unwrap(),
+            SigningKey::from_bytes(&[3; 32]),
+            Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap()),
+        )
+        .unwrap();
+        let decision = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(1_001),
+                    monotonic_elapsed_ms: 1,
+                    monotonic_anchor_ns: 2_000_000,
+                },
+                bloom_triad_protocol::BootEpoch::from_bytes([3; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(decision.effective_now_ms, 1_001);
+        let migrated_anchor: (Option<String>, String, String) = engine
+            .connection
+            .lock()
+            .query_row(
+                "SELECT observed_utc_ms, monotonic_anchor_ns, boot_epoch
+                 FROM operation_clock_anchors",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            migrated_anchor,
+            (None, "0".into(), "00000000000000000000000000000000".into())
+        );
+        engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000),
+                    monotonic_elapsed_ms: 1,
+                    monotonic_anchor_ns: 3_000_000,
+                },
+                bloom_triad_protocol::BootEpoch::from_bytes([3; 16]),
+                1_000,
+                false,
+            )
+            .unwrap();
+        drop(engine);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE audit_chain SET payload_jcs = '{\"tampered\":true}'
+                 WHERE sequence = 0",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let reopened = SignerEngine::open(
+            &path,
+            Token::new("broker-key").unwrap(),
+            SigningKey::from_bytes(&[1; 32]).verifying_key(),
+            SigningKey::from_bytes(&[2; 32]).verifying_key(),
+            Token::new("revocation-key").unwrap(),
+            SigningKey::from_bytes(&[3; 32]),
+            Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap()),
+        );
+        let error = match reopened {
+            Ok(_) => panic!("tampered Signer audit chain reopened"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+    }
 }
