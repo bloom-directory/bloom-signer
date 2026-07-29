@@ -7,6 +7,8 @@ use std::{collections::BTreeMap, sync::Arc};
 pub enum CompiledBackend {
     #[cfg(feature = "local")]
     Local(Arc<bloom_signer_backend_local::LocalSignerBackend>),
+    #[cfg(feature = "aws-kms")]
+    AwsKms(Arc<bloom_signer_backend_aws_kms::AwsKmsSignerBackend>),
 }
 
 impl CompiledBackend {
@@ -14,6 +16,8 @@ impl CompiledBackend {
         match self {
             #[cfg(feature = "local")]
             Self::Local(backend) => backend.clone(),
+            #[cfg(feature = "aws-kms")]
+            Self::AwsKms(backend) => backend.clone(),
         }
     }
 }
@@ -75,6 +79,19 @@ impl BackendRegistry {
             .collect()
     }
 
+    #[cfg(feature = "aws-kms")]
+    pub fn aws_kms_audit_events(&self) -> Vec<bloom_signer_backend_aws_kms::AwsKmsAuditEvent> {
+        self.backends
+            .read()
+            .values()
+            .flat_map(|backend| match backend {
+                CompiledBackend::AwsKms(aws) => aws.audit_events(),
+                #[cfg(feature = "local")]
+                CompiledBackend::Local(_) => Vec::new(),
+            })
+            .collect()
+    }
+
     pub fn key_is_available(
         &self,
         key_ref: &bloom_triad_protocol::KeyRef,
@@ -101,6 +118,8 @@ impl BackendRegistry {
                     format!("local backend key availability failed: {error:?}"),
                 )
             }),
+            #[cfg(feature = "aws-kms")]
+            CompiledBackend::AwsKms(aws) => Ok(aws.key_is_available(key_ref)),
         }
     }
 
@@ -125,6 +144,8 @@ impl BackendRegistry {
         match backend {
             #[cfg(feature = "local")]
             CompiledBackend::Local(local) => Ok(local.key_is_registered(key_ref)),
+            #[cfg(feature = "aws-kms")]
+            CompiledBackend::AwsKms(aws) => Ok(aws.key_is_registered(key_ref)),
         }
     }
 
@@ -154,6 +175,11 @@ impl BackendRegistry {
                     )
                 })
             }
+            #[cfg(feature = "aws-kms")]
+            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "AWS KMS keys do not use Signer activation",
+            )),
         }
     }
 
@@ -326,6 +352,11 @@ impl BackendRegistry {
                         format!("local key derivation failed: {error:?}"),
                     )
                 }),
+            #[cfg(feature = "aws-kms")]
+            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "AWS KMS does not support derived keys",
+            )),
         }
     }
 
@@ -354,6 +385,11 @@ impl BackendRegistry {
                     )
                 })
             }
+            #[cfg(feature = "aws-kms")]
+            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "AWS KMS does not support derived keys",
+            )),
         }
     }
 
@@ -383,6 +419,11 @@ impl BackendRegistry {
                     )
                 })
             }
+            #[cfg(feature = "aws-kms")]
+            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "AWS KMS does not support derived keys",
+            )),
         }
     }
 
@@ -398,6 +439,8 @@ impl BackendRegistry {
             .values()
             .flat_map(|backend| match backend {
                 CompiledBackend::Local(local) => local.pending_derivations(),
+                #[cfg(feature = "aws-kms")]
+                CompiledBackend::AwsKms(_) => Vec::new(),
             })
             .collect()
     }

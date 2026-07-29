@@ -6,5 +6,30 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-sdk-kms.workspace = true
+aws-sdk-sts.workspace = true
+aws-smithy-runtime-api.workspace = true
+aws-smithy-types.workspace = true
+aws-types.workspace = true
+bloom-triad-protocol.workspace = true
 bloom-signer-backend-api = { path = "../bloom-signer-backend-api" }
+futures.workspace = true
+hex.workspace = true
+hmac.workspace = true
+k256.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 
+[dev-dependencies]
+aws-smithy-runtime = { version = "=1.9.4", features = ["test-util"] }
+http = "1"
+tempfile = "3"
+tokio = { workspace = true, features = ["macros"] }
