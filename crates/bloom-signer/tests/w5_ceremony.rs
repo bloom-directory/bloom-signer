@@ -1186,6 +1186,7 @@ fn generic_custody_export_policy_and_delete_apply_exact_typed_effects() {
     };
     let (policy_result, prepared) =
         complete_policy_update(&service, &authenticator, &wallet_id, update, 8_000).unwrap();
+    assert_eq!(policy_result.public_status, CeremonyState::Succeeded);
     assert!(policy_result.encrypted_browser_result.is_none());
     assert_eq!(engine.policy_snapshot(&wallet_id).unwrap().version.get(), 1);
     let compare = PolicyCompareAndSwapRequest {

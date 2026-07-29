@@ -895,7 +895,10 @@ impl SignerCeremonyService {
         let mut result = CustodyResult {
             ceremony_kind: request.ceremony_kind,
             custody_operation_id: request.custody_operation_id.clone(),
-            public_status: CeremonyState::Completed,
+            public_status: request
+                .ceremony_kind
+                .successful_terminal_state()
+                .ok_or_else(kind_mismatch)?,
             wallet_id,
             public_key_refs: apply_outcome.public_key_refs,
             credential_summaries,
