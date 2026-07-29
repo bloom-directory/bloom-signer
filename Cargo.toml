@@ -19,3 +19,15 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 futures = "0.3"
+bip32 = { version = "0.5", features = ["secp256k1"] }
+chacha20poly1305 = "0.10"
+ed25519-dalek = "2"
+hex = "0.4"
+k256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+parking_lot = "0.12"
+rand = "0.8"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde_jcs = "0.2"
+serde_json = "1"
+sha2 = "0.10"
+sha3 = "0.10"

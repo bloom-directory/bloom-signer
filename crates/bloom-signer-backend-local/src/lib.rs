@@ -1,1 +1,785 @@
-//! Local Signer backend.
+//! Encrypted, boot-activated local secp256k1 backend with a BIP32 registry.
+
+use bip32::{DerivationPath, XPrv};
+use bloom_signer_backend_api::{
+    ActivationStatus, BackendCapabilities, BackendError, BackendFuture, BackendInput,
+    BackendSignRequest, BackendSignature, DerivationCapability, KeyDescription,
+    ProviderIdempotency, SecretBytes, SignerBackend, SignerBackendActivation,
+    SignerBackendDerivation,
+};
+use bloom_triad_protocol::{
+    Base64UrlBytes, CryptoInputKind, CryptoSuite, DecimalU64, DerivationRef, Digest32, KeyRef,
+    KeySpec, SignatureEncoding, Token,
+};
+use chacha20poly1305::{
+    Key, XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit, Payload},
+};
+use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+use k256::{ecdsa::SigningKey, pkcs8::EncodePublicKey};
+use parking_lot::RwLock;
+use rand::{RngCore, rngs::OsRng};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
+use zeroize::Zeroizing;
+
+const ROOT_AAD_DOMAIN: &[u8] = b"bloom-local-root-wrap/v1";
+const WRAP_FORMAT_VERSION: u32 = 1;
+const DERIVATION_AUTHORITY_DOMAIN: &[u8] = b"bloom-key-derive-authority/v1";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncryptedLocalBackup {
+    pub root_key_id: Token,
+    pub wrap_format_version: u32,
+    pub nonce: Base64UrlBytes,
+    pub encrypted_seed: Base64UrlBytes,
+    pub authority_verifying_key: Base64UrlBytes,
+    pub derivation_registry: Vec<KeyRef>,
+    pub derivation_namespaces: Vec<DerivationNamespace>,
+    pub derivation_tombstones: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivationNamespace {
+    pub namespace_id: Token,
+    pub canonical_prefix: String,
+    pub next_index: DecimalU64,
+    pub maximum_children: DecimalU64,
+    pub authority_digest: Digest32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivationGrant {
+    pub authority_kind: Token,
+    pub namespace_id: Token,
+    pub canonical_prefix: String,
+    pub starting_index: DecimalU64,
+    pub maximum_children: DecimalU64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DerivationAuthority {
+    grant: DerivationGrant,
+    signature: Base64UrlBytes,
+}
+
+impl DerivationAuthority {
+    pub fn from_signed(grant: DerivationGrant, signature: Base64UrlBytes) -> Self {
+        Self { grant, signature }
+    }
+}
+
+#[derive(Default)]
+struct LocalState {
+    backup: Option<EncryptedLocalBackup>,
+    active_kek: Option<SecretBytes>,
+    registry: BTreeMap<String, KeyRef>,
+    storage_path: Option<PathBuf>,
+}
+
+pub struct LocalSignerBackend {
+    backend_instance_id: Token,
+    state: RwLock<LocalState>,
+}
+
+impl LocalSignerBackend {
+    pub fn provision(
+        backend_instance_id: Token,
+        root_key_id: Token,
+        seed: SecretBytes,
+        kek: SecretBytes,
+        authority_verifying_key: VerifyingKey,
+    ) -> Result<Self, BackendError> {
+        if !(16..=64).contains(&seed.expose_to_backend().len())
+            || kek.expose_to_backend().len() != 32
+        {
+            return Err(BackendError::InvalidRequest);
+        }
+        let mut nonce = [0_u8; 24];
+        OsRng.fill_bytes(&mut nonce);
+        let aad = root_aad(&backend_instance_id, &root_key_id);
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(kek.expose_to_backend()));
+        let encrypted_seed = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: seed.expose_to_backend(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| BackendError::DefinitiveRejected)?;
+        Ok(Self {
+            backend_instance_id,
+            state: RwLock::new(LocalState {
+                backup: Some(EncryptedLocalBackup {
+                    root_key_id,
+                    wrap_format_version: WRAP_FORMAT_VERSION,
+                    nonce: Base64UrlBytes::from_bytes(&nonce),
+                    encrypted_seed: Base64UrlBytes::from_bytes(&encrypted_seed),
+                    authority_verifying_key: Base64UrlBytes::from_bytes(
+                        &authority_verifying_key.to_bytes(),
+                    ),
+                    derivation_registry: vec![],
+                    derivation_namespaces: vec![],
+                    derivation_tombstones: vec![],
+                }),
+                active_kek: Some(kek),
+                registry: BTreeMap::new(),
+                storage_path: None,
+            }),
+        })
+    }
+
+    pub fn provision_at(
+        storage_path: impl AsRef<Path>,
+        backend_instance_id: Token,
+        root_key_id: Token,
+        seed: SecretBytes,
+        kek: SecretBytes,
+        authority_verifying_key: VerifyingKey,
+    ) -> Result<Self, BackendError> {
+        let backend = Self::provision(
+            backend_instance_id,
+            root_key_id,
+            seed,
+            kek,
+            authority_verifying_key,
+        )?;
+        {
+            let mut state = backend.state.write();
+            state.storage_path = Some(storage_path.as_ref().to_path_buf());
+            persist_backup(&state)?;
+        }
+        Ok(backend)
+    }
+
+    pub fn open_at(
+        storage_path: impl AsRef<Path>,
+        backend_instance_id: Token,
+    ) -> Result<Self, BackendError> {
+        let bytes =
+            fs::read(storage_path.as_ref()).map_err(|_| BackendError::DefinitiveRejected)?;
+        let backup: EncryptedLocalBackup =
+            serde_json::from_slice(&bytes).map_err(|_| BackendError::InvalidRequest)?;
+        let backend = Self::restore(backend_instance_id, backup)?;
+        backend.state.write().storage_path = Some(storage_path.as_ref().to_path_buf());
+        Ok(backend)
+    }
+
+    pub fn restore(
+        backend_instance_id: Token,
+        backup: EncryptedLocalBackup,
+    ) -> Result<Self, BackendError> {
+        let mut locators = std::collections::BTreeSet::new();
+        let mut paths = std::collections::BTreeSet::new();
+        let mut namespace_ids = std::collections::BTreeSet::new();
+        let tombstones: std::collections::BTreeSet<_> =
+            backup.derivation_tombstones.iter().cloned().collect();
+        if backup.wrap_format_version != WRAP_FORMAT_VERSION
+            || backup.nonce.decode().len() != 24
+            || backup.authority_verifying_key.decode().len() != 32
+            || backup.derivation_registry.iter().any(|key| {
+                !matches!(
+                    &key.derivation,
+                    Some(DerivationRef::Bip32Secp256k1 { root_key_id, .. })
+                        if root_key_id == &backup.root_key_id
+                ) || key.backend.as_str() != "local"
+                    || key.backend_instance != backend_instance_id
+                    || !locators.insert(key.locator.clone())
+                    || match &key.derivation {
+                        Some(DerivationRef::Bip32Secp256k1 { path, .. }) => {
+                            !paths.insert(path.clone()) || tombstones.contains(path)
+                        }
+                        _ => true,
+                    }
+            })
+            || tombstones.len() != backup.derivation_tombstones.len()
+            || backup.derivation_namespaces.iter().any(|namespace| {
+                !namespace_ids.insert(namespace.namespace_id.clone())
+                    || validate_namespace_prefix(&namespace.canonical_prefix).is_err()
+                    || namespace.next_index.get() > namespace.maximum_children.get()
+                    || namespace.maximum_children.get() > 0x8000_0000
+            })
+        {
+            return Err(BackendError::InvalidRequest);
+        }
+        let registry = backup
+            .derivation_registry
+            .iter()
+            .map(|key| (key.locator.clone(), key.clone()))
+            .collect();
+        Ok(Self {
+            backend_instance_id,
+            state: RwLock::new(LocalState {
+                backup: Some(backup),
+                active_kek: None,
+                registry,
+                storage_path: None,
+            }),
+        })
+    }
+
+    pub fn encrypted_backup(&self) -> Result<EncryptedLocalBackup, BackendError> {
+        self.state
+            .read()
+            .backup
+            .clone()
+            .ok_or(BackendError::DefinitiveRejected)
+    }
+
+    pub fn key_is_registered(&self, key_ref: &KeyRef) -> bool {
+        self.state.read().registry.get(&key_ref.locator) == Some(key_ref)
+    }
+
+    pub fn key_is_available(&self, key_ref: &KeyRef) -> Result<bool, BackendError> {
+        if !self.key_is_registered(key_ref) {
+            return Ok(false);
+        }
+        Ok(self.state.read().active_kek.is_some())
+    }
+
+    pub fn root_key_ref(&self) -> Result<KeyRef, BackendError> {
+        let backup = self
+            .state
+            .read()
+            .backup
+            .clone()
+            .ok_or(BackendError::DefinitiveRejected)?;
+        let description = self.describe_path("m")?;
+        Ok(KeyRef {
+            backend: self.backend_id(),
+            backend_instance: self.backend_instance_id.clone(),
+            locator: format!("root:{}", backup.root_key_id.as_str()),
+            key_spec: KeySpec::Secp256k1,
+            public_key_fingerprint: description.public_key_fingerprint,
+            derivation: None,
+        })
+    }
+
+    pub fn configure_namespace(&self, authority: &DerivationAuthority) -> Result<(), BackendError> {
+        let authority_digest = self.verify_derivation_authority(authority)?;
+        let grant = &authority.grant;
+        validate_namespace_prefix(&grant.canonical_prefix)?;
+        let starting_index = grant.starting_index.get();
+        let maximum_children = grant.maximum_children.get();
+        if maximum_children == 0
+            || starting_index > 0x7fff_ffff
+            || maximum_children > 0x8000_0000
+            || starting_index.saturating_add(maximum_children) > 0x8000_0000
+        {
+            return Err(BackendError::InvalidRequest);
+        }
+        let mut state = self.state.write();
+        let mut next = state
+            .backup
+            .clone()
+            .ok_or(BackendError::DefinitiveRejected)?;
+        if next
+            .derivation_namespaces
+            .iter()
+            .any(|namespace| namespace.namespace_id == grant.namespace_id)
+        {
+            return Err(BackendError::InvalidRequest);
+        }
+        next.derivation_namespaces.push(DerivationNamespace {
+            namespace_id: grant.namespace_id.clone(),
+            canonical_prefix: grant.canonical_prefix.clone(),
+            next_index: DecimalU64::new(starting_index),
+            maximum_children: DecimalU64::new(starting_index + maximum_children),
+            authority_digest,
+        });
+        commit_backup(&mut state, next)
+    }
+
+    pub fn allocate_derived_key(
+        &self,
+        root: &KeyRef,
+        namespace_id: &Token,
+        authority: &DerivationAuthority,
+    ) -> Result<KeyDescription, BackendError> {
+        let authority_digest = self.verify_derivation_authority(authority)?;
+        if self.root_key_ref()? != *root {
+            return Err(BackendError::InvalidRequest);
+        }
+        let snapshot = self
+            .state
+            .read()
+            .backup
+            .clone()
+            .ok_or(BackendError::DefinitiveRejected)?;
+        let namespace = snapshot
+            .derivation_namespaces
+            .iter()
+            .find(|item| &item.namespace_id == namespace_id)
+            .ok_or(BackendError::InvalidRequest)?;
+        if authority.grant.namespace_id != *namespace_id
+            || authority_digest != namespace.authority_digest
+        {
+            return Err(BackendError::InvalidRequest);
+        }
+        if namespace.next_index.get() >= namespace.maximum_children.get()
+            || namespace.next_index.get() > 0x7fff_ffff
+        {
+            return Err(BackendError::InvalidRequest);
+        }
+        let path = format!(
+            "{}/{}",
+            namespace.canonical_prefix,
+            namespace.next_index.get()
+        );
+        if snapshot.derivation_tombstones.contains(&path)
+            || snapshot.derivation_registry.iter().any(|key| {
+                matches!(
+                    &key.derivation,
+                    Some(DerivationRef::Bip32Secp256k1 { path: existing, .. })
+                        if existing == &path
+                )
+            })
+        {
+            return Err(BackendError::DefinitiveRejected);
+        }
+        let description = self.describe_path(&path)?;
+        let mut state = self.state.write();
+        let mut next = state
+            .backup
+            .clone()
+            .ok_or(BackendError::DefinitiveRejected)?;
+        let current = next
+            .derivation_namespaces
+            .iter_mut()
+            .find(|item| &item.namespace_id == namespace_id)
+            .ok_or(BackendError::DefinitiveRejected)?;
+        if current.next_index != namespace.next_index {
+            return Err(BackendError::DefinitiveRejected);
+        }
+        current.next_index = DecimalU64::new(
+            current
+                .next_index
+                .get()
+                .checked_add(1)
+                .ok_or(BackendError::DefinitiveRejected)?,
+        );
+        next.derivation_registry.push(description.key_ref.clone());
+        commit_backup(&mut state, next)?;
+        state.registry.insert(
+            description.key_ref.locator.clone(),
+            description.key_ref.clone(),
+        );
+        Ok(description)
+    }
+
+    pub fn tombstone_derived_key(&self, key_ref: &KeyRef) -> Result<(), BackendError> {
+        let path = match &key_ref.derivation {
+            Some(DerivationRef::Bip32Secp256k1 { path, .. }) => path.clone(),
+            _ => return Err(BackendError::InvalidRequest),
+        };
+        let mut state = self.state.write();
+        if state.registry.get(&key_ref.locator) != Some(key_ref) {
+            return Err(BackendError::InvalidRequest);
+        }
+        let mut next = state
+            .backup
+            .clone()
+            .ok_or(BackendError::DefinitiveRejected)?;
+        next.derivation_registry.retain(|key| key != key_ref);
+        if !next.derivation_tombstones.contains(&path) {
+            next.derivation_tombstones.push(path);
+        }
+        commit_backup(&mut state, next)?;
+        state.registry.remove(&key_ref.locator);
+        Ok(())
+    }
+
+    fn verify_derivation_authority(
+        &self,
+        authority: &DerivationAuthority,
+    ) -> Result<Digest32, BackendError> {
+        if !matches!(
+            authority.grant.authority_kind.as_str(),
+            "policy" | "ceremony"
+        ) {
+            return Err(BackendError::InvalidRequest);
+        }
+        let backup = self
+            .state
+            .read()
+            .backup
+            .clone()
+            .ok_or(BackendError::DefinitiveRejected)?;
+        let verifying_key: [u8; 32] = backup
+            .authority_verifying_key
+            .decode()
+            .try_into()
+            .map_err(|_| BackendError::InvalidRequest)?;
+        let signature: [u8; 64] = authority
+            .signature
+            .decode()
+            .try_into()
+            .map_err(|_| BackendError::InvalidRequest)?;
+        let grant_jcs =
+            serde_jcs::to_vec(&authority.grant).map_err(|_| BackendError::InvalidRequest)?;
+        let mut message = DERIVATION_AUTHORITY_DOMAIN.to_vec();
+        message.extend_from_slice(&grant_jcs);
+        VerifyingKey::from_bytes(&verifying_key)
+            .map_err(|_| BackendError::InvalidRequest)?
+            .verify(&message, &Signature::from_bytes(&signature))
+            .map_err(|_| BackendError::DefinitiveRejected)?;
+        Ok(Digest32::from_bytes(Sha256::digest(&message).into()))
+    }
+
+    fn active_seed(&self) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+        let state = self.state.read();
+        let backup = state
+            .backup
+            .as_ref()
+            .ok_or(BackendError::DefinitiveRejected)?;
+        let kek = state
+            .active_kek
+            .as_ref()
+            .ok_or(BackendError::DefinitiveRejected)?;
+        let nonce: [u8; 24] = backup
+            .nonce
+            .decode()
+            .try_into()
+            .map_err(|_| BackendError::InvalidRequest)?;
+        let aad = root_aad(&self.backend_instance_id, &backup.root_key_id);
+        XChaCha20Poly1305::new(Key::from_slice(kek.expose_to_backend()))
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &backup.encrypted_seed.decode(),
+                    aad: &aad,
+                },
+            )
+            .map(Zeroizing::new)
+            .map_err(|_| BackendError::DefinitiveRejected)
+    }
+
+    fn derive_signing_key(&self, key_ref: &KeyRef) -> Result<SigningKey, BackendError> {
+        let registered = self
+            .state
+            .read()
+            .registry
+            .get(&key_ref.locator)
+            .cloned()
+            .ok_or(BackendError::InvalidRequest)?;
+        if &registered != key_ref {
+            return Err(BackendError::InvalidRequest);
+        }
+        let DerivationRef::Bip32Secp256k1 { path, .. } =
+            registered.derivation.ok_or(BackendError::InvalidRequest)?;
+        let path = DerivationPath::from_str(&path).map_err(|_| BackendError::InvalidRequest)?;
+        let seed = self.active_seed()?;
+        XPrv::derive_from_path(seed.as_slice(), &path)
+            .map(SigningKey::from)
+            .map_err(|_| BackendError::DefinitiveRejected)
+    }
+
+    fn validate_registered_derivations(&self) -> Result<(), BackendError> {
+        let registered: Vec<KeyRef> = self.state.read().registry.values().cloned().collect();
+        for key_ref in registered {
+            let DerivationRef::Bip32Secp256k1 { path, .. } = key_ref
+                .derivation
+                .as_ref()
+                .ok_or(BackendError::InvalidRequest)?;
+            if self.describe_path(path)?.key_ref != key_ref {
+                return Err(BackendError::DefinitiveRejected);
+            }
+        }
+        Ok(())
+    }
+
+    fn describe_path(&self, canonical_path: &str) -> Result<KeyDescription, BackendError> {
+        let backup = self
+            .state
+            .read()
+            .backup
+            .clone()
+            .ok_or(BackendError::DefinitiveRejected)?;
+        let path =
+            DerivationPath::from_str(canonical_path).map_err(|_| BackendError::InvalidRequest)?;
+        if path.to_string() != canonical_path {
+            return Err(BackendError::InvalidRequest);
+        }
+        let seed = self.active_seed()?;
+        let signing_key = XPrv::derive_from_path(seed.as_slice(), &path)
+            .map(SigningKey::from)
+            .map_err(|_| BackendError::DefinitiveRejected)?;
+        let public_key = k256::PublicKey::from_sec1_bytes(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        )
+        .map_err(|_| BackendError::DefinitiveRejected)?;
+        let spki = public_key
+            .to_public_key_der()
+            .map_err(|_| BackendError::DefinitiveRejected)?
+            .as_bytes()
+            .to_vec();
+        let fingerprint = Digest32::from_bytes(Sha256::digest(&spki).into());
+        let locator = hex::encode(Sha256::digest(
+            [
+                backup.root_key_id.as_str().as_bytes(),
+                canonical_path.as_bytes(),
+            ]
+            .concat(),
+        ));
+        let key_ref = KeyRef {
+            backend: Token::new("local").map_err(|_| BackendError::InvalidRequest)?,
+            backend_instance: self.backend_instance_id.clone(),
+            locator,
+            key_spec: KeySpec::Secp256k1,
+            public_key_fingerprint: fingerprint.clone(),
+            derivation: Some(DerivationRef::Bip32Secp256k1 {
+                root_key_id: backup.root_key_id,
+                path: canonical_path.into(),
+            }),
+        };
+        Ok(KeyDescription {
+            key_ref,
+            canonical_spki_der: Base64UrlBytes::from_bytes(&spki),
+            public_key_fingerprint: fingerprint,
+            supported_crypto_suites: vec![
+                CryptoSuite::Secp256k1Keccak256Recoverable,
+                CryptoSuite::Secp256k1Sha256Recoverable,
+            ],
+        })
+    }
+}
+
+impl SignerBackend for LocalSignerBackend {
+    fn backend_id(&self) -> Token {
+        Token::new("local").expect("static token")
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            backend_id: self.backend_id(),
+            backend_instance_id: self.backend_instance_id.clone(),
+            supported_key_specs: vec![KeySpec::Secp256k1],
+            supported_crypto_suites: vec![
+                CryptoSuite::Secp256k1Keccak256Recoverable,
+                CryptoSuite::Secp256k1Sha256Recoverable,
+            ],
+            supported_derivation: vec![DerivationCapability {
+                scheme: Token::new("bip32-secp256k1").expect("static token"),
+                maximum_depth: 10,
+                maximum_index: 0x7fff_ffff,
+            }],
+            input_kinds: vec![CryptoInputKind::Digest32],
+            output_encodings: vec![SignatureEncoding::Secp256k1Recoverable65],
+            maximum_input_bytes: DecimalU64::new(32),
+            maximum_batch_size: DecimalU64::new(32),
+            can_generate: true,
+            can_import: true,
+            can_export_encrypted: true,
+            can_delete: true,
+            requires_activation: true,
+            requires_user_presence: true,
+            networked: false,
+            provider_idempotency: ProviderIdempotency::NoDeduplication,
+        }
+    }
+
+    fn describe_key<'a>(
+        &'a self,
+        key: &'a KeyRef,
+    ) -> BackendFuture<'a, Result<KeyDescription, BackendError>> {
+        Box::pin(async move {
+            let registered = self
+                .state
+                .read()
+                .registry
+                .get(&key.locator)
+                .cloned()
+                .ok_or(BackendError::InvalidRequest)?;
+            if registered != *key {
+                return Err(BackendError::InvalidRequest);
+            }
+            let DerivationRef::Bip32Secp256k1 { path, .. } = &key
+                .derivation
+                .as_ref()
+                .ok_or(BackendError::InvalidRequest)?;
+            self.describe_path(path)
+        })
+    }
+
+    fn sign<'a>(
+        &'a self,
+        request: BackendSignRequest,
+    ) -> BackendFuture<'a, Result<BackendSignature, BackendError>> {
+        Box::pin(async move {
+            if !request.input_matches_suite()
+                || !self
+                    .capabilities()
+                    .supported_crypto_suites
+                    .contains(&request.crypto_suite)
+            {
+                return Err(BackendError::Unsupported);
+            }
+            let BackendInput::Digest32 { digest } = request.input else {
+                return Err(BackendError::InvalidRequest);
+            };
+            let digest: [u8; 32] = hex::decode(digest.as_str())
+                .map_err(|_| BackendError::InvalidRequest)?
+                .try_into()
+                .map_err(|_| BackendError::InvalidRequest)?;
+            let key = self.derive_signing_key(&request.key_ref)?;
+            let (signature, recovery_id) = key
+                .sign_prehash_recoverable(&digest)
+                .map_err(|_| BackendError::DefinitiveRejected)?;
+            let mut normalized = signature.to_bytes().to_vec();
+            normalized.push(recovery_id.to_byte());
+            Ok(BackendSignature {
+                crypto_suite: request.crypto_suite,
+                encoding: SignatureEncoding::Secp256k1Recoverable65,
+                bytes: Base64UrlBytes::from_bytes(&normalized),
+                provider_correlation_id: None,
+            })
+        })
+    }
+}
+
+impl SignerBackendActivation for LocalSignerBackend {
+    fn prepare<'a>(&'a self, _key: &'a KeyRef) -> BackendFuture<'a, Result<Token, BackendError>> {
+        Box::pin(async { Token::new("local-kek-v1").map_err(|_| BackendError::InvalidRequest) })
+    }
+
+    fn activate<'a>(
+        &'a self,
+        _key: &'a KeyRef,
+        secret: SecretBytes,
+    ) -> BackendFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            if secret.expose_to_backend().len() != 32 {
+                return Err(BackendError::InvalidRequest);
+            }
+            self.state.write().active_kek = Some(secret);
+            if self
+                .active_seed()
+                .and_then(|_| self.validate_registered_derivations())
+                .is_err()
+            {
+                self.state.write().active_kek = None;
+                return Err(BackendError::DefinitiveRejected);
+            }
+            Ok(())
+        })
+    }
+
+    fn deactivate<'a>(&'a self, _key: &'a KeyRef) -> BackendFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.state.write().active_kek = None;
+            Ok(())
+        })
+    }
+
+    fn activation_status<'a>(
+        &'a self,
+        _key: &'a KeyRef,
+    ) -> BackendFuture<'a, Result<ActivationStatus, BackendError>> {
+        Box::pin(async move {
+            Ok(if self.state.read().active_kek.is_some() {
+                ActivationStatus::Active
+            } else {
+                ActivationStatus::Inactive
+            })
+        })
+    }
+}
+
+impl SignerBackendDerivation for LocalSignerBackend {
+    fn supported_derivation_schemes(&self) -> Vec<DerivationCapability> {
+        self.capabilities().supported_derivation
+    }
+
+    fn derive_public<'a>(
+        &'a self,
+        root: &'a KeyRef,
+        canonical_path: &'a str,
+    ) -> BackendFuture<'a, Result<KeyDescription, BackendError>> {
+        Box::pin(async move {
+            if self.root_key_ref()? != *root {
+                return Err(BackendError::InvalidRequest);
+            }
+            let key = self
+                .state
+                .read()
+                .registry
+                .values()
+                .find(|key| {
+                    matches!(
+                        &key.derivation,
+                        Some(DerivationRef::Bip32Secp256k1 { path, .. })
+                            if path == canonical_path
+                    )
+                })
+                .cloned()
+                .ok_or(BackendError::InvalidRequest)?;
+            self.describe_key(&key).await
+        })
+    }
+
+    fn register_derived_key<'a>(
+        &'a self,
+        _root: &'a KeyRef,
+        _canonical_path: &'a str,
+    ) -> BackendFuture<'a, Result<KeyDescription, BackendError>> {
+        Box::pin(async { Err(BackendError::InvalidRequest) })
+    }
+}
+
+fn validate_namespace_prefix(prefix: &str) -> Result<(), BackendError> {
+    let path = DerivationPath::from_str(prefix).map_err(|_| BackendError::InvalidRequest)?;
+    if path.to_string() != prefix || prefix == "m" || prefix.split('/').count() > 10 {
+        return Err(BackendError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn commit_backup(state: &mut LocalState, next: EncryptedLocalBackup) -> Result<(), BackendError> {
+    let previous = state.backup.replace(next);
+    if let Err(error) = persist_backup(state) {
+        state.backup = previous;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn persist_backup(state: &LocalState) -> Result<(), BackendError> {
+    let Some(path) = &state.storage_path else {
+        return Ok(());
+    };
+    let backup = state
+        .backup
+        .as_ref()
+        .ok_or(BackendError::DefinitiveRejected)?;
+    let bytes = serde_jcs::to_vec(backup).map_err(|_| BackendError::DefinitiveRejected)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(BackendError::InvalidRequest)?;
+    let temporary = path.with_file_name(format!(".{file_name}.new"));
+    fs::write(&temporary, bytes).map_err(|_| BackendError::DefinitiveRejected)?;
+    fs::rename(&temporary, path).map_err(|_| BackendError::DefinitiveRejected)
+}
+
+fn root_aad(backend_instance_id: &Token, root_key_id: &Token) -> Vec<u8> {
+    [
+        ROOT_AAD_DOMAIN,
+        backend_instance_id.as_str().as_bytes(),
+        root_key_id.as_str().as_bytes(),
+        &WRAP_FORMAT_VERSION.to_be_bytes(),
+    ]
+    .concat()
+}

@@ -7,4 +7,21 @@ license.workspace = true
 
 [dependencies]
 bloom-signer-backend-api = { path = "../bloom-signer-backend-api" }
+bip32.workspace = true
+bloom-triad-protocol.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+k256.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+zeroize.workspace = true
 
+[dev-dependencies]
+futures.workspace = true
+serde_json.workspace = true

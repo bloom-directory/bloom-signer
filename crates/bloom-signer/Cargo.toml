@@ -15,4 +15,17 @@ bloom-triad-protocol.workspace = true
 bloom-signer-backend-api = { path = "../bloom-signer-backend-api" }
 bloom-signer-backend-local = { path = "../bloom-signer-backend-local", optional = true }
 bloom-signer-backend-aws-kms = { path = "../bloom-signer-backend-aws-kms", optional = true }
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
 
+[dev-dependencies]
+futures.workspace = true
