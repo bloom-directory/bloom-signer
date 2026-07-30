@@ -18,7 +18,7 @@ use bloom_signer::{
 #[cfg(feature = "aws-kms")]
 use bloom_signer_backend_api::SecretBytes;
 use bloom_triad_local_transport::{
-    EndpointQuota, LocalIdentity, PeerAcl, load_identity_and_manifest,
+    EndpointQuota, LocalIdentity, NetworkContainmentGuard, PeerAcl, load_identity_and_manifest,
 };
 use bloom_triad_protocol::{Digest32, ProtocolError, ProtocolErrorCode, Token};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -43,6 +43,7 @@ struct SignerConfig {
     ceremony_key_id: String,
     ceremony_signing_seed_hex: String,
     build_digest: String,
+    network_containment: Option<NetworkContainmentConfig>,
     maximum_connections: usize,
     maximum_in_flight_mutations: usize,
     maximum_requests_per_window: usize,
@@ -56,6 +57,14 @@ struct SignerConfig {
     control_maximum_journal_admissions_per_window: usize,
     control_journal_window_ms: u64,
     aws_kms_backends: Vec<AwsKmsBackendConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkContainmentConfig {
+    status_path: PathBuf,
+    login_uid: u32,
+    maximum_age_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -152,14 +161,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
-    let service = Arc::new(SignerRpcService::new(
+    let containment = config
+        .network_containment
+        .as_ref()
+        .map(|containment| {
+            NetworkContainmentGuard::new(
+                containment.status_path.clone(),
+                containment.login_uid,
+                build_digest.clone(),
+                containment.maximum_age_ms,
+            )
+        })
+        .transpose()?;
+    let mut service = SignerRpcService::new(
         engine,
         ceremony,
         clock,
         identity.boot_epoch.clone(),
         build_digest,
         env!("CARGO_PKG_VERSION"),
-    ));
+    );
+    if let Some(containment) = containment {
+        service = service.with_network_containment(containment);
+    }
+    let service = Arc::new(service);
 
     let rpc_listener = UnixListener::from_std(bloom_service_activation::take_unix_listener(
         &activation_name,

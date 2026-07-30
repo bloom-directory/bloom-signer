@@ -3,14 +3,15 @@
 use std::sync::Arc;
 
 use bloom_signer_backend_api::{BackendError, BackendInput, BackendSignRequest};
+use bloom_triad_local_transport::NetworkContainmentGuard;
 use bloom_triad_protocol::{
     BackendPublicCapability, Base64UrlBytes, BootEpoch, BrokerSignerMethod, BrokerSignerRequest,
     BrokerSignerResponse, BrokerSignerService, ControlRequest, ControlResponse, CryptoInputKind,
     DecimalU64, Digest32, KeyPublic, OperationId, ProtocolError, ProtocolErrorCode,
-    RPC_ENVELOPE_SCHEMA_V1, Readiness, RevocationControlService, ServiceCapabilities,
-    ServiceFuture, SignRequest, SignerCeremonyCompleteRequest, SignerCeremonyCompleteResponse,
-    SignerCeremonyPrepareRequest, SignerCeremonyPrepareResponse, SignerPreparedApproval,
-    SignerPreparedCustody, SigningResult, Token,
+    RPC_ENVELOPE_SCHEMA_V1, Readiness, ReadinessState, RevocationControlService,
+    ServiceCapabilities, ServiceFuture, SignRequest, SignerCeremonyCompleteRequest,
+    SignerCeremonyCompleteResponse, SignerCeremonyPrepareRequest, SignerCeremonyPrepareResponse,
+    SignerPreparedApproval, SignerPreparedCustody, SigningResult, Token,
 };
 use k256::pkcs8::DecodePublicKey;
 use sha2::{Digest as _, Sha256};
@@ -82,6 +83,7 @@ pub struct SignerRpcService {
     build_digest: Digest32,
     service_version: String,
     signing_gate: Mutex<()>,
+    network_containment: Option<NetworkContainmentGuard>,
 }
 
 impl SignerRpcService {
@@ -101,7 +103,13 @@ impl SignerRpcService {
             build_digest,
             service_version: service_version.into(),
             signing_gate: Mutex::new(()),
+            network_containment: None,
         }
+    }
+
+    pub fn with_network_containment(mut self, guard: NetworkContainmentGuard) -> Self {
+        self.network_containment = Some(guard);
+        self
     }
 
     async fn dispatch_inner(
@@ -111,6 +119,9 @@ impl SignerRpcService {
         use BrokerSignerRequest as Request;
         use BrokerSignerResponse as Response;
 
+        if signer_request_requires_containment(&request) {
+            self.require_network_containment()?;
+        }
         let now_ms = self.clock.now_ms(false)?;
         match request {
             Request::SystemHello(_) => Err(ProtocolError::new(
@@ -367,7 +378,11 @@ impl SignerRpcService {
     }
 
     fn readiness(&self) -> Result<Readiness, ProtocolError> {
-        let (state, conditions) = self.clock.readiness()?;
+        let (mut state, mut conditions) = self.clock.readiness()?;
+        if self.require_network_containment().is_err() {
+            state = ReadinessState::Unavailable;
+            conditions.push(Token::new("network_containment_unavailable")?);
+        }
         Ok(Readiness {
             service_id: Token::new("bloom-signer").expect("static service ID"),
             service_version: self.service_version.clone(),
@@ -376,6 +391,13 @@ impl SignerRpcService {
             state,
             conditions,
         })
+    }
+
+    fn require_network_containment(&self) -> Result<(), ProtocolError> {
+        match &self.network_containment {
+            Some(guard) => guard.check(),
+            None => Ok(()),
+        }
     }
 
     fn capabilities(&self) -> Result<ServiceCapabilities, ProtocolError> {
@@ -546,6 +568,32 @@ impl SignerRpcService {
         )?;
         Ok(result)
     }
+}
+
+fn signer_request_requires_containment(request: &BrokerSignerRequest) -> bool {
+    use BrokerSignerRequest as Request;
+
+    matches!(
+        request,
+        Request::KeyDerivePrepare(_)
+            | Request::KeyEnrollPrepare(_)
+            | Request::CeremonyPrepare(_)
+            | Request::CeremonyComplete(_)
+            | Request::SignerSign(_)
+            | Request::SignerSignBatch(_)
+            | Request::PolicyCompareAndSwap(_)
+            | Request::WalletRegistrationPrepare(_)
+            | Request::WalletUnlockPrepare(_)
+            | Request::WalletImportPrepare(_)
+            | Request::WalletExportPrepare(_)
+            | Request::WalletDeletePrepare(_)
+            | Request::CredentialAddPrepare(_)
+            | Request::CredentialRemovePrepare(_)
+            | Request::CredentialReplacePrepare(_)
+            | Request::RecoveryPrepare(_)
+            | Request::CustodyBindOutputRecipient(_)
+            | Request::CustodyComplete(_)
+    )
 }
 
 impl BrokerSignerService for SignerRpcService {
@@ -905,6 +953,59 @@ mod tests {
                 .code,
             ProtocolErrorCode::AmbiguousProviderEffect
         );
+    }
+
+    #[tokio::test]
+    async fn stale_or_missing_root_containment_blocks_signing_but_reports_readiness() {
+        let (service, broker_key, terms) = fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let service = service.with_network_containment(
+            NetworkContainmentGuard::new(
+                directory.path().join("missing-status.json"),
+                501,
+                Digest32::from_bytes([2; 32]),
+                5_000,
+            )
+            .unwrap(),
+        );
+        let readiness = match BrokerSignerService::dispatch(
+            &service,
+            BrokerSignerRequest::SignerReadiness(bloom_triad_protocol::Empty {}),
+        )
+        .await
+        .unwrap()
+        {
+            BrokerSignerResponse::SignerReadiness(readiness) => readiness,
+            _ => panic!("wrong readiness response"),
+        };
+        assert_eq!(readiness.state, ReadinessState::Unavailable);
+        assert!(
+            readiness
+                .conditions
+                .iter()
+                .any(|condition| condition.as_str() == "network_containment_unavailable")
+        );
+        assert_eq!(
+            BrokerSignerService::dispatch(
+                &service,
+                BrokerSignerRequest::SignerSign(sign_request(&broker_key, &terms, 7)),
+            )
+            .await
+            .unwrap_err()
+            .code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
+        assert!(matches!(
+            RevocationControlService::dispatch(
+                &service,
+                ControlRequest::Status(bloom_triad_protocol::WalletRequest {
+                    wallet_id: terms.wallet_id.clone(),
+                }),
+            )
+            .await
+            .unwrap(),
+            ControlResponse::Status(_)
+        ));
     }
 
     #[tokio::test]
