@@ -98,11 +98,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let manifest_path = env_path("BLOOM_EDGE_MANIFEST", "/etc/bloom/edge-manifest.json");
     let config_path = env_path("BLOOM_SIGNER_CONFIG", "/etc/bloom/signer.json");
-    let activation_name =
-        std::env::var("BLOOM_SIGNER_ACTIVATION_NAME").unwrap_or_else(|_| "signer".into());
-    let control_activation_name = std::env::var("BLOOM_SIGNER_CONTROL_ACTIVATION_NAME")
-        .unwrap_or_else(|_| "signer-control".into());
-
     let (identity, manifest) =
         load_identity_and_manifest(&identity_path, &manifest_path, "bloom-signer")?;
     let trusted_time_source = manifest.trusted_time_source.clone();
@@ -186,11 +181,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let service = Arc::new(service);
 
-    let rpc_listener = UnixListener::from_std(bloom_service_activation::take_unix_listener(
-        &activation_name,
+    let rpc_listener = UnixListener::from_std(acquire_unix_listener(
+        "BLOOM_SIGNER_SOCKET",
+        "BLOOM_SIGNER_ACTIVATION_NAME",
+        "signer",
     )?)?;
-    let control_listener = UnixListener::from_std(bloom_service_activation::take_unix_listener(
-        &control_activation_name,
+    let control_listener = UnixListener::from_std(acquire_unix_listener(
+        "BLOOM_SIGNER_CONTROL_SOCKET",
+        "BLOOM_SIGNER_CONTROL_ACTIVATION_NAME",
+        "signer-control",
     )?)?;
     let rpc_quota = Arc::new(EndpointQuota::new(
         config.maximum_in_flight_mutations,
@@ -254,6 +253,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_unix_listener(
+    path_variable: &str,
+    _activation_variable: &str,
+    _default_activation_name: &str,
+) -> Result<std::os::unix::net::UnixListener, Box<dyn std::error::Error>> {
+    let path = std::env::var_os(path_variable)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{path_variable} is required by the macOS service profile"))?;
+    Ok(bloom_service_activation::bind_owned_unix_listener(&path)?)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn acquire_unix_listener(
+    _path_variable: &str,
+    activation_variable: &str,
+    default_activation_name: &str,
+) -> Result<std::os::unix::net::UnixListener, Box<dyn std::error::Error>> {
+    let name =
+        std::env::var(activation_variable).unwrap_or_else(|_| default_activation_name.to_string());
+    Ok(bloom_service_activation::take_unix_listener(&name)?)
 }
 
 fn require_clock_repair_confirmation(
