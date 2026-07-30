@@ -484,22 +484,6 @@ fn verifying_key(encoded: &str) -> Result<VerifyingKey, ProtocolError> {
     VerifyingKey::from_bytes(&bytes).map_err(|_| invalid_key("public key encoding is invalid"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn logout_drain_waits_for_an_accepted_operation() {
-        let connections = Arc::new(Semaphore::new(2));
-        let accepted = connections.clone().acquire_owned().await.unwrap();
-        let drain = tokio::spawn(drain_connections(connections, 2, "test"));
-        tokio::task::yield_now().await;
-        assert!(!drain.is_finished());
-        drop(accepted);
-        drain.await.unwrap().unwrap();
-    }
-}
-
 fn take_signing_key(encoded: &mut String) -> Result<SigningKey, ProtocolError> {
     let mut bytes: [u8; 32] = hex::decode(encoded.as_bytes())
         .map_err(|_| invalid_key("signing seed must be hexadecimal"))?
@@ -573,4 +557,20 @@ fn build_aws_backends(
 
 fn invalid_key(message: &str) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::UnauthenticatedPeer, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn logout_drain_waits_for_an_accepted_operation() {
+        let connections = Arc::new(Semaphore::new(2));
+        let accepted = connections.clone().acquire_owned().await.unwrap();
+        let drain = tokio::spawn(drain_connections(connections, 2, "test"));
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        drop(accepted);
+        drain.await.unwrap().unwrap();
+    }
 }
