@@ -733,12 +733,13 @@ fn now_ms() -> Result<u64, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custody::WalletCustody;
     use bloom_signer_backend_api::{SecretBytes, SignerBackendActivation};
     use bloom_signer_backend_local::LocalSignerBackend;
     use bloom_triad_protocol::{
-        ActivationMode, ApprovalLimits, ApprovalSelector, ApprovalSubject, CryptoSuite,
-        RequestNonce, RevokeRequest, SealedApprovalTerms, SelectorKind, SignOperationIdentity,
-        UnsignedSignRequest,
+        ActivationMode, ApprovalLimits, ApprovalSelector, ApprovalSubject, CryptoSuite, KeyRef,
+        KeySpec, RequestNonce, RevokeRequest, SealedApprovalTerms, SelectorKind,
+        SignOperationIdentity, UnsignedSignRequest,
     };
     use ed25519_dalek::{Signer as _, SigningKey};
 
@@ -908,6 +909,39 @@ mod tests {
         }
     }
 
+    fn retarget_sign_request(
+        broker_key: &SigningKey,
+        terms: &SealedApprovalTerms,
+        key_ref: KeyRef,
+        attempt_byte: u8,
+    ) -> SignRequest {
+        let mut request = sign_request(broker_key, terms, attempt_byte);
+        request.unsigned.operation_id = OperationId::from_bytes([attempt_byte; 32]);
+        request.unsigned.key_ref = key_ref.clone();
+        request.unsigned.crypto_suite = CryptoSuite::Ed25519Message;
+        request.unsigned.operation_digest = SignOperationIdentity {
+            operation_id: request.unsigned.operation_id.clone(),
+            approval_id: request.unsigned.approval_id.clone(),
+            key_ref,
+            crypto_suite: CryptoSuite::Ed25519Message,
+            ordered_payload_digests: request.unsigned.ordered_payload_digests.clone(),
+            ordered_hashes: request.unsigned.ordered_hashes.clone(),
+            petal_use_claim_digest: None,
+            claim_assurance_digest: None,
+            policy_version: request.unsigned.policy_version.clone(),
+            policy_digest: request.unsigned.policy_digest.clone(),
+        }
+        .digest()
+        .unwrap();
+        request.unsigned.attempt_digest = request.unsigned.computed_attempt_digest().unwrap();
+        request.broker_signature = Base64UrlBytes::from_bytes(
+            &broker_key
+                .sign(&request.unsigned.attempt_digest.to_bytes())
+                .to_bytes(),
+        );
+        request
+    }
+
     #[tokio::test]
     async fn rpc_signing_publishes_once_and_returns_stable_retry_result() {
         let (service, broker_key, terms) = fixture().await;
@@ -932,6 +966,96 @@ mod tests {
                 _ => panic!("wrong response"),
             };
         assert_eq!(retry_result, first_result);
+    }
+
+    #[tokio::test]
+    async fn dedicated_policy_key_is_unreachable_through_single_and_batch_signing() {
+        let (service, broker_key, terms) = fixture().await;
+        let custody = WalletCustody::register(
+            terms.wallet_id.clone(),
+            SecretBytes::new(vec![1; 32]),
+            SecretBytes::new(vec![2; 32]),
+            SecretBytes::new(vec![3; 32]),
+            Base64UrlBytes::from_bytes(b"service-policy-credential"),
+            SecretBytes::new(vec![4; 32]),
+        )
+        .unwrap();
+        let unlocked = custody
+            .unlock_with_credential(
+                &Base64UrlBytes::from_bytes(b"service-policy-credential"),
+                &SecretBytes::new(vec![4; 32]),
+            )
+            .unwrap();
+        let policy_signing_key_id = Token::new("dedicated-policy-key").unwrap();
+        service
+            .engine
+            .install_initial_policy(
+                &terms.wallet_id,
+                Base64UrlBytes::from_bytes(br#"{"limit":1}"#),
+                policy_signing_key_id.clone(),
+                &unlocked,
+            )
+            .unwrap();
+        let policy = service
+            .engine
+            .export_backup(&terms.wallet_id, Some(custody.backup()), Vec::new())
+            .unwrap()
+            .policy
+            .expect("installed policy must be exportable");
+        assert_eq!(policy.snapshot.policy_signing_key_id, policy_signing_key_id);
+        let policy_key_ref = KeyRef {
+            backend: terms.key_ref.backend.clone(),
+            backend_instance: terms.key_ref.backend_instance.clone(),
+            locator: policy.snapshot.policy_signing_key_id.as_str().to_owned(),
+            key_spec: KeySpec::Ed25519,
+            public_key_fingerprint: Digest32::from_bytes(
+                Sha256::digest(policy.policy_verifying_key.decode()).into(),
+            ),
+            derivation: None,
+        };
+        assert!(
+            !service
+                .engine
+                .backend_registry()
+                .key_is_registered(&policy_key_ref)
+                .unwrap(),
+            "the dedicated policy key must not enter the general signing registry"
+        );
+        let mut policy_key_terms = terms.clone();
+        policy_key_terms.key_ref = policy_key_ref.clone();
+        policy_key_terms.allowed_crypto_suites = vec![CryptoSuite::Ed25519Message];
+        policy_key_terms.request_nonce = RequestNonce::from_bytes([67; 16]);
+        assert_eq!(
+            service
+                .engine
+                .install_approval_for_test(&policy_key_terms)
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::KeyrefMismatch
+        );
+
+        for (request, is_batch) in [
+            (
+                retarget_sign_request(&broker_key, &terms, policy_key_ref.clone(), 10),
+                false,
+            ),
+            (
+                retarget_sign_request(&broker_key, &terms, policy_key_ref, 11),
+                true,
+            ),
+        ] {
+            let result = if is_batch {
+                BrokerSignerService::dispatch(
+                    &service,
+                    BrokerSignerRequest::SignerSignBatch(request),
+                )
+                .await
+            } else {
+                BrokerSignerService::dispatch(&service, BrokerSignerRequest::SignerSign(request))
+                    .await
+            };
+            assert_eq!(result.unwrap_err().code, ProtocolErrorCode::KeyrefMismatch);
+        }
     }
 
     #[tokio::test]

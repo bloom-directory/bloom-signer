@@ -345,6 +345,7 @@ fn complete_generic(
     service: &SignerCeremonyService,
     authenticator: &VirtualAuthenticator,
     wallet_id: &Token,
+    key_ref: Option<KeyRef>,
     workflow: (CeremonyKind, OperationId, serde_json::Value),
     output_recipient: Option<&HpkeRecipient>,
     now_ms: u64,
@@ -357,7 +358,7 @@ fn complete_generic(
             ceremony_kind: kind,
             custody_operation_id: operation_id.clone(),
             wallet_id: Some(wallet_id.clone()),
-            key_ref: None,
+            key_ref: key_ref.clone(),
             exact_terms_digest: exact_terms_digest.clone(),
             expected_input_class: Token::new("generic-custody-v1").unwrap(),
             browser_output_recipient_key: None,
@@ -381,7 +382,7 @@ fn complete_generic(
         signer_nonce: prepared.contribution.signer_nonce.clone(),
         signer_contribution_digest: prepared.contribution.digest()?,
         wallet_id: Some(wallet_id.clone()),
-        key_ref: None,
+        key_ref,
         credential_id: Some(assertion.credential_id.clone()),
         expected_input_class: Token::new("generic-custody-v1").unwrap(),
     }
@@ -410,6 +411,100 @@ fn complete_generic(
         now_ms + 100,
     )?;
     Ok((result, prepared.contribution))
+}
+
+fn complete_credential_change(
+    service: &SignerCeremonyService,
+    authority: &VirtualAuthenticator,
+    replacement: &VirtualAuthenticator,
+    wallet_id: &Token,
+    kind: CeremonyKind,
+    operation_id: OperationId,
+    authority_sign_count: u32,
+    now_ms: u64,
+) -> CustodyResult {
+    assert!(matches!(
+        kind,
+        CeremonyKind::CredentialAdd | CeremonyKind::CredentialReplace
+    ));
+    let prepared = service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: kind,
+                custody_operation_id: operation_id.clone(),
+                wallet_id: Some(wallet_id.clone()),
+                key_ref: None,
+                exact_terms_digest: digest("e1"),
+                expected_input_class: Token::new("credential-change-prfs").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+            },
+            now_ms,
+        )
+        .unwrap();
+    let authority_assertion = authority.assertion(
+        &prepared.challenges[0].canonical_bytes().unwrap(),
+        authority_sign_count,
+    );
+    let new_credential_attestation =
+        replacement.attestation(&prepared.challenges[1].canonical_bytes().unwrap());
+    let new_credential_prf_assertion =
+        replacement.assertion(&prepared.challenges[2].canonical_bytes().unwrap(), 1);
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: kind,
+        custody_operation_id: operation_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest().unwrap(),
+        wallet_id: Some(wallet_id.clone()),
+        key_ref: None,
+        credential_id: Some(new_credential_attestation.credential_id.clone()),
+        expected_input_class: Token::new("credential-change-prfs").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "authority_prf": Base64UrlBytes::from_bytes(&authority.deterministic_prf()),
+        "new_credential_prf": Base64UrlBytes::from_bytes(&replacement.deterministic_prf()),
+    }))
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    service
+        .complete_custody(
+            CustodyCompleteRequest {
+                ceremony_kind: kind,
+                custody_operation_id: operation_id,
+                ceremony_id: prepared.contribution.ceremony_id,
+                proof: WebAuthnCeremonyProof::AuthorityCredentialChange {
+                    authority_assertion,
+                    new_credential_attestation,
+                    new_credential_prf_assertion: Some(new_credential_prf_assertion),
+                },
+                encrypted_input: Some(encrypted_input),
+                public_binding_digest: digest("e1"),
+            },
+            now_ms + 100,
+        )
+        .unwrap()
+}
+
+fn assert_approval_capacity_unused(engine: &SignerEngine, approval_id: &Digest32) {
+    let backup = engine
+        .export_backup(&Token::new("wallet-1").unwrap(), None, Vec::new())
+        .unwrap();
+    let counter = backup
+        .approval_counters
+        .iter()
+        .find(|counter| &counter.approval_id == approval_id)
+        .expect("test approval counter must be exported");
+    assert_eq!(counter.committed_operations.get(), 0);
+    assert_eq!(counter.committed_signatures.get(), 0);
 }
 
 fn complete_petal_key_derivation(
@@ -1530,6 +1625,139 @@ fn raw_private_key_import_creates_a_new_wallet_and_first_passkey() {
 }
 
 #[test]
+fn credential_replace_remove_and_backend_enrollment_do_not_spend_approval_capacity() {
+    let original = VirtualAuthenticator::generate();
+    let replacement = VirtualAuthenticator::generate();
+    let removable = VirtualAuthenticator::generate();
+    let (service, approval_key_ref, engine, _) = service(&original);
+    let approval_id = engine
+        .install_approval_for_test(&terms(approval_key_ref))
+        .unwrap();
+    assert_approval_capacity_unused(&engine, &approval_id);
+
+    let (registration, _) = complete_new_wallet(
+        &service,
+        &original,
+        CeremonyKind::WalletRegistration,
+        operation("e2"),
+        None,
+        None,
+        20_000,
+    );
+    let wallet_id = registration.wallet_id.unwrap();
+    let root_key_ref = registration.public_key_refs[0].clone();
+    let original_credential = original.credential(0);
+
+    let replaced = complete_credential_change(
+        &service,
+        &original,
+        &replacement,
+        &wallet_id,
+        CeremonyKind::CredentialReplace,
+        operation("e3"),
+        2,
+        21_000,
+    );
+    assert_eq!(replaced.public_status, CeremonyState::Succeeded);
+    assert!(
+        service
+            .credential(&wallet_id, &original_credential.credential_id)
+            .is_err()
+    );
+    assert!(
+        service
+            .credential(&wallet_id, &replacement.credential(0).credential_id)
+            .is_ok()
+    );
+    assert_approval_capacity_unused(&engine, &approval_id);
+
+    let added = complete_credential_change(
+        &service,
+        &replacement,
+        &removable,
+        &wallet_id,
+        CeremonyKind::CredentialAdd,
+        operation("e4"),
+        2,
+        22_000,
+    );
+    assert_eq!(added.public_status, CeremonyState::Succeeded);
+    let removable_credential = removable.credential(0);
+    assert!(
+        service
+            .credential(&wallet_id, &removable_credential.credential_id)
+            .is_ok()
+    );
+
+    let mut removal_target = root_key_ref.clone();
+    removal_target.locator = removable_credential.credential_id.encoded().to_owned();
+    removal_target.derivation = None;
+    let remove_operation = operation("e5");
+    let remove_prepared = service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::CredentialRemove,
+                custody_operation_id: remove_operation.clone(),
+                wallet_id: Some(wallet_id.clone()),
+                key_ref: Some(removal_target),
+                exact_terms_digest: digest("e6"),
+                expected_input_class: Token::new("credential-remove-v1").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+            },
+            23_000,
+        )
+        .unwrap();
+    let authority_assertion =
+        replacement.assertion(&remove_prepared.challenges[0].canonical_bytes().unwrap(), 3);
+    let removed = service
+        .complete_custody(
+            CustodyCompleteRequest {
+                ceremony_kind: CeremonyKind::CredentialRemove,
+                custody_operation_id: remove_operation,
+                ceremony_id: remove_prepared.contribution.ceremony_id,
+                proof: WebAuthnCeremonyProof::Assertion {
+                    assertion: authority_assertion,
+                },
+                encrypted_input: None,
+                public_binding_digest: digest("e6"),
+            },
+            23_100,
+        )
+        .unwrap();
+    assert_eq!(removed.public_status, CeremonyState::Succeeded);
+    assert!(
+        service
+            .credential(&wallet_id, &removable_credential.credential_id)
+            .is_err()
+    );
+    assert!(
+        service
+            .credential(&wallet_id, &replacement.credential(0).credential_id)
+            .is_ok()
+    );
+    assert_approval_capacity_unused(&engine, &approval_id);
+
+    let (enrolled, _) = complete_generic(
+        &service,
+        &replacement,
+        &wallet_id,
+        Some(root_key_ref.clone()),
+        (
+            CeremonyKind::BackendEnrollment,
+            operation("e7"),
+            serde_json::json!({"kind": "backend_enrollment"}),
+        ),
+        None,
+        24_000,
+    )
+    .unwrap();
+    assert_eq!(enrolled.public_status, CeremonyState::Succeeded);
+    assert_eq!(enrolled.public_key_refs, vec![root_key_ref]);
+    assert_approval_capacity_unused(&engine, &approval_id);
+}
+
+#[test]
 fn restart_tombstones_a_derived_key_allocated_before_custody_commit() {
     let authority_key = SigningKey::from_bytes(&[5; 32]);
     let backend = Arc::new(
@@ -1609,6 +1837,7 @@ fn generic_custody_export_policy_and_delete_apply_exact_typed_effects() {
         &service,
         &authenticator,
         &wallet_id,
+        None,
         (CeremonyKind::WalletExport, operation("b1"), export_effect),
         Some(&output_recipient),
         6_000,
@@ -1709,6 +1938,7 @@ fn generic_custody_export_policy_and_delete_apply_exact_typed_effects() {
         &service,
         &authenticator,
         &wallet_id,
+        None,
         (
             CeremonyKind::WalletDelete,
             operation("b4"),
@@ -1729,6 +1959,7 @@ fn generic_custody_export_policy_and_delete_apply_exact_typed_effects() {
         &service,
         &authenticator,
         &wallet_id,
+        None,
         (
             CeremonyKind::WalletDelete,
             operation("b5"),
