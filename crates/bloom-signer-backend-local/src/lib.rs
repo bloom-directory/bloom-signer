@@ -45,6 +45,10 @@ pub struct EncryptedLocalBackup {
     pub nonce: Base64UrlBytes,
     pub encrypted_seed: Base64UrlBytes,
     pub authority_verifying_key: Base64UrlBytes,
+    /// Public SPKI descriptions pinned while custody is active. These permit
+    /// key projection after restart without decrypting root material.
+    #[serde(default)]
+    pub public_descriptions: Vec<KeyDescription>,
     pub derivation_registry: Vec<KeyRef>,
     pub derivation_namespaces: Vec<DerivationNamespace>,
     pub derivation_tombstones: Vec<String>,
@@ -185,6 +189,7 @@ impl LocalSignerBackend {
                     authority_verifying_key: Base64UrlBytes::from_bytes(
                         &authority_verifying_key.to_bytes(),
                     ),
+                    public_descriptions: vec![],
                     derivation_registry: vec![],
                     derivation_namespaces: vec![],
                     derivation_tombstones: vec![],
@@ -203,6 +208,15 @@ impl LocalSignerBackend {
             .as_mut()
             .ok_or(BackendError::DefinitiveRejected)?
             .pinned_root = Some(root);
+        let mut description = backend.describe_path("m")?;
+        description.key_ref = backend.root_key_ref()?;
+        backend
+            .state
+            .write()
+            .backup
+            .as_mut()
+            .ok_or(BackendError::DefinitiveRejected)?
+            .public_descriptions = vec![description];
         Ok(backend)
     }
 
@@ -491,6 +505,7 @@ impl LocalSignerBackend {
                 .ok_or(BackendError::DefinitiveRejected)?,
         );
         next.derivation_registry.push(description.key_ref.clone());
+        next.public_descriptions.push(description.clone());
         if let Some(operation_id) = operation_id {
             next.pending_derivations.insert(
                 operation_id.as_str().to_owned(),
@@ -554,6 +569,8 @@ impl LocalSignerBackend {
             .clone()
             .ok_or(BackendError::DefinitiveRejected)?;
         next.derivation_registry.retain(|key| key != key_ref);
+        next.public_descriptions
+            .retain(|description| &description.key_ref != key_ref);
         next.pending_derivations
             .retain(|_, pending| pending != key_ref);
         if !next.derivation_tombstones.contains(&path) {
@@ -805,6 +822,22 @@ impl SignerBackend for LocalSignerBackend {
         key: &'a KeyRef,
     ) -> BackendFuture<'a, Result<KeyDescription, BackendError>> {
         Box::pin(async move {
+            if let Some(description) = self.state.read().backup.as_ref().and_then(|backup| {
+                backup
+                    .public_descriptions
+                    .iter()
+                    .find(|description| &description.key_ref == key)
+                    .cloned()
+            }) {
+                if description.public_key_fingerprint != key.public_key_fingerprint
+                    || Digest32::from_bytes(
+                        Sha256::digest(&description.canonical_spki_der.decode()).into(),
+                    ) != key.public_key_fingerprint
+                {
+                    return Err(BackendError::DefinitiveRejected);
+                }
+                return Ok(description);
+            }
             if self.root_key_ref()? == *key {
                 let mut description = self.describe_path("m")?;
                 description.key_ref = key.clone();

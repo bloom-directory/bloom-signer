@@ -88,7 +88,11 @@ fn ac25_bip32_derivation_and_registry_match_reviewed_vector() {
         futures::executor::block_on(restored.activation_status(&first.key_ref)).unwrap(),
         ActivationStatus::Inactive
     );
-    assert!(futures::executor::block_on(restored.describe_key(&first.key_ref)).is_err());
+    assert_eq!(
+        futures::executor::block_on(restored.describe_key(&first.key_ref)).unwrap(),
+        first,
+        "public projection must not require custody activation after restart"
+    );
     futures::executor::block_on(restored.activate(&first.key_ref, SecretBytes::new(vec![7; 32])))
         .unwrap();
     assert_eq!(
@@ -133,6 +137,17 @@ fn ac15_deactivation_and_restart_remove_plaintext_key_availability() {
     let restarted =
         LocalSignerBackend::restore(Token::new("local-default").unwrap(), backup).unwrap();
     assert!(futures::executor::block_on(restarted.sign(request)).is_err());
+}
+
+#[test]
+fn restarted_public_projection_rejects_an_spki_fingerprint_mismatch() {
+    let backend = backend((0_u8..32).collect());
+    let root = backend.root_key_ref().unwrap();
+    let mut backup = backend.encrypted_backup().unwrap();
+    backup.public_descriptions[0].canonical_spki_der = Base64UrlBytes::from_bytes(&[9; 33]);
+    let restored =
+        LocalSignerBackend::restore(Token::new("local-default").unwrap(), backup).unwrap();
+    assert!(futures::executor::block_on(restored.describe_key(&root)).is_err());
 }
 
 #[test]
