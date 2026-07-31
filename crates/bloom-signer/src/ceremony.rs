@@ -58,6 +58,7 @@ enum PendingRequest {
     PolicyUpdate(Box<PolicyUpdateCeremonyPrepareRequest>),
 }
 
+#[allow(clippy::large_enum_variant)]
 enum PendingContribution {
     Approval(SignerCeremonyContribution),
     Custody(CustodySignerContribution),

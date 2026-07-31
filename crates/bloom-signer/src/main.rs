@@ -3,26 +3,36 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    collections::BTreeMap,
     fs,
     io::ErrorKind,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
+use bloom_audit_checkpoint::{CheckpointSink, CheckpointStore, PinnedAuditKey};
 use bloom_signer::{
-    ceremony::SignerCeremonyService, clock::SignerClock, engine::SignerEngine,
-    registry::BackendRegistry, registry::CompiledBackend, service::SignerRpcService,
+    ceremony::SignerCeremonyService,
+    clock::SignerClock,
+    engine::{SignerAuditKeys, SignerEngine},
+    registry::BackendRegistry,
+    registry::CompiledBackend,
+    service::SignerRpcService,
 };
 #[cfg(feature = "aws-kms")]
 use bloom_signer_backend_api::SecretBytes;
 #[cfg(feature = "triad-dev-harness")]
 use bloom_triad_local_transport::load_developer_identity_and_manifest;
 use bloom_triad_local_transport::{
-    EndpointQuota, LocalIdentity, NetworkContainmentGuard, PeerAcl, load_identity_and_manifest,
+    BrokerSignerJournalExchange, EndpointQuota, LocalIdentity, NetworkContainmentGuard, PeerAcl,
+    load_identity_and_manifest,
 };
-use bloom_triad_protocol::{Digest32, ProtocolError, ProtocolErrorCode, Token};
+use bloom_triad_protocol::{
+    ControlRequest, ControlResponse, Digest32, ProtocolError, ProtocolErrorCode,
+    RevocationControlService, ServiceFuture, SignedJournalHead, Token,
+};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
@@ -42,6 +52,12 @@ struct SignerConfig {
     ceremony_verifying_public_key_hex: String,
     revocation_key_id: String,
     revocation_signing_seed_hex: String,
+    audit_key_id: String,
+    audit_signing_seed_hex: String,
+    #[serde(default)]
+    audit_historical_public_keys: Vec<AuditPublicKeyConfig>,
+    #[serde(default)]
+    audit_rotation_previous_key: Option<AuditPreviousSigningKeyConfig>,
     ceremony_key_id: String,
     ceremony_signing_seed_hex: String,
     build_digest: String,
@@ -63,6 +79,20 @@ struct SignerConfig {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AuditPublicKeyConfig {
+    key_id: String,
+    public_key_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditPreviousSigningKeyConfig {
+    key_id: String,
+    signing_seed_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NetworkContainmentConfig {
     status_path: PathBuf,
     login_uid: u32,
@@ -79,6 +109,10 @@ struct AwsKmsBackendConfig {
 impl Drop for SignerConfig {
     fn drop(&mut self) {
         self.revocation_signing_seed_hex.zeroize();
+        self.audit_signing_seed_hex.zeroize();
+        if let Some(previous) = &mut self.audit_rotation_previous_key {
+            previous.signing_seed_hex.zeroize();
+        }
         self.ceremony_signing_seed_hex.zeroize();
         for backend in &mut self.aws_kms_backends {
             backend.state_authentication_key_hex.zeroize();
@@ -115,6 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         load_identity_and_manifest(&identity_path, &manifest_path, "bloom-signer")?;
     let (identity, manifest) = loaded_identity;
     let trusted_time_source = manifest.trusted_time_source.clone();
+    let signer_effective_uid = manifest.signer.effective_uid;
     let session_acl = manifest
         .session
         .clone()
@@ -130,22 +165,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if revoke_client_acl.service_id.as_str() != "bloom-revoke-client" {
         return Err("edge manifest does not pin the dedicated revoke client".into());
     }
+    let checkpoint_store = Arc::new(CheckpointStore::open(
+        env_path(
+            "BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR",
+            "/var/db/bloom/signer/audit-checkpoints",
+        ),
+        signer_effective_uid,
+        identity.service_id.clone(),
+        [
+            PinnedAuditKey {
+                service_id: broker_acl.service_id.clone(),
+                key_id: broker_acl.application_key_id.clone(),
+                verifying_key: VerifyingKey::from_bytes(&broker_acl.application_public_key)?,
+            },
+            PinnedAuditKey {
+                service_id: identity.service_id.clone(),
+                key_id: identity.application_key_id.clone(),
+                verifying_key: identity.signing_key.verifying_key(),
+            },
+        ],
+    )?);
     let mut config = load_config(&config_path)?;
     let broker_public_key = verifying_key(&config.broker_signing_public_key_hex)?;
     let ceremony_public_key = verifying_key(&config.ceremony_verifying_public_key_hex)?;
     let revocation_signing_key = take_signing_key(&mut config.revocation_signing_seed_hex)?;
+    let audit_signing_key = take_signing_key(&mut config.audit_signing_seed_hex)?;
+    if config.audit_key_id == config.revocation_key_id
+        || audit_signing_key.verifying_key() == revocation_signing_key.verifying_key()
+        || audit_signing_key.verifying_key() == identity.signing_key.verifying_key()
+    {
+        return Err(
+            "Signer audit key must be distinct from revocation and application keys".into(),
+        );
+    }
+    let previous_audit_signing_key = config
+        .audit_rotation_previous_key
+        .as_mut()
+        .map(|previous| -> Result<(Token, SigningKey), ProtocolError> {
+            Ok((
+                Token::new(previous.key_id.clone())?,
+                take_signing_key(&mut previous.signing_seed_hex)?,
+            ))
+        })
+        .transpose()?;
     let ceremony_signing_key = take_signing_key(&mut config.ceremony_signing_seed_hex)?;
+    if config.audit_key_id == config.ceremony_key_id
+        || audit_signing_key.verifying_key() == ceremony_signing_key.verifying_key()
+    {
+        return Err("Signer audit key must be distinct from the ceremony key".into());
+    }
     let build_digest = Digest32::new(config.build_digest.clone())?;
 
     let compiled_backends = build_aws_backends(&mut config.aws_kms_backends)?;
     let registry = Arc::new(BackendRegistry::from_compiled(compiled_backends)?);
-    let engine = Arc::new(SignerEngine::open(
+    let engine = Arc::new(open_operational_signer_engine(
         &config.database_path,
         Token::new(config.broker_signing_key_id.clone())?,
         broker_public_key,
         ceremony_public_key,
         Token::new(config.revocation_key_id.clone())?,
         revocation_signing_key,
+        Token::new(config.audit_key_id.clone())?,
+        audit_signing_key,
+        &config.audit_historical_public_keys,
+        previous_audit_signing_key,
         registry,
     )?);
     let ceremony = Arc::new(SignerCeremonyService::new(
@@ -182,6 +265,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .transpose()?;
+    let initial_audit_head =
+        select_initial_self_head(engine.as_ref(), checkpoint_store.as_ref(), &identity)?;
+    let journal_exchange = Arc::new(SignerJournalExchange {
+        engine: engine.clone(),
+        checkpoints: checkpoint_store,
+        identity: identity.clone(),
+        last_verified_head: Mutex::new(initial_audit_head),
+    });
     let mut service = SignerRpcService::new(
         engine,
         ceremony,
@@ -194,6 +285,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         service = service.with_network_containment(containment);
     }
     let service = Arc::new(service);
+    let control_service = Arc::new(CheckpointingControlService {
+        inner: service.clone(),
+        journals: journal_exchange.clone(),
+    });
 
     let rpc_listener = UnixListener::from_std(acquire_unix_listener(
         "BLOOM_SIGNER_SOCKET",
@@ -238,6 +333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             broker_acl,
             rpc_quota,
             service.clone(),
+            journal_exchange,
             config.maximum_connections,
             &mut rpc_shutdown,
         ),
@@ -246,7 +342,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             identity,
             revoke_client_acl,
             control_quota,
-            service,
+            control_service,
             config.control_maximum_connections,
             &mut control_shutdown,
         ),
@@ -345,12 +441,14 @@ fn clock_repair_request() -> Result<Option<u64>, Box<dyn std::error::Error>> {
         .transpose()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_rpc(
     listener: UnixListener,
     identity: LocalIdentity,
     broker_acl: PeerAcl,
     quota: Arc<EndpointQuota>,
     service: Arc<SignerRpcService>,
+    journals: Arc<SignerJournalExchange>,
     maximum_connections: usize,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()> {
@@ -370,19 +468,124 @@ async fn serve_rpc(
         let broker_acl = broker_acl.clone();
         let quota = quota.clone();
         let service = service.clone();
+        let journals = journals.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = bloom_triad_local_transport::dispatch_broker_signer_connection(
-                &mut stream,
-                &identity,
-                &broker_acl,
-                &quota,
-                service.as_ref(),
-            )
-            .await;
+            let _ =
+                bloom_triad_local_transport::dispatch_broker_signer_connection_with_journal_heads(
+                    &mut stream,
+                    &identity,
+                    &broker_acl,
+                    &quota,
+                    service.as_ref(),
+                    journals.as_ref(),
+                )
+                .await;
         });
     }
     drain_connections(connections, maximum_connections, "RPC").await
+}
+
+struct SignerJournalExchange {
+    engine: Arc<SignerEngine>,
+    checkpoints: Arc<dyn CheckpointSink>,
+    identity: LocalIdentity,
+    last_verified_head: Mutex<Option<SignedJournalHead>>,
+}
+
+fn select_initial_self_head(
+    engine: &SignerEngine,
+    checkpoints: &dyn CheckpointSink,
+    identity: &LocalIdentity,
+) -> Result<Option<SignedJournalHead>, ProtocolError> {
+    let retained = checkpoints
+        .latest_peer_head(&identity.service_id)
+        .map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                format!("load retained Signer local audit checkpoint: {error}"),
+            )
+        })?;
+    let Ok((sequence, head_hash)) = engine.verified_audit_head() else {
+        return Ok(retained);
+    };
+    let head = bloom_triad_local_transport::sign_journal_head(identity, sequence, head_hash);
+    match checkpoints.append_peer_head(&head) {
+        Ok(_) => Ok(Some(head)),
+        Err(_) => {
+            // A rollback/conflict against the independently retained head is
+            // audit degradation, not permission to fabricate a zero head or
+            // to discard read/status availability.
+            engine.latch_audit_degraded();
+            Ok(retained)
+        }
+    }
+}
+
+impl BrokerSignerJournalExchange for SignerJournalExchange {
+    fn checkpoint_request_head(
+        &self,
+        method: &Token,
+        peer_head: &bloom_triad_protocol::SignedJournalHead,
+    ) -> Result<(), ProtocolError> {
+        if let Err(error) = self.checkpoints.append_peer_head(peer_head) {
+            self.engine.latch_audit_degraded();
+            if !bloom_triad_local_transport::is_read_only_method(method) {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!("persist Broker audit checkpoint before dispatching mutation: {error}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn local_journal_head(&self) -> Result<(u64, Digest32), ProtocolError> {
+        match self.engine.verified_audit_head() {
+            Ok((sequence, head_hash)) => {
+                let signed = bloom_triad_local_transport::sign_journal_head(
+                    &self.identity,
+                    sequence,
+                    head_hash.clone(),
+                );
+                self.checkpoints
+                    .append_peer_head(&signed)
+                    .map_err(|error| {
+                        self.engine.latch_audit_degraded();
+                        ProtocolError::new(
+                            ProtocolErrorCode::ServiceUnavailable,
+                            format!(
+                                "persist Signer local audit checkpoint before response: {error}"
+                            ),
+                        )
+                    })?;
+                *self.last_verified_head.lock().map_err(|_| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "Signer last verified audit head lock is poisoned",
+                    )
+                })? = Some(signed);
+                Ok((sequence, head_hash))
+            }
+            Err(_) => self
+                .last_verified_head
+                .lock()
+                .map_err(|_| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "Signer last verified audit head lock is poisoned",
+                    )
+                })?
+                .as_ref()
+                .map(|head| (head.sequence.get(), head.head_hash.clone()))
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "Signer audit is degraded and has no independently retained local head",
+                    )
+                }),
+        }
+    }
 }
 
 async fn serve_control(
@@ -390,7 +593,7 @@ async fn serve_control(
     identity: LocalIdentity,
     revoke_client_acl: PeerAcl,
     quota: Arc<EndpointQuota>,
-    service: Arc<SignerRpcService>,
+    service: Arc<CheckpointingControlService>,
     maximum_connections: usize,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()> {
@@ -423,6 +626,26 @@ async fn serve_control(
         });
     }
     drain_connections(connections, maximum_connections, "control").await
+}
+
+struct CheckpointingControlService {
+    inner: Arc<SignerRpcService>,
+    journals: Arc<SignerJournalExchange>,
+}
+
+impl RevocationControlService for CheckpointingControlService {
+    fn dispatch<'a>(&'a self, request: ControlRequest) -> ServiceFuture<'a, ControlResponse> {
+        Box::pin(async move {
+            let is_read_only = matches!(&request, ControlRequest::Status(_));
+            let result = RevocationControlService::dispatch(self.inner.as_ref(), request).await;
+            if !is_read_only {
+                // The local OS checkpoint is part of publishing a security
+                // mutation outcome, including durable-effect error outcomes.
+                self.journals.local_journal_head()?;
+            }
+            result
+        })
+    }
 }
 
 async fn connect_authenticated_session(
@@ -486,6 +709,98 @@ async fn drain_connections(
     })?
     .map_err(|_| std::io::Error::other("Signer connection gate closed"))?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_operational_signer_engine(
+    path: &Path,
+    broker_key_id: Token,
+    broker_public_key: VerifyingKey,
+    ceremony_public_key: VerifyingKey,
+    revocation_key_id: Token,
+    revocation_signing_key: SigningKey,
+    current_audit_key_id: Token,
+    current_audit_signing_key: SigningKey,
+    historical: &[AuditPublicKeyConfig],
+    previous: Option<(Token, SigningKey)>,
+    registry: Arc<BackendRegistry>,
+) -> Result<SignerEngine, ProtocolError> {
+    let mut trusted = BTreeMap::new();
+    for entry in historical {
+        let key_id = Token::new(entry.key_id.clone())?;
+        let key = verifying_key(&entry.public_key_hex)?;
+        if trusted
+            .insert(key_id.clone(), key)
+            .is_some_and(|old| old != key)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                format!("Signer audit key ID {key_id} has conflicting public keys"),
+            ));
+        }
+    }
+    if let Some((previous_key_id, previous_key)) = &previous {
+        if previous_key_id == &current_audit_key_id
+            || previous_key.verifying_key() == current_audit_signing_key.verifying_key()
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "Signer audit rotation previous key ID and material must differ from current key",
+            ));
+        }
+        if trusted
+            .insert(previous_key_id.clone(), previous_key.verifying_key())
+            .is_some_and(|old| old != previous_key.verifying_key())
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "Signer audit previous key conflicts with retained public key",
+            ));
+        }
+    }
+    let current = SignerEngine::open(
+        path,
+        broker_key_id.clone(),
+        broker_public_key,
+        ceremony_public_key,
+        revocation_key_id.clone(),
+        revocation_signing_key.clone(),
+        SignerAuditKeys {
+            current_key_id: current_audit_key_id.clone(),
+            current_signing_key: current_audit_signing_key.clone(),
+            historical_verifying_keys: trusted.clone(),
+        },
+        registry.clone(),
+    )?;
+    if !current.audit_is_degraded() || previous.is_none() {
+        return Ok(current);
+    }
+    let (previous_key_id, previous_signing_key) = previous.expect("checked above");
+    trusted.insert(
+        current_audit_key_id.clone(),
+        current_audit_signing_key.verifying_key(),
+    );
+    let prior = SignerEngine::open(
+        path,
+        broker_key_id,
+        broker_public_key,
+        ceremony_public_key,
+        revocation_key_id,
+        revocation_signing_key,
+        SignerAuditKeys {
+            current_key_id: previous_key_id,
+            current_signing_key: previous_signing_key,
+            historical_verifying_keys: trusted,
+        },
+        registry,
+    )?;
+    if prior.audit_is_degraded() {
+        // Corrupted history remains readable but cannot be "repaired" by a
+        // key rotation. Return the original current-key degraded view.
+        return Ok(current);
+    }
+    prior.rotate_audit_key(current_audit_key_id, current_audit_signing_key)?;
+    Ok(prior)
 }
 
 fn env_path(name: &str, default: &str) -> PathBuf {
@@ -612,6 +927,97 @@ fn invalid_key(message: &str) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bloom_audit_checkpoint::{AppendOutcome, CheckpointError};
+    use bloom_triad_protocol::{Base64UrlBytes, DecimalU64, SignedJournalHead};
+    use ed25519_dalek::Signer as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct FailingCheckpointSink;
+
+    struct FailingSelfCheckpointSink;
+
+    struct RetainedRollbackSink(SignedJournalHead);
+
+    impl CheckpointSink for FailingCheckpointSink {
+        fn append_peer_head(
+            &self,
+            peer_head: &SignedJournalHead,
+        ) -> Result<AppendOutcome, CheckpointError> {
+            if peer_head.service_id.as_str() == "bloom-signer" {
+                return Ok(AppendOutcome::Appended);
+            }
+            Err(CheckpointError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "forced request checkpoint failure",
+            )))
+        }
+    }
+
+    impl CheckpointSink for FailingSelfCheckpointSink {
+        fn append_peer_head(
+            &self,
+            _peer_head: &SignedJournalHead,
+        ) -> Result<AppendOutcome, CheckpointError> {
+            Err(CheckpointError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "forced self checkpoint failure",
+            )))
+        }
+    }
+
+    impl CheckpointSink for RetainedRollbackSink {
+        fn append_peer_head(
+            &self,
+            _peer_head: &SignedJournalHead,
+        ) -> Result<AppendOutcome, CheckpointError> {
+            Err(CheckpointError::SequenceRollback)
+        }
+
+        fn latest_peer_head(
+            &self,
+            service_id: &Token,
+        ) -> Result<Option<SignedJournalHead>, CheckpointError> {
+            Ok((service_id == &self.0.service_id).then(|| self.0.clone()))
+        }
+    }
+
+    fn test_engine() -> Arc<SignerEngine> {
+        Arc::new(
+            SignerEngine::open_in_memory(
+                Token::new("broker-app").unwrap(),
+                SigningKey::from_bytes(&[7; 32]).verifying_key(),
+                SigningKey::from_bytes(&[6; 32]).verifying_key(),
+                Token::new("signer-revocation-key").unwrap(),
+                SigningKey::from_bytes(&[4; 32]),
+                SignerAuditKeys {
+                    current_key_id: Token::new("signer-audit-key").unwrap(),
+                    current_signing_key: SigningKey::from_bytes(&[14; 32]),
+                    historical_verifying_keys: BTreeMap::new(),
+                },
+                Arc::new(BackendRegistry::from_compiled(vec![]).unwrap()),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn broker_head() -> SignedJournalHead {
+        SignedJournalHead {
+            service_id: Token::new("bloom-broker").unwrap(),
+            sequence: DecimalU64::new(1),
+            head_hash: Digest32::from_bytes([1; 32]),
+            key_id: Token::new("broker-app").unwrap(),
+            signature: Base64UrlBytes::from_bytes(&[1; 64]),
+        }
+    }
+
+    fn signer_identity() -> LocalIdentity {
+        LocalIdentity {
+            service_id: Token::new("bloom-signer").unwrap(),
+            boot_epoch: bloom_triad_protocol::BootEpoch::new("01".repeat(16)).unwrap(),
+            application_key_id: Token::new("signer-app").unwrap(),
+            signing_key: Arc::new(SigningKey::from_bytes(&[9; 32])),
+        }
+    }
 
     #[test]
     fn session_disconnect_errors_exit_cleanly_without_keepalive_retry() {
@@ -638,5 +1044,257 @@ mod tests {
         assert!(!drain.is_finished());
         drop(accepted);
         drain.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn request_checkpoint_failure_blocks_mutations_but_keeps_read_heads_available() {
+        let engine = test_engine();
+        let exchange = SignerJournalExchange {
+            engine: engine.clone(),
+            checkpoints: Arc::new(FailingCheckpointSink),
+            identity: signer_identity(),
+            last_verified_head: Mutex::new(None),
+        };
+        assert!(
+            exchange
+                .checkpoint_request_head(&Token::new("signer.readiness").unwrap(), &broker_head(),)
+                .is_ok()
+        );
+        assert_eq!(exchange.local_journal_head().unwrap().0, 0);
+        assert_eq!(
+            exchange
+                .checkpoint_request_head(&Token::new("signer.sign").unwrap(), &broker_head())
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
+        assert_eq!(
+            engine.repair_clock(1).unwrap_err().code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
+    }
+
+    #[test]
+    fn production_audit_key_rotation_restarts_with_verification_only_history() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("signer.sqlite3");
+        let first_id = Token::new("signer-audit-first").unwrap();
+        let previous_id = Token::new("signer-audit-previous").unwrap();
+        let current_id = Token::new("signer-audit-current").unwrap();
+        let first = SigningKey::from_bytes(&[51; 32]);
+        let previous = SigningKey::from_bytes(&[52; 32]);
+        let current = SigningKey::from_bytes(&[53; 32]);
+        let registry = || Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+        let initial = SignerEngine::open(
+            &path,
+            Token::new("broker-app").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            SigningKey::from_bytes(&[6; 32]).verifying_key(),
+            Token::new("revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            SignerAuditKeys {
+                current_key_id: first_id.clone(),
+                current_signing_key: first.clone(),
+                historical_verifying_keys: BTreeMap::new(),
+            },
+            registry(),
+        )
+        .unwrap();
+        initial
+            .rotate_audit_key(previous_id.clone(), previous.clone())
+            .unwrap();
+        drop(initial);
+        let historical = vec![AuditPublicKeyConfig {
+            key_id: first_id.as_str().to_owned(),
+            public_key_hex: hex::encode(first.verifying_key().to_bytes()),
+        }];
+        let rotated = open_operational_signer_engine(
+            &path,
+            Token::new("broker-app").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            SigningKey::from_bytes(&[6; 32]).verifying_key(),
+            Token::new("revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            current_id.clone(),
+            current.clone(),
+            &historical,
+            Some((previous_id.clone(), previous.clone())),
+            registry(),
+        )
+        .unwrap();
+        assert!(!rotated.audit_is_degraded());
+        drop(rotated);
+        let mut retained = historical;
+        retained.push(AuditPublicKeyConfig {
+            key_id: previous_id.as_str().to_owned(),
+            public_key_hex: hex::encode(previous.verifying_key().to_bytes()),
+        });
+        let restarted = open_operational_signer_engine(
+            &path,
+            Token::new("broker-app").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            SigningKey::from_bytes(&[6; 32]).verifying_key(),
+            Token::new("revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            current_id,
+            current,
+            &retained,
+            None,
+            registry(),
+        )
+        .unwrap();
+        assert!(!restarted.audit_is_degraded());
+    }
+
+    #[test]
+    fn retained_self_head_survives_local_corruption_without_peer_rollback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkpoint_root = temporary.path().join("checkpoints");
+        fs::create_dir(&checkpoint_root).unwrap();
+        fs::set_permissions(&checkpoint_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let identity = signer_identity();
+        let broker_key = SigningKey::from_bytes(&[7; 32]);
+        let store = Arc::new(
+            CheckpointStore::open(
+                &checkpoint_root,
+                fs::metadata(&checkpoint_root).unwrap().uid(),
+                identity.service_id.clone(),
+                [
+                    PinnedAuditKey {
+                        service_id: identity.service_id.clone(),
+                        key_id: identity.application_key_id.clone(),
+                        verifying_key: identity.signing_key.verifying_key(),
+                    },
+                    PinnedAuditKey {
+                        service_id: Token::new("bloom-broker").unwrap(),
+                        key_id: Token::new("broker-app").unwrap(),
+                        verifying_key: broker_key.verifying_key(),
+                    },
+                ],
+            )
+            .unwrap(),
+        );
+        let mut peer = broker_head();
+        peer.signature =
+            Base64UrlBytes::from_bytes(&broker_key.sign(&peer.signature_message()).to_bytes());
+        store.append_peer_head(&peer).unwrap();
+        let database_path = temporary.path().join("signer.sqlite3");
+        let engine = Arc::new(
+            SignerEngine::open(
+                &database_path,
+                Token::new("broker-app").unwrap(),
+                SigningKey::from_bytes(&[7; 32]).verifying_key(),
+                SigningKey::from_bytes(&[6; 32]).verifying_key(),
+                Token::new("signer-revocation-key").unwrap(),
+                SigningKey::from_bytes(&[4; 32]),
+                SignerAuditKeys {
+                    current_key_id: Token::new("signer-audit-key").unwrap(),
+                    current_signing_key: SigningKey::from_bytes(&[14; 32]),
+                    historical_verifying_keys: BTreeMap::new(),
+                },
+                Arc::new(BackendRegistry::from_compiled(vec![]).unwrap()),
+            )
+            .unwrap(),
+        );
+        engine
+            .rotate_audit_key(
+                Token::new("signer-audit-next").unwrap(),
+                SigningKey::from_bytes(&[61; 32]),
+            )
+            .unwrap();
+        let exchange = SignerJournalExchange {
+            engine: engine.clone(),
+            checkpoints: store.clone(),
+            identity: identity.clone(),
+            last_verified_head: Mutex::new(None),
+        };
+        let retained = exchange.local_journal_head().unwrap();
+        assert!(retained.0 > 0);
+        rusqlite::Connection::open(&database_path)
+            .unwrap()
+            .execute(
+                "UPDATE audit_chain SET payload_jcs = '{}' WHERE sequence = 0",
+                [],
+            )
+            .unwrap();
+        let restarted_store = Arc::new(
+            CheckpointStore::open(
+                &checkpoint_root,
+                fs::metadata(&checkpoint_root).unwrap().uid(),
+                identity.service_id.clone(),
+                [
+                    PinnedAuditKey {
+                        service_id: identity.service_id.clone(),
+                        key_id: identity.application_key_id.clone(),
+                        verifying_key: identity.signing_key.verifying_key(),
+                    },
+                    PinnedAuditKey {
+                        service_id: Token::new("bloom-broker").unwrap(),
+                        key_id: Token::new("broker-app").unwrap(),
+                        verifying_key: broker_key.verifying_key(),
+                    },
+                ],
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            restarted_store
+                .latest_peer_head(&Token::new("bloom-broker").unwrap())
+                .unwrap(),
+            Some(peer)
+        );
+        let retained_signed = restarted_store
+            .latest_peer_head(&identity.service_id)
+            .unwrap();
+        let degraded_exchange = SignerJournalExchange {
+            engine,
+            checkpoints: restarted_store,
+            identity,
+            last_verified_head: Mutex::new(retained_signed),
+        };
+        assert_eq!(degraded_exchange.local_journal_head().unwrap(), retained);
+    }
+
+    #[test]
+    fn self_checkpoint_failure_suppresses_head_and_latches_mutations() {
+        let engine = test_engine();
+        let exchange = SignerJournalExchange {
+            engine: engine.clone(),
+            checkpoints: Arc::new(FailingSelfCheckpointSink),
+            identity: signer_identity(),
+            last_verified_head: Mutex::new(None),
+        };
+        assert_eq!(
+            exchange.local_journal_head().unwrap_err().code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
+        assert!(engine.audit_is_degraded());
+        assert_eq!(
+            engine.repair_clock(1).unwrap_err().code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
+    }
+
+    #[test]
+    fn startup_uses_retained_nonzero_head_and_degrades_on_local_rollback() {
+        let engine = test_engine();
+        let identity = signer_identity();
+        let retained = bloom_triad_local_transport::sign_journal_head(
+            &identity,
+            9,
+            Digest32::from_bytes([9; 32]),
+        );
+        let selected = select_initial_self_head(
+            engine.as_ref(),
+            &RetainedRollbackSink(retained.clone()),
+            &identity,
+        )
+        .unwrap();
+        assert_eq!(selected, Some(retained));
+        assert!(engine.audit_is_degraded());
+        assert_eq!(
+            engine.repair_clock(1).unwrap_err().code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
     }
 }

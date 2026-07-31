@@ -831,7 +831,7 @@ impl SignerBackend for LocalSignerBackend {
             }) {
                 if description.public_key_fingerprint != key.public_key_fingerprint
                     || Digest32::from_bytes(
-                        Sha256::digest(&description.canonical_spki_der.decode()).into(),
+                        Sha256::digest(description.canonical_spki_der.decode()).into(),
                     ) != key.public_key_fingerprint
                 {
                     return Err(BackendError::DefinitiveRejected);

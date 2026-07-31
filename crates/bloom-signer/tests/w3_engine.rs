@@ -1,8 +1,8 @@
 use bloom_signer::clock::{ClockCondition, ClockDecision};
 use bloom_signer::custody::WalletCustody;
 use bloom_signer::engine::{
-    ApprovalCounterBackup, BackendEnrollmentBackup, SignAuthorization, SignerBackupSet,
-    SignerEngine, SignerOperationEffect, WalletDerivationStatus,
+    ApprovalCounterBackup, BackendEnrollmentBackup, SignAuthorization, SignerAuditKeys,
+    SignerBackupSet, SignerEngine, SignerOperationEffect, WalletDerivationStatus,
 };
 use bloom_signer::registry::{BackendRegistry, CompiledBackend};
 use bloom_signer_backend_api::{SecretBytes, SignerBackendActivation};
@@ -10,7 +10,15 @@ use bloom_signer_backend_local::{DerivationAuthority, DerivationGrant, LocalSign
 use bloom_triad_protocol::*;
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
+
+fn audit_keys() -> SignerAuditKeys {
+    SignerAuditKeys {
+        current_key_id: Token::new("signer-audit-key").unwrap(),
+        current_signing_key: SigningKey::from_bytes(&[14; 32]),
+        historical_verifying_keys: BTreeMap::new(),
+    }
+}
 
 fn digest(byte: &str) -> Digest32 {
     Digest32::new(byte.repeat(32)).unwrap()
@@ -126,6 +134,7 @@ fn new_engine(broker: &SigningKey) -> SignerEngine {
         SigningKey::from_bytes(&[6; 32]).verifying_key(),
         Token::new("signer-revocation-key").unwrap(),
         SigningKey::from_bytes(&[4; 32]),
+        audit_keys(),
         registry,
     )
     .unwrap();
@@ -431,6 +440,7 @@ fn ac11_approval_ceiling_selector_issuer_key_state_retry_and_release_are_closed(
         SigningKey::from_bytes(&[6; 32]).verifying_key(),
         Token::new("signer-revocation-key").unwrap(),
         SigningKey::from_bytes(&[4; 32]),
+        audit_keys(),
         Arc::new(
             BackendRegistry::from_compiled(vec![CompiledBackend::Local(inactive_backend)]).unwrap(),
         ),
@@ -527,6 +537,10 @@ fn ac32_backup_restore_refuses_missing_registry_for_derivation_and_lower_state()
     let approval_id = engine.install_approval_for_test(&terms).unwrap();
     let request = signed(&broker, unsigned_request(&terms, "07"));
     engine.authorize_sign(&request, &clock(2_500)).unwrap();
+    let audit_backup = engine
+        .export_backup(&terms.wallet_id, None, vec![])
+        .unwrap();
+    let audit_entries = audit_backup.audit_entries;
     let missing = SignerBackupSet {
         wallet_id: terms.wallet_id.clone(),
         wallet_revocation_epoch: terms.wallet_revocation_epoch.clone(),
@@ -546,6 +560,9 @@ fn ac32_backup_restore_refuses_missing_registry_for_derivation_and_lower_state()
             committed_operations: DecimalU64::new(1),
             committed_signatures: DecimalU64::new(1),
         }],
+        audit_entries,
+        audit_rotations: audit_backup.audit_rotations,
+        audit_verifying_keys: audit_backup.audit_verifying_keys,
     };
     engine.restore_backup(&missing).unwrap();
     assert_eq!(
@@ -623,7 +640,7 @@ fn signed_revocation_state_and_revoke_all_are_monotonic() {
 }
 
 #[test]
-fn ac32_export_contains_custody_policy_registry_and_monotonic_counters() {
+fn ac32_rotated_audit_export_restore_carries_custody_policy_registry_and_counters() {
     let broker = SigningKey::from_bytes(&[7; 32]);
     let terms = exact_terms();
     let engine = new_engine(&broker);
@@ -667,6 +684,11 @@ fn ac32_export_contains_custody_policy_registry_and_monotonic_counters() {
         encrypted_record: Base64UrlBytes::from_bytes(&serde_jcs::to_vec(&backend_record).unwrap()),
         pinned_keys: backend_record.derivation_registry.clone(),
     };
+    let rotated_audit_key_id = Token::new("signer-audit-key-2").unwrap();
+    let rotated_audit_key = SigningKey::from_bytes(&[15; 32]);
+    engine
+        .rotate_audit_key(rotated_audit_key_id.clone(), rotated_audit_key.clone())
+        .unwrap();
     let exported = engine
         .export_backup(
             &terms.wallet_id,
@@ -674,6 +696,15 @@ fn ac32_export_contains_custody_policy_registry_and_monotonic_counters() {
             vec![backend_enrollment],
         )
         .unwrap();
+    assert!(
+        !exported.audit_entries.is_empty(),
+        "normative export must carry the verified Signer audit chain"
+    );
+    assert_eq!(
+        exported.audit_entries.last().unwrap().event_type,
+        "custody.export",
+        "the returned continuity chain must include its own export event"
+    );
     assert_eq!(
         exported.derivation_registry.as_ref().unwrap().namespaces[0]
             .next_index
@@ -687,6 +718,8 @@ fn ac32_export_contains_custody_policy_registry_and_monotonic_counters() {
         Some(Base64UrlBytes::from_bytes(b"normalized-signature-result"))
     );
     assert_eq!(exported.approval_counters[0].committed_operations.get(), 1);
+    assert_eq!(exported.audit_rotations.len(), 1);
+    assert_eq!(exported.audit_rotations[0].new_key_id, rotated_audit_key_id);
     let mut legacy_backup_json = serde_json::to_value(&exported).unwrap();
     for operation in legacy_backup_json["operations"].as_array_mut().unwrap() {
         let operation = operation.as_object_mut().unwrap();
@@ -701,6 +734,33 @@ fn ac32_export_contains_custody_policy_registry_and_monotonic_counters() {
         legacy_backup.operations[0].clock_boot_epoch,
         BootEpoch::from_bytes([0; 16])
     );
+    let mut stripped_audit_json = serde_json::to_value(&exported).unwrap();
+    stripped_audit_json
+        .as_object_mut()
+        .unwrap()
+        .remove("audit_entries");
+    assert!(
+        serde_json::from_value::<SignerBackupSet>(stripped_audit_json).is_err(),
+        "ordinary restore input must not silently omit normative audit continuity"
+    );
+    let mut stripped_rotations_json = serde_json::to_value(&exported).unwrap();
+    stripped_rotations_json
+        .as_object_mut()
+        .unwrap()
+        .remove("audit_rotations");
+    assert!(
+        serde_json::from_value::<SignerBackupSet>(stripped_rotations_json).is_err(),
+        "ordinary restore input must not silently omit audit-key rotation continuity"
+    );
+    let mut stripped_keys_json = serde_json::to_value(&exported).unwrap();
+    stripped_keys_json
+        .as_object_mut()
+        .unwrap()
+        .remove("audit_verifying_keys");
+    assert!(
+        serde_json::from_value::<SignerBackupSet>(stripped_keys_json).is_err(),
+        "ordinary restore input must not omit pinned audit verification keys"
+    );
 
     let restored_backend = Arc::new(
         exported
@@ -711,12 +771,22 @@ fn ac32_export_contains_custody_policy_registry_and_monotonic_counters() {
         restored_backend.activate(&terms.key_ref, SecretBytes::new(vec![7; 32])),
     )
     .unwrap();
+    let mut historical_audit_keys = BTreeMap::new();
+    historical_audit_keys.insert(
+        Token::new("signer-audit-key").unwrap(),
+        SigningKey::from_bytes(&[14; 32]).verifying_key(),
+    );
     let restored = SignerEngine::open_in_memory(
         Token::new("broker-app-1").unwrap(),
         broker.verifying_key(),
         SigningKey::from_bytes(&[6; 32]).verifying_key(),
         Token::new("signer-revocation-key").unwrap(),
         SigningKey::from_bytes(&[4; 32]),
+        SignerAuditKeys {
+            current_key_id: rotated_audit_key_id,
+            current_signing_key: rotated_audit_key,
+            historical_verifying_keys: historical_audit_keys,
+        },
         Arc::new(
             BackendRegistry::from_compiled(vec![CompiledBackend::Local(restored_backend)]).unwrap(),
         ),
@@ -733,7 +803,68 @@ fn ac32_export_contains_custody_policy_registry_and_monotonic_counters() {
         restored.restore_backup(&inconsistent).unwrap_err().code,
         ProtocolErrorCode::MalformedFrame
     );
+    let mut corrupt_audit = exported.clone();
+    corrupt_audit.audit_entries[0].payload_jcs = "{}".into();
+    assert_eq!(
+        restored.restore_backup(&corrupt_audit).unwrap_err().code,
+        ProtocolErrorCode::MalformedFrame
+    );
+    let mut duplicate_rotation = exported.clone();
+    duplicate_rotation
+        .audit_rotations
+        .push(duplicate_rotation.audit_rotations[0].clone());
+    assert_eq!(
+        restored
+            .restore_backup(&duplicate_rotation)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::MalformedFrame
+    );
+    let mut duplicate_transition = exported.clone();
+    let mut repeated = duplicate_transition.audit_rotations[0].clone();
+    repeated.first_new_sequence =
+        DecimalU64::new(repeated.first_new_sequence.get().checked_add(10).unwrap());
+    duplicate_transition.audit_rotations.push(repeated);
+    assert_eq!(
+        restored
+            .restore_backup(&duplicate_transition)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::MalformedFrame
+    );
+    let mut tampered_rotation = exported.clone();
+    tampered_rotation.audit_rotations[0].old_key_signature = Base64UrlBytes::from_bytes(&[0; 64]);
+    assert_eq!(
+        restored
+            .restore_backup(&tampered_rotation)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::MalformedFrame
+    );
+    let mut missing_key_pin = exported.clone();
+    missing_key_pin
+        .audit_verifying_keys
+        .retain(|key| key.key_id.as_str() != "signer-audit-key");
+    assert_eq!(
+        restored.restore_backup(&missing_key_pin).unwrap_err().code,
+        ProtocolErrorCode::UnauthenticatedPeer
+    );
+    let mut substituted_key_pin = exported.clone();
+    substituted_key_pin.audit_verifying_keys[0].verifying_key =
+        Base64UrlBytes::from_bytes(&SigningKey::from_bytes(&[99; 32]).verifying_key().to_bytes());
+    assert_eq!(
+        restored
+            .restore_backup(&substituted_key_pin)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::UnauthenticatedPeer
+    );
     restored.restore_backup(&legacy_backup).unwrap();
+    assert_eq!(
+        restored.restore_backup(&exported).unwrap_err().code,
+        ProtocolErrorCode::RevocationEpochUnreconciled,
+        "restore must refuse an audit chain behind the durable import event"
+    );
     let round_trip = restored
         .export_backup(
             &terms.wallet_id,
@@ -818,5 +949,27 @@ fn backend_registry_accepts_only_compiled_variants() {
             .unwrap()
             .code,
         ProtocolErrorCode::BackendUnsupported
+    );
+}
+
+#[test]
+fn production_visible_constructor_rejects_shared_revocation_audit_key() {
+    let shared = SigningKey::from_bytes(&[4; 32]);
+    let result = SignerEngine::open_in_memory(
+        Token::new("broker-app-1").unwrap(),
+        SigningKey::from_bytes(&[7; 32]).verifying_key(),
+        SigningKey::from_bytes(&[6; 32]).verifying_key(),
+        Token::new("signer-revocation-key").unwrap(),
+        shared.clone(),
+        SignerAuditKeys {
+            current_key_id: Token::new("signer-audit-key").unwrap(),
+            current_signing_key: shared,
+            historical_verifying_keys: BTreeMap::new(),
+        },
+        Arc::new(BackendRegistry::from_compiled(vec![]).unwrap()),
+    );
+    assert_eq!(
+        result.err().unwrap().code,
+        ProtocolErrorCode::MalformedFrame
     );
 }

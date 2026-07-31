@@ -494,6 +494,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-audit-checkpoint"
+version = "0.1.3"
+dependencies = [
+ "bloom-triad-protocol",
+ "ed25519-dalek",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
 dependencies = [
@@ -506,9 +519,11 @@ version = "0.1.0"
 dependencies = [
  "bloom-broker-api",
  "ciborium",
+ "hex",
  "hpke",
  "p256",
  "rand",
+ "serde_jcs",
  "serde_json",
  "sha2",
 ]
@@ -525,6 +540,7 @@ dependencies = [
 name = "bloom-signer"
 version = "0.1.0"
 dependencies = [
+ "bloom-audit-checkpoint",
  "bloom-broker-debug-driver",
  "bloom-service-activation",
  "bloom-signer-backend-api",

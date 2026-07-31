@@ -122,7 +122,11 @@ impl SignerRpcService {
         if signer_request_requires_containment(&request) {
             self.require_network_containment()?;
         }
-        let now_ms = self.clock.now_ms(false)?;
+        let now_ms = if broker_signer_request_is_read_only(&request) {
+            self.clock.now_ms_read_only()?
+        } else {
+            self.clock.now_ms(false)?
+        };
         match request {
             Request::SystemHello(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::UnknownMethod,
@@ -353,7 +357,11 @@ impl SignerRpcService {
         &self,
         request: ControlRequest,
     ) -> Result<ControlResponse, ProtocolError> {
-        let now_ms = self.clock.now_ms(false)?;
+        let now_ms = if matches!(&request, ControlRequest::Status(_)) {
+            self.clock.now_ms_read_only()?
+        } else {
+            self.clock.now_ms(false)?
+        };
         match request {
             ControlRequest::Revoke(request) => {
                 let approval_id = request.approval_id.clone();
@@ -485,8 +493,16 @@ impl SignerRpcService {
             }
         }
 
-        self.engine
-            .mark_operation_dispatched(&request.unsigned.operation_id)?;
+        let provider_attempt_ids = (0..request.unsigned.ordered_hashes.len())
+            .map(|index| {
+                provider_attempt_id(&request.unsigned.operation_digest, &self.boot_epoch, index)
+            })
+            .collect::<Vec<_>>();
+        self.engine.mark_operation_dispatched(
+            &request.unsigned.operation_id,
+            &request.unsigned.key_ref,
+            &provider_attempt_ids,
+        )?;
         let backend = self.engine.backend_registry().get(
             &request.unsigned.key_ref.backend,
             &request.unsigned.key_ref.backend_instance,
@@ -503,11 +519,7 @@ impl SignerRpcService {
             };
             let result = backend
                 .sign(BackendSignRequest {
-                    provider_attempt_id: provider_attempt_id(
-                        &request.unsigned.operation_digest,
-                        &self.boot_epoch,
-                        index,
-                    ),
+                    provider_attempt_id: provider_attempt_ids[index].clone(),
                     key_ref: request.unsigned.key_ref.clone(),
                     crypto_suite: request.unsigned.crypto_suite,
                     input,
@@ -593,6 +605,30 @@ fn signer_request_requires_containment(request: &BrokerSignerRequest) -> bool {
             | Request::RecoveryPrepare(_)
             | Request::CustodyBindOutputRecipient(_)
             | Request::CustodyComplete(_)
+    )
+}
+
+fn broker_signer_request_is_read_only(request: &BrokerSignerRequest) -> bool {
+    use BrokerSignerRequest as Request;
+    matches!(
+        request,
+        Request::SystemHello(_)
+            | Request::SignerReadiness(_)
+            | Request::SignerCapabilities(_)
+            | Request::KeyGetPublic(_)
+            | Request::KeyListPublic(_)
+            | Request::KeyDerivationCapabilities(_)
+            | Request::KeyListDerived(_)
+            | Request::KeyEnrollStatus(_)
+            | Request::CeremonyStatus(_)
+            | Request::SealedApprovalStatus(_)
+            | Request::RevocationState(_)
+            | Request::OperationStatus(_)
+            | Request::PolicyRead(_)
+            | Request::WalletRegistrationStatus(_)
+            | Request::CredentialListPublic(_)
+            | Request::CustodyResult(_)
+            | Request::CustodyStatus(_)
     )
 }
 
@@ -733,7 +769,7 @@ fn now_ms() -> Result<u64, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custody::WalletCustody;
+    use crate::{custody::WalletCustody, engine::SignerAuditKeys};
     use bloom_signer_backend_api::{SecretBytes, SignerBackendActivation};
     use bloom_signer_backend_local::LocalSignerBackend;
     use bloom_triad_protocol::{
@@ -742,6 +778,7 @@ mod tests {
         SignOperationIdentity, UnsignedSignRequest,
     };
     use ed25519_dalek::{Signer as _, SigningKey};
+    use std::collections::BTreeMap;
 
     fn test_time_source() -> &'static str {
         #[cfg(target_os = "linux")]
@@ -783,6 +820,11 @@ mod tests {
                 SigningKey::from_bytes(&[6; 32]).verifying_key(),
                 Token::new("signer-revocation-key").unwrap(),
                 SigningKey::from_bytes(&[4; 32]),
+                SignerAuditKeys {
+                    current_key_id: Token::new("signer-audit-key").unwrap(),
+                    current_signing_key: SigningKey::from_bytes(&[14; 32]),
+                    historical_verifying_keys: BTreeMap::new(),
+                },
                 registry,
             )
             .unwrap(),
@@ -966,6 +1008,54 @@ mod tests {
                 _ => panic!("wrong response"),
             };
         assert_eq!(retry_result, first_result);
+        let audit = service
+            .engine
+            .export_backup(&terms.wallet_id, None, Vec::new())
+            .unwrap()
+            .audit_entries;
+        let authorized = audit
+            .iter()
+            .find(|entry| entry.event_type == "sign.authorized")
+            .expect("sign authorization audit entry");
+        let payload: serde_json::Value = serde_json::from_str(&authorized.payload_jcs).unwrap();
+        assert_eq!(
+            payload["validation_receipt_digest"],
+            serde_json::to_value(Digest32::from_bytes([77; 32])).unwrap()
+        );
+        let dispatched = audit
+            .iter()
+            .find(|entry| entry.event_type == "backend.dispatched")
+            .expect("backend dispatch correlation audit entry");
+        let dispatched_payload: serde_json::Value =
+            serde_json::from_str(&dispatched.payload_jcs).unwrap();
+        assert_eq!(
+            dispatched_payload["operation_id"],
+            serde_json::to_value(&first_result.operation_id).unwrap()
+        );
+        assert!(
+            !dispatched_payload["provider_attempt_ids"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let result_entry = audit
+            .iter()
+            .find(|entry| entry.event_type == "sign.result")
+            .expect("normalized result correlation audit entry");
+        let result_payload: serde_json::Value =
+            serde_json::from_str(&result_entry.payload_jcs).unwrap();
+        let encoded_result: Base64UrlBytes =
+            serde_json::from_value(result_payload["normalized_result"].clone()).unwrap();
+        let audited_result: SigningResult =
+            serde_json::from_slice(&encoded_result.decode()).unwrap();
+        assert_eq!(
+            audited_result.signer_receipt_digest,
+            first_result.signer_receipt_digest
+        );
+        assert_eq!(
+            audited_result.broker_receipt_digest,
+            Digest32::from_bytes([77; 32])
+        );
     }
 
     #[tokio::test]
@@ -1066,7 +1156,15 @@ mod tests {
         service.engine.authorize_sign(&first, &clock).unwrap();
         service
             .engine
-            .mark_operation_dispatched(&first.unsigned.operation_id)
+            .mark_operation_dispatched(
+                &first.unsigned.operation_id,
+                &first.unsigned.key_ref,
+                &[provider_attempt_id(
+                    &first.unsigned.operation_digest,
+                    &service.boot_epoch,
+                    0,
+                )],
+            )
             .unwrap();
 
         let retry = sign_request(&broker_key, &terms, 4);
@@ -1130,6 +1228,82 @@ mod tests {
             .unwrap(),
             ControlResponse::Status(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn audit_degradation_preserves_rpc_reads_and_status_but_blocks_mutation() {
+        let (service, broker_key, terms) = fixture().await;
+        service.engine.latch_audit_degraded();
+
+        let readiness = BrokerSignerService::dispatch(
+            &service,
+            BrokerSignerRequest::SignerReadiness(bloom_triad_protocol::Empty {}),
+        )
+        .await
+        .unwrap();
+        let BrokerSignerResponse::SignerReadiness(readiness) = readiness else {
+            panic!("wrong readiness response");
+        };
+        assert_eq!(readiness.state, ReadinessState::DegradedReadOnly);
+        assert!(
+            readiness
+                .conditions
+                .iter()
+                .any(|condition| condition.as_str() == "audit_degraded")
+        );
+
+        assert!(matches!(
+            BrokerSignerService::dispatch(
+                &service,
+                BrokerSignerRequest::SignerCapabilities(bloom_triad_protocol::Empty {}),
+            )
+            .await
+            .unwrap(),
+            BrokerSignerResponse::SignerCapabilities(_)
+        ));
+        assert!(matches!(
+            BrokerSignerService::dispatch(
+                &service,
+                BrokerSignerRequest::KeyListPublic(bloom_triad_protocol::WalletRequest {
+                    wallet_id: terms.wallet_id.clone(),
+                }),
+            )
+            .await
+            .unwrap(),
+            BrokerSignerResponse::KeyListPublic(_)
+        ));
+        assert!(matches!(
+            BrokerSignerService::dispatch(
+                &service,
+                BrokerSignerRequest::SealedApprovalStatus(bloom_triad_protocol::IdRequest {
+                    id: terms.approval_id().unwrap(),
+                }),
+            )
+            .await
+            .unwrap(),
+            BrokerSignerResponse::SealedApprovalStatus(_)
+        ));
+        assert!(matches!(
+            RevocationControlService::dispatch(
+                &service,
+                ControlRequest::Status(bloom_triad_protocol::WalletRequest {
+                    wallet_id: terms.wallet_id.clone(),
+                }),
+            )
+            .await
+            .unwrap(),
+            ControlResponse::Status(_)
+        ));
+        assert_eq!(
+            BrokerSignerService::dispatch(
+                &service,
+                BrokerSignerRequest::SignerSign(sign_request(&broker_key, &terms, 8)),
+            )
+            .await
+            .unwrap_err()
+            .code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
     }
 
     #[tokio::test]

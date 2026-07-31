@@ -2,7 +2,7 @@ use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
     ceremony::SignerCeremonyService,
     clock::{ClockCondition, ClockDecision},
-    engine::SignerEngine,
+    engine::{SignerAuditKeys, SignerEngine},
     hpke::{CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO},
     registry::{BackendRegistry, CompiledBackend},
 };
@@ -12,7 +12,15 @@ use bloom_triad_protocol::*;
 use ed25519_dalek::{Signer as _, SigningKey};
 use k256::pkcs8::EncodePublicKey as _;
 use sha2::Digest as _;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
+
+fn audit_keys() -> SignerAuditKeys {
+    SignerAuditKeys {
+        current_key_id: Token::new("signer-audit-key").unwrap(),
+        current_signing_key: SigningKey::from_bytes(&[14; 32]),
+        historical_verifying_keys: BTreeMap::new(),
+    }
+}
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -139,6 +147,7 @@ fn service(
             SigningKey::from_bytes(&[9; 32]).verifying_key(),
             Token::new("signer-revocation-key").unwrap(),
             SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
             registry.clone(),
         )
         .unwrap(),
@@ -413,6 +422,7 @@ fn complete_generic(
     Ok((result, prepared.contribution))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn complete_credential_change(
     service: &SignerCeremonyService,
     authority: &VirtualAuthenticator,
@@ -673,6 +683,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
             ceremony_key.verifying_key(),
             Token::new("signer-revocation-key").unwrap(),
             SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
             registry,
         )
         .unwrap(),
@@ -779,6 +790,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
             ceremony_key.verifying_key(),
             Token::new("signer-revocation-key").unwrap(),
             SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
             restarted_registry.clone(),
         )
         .unwrap(),
@@ -1803,6 +1815,7 @@ fn restart_tombstones_a_derived_key_allocated_before_custody_commit() {
             SigningKey::from_bytes(&[9; 32]).verifying_key(),
             Token::new("signer-revocation-key").unwrap(),
             SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
             registry.clone(),
         )
         .unwrap(),

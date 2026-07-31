@@ -16,6 +16,7 @@ license = "MIT"
 [workspace.dependencies]
 bloom-triad-protocol = { path = "../bloom/crates/bloom-triad-protocol" }
 bloom-triad-local-transport = { path = "../bloom/crates/bloom-triad-local-transport" }
+bloom-audit-checkpoint = { path = "../bloom/crates/bloom-audit-checkpoint" }
 bloom-service-activation = { path = "../bloom/crates/bloom-service-activation" }
 bloom-trusted-time = { path = "../bloom/crates/bloom-trusted-time" }
 aws-config = { version = "=1.8.1", default-features = false, features = ["rt-tokio", "rustls"] }
