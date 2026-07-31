@@ -9,6 +9,7 @@ license.workspace = true
 default = ["local"]
 local = ["dep:bloom-signer-backend-local"]
 aws-kms = ["dep:bloom-signer-backend-aws-kms"]
+triad-dev-harness = ["bloom-triad-local-transport/triad-dev-harness"]
 
 [dependencies]
 bloom-triad-protocol.workspace = true

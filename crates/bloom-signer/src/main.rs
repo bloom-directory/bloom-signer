@@ -17,6 +17,8 @@ use bloom_signer::{
 };
 #[cfg(feature = "aws-kms")]
 use bloom_signer_backend_api::SecretBytes;
+#[cfg(feature = "triad-dev-harness")]
+use bloom_triad_local_transport::load_developer_identity_and_manifest;
 use bloom_triad_local_transport::{
     EndpointQuota, LocalIdentity, NetworkContainmentGuard, PeerAcl, load_identity_and_manifest,
 };
@@ -98,8 +100,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let manifest_path = env_path("BLOOM_EDGE_MANIFEST", "/etc/bloom/edge-manifest.json");
     let config_path = env_path("BLOOM_SIGNER_CONFIG", "/etc/bloom/signer.json");
-    let (identity, manifest) =
+    #[cfg(feature = "triad-dev-harness")]
+    let loaded_identity = match std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT") {
+        Some(root) => load_developer_identity_and_manifest(
+            Path::new(&root),
+            &identity_path,
+            &manifest_path,
+            "bloom-signer",
+        )?,
+        None => load_identity_and_manifest(&identity_path, &manifest_path, "bloom-signer")?,
+    };
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let loaded_identity =
         load_identity_and_manifest(&identity_path, &manifest_path, "bloom-signer")?;
+    let (identity, manifest) = loaded_identity;
     let trusted_time_source = manifest.trusted_time_source.clone();
     let session_acl = manifest
         .session
