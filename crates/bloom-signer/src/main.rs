@@ -242,6 +242,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(0) => shutdown_tx
                     .send(true)
                     .map_err(|_| std::io::Error::other("Signer shutdown receivers disappeared")),
+                Err(error) if is_session_disconnect(&error) => shutdown_tx
+                    .send(true)
+                    .map_err(|_| std::io::Error::other("Signer shutdown receivers disappeared")),
                 Ok(_) => Err(std::io::Error::other(
                     "session sentinel sent unexpected channel data",
                 )),
@@ -253,6 +256,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     Ok(())
+}
+
+fn is_session_disconnect(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -584,6 +598,22 @@ fn invalid_key(message: &str) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_disconnect_errors_exit_cleanly_without_keepalive_retry() {
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::NotConnected,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(is_session_disconnect(&std::io::Error::from(kind)));
+        }
+        assert!(!is_session_disconnect(&std::io::Error::from(
+            ErrorKind::PermissionDenied
+        )));
+    }
 
     #[tokio::test]
     async fn logout_drain_waits_for_an_accepted_operation() {
