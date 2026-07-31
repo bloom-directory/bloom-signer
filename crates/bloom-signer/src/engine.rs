@@ -1,11 +1,12 @@
 use bloom_triad_protocol::{
-    ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalTombstone,
-    Base64UrlBytes, CeremonyPublicStatus, CredentialPublic, CredentialState, CustodyResult,
-    DecimalU64, Digest32, KeyRef, OperationId, OperationPublicStatus, OperationState,
-    PolicyCommitReceipt, PolicyCompareAndSwapRequest, PolicyUpdateCeremonyPrepareRequest,
-    PolicyUpdateRequest, PolicyValidationReceipt, ProtocolError, ProtocolErrorCode,
-    RevocationState, SealedApprovalTerms, SelectorKind, SignRequest, SignedPolicySnapshot,
-    SignerActivationReceipt, SigningResult, Token, WalletTombstone, WebAuthnCredential,
+    ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
+    ApprovalTombstone, Base64UrlBytes, CeremonyPublicStatus, CredentialPublic, CredentialState,
+    CustodyResult, DecimalU64, Digest32, KeyRef, OperationId, OperationPublicStatus,
+    OperationState, PetalKeyScope, PolicyCommitReceipt, PolicyCompareAndSwapRequest,
+    PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest, PolicyValidationReceipt,
+    ProtocolError, ProtocolErrorCode, RevocationState, SealedApprovalTerms, SelectorKind,
+    SignRequest, SignedPolicySnapshot, SignerActivationReceipt, SigningResult, Token,
+    WalletTombstone, WebAuthnCredential,
 };
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use parking_lot::Mutex;
@@ -52,7 +53,10 @@ pub(crate) enum CeremonyDatabaseEffect {
         backend_enrollment: Option<BackendEnrollmentBackup>,
     },
     PolicyUpdatePending(Box<CeremonyPolicyUpdate>),
-    EnrollKey(KeyRef),
+    EnrollKey {
+        key_ref: KeyRef,
+        petal_scope: Option<PetalKeyScope>,
+    },
 }
 
 pub(crate) struct CeremonyPolicyUpdate {
@@ -233,6 +237,15 @@ pub struct PolicyBackup {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct PetalKeyScopeBackup {
+    pub key_ref: KeyRef,
+    pub scope: PetalKeyScope,
+    pub created_at_ms: DecimalU64,
+    pub expires_at_ms: DecimalU64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignerBackupSet {
     pub wallet_id: Token,
     pub wallet_revocation_epoch: DecimalU64,
@@ -240,6 +253,8 @@ pub struct SignerBackupSet {
     pub derivation_registry: Option<DerivationRegistryBackup>,
     pub backend_enrollments: Vec<BackendEnrollmentBackup>,
     pub policy: Option<PolicyBackup>,
+    #[serde(default)]
+    pub petal_key_scopes: Vec<PetalKeyScopeBackup>,
     pub approvals: Vec<ApprovalStateBackup>,
     pub approval_tombstones: Vec<ApprovalTombstone>,
     pub wallet_tombstone: Option<WalletTombstone>,
@@ -380,7 +395,17 @@ impl SignerEngine {
                 CREATE TABLE IF NOT EXISTS enrolled_keys (
                     key_fingerprint TEXT PRIMARY KEY,
                     key_ref_jcs TEXT NOT NULL,
-                    available INTEGER NOT NULL
+                    available INTEGER NOT NULL,
+                    authority_class TEXT NOT NULL DEFAULT 'unscoped'
+                );
+                CREATE TABLE IF NOT EXISTS petal_key_scopes (
+                    key_fingerprint TEXT PRIMARY KEY,
+                    wallet_id TEXT NOT NULL,
+                    custody_operation_id TEXT NOT NULL UNIQUE,
+                    scope_digest TEXT NOT NULL,
+                    scope_jcs TEXT NOT NULL,
+                    created_at_ms TEXT NOT NULL,
+                    expires_at_ms TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS ceremony_backend_enrollments (
                     backend_instance TEXT PRIMARY KEY,
@@ -505,6 +530,12 @@ impl SignerEngine {
             "clock_state",
             "monotonic_anchor_ns",
             "TEXT NOT NULL DEFAULT '0'",
+        )?;
+        ensure_column(
+            &connection,
+            "enrolled_keys",
+            "authority_class",
+            "TEXT NOT NULL DEFAULT 'unscoped'",
         )?;
         ensure_column(
             &connection,
@@ -858,6 +889,7 @@ impl SignerEngine {
                 "approval key is not registered in a compiled backend",
             ));
         }
+        validate_petal_key_approval(&transaction, terms, terms.issued_at_ms.get())?;
         let stored_epoch: Option<String> = transaction
             .query_row(
                 "SELECT revocation_epoch FROM wallet_state WHERE wallet_id = ?1",
@@ -1176,21 +1208,87 @@ impl SignerEngine {
                     )
                     .map_err(storage)?;
             }
-            CeremonyDatabaseEffect::EnrollKey(key_ref) => {
+            CeremonyDatabaseEffect::EnrollKey {
+                key_ref,
+                petal_scope,
+            } => {
+                let authority_class = if petal_scope.is_some() {
+                    "petal"
+                } else {
+                    "unscoped"
+                };
                 transaction
                     .execute(
-                        "INSERT INTO enrolled_keys(key_fingerprint, key_ref_jcs, available)
-                         VALUES (?1, ?2, ?3)
+                        "INSERT INTO enrolled_keys(
+                            key_fingerprint, key_ref_jcs, available, authority_class
+                         ) VALUES (?1, ?2, ?3, ?4)
                          ON CONFLICT(key_fingerprint) DO UPDATE SET
                             key_ref_jcs = excluded.key_ref_jcs,
-                            available = excluded.available",
+                            available = excluded.available,
+                            authority_class = excluded.authority_class",
                         params![
                             key_ref.public_key_fingerprint.as_str(),
                             serde_jcs::to_string(&key_ref).map_err(malformed)?,
                             true,
+                            authority_class,
                         ],
                     )
                     .map_err(storage)?;
+                if let Some(scope) = petal_scope {
+                    let scope_digest = scope.digest()?;
+                    let expires_at_ms = committed_at_ms
+                        .checked_add(scope.maximum_lifetime_ms.get())
+                        .ok_or_else(|| {
+                            error(
+                                ProtocolErrorCode::MalformedFrame,
+                                "Petal key scope lifetime overflows the protocol clock",
+                            )
+                        })?;
+                    transaction
+                        .execute(
+                            "INSERT INTO petal_key_scopes(
+                                key_fingerprint, wallet_id, custody_operation_id,
+                                scope_digest, scope_jcs, created_at_ms, expires_at_ms
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            params![
+                                key_ref.public_key_fingerprint.as_str(),
+                                scope.wallet_id.as_str(),
+                                scope.custody_operation_id.as_str(),
+                                scope_digest.as_str(),
+                                serde_jcs::to_string(&scope).map_err(malformed)?,
+                                committed_at_ms.to_string(),
+                                expires_at_ms.to_string(),
+                            ],
+                        )
+                        .map_err(storage)?;
+                    #[cfg(feature = "local")]
+                    {
+                        let enrollment = BackendEnrollmentBackup {
+                            backend: scope.parent_key_ref.backend.clone(),
+                            backend_instance: scope.parent_key_ref.backend_instance.clone(),
+                            encrypted_record: self
+                                .backend_registry
+                                .local_encrypted_backup(&scope.parent_key_ref)?,
+                            pinned_keys: vec![scope.parent_key_ref.clone()],
+                        };
+                        let updated = transaction
+                            .execute(
+                                "UPDATE ceremony_backend_enrollments
+                                 SET enrollment_jcs = ?2 WHERE backend_instance = ?1",
+                                params![
+                                    scope.parent_key_ref.backend_instance.as_str(),
+                                    serde_jcs::to_string(&enrollment).map_err(malformed)?,
+                                ],
+                            )
+                            .map_err(storage)?;
+                        if updated != 1 {
+                            return Err(error(
+                                ProtocolErrorCode::KeyrefMismatch,
+                                "Petal sub-key parent lacks durable wallet custody enrollment",
+                            ));
+                        }
+                    }
+                }
             }
         }
         transaction
@@ -1336,6 +1434,7 @@ impl SignerEngine {
         }
         let terms: SealedApprovalTerms = serde_json::from_str(&approval.0).map_err(malformed)?;
         require_key_available(&transaction, &self.backend_registry, &terms.key_ref)?;
+        validate_petal_key_approval(&transaction, &terms, effective_now_ms)?;
         validate_against_approval(request, &terms, effective_now_ms)?;
         let epoch = wallet_epoch(&transaction, &terms.wallet_id)?;
         if epoch != terms.wallet_revocation_epoch.get() {
@@ -1734,6 +1833,50 @@ impl SignerEngine {
             }
         }
         Ok(keys)
+    }
+
+    pub(crate) fn require_enrolled_parent_key(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+    ) -> Result<(), ProtocolError> {
+        if &key_ref.backend_instance != wallet_id {
+            return Err(error(
+                ProtocolErrorCode::KeyrefMismatch,
+                "Petal sub-key parent is not owned by the named wallet",
+            ));
+        }
+        let connection = self.connection.lock();
+        let enrolled: Option<(String, bool)> = connection
+            .query_row(
+                "SELECT key_ref_jcs, available FROM enrolled_keys
+                 WHERE key_fingerprint = ?1",
+                [key_ref.public_key_fingerprint.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(storage)?;
+        let expected = serde_jcs::to_string(key_ref).map_err(malformed)?;
+        if enrolled
+            .as_ref()
+            .map(|(stored, available)| (stored, *available))
+            != Some((&expected, true))
+            || !self.backend_registry.key_is_available(key_ref)?
+        {
+            return Err(error(
+                ProtocolErrorCode::KeyrefMismatch,
+                "Petal sub-key parent is absent or unavailable for the named wallet",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_petal_scope_for_approval(
+        &self,
+        terms: &SealedApprovalTerms,
+        effective_now_ms: u64,
+    ) -> Result<(), ProtocolError> {
+        validate_petal_key_approval(&self.connection.lock(), terms, effective_now_ms)
     }
 
     pub fn credential_public(
@@ -2424,6 +2567,31 @@ impl SignerEngine {
         if let Some(policy) = &backup.policy {
             verify_policy_backup(policy)?;
         }
+        for scoped in &backup.petal_key_scopes {
+            scoped.scope.validate()?;
+            if scoped.scope.wallet_id != backup.wallet_id
+                || scoped.scope.parent_key_ref.backend_instance != backup.wallet_id
+                || scoped.key_ref.backend != scoped.scope.parent_key_ref.backend
+                || scoped.key_ref.backend_instance != scoped.scope.parent_key_ref.backend_instance
+                || scoped.key_ref.derivation.is_none()
+                || scoped.expires_at_ms.get()
+                    != scoped
+                        .created_at_ms
+                        .get()
+                        .checked_add(scoped.scope.maximum_lifetime_ms.get())
+                        .ok_or_else(|| {
+                            error(
+                                ProtocolErrorCode::MalformedFrame,
+                                "Petal key scope backup lifetime overflows",
+                            )
+                        })?
+            {
+                return Err(error(
+                    ProtocolErrorCode::KeyrefMismatch,
+                    "Petal key scope backup binding is invalid",
+                ));
+            }
+        }
         let revocation_public_key = self.revocation_signing_key.verifying_key();
         for tombstone in &backup.approval_tombstones {
             verify_approval_tombstone(tombstone, &revocation_public_key)?;
@@ -2657,6 +2825,62 @@ impl SignerEngine {
                 ],
             )
             .map_err(storage)?;
+        for scoped in &backup.petal_key_scopes {
+            let key_ref_jcs = serde_jcs::to_string(&scoped.key_ref).map_err(malformed)?;
+            let scope_jcs = serde_jcs::to_string(&scoped.scope).map_err(malformed)?;
+            let existing: Option<(String, String, String, String)> = transaction
+                .query_row(
+                    "SELECT e.key_ref_jcs, p.scope_jcs, p.created_at_ms, p.expires_at_ms
+                     FROM petal_key_scopes p
+                     JOIN enrolled_keys e ON e.key_fingerprint = p.key_fingerprint
+                     WHERE p.key_fingerprint = ?1",
+                    [scoped.key_ref.public_key_fingerprint.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(storage)?;
+            let expected = (
+                key_ref_jcs.clone(),
+                scope_jcs.clone(),
+                scoped.created_at_ms.get().to_string(),
+                scoped.expires_at_ms.get().to_string(),
+            );
+            if existing.as_ref().is_some_and(|stored| stored != &expected) {
+                return Err(error(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "Petal key scope backup conflicts with durable scope",
+                ));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO enrolled_keys(
+                        key_fingerprint, key_ref_jcs, available, authority_class
+                     ) VALUES (?1, ?2, 0, 'petal')
+                     ON CONFLICT(key_fingerprint) DO UPDATE SET
+                        key_ref_jcs = excluded.key_ref_jcs,
+                        authority_class = 'petal'",
+                    params![scoped.key_ref.public_key_fingerprint.as_str(), key_ref_jcs],
+                )
+                .map_err(storage)?;
+            transaction
+                .execute(
+                    "INSERT INTO petal_key_scopes(
+                        key_fingerprint, wallet_id, custody_operation_id,
+                        scope_digest, scope_jcs, created_at_ms, expires_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(key_fingerprint) DO NOTHING",
+                    params![
+                        scoped.key_ref.public_key_fingerprint.as_str(),
+                        scoped.scope.wallet_id.as_str(),
+                        scoped.scope.custody_operation_id.as_str(),
+                        scoped.scope.digest()?.as_str(),
+                        scope_jcs,
+                        scoped.created_at_ms.get().to_string(),
+                        scoped.expires_at_ms.get().to_string(),
+                    ],
+                )
+                .map_err(storage)?;
+        }
         if let Some(policy) = &backup.policy {
             let current_policy: Option<(String, String)> = transaction
                 .query_row(
@@ -3158,6 +3382,34 @@ impl SignerEngine {
                 canonical_result: Base64UrlBytes::from_bytes(result_jcs.as_bytes()),
             });
         }
+        let mut scope_statement = connection
+            .prepare(
+                "SELECT e.key_ref_jcs, p.scope_jcs, p.created_at_ms, p.expires_at_ms
+                 FROM petal_key_scopes p
+                 JOIN enrolled_keys e ON e.key_fingerprint = p.key_fingerprint
+                 WHERE p.wallet_id = ?1 ORDER BY p.scope_digest",
+            )
+            .map_err(storage)?;
+        let scope_rows = scope_statement
+            .query_map([wallet_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(storage)?;
+        let mut petal_key_scopes = Vec::new();
+        for row in scope_rows {
+            let (key_ref, scope, created_at_ms, expires_at_ms) = row.map_err(storage)?;
+            petal_key_scopes.push(PetalKeyScopeBackup {
+                key_ref: serde_json::from_str(&key_ref).map_err(malformed)?,
+                scope: serde_json::from_str(&scope).map_err(malformed)?,
+                created_at_ms: DecimalU64::new(created_at_ms.parse().map_err(malformed)?),
+                expires_at_ms: DecimalU64::new(expires_at_ms.parse().map_err(malformed)?),
+            });
+        }
         Ok(SignerBackupSet {
             wallet_id: wallet_id.clone(),
             wallet_revocation_epoch,
@@ -3165,6 +3417,7 @@ impl SignerEngine {
             derivation_registry,
             backend_enrollments,
             policy,
+            petal_key_scopes,
             approvals,
             approval_tombstones,
             wallet_tombstone,
@@ -3591,6 +3844,120 @@ fn validate_against_approval(
                 "selector kind, exact ordered inputs, or signature count differs from approval",
             ));
         }
+    }
+    Ok(())
+}
+
+/// A public KeyRef is not an authority to use a Petal-owned child. Signer
+/// therefore repeats this check both when an approval is activated and for
+/// every sign reservation, independently of Broker's provenance checks.
+fn validate_petal_key_approval(
+    connection: &Connection,
+    terms: &SealedApprovalTerms,
+    effective_now_ms: u64,
+) -> Result<(), ProtocolError> {
+    let authority_class: Option<String> = connection
+        .query_row(
+            "SELECT authority_class FROM enrolled_keys WHERE key_fingerprint = ?1",
+            [terms.key_ref.public_key_fingerprint.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    if authority_class.as_deref() != Some("petal") {
+        return Ok(());
+    }
+    let stored: Option<(String, String, String)> = connection
+        .query_row(
+            "SELECT scope_jcs, created_at_ms, expires_at_ms
+             FROM petal_key_scopes WHERE key_fingerprint = ?1",
+            [terms.key_ref.public_key_fingerprint.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(storage)?;
+    let (scope_jcs, created_at_ms, scope_expires_at_ms) = stored.ok_or_else(|| {
+        error(
+            ProtocolErrorCode::ServiceUnavailable,
+            "Petal sub-key scope record is missing",
+        )
+    })?;
+    let scope: PetalKeyScope = serde_json::from_str(&scope_jcs).map_err(malformed)?;
+    let created_at_ms = created_at_ms.parse::<u64>().map_err(malformed)?;
+    let scope_expires_at_ms = scope_expires_at_ms.parse::<u64>().map_err(malformed)?;
+
+    if terms.wallet_id != scope.wallet_id {
+        return Err(error(
+            ProtocolErrorCode::KeyrefMismatch,
+            "Petal sub-key approval names a different wallet",
+        ));
+    }
+    let ApprovalSubject::Petal {
+        package_hash,
+        route,
+        agent_id,
+    } = &terms.subject
+    else {
+        return Err(error(
+            ProtocolErrorCode::SelectorMismatch,
+            "Petal sub-key requires a Petal approval subject",
+        ));
+    };
+    if package_hash != &scope.package_hash || route != &scope.route || agent_id != &scope.agent_id {
+        return Err(error(
+            ProtocolErrorCode::SelectorMismatch,
+            "Petal approval identity differs from the derived-key scope",
+        ));
+    }
+    if let ApprovalSelector::Petal {
+        package_hash: selector_package,
+        route: selector_route,
+        allowed_operation_classes,
+        ..
+    } = &terms.selector
+    {
+        if selector_package != &scope.package_hash || selector_route != &scope.route {
+            return Err(error(
+                ProtocolErrorCode::SelectorMismatch,
+                "Petal selector identity differs from the derived-key scope",
+            ));
+        }
+        if allowed_operation_classes.is_empty()
+            || allowed_operation_classes
+                .iter()
+                .any(|operation_class| operation_class != &scope.purpose)
+        {
+            return Err(error(
+                ProtocolErrorCode::SelectorMismatch,
+                "Petal selector operation classes exceed the derived-key purpose",
+            ));
+        }
+    }
+    if terms.allowed_crypto_suites.is_empty()
+        || terms
+            .allowed_crypto_suites
+            .iter()
+            .any(|suite| !scope.allowed_crypto_suites.contains(suite))
+    {
+        return Err(error(
+            ProtocolErrorCode::SuiteNotAllowed,
+            "approval suite exceeds the Petal derived-key scope",
+        ));
+    }
+    if effective_now_ms < created_at_ms
+        || effective_now_ms >= scope_expires_at_ms
+        || terms.not_before_ms.get() < created_at_ms
+        || terms.expires_at_ms.get() > scope_expires_at_ms
+        || terms
+            .expires_at_ms
+            .get()
+            .saturating_sub(terms.not_before_ms.get())
+            > scope.maximum_lifetime_ms.get()
+    {
+        return Err(error(
+            ProtocolErrorCode::ApprovalExpired,
+            "approval validity exceeds the Petal derived-key scope",
+        ));
     }
     Ok(())
 }

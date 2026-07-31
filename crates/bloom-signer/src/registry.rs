@@ -319,6 +319,76 @@ impl BackendRegistry {
     }
 
     #[cfg(feature = "local")]
+    pub fn local_encrypted_backup(&self, root: &KeyRef) -> Result<Base64UrlBytes, ProtocolError> {
+        let backend = self
+            .backends
+            .read()
+            .get(&(root.backend.clone(), root.backend_instance.clone()))
+            .cloned()
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::BackendUnsupported,
+                    "local derivation backend is not compiled into this Signer",
+                )
+            })?;
+        match backend {
+            CompiledBackend::Local(local) => Ok(Base64UrlBytes::from_bytes(
+                &serde_jcs::to_vec(&local.encrypted_backup().map_err(|error| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        format!("local wallet backup failed: {error:?}"),
+                    )
+                })?)
+                .map_err(|error| {
+                    ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
+                })?,
+            )),
+            #[cfg(feature = "aws-kms")]
+            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "AWS KMS does not expose local custody backups",
+            )),
+        }
+    }
+
+    #[cfg(feature = "local")]
+    pub fn configure_local_derivation_namespace(
+        &self,
+        root: &bloom_triad_protocol::KeyRef,
+        grant: bloom_signer_backend_local::DerivationGrant,
+        signature: bloom_triad_protocol::Base64UrlBytes,
+    ) -> Result<(), ProtocolError> {
+        let backend = self
+            .backends
+            .read()
+            .get(&(root.backend.clone(), root.backend_instance.clone()))
+            .cloned()
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::BackendUnsupported,
+                    "derivation backend is not compiled into this Signer",
+                )
+            })?;
+        match backend {
+            CompiledBackend::Local(local) => local
+                .configure_namespace(
+                    &bloom_signer_backend_local::DerivationAuthority::from_signed(grant, signature),
+                )
+                .map_err(|error| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::BackendInvalidRequest,
+                        format!("local derivation namespace configuration failed: {error:?}"),
+                    )
+                }),
+            #[cfg(feature = "aws-kms")]
+            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "AWS KMS does not support derived keys",
+            )),
+        }
+    }
+
+    #[cfg(feature = "local")]
     pub fn allocate_local_derived_key(
         &self,
         root: &bloom_triad_protocol::KeyRef,

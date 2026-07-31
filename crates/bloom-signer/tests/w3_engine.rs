@@ -534,6 +534,7 @@ fn ac32_backup_restore_refuses_missing_registry_for_derivation_and_lower_state()
         derivation_registry: None,
         backend_enrollments: vec![],
         policy: None,
+        petal_key_scopes: vec![],
         approvals: vec![],
         approval_tombstones: vec![],
         wallet_tombstone: None,

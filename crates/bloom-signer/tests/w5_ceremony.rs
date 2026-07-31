@@ -1,6 +1,7 @@
 use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
 use bloom_signer::{
     ceremony::SignerCeremonyService,
+    clock::{ClockCondition, ClockDecision},
     engine::SignerEngine,
     hpke::{CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO},
     registry::{BackendRegistry, CompiledBackend},
@@ -31,6 +32,59 @@ fn digest(byte: &str) -> Digest32 {
 
 fn operation(byte: &str) -> OperationId {
     OperationId::new(byte.repeat(32)).unwrap()
+}
+
+fn signed_petal_request(
+    terms: &SealedApprovalTerms,
+    broker: &SigningKey,
+    operation_id: OperationId,
+) -> SignRequest {
+    let identity = SignOperationIdentity {
+        operation_id: operation_id.clone(),
+        approval_id: terms.approval_id().unwrap(),
+        key_ref: terms.key_ref.clone(),
+        crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+        ordered_payload_digests: vec![digest("b5")],
+        ordered_hashes: vec![digest("b6")],
+        petal_use_claim_digest: Some(digest("bd")),
+        claim_assurance_digest: Some(digest("be")),
+        policy_version: terms.policy_version.clone(),
+        policy_digest: terms.policy_digest.clone(),
+    };
+    let mut unsigned = UnsignedSignRequest {
+        schema: Token::new("bloom.sign-request/1").unwrap(),
+        attempt_id: digest("bf"),
+        operation_id,
+        operation_digest: identity.digest().unwrap(),
+        attempt_digest: digest("00"),
+        audience: Token::new("bloom-signer").unwrap(),
+        issuer_service_id: Token::new("bloom-broker").unwrap(),
+        issuer_boot_epoch: BootEpoch::new("c0".repeat(16)).unwrap(),
+        broker_signing_key_id: Token::new("broker-app-1").unwrap(),
+        approval_id: terms.approval_id().unwrap(),
+        wallet_id: terms.wallet_id.clone(),
+        key_ref: terms.key_ref.clone(),
+        crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+        selector_kind: SelectorKind::Petal,
+        ordered_payload_digests: vec![digest("b5")],
+        ordered_hashes: vec![digest("b6")],
+        signature_count: DecimalU64::new(1),
+        petal_use_claim_digest: Some(digest("bd")),
+        claim_assurance_digest: Some(digest("be")),
+        policy_version: terms.policy_version.clone(),
+        policy_digest: terms.policy_digest.clone(),
+        validation_receipt_digest: digest("c1"),
+        issued_at_ms: DecimalU64::new(10_500),
+        not_before_ms: DecimalU64::new(10_500),
+        expires_at_ms: DecimalU64::new(11_000),
+    };
+    unsigned.attempt_digest = unsigned.computed_attempt_digest().unwrap();
+    SignRequest {
+        broker_signature: Base64UrlBytes::from_bytes(
+            &broker.sign(&unsigned.attempt_digest.to_bytes()).to_bytes(),
+        ),
+        unsigned,
+    }
 }
 
 fn backend(kek: [u8; 32]) -> (Arc<LocalSignerBackend>, KeyRef) {
@@ -149,6 +203,7 @@ fn register_wallet(
         exact_terms_digest: digest("a1"),
         expected_input_class: Token::new("passkey-prf").unwrap(),
         browser_output_recipient_key: None,
+        petal_key_scope: None,
     };
     let prepared = service.prepare_custody(prepare, now_ms).unwrap();
     let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
@@ -219,6 +274,7 @@ fn complete_new_wallet(
                 exact_terms_digest: digest("d1"),
                 expected_input_class: expected_input_class.clone(),
                 browser_output_recipient_key: None,
+                petal_key_scope: None,
             },
             now_ms,
         )
@@ -305,6 +361,7 @@ fn complete_generic(
             exact_terms_digest: exact_terms_digest.clone(),
             expected_input_class: Token::new("generic-custody-v1").unwrap(),
             browser_output_recipient_key: None,
+            petal_key_scope: None,
         },
         now_ms,
     )?;
@@ -355,6 +412,65 @@ fn complete_generic(
     Ok((result, prepared.contribution))
 }
 
+fn complete_petal_key_derivation(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    scope: PetalKeyScope,
+    browser_effect: Option<serde_json::Value>,
+    now_ms: u64,
+) -> Result<(CustodyResult, CustodyCompleteRequest), ProtocolError> {
+    let scope_digest = scope.digest()?;
+    let prepared = service.prepare_custody(
+        CustodyPrepareRequest {
+            ceremony_kind: CeremonyKind::KeyDerive,
+            custody_operation_id: scope.custody_operation_id.clone(),
+            wallet_id: Some(scope.wallet_id.clone()),
+            key_ref: Some(scope.parent_key_ref.clone()),
+            exact_terms_digest: scope_digest.clone(),
+            expected_input_class: Token::new("petal-subkey-v1").unwrap(),
+            browser_output_recipient_key: None,
+            petal_key_scope: Some(scope.clone()),
+        },
+        now_ms,
+    )?;
+    assert_eq!(prepared.contribution.petal_key_scope, Some(scope.clone()));
+    let assertion =
+        authenticator.assertion(&prepared.challenges[0].canonical_bytes()?, now_ms as u32);
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::KeyDerive,
+        custody_operation_id: scope.custody_operation_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest()?,
+        wallet_id: Some(scope.wallet_id.clone()),
+        key_ref: Some(scope.parent_key_ref.clone()),
+        credential_id: Some(assertion.credential_id.clone()),
+        expected_input_class: Token::new("petal-subkey-v1").unwrap(),
+    }
+    .canonical_bytes()?;
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "effect": browser_effect.unwrap_or_else(|| serde_json::json!({"kind": "key_derive"})),
+    }))
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )?;
+    let complete = CustodyCompleteRequest {
+        ceremony_kind: CeremonyKind::KeyDerive,
+        custody_operation_id: scope.custody_operation_id,
+        ceremony_id: prepared.contribution.ceremony_id,
+        proof: WebAuthnCeremonyProof::Assertion { assertion },
+        encrypted_input: Some(encrypted_input),
+        public_binding_digest: scope_digest,
+    };
+    let result = service.complete_custody(complete.clone(), now_ms + 100)?;
+    Ok((result, complete))
+}
+
 fn complete_policy_update(
     service: &SignerCeremonyService,
     authenticator: &VirtualAuthenticator,
@@ -385,6 +501,7 @@ fn complete_policy_update(
             exact_terms_digest: update.terms_digest()?,
             expected_input_class: Token::new("policy_update_credential_prf").unwrap(),
             browser_output_recipient_key: None,
+            petal_key_scope: None,
         },
         update,
         broker_validation_receipt: validation,
@@ -443,6 +560,350 @@ fn complete_policy_update(
         now_ms + 100,
     )?;
     Ok((result, request))
+}
+
+#[test]
+fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let authenticator = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
+    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+    let engine = Arc::new(
+        SignerEngine::open(
+            &database,
+            Token::new("broker-app-1").unwrap(),
+            broker.verifying_key(),
+            ceremony_key.verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            registry,
+        )
+        .unwrap(),
+    );
+    let service = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        ceremony_key.clone(),
+    )
+    .unwrap();
+    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("b1"), 10_000);
+    let parent = engine.enrolled_key_refs(&wallet_id).unwrap().remove(0);
+    let base_scope = PetalKeyScope {
+        wallet_id: wallet_id.clone(),
+        parent_key_ref: parent.clone(),
+        package_hash: digest("b2"),
+        route: "/petals/exchange/sign".into(),
+        agent_id: Some("account-a".into()),
+        purpose: Token::new("exchange-agent").unwrap(),
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+        maximum_lifetime_ms: DecimalU64::new(20_000),
+        custody_operation_id: operation("b3"),
+    };
+
+    let mut cross_wallet = base_scope.clone();
+    cross_wallet.wallet_id = Token::new("another-wallet").unwrap();
+    assert_eq!(
+        service
+            .prepare_custody(
+                CustodyPrepareRequest {
+                    ceremony_kind: CeremonyKind::KeyDerive,
+                    custody_operation_id: cross_wallet.custody_operation_id.clone(),
+                    wallet_id: Some(cross_wallet.wallet_id.clone()),
+                    key_ref: Some(parent.clone()),
+                    exact_terms_digest: cross_wallet.digest().unwrap(),
+                    expected_input_class: Token::new("petal-subkey-v1").unwrap(),
+                    browser_output_recipient_key: None,
+                    petal_key_scope: Some(cross_wallet),
+                },
+                10_150,
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::KeyrefMismatch
+    );
+
+    let mut browser_controlled = base_scope.clone();
+    browser_controlled.custody_operation_id = operation("bc");
+    assert_eq!(
+        complete_petal_key_derivation(
+            &service,
+            &authenticator,
+            browser_controlled,
+            Some(serde_json::json!({
+                "kind": "key_derive",
+                "namespace_id": "browser-chosen",
+                "grant": {
+                    "authority_kind": "ceremony",
+                    "namespace_id": "browser-chosen",
+                    "canonical_prefix": "m/0",
+                    "starting_index": "0",
+                    "maximum_children": "1"
+                },
+                "authority_signature": Base64UrlBytes::from_bytes(&[0; 64]),
+            })),
+            10_175,
+        )
+        .unwrap_err()
+        .code,
+        ProtocolErrorCode::BackendInvalidRequest
+    );
+
+    let (first, first_complete) =
+        complete_petal_key_derivation(&service, &authenticator, base_scope.clone(), None, 10_200)
+            .unwrap();
+    assert!(first.encrypted_browser_result.is_none());
+    assert_eq!(first.public_key_refs.len(), 1);
+    // Completion replay returns the same public receipt and never allocates a
+    // second child for the same custody identity.
+    assert_eq!(
+        service.complete_custody(first_complete, 10_400).unwrap(),
+        first
+    );
+
+    let mut second_scope = base_scope.clone();
+    second_scope.custody_operation_id = operation("b4");
+    let (second, _) =
+        complete_petal_key_derivation(&service, &authenticator, second_scope, None, 10_500)
+            .unwrap();
+    assert_ne!(first.public_key_refs[0], second.public_key_refs[0]);
+    let child = first.public_key_refs[0].clone();
+
+    drop(service);
+    drop(engine);
+    // A fresh engine and empty registry restore both custody and the derived
+    // key from Signer's durable records. The scope remains an independent
+    // authorization boundary after restart.
+    let restarted_registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+    let restarted_engine = Arc::new(
+        SignerEngine::open(
+            &database,
+            Token::new("broker-app-1").unwrap(),
+            broker.verifying_key(),
+            ceremony_key.verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            restarted_registry.clone(),
+        )
+        .unwrap(),
+    );
+    let restarted_service = SignerCeremonyService::new(
+        restarted_engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        ceremony_key,
+    )
+    .unwrap();
+    let policy = restarted_engine.policy_snapshot(&wallet_id).unwrap();
+    let epoch = restarted_engine
+        .revocation_state(&wallet_id, 10_400)
+        .unwrap()
+        .wallet_revocation_epoch;
+    let scoped_terms = SealedApprovalTerms {
+        subject: ApprovalSubject::Petal {
+            package_hash: base_scope.package_hash.clone(),
+            route: base_scope.route.clone(),
+            agent_id: base_scope.agent_id.clone(),
+        },
+        wallet_id: wallet_id.clone(),
+        key_ref: child,
+        allowed_crypto_suites: base_scope.allowed_crypto_suites.clone(),
+        selector: ApprovalSelector::Exact {
+            ordered_payload_digests: vec![digest("b5")],
+            ordered_hashes: vec![digest("b6")],
+        },
+        limits: ApprovalLimits {
+            max_operations: DecimalU64::new(1),
+            max_signatures: DecimalU64::new(1),
+            operation_rate_limits: vec![],
+            signature_rate_limits: vec![],
+            value_limits: vec![],
+        },
+        activation_mode: ActivationMode::BootBound,
+        wallet_revocation_epoch: epoch,
+        policy_version: policy.version,
+        policy_digest: policy.policy_digest,
+        provenance_digest: digest("b7"),
+        request_nonce: RequestNonce::new("b8".repeat(16)).unwrap(),
+        issued_at_ms: DecimalU64::new(10_400),
+        not_before_ms: DecimalU64::new(10_400),
+        expires_at_ms: DecimalU64::new(20_000),
+        renewal_of: None,
+    };
+
+    let mut cli = scoped_terms.clone();
+    cli.subject = ApprovalSubject::Cli {
+        client_id: Token::new("bloom-cli").unwrap(),
+        command_class: Token::new("wallet-sign").unwrap(),
+    };
+    assert_eq!(
+        restarted_service
+            .prepare_approval(
+                CeremonyPrepareRequest {
+                    activation_operation_id: operation("ba"),
+                    terms: cli.clone(),
+                    review_manifest_digest: digest("bb"),
+                    exact_ordered_payload_digests: vec![digest("b5")],
+                    exact_ordered_hashes: vec![digest("b6")],
+                    replacement_approval_id: None,
+                },
+                10_400,
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&cli)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+    let mut another_petal = scoped_terms.clone();
+    another_petal.subject = ApprovalSubject::Petal {
+        package_hash: digest("b9"),
+        route: base_scope.route.clone(),
+        agent_id: base_scope.agent_id.clone(),
+    };
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&another_petal)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+    let mut another_agent = scoped_terms.clone();
+    another_agent.subject = ApprovalSubject::Petal {
+        package_hash: base_scope.package_hash.clone(),
+        route: base_scope.route.clone(),
+        agent_id: Some("account-b".into()),
+    };
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&another_agent)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+    let mut another_wallet = scoped_terms.clone();
+    another_wallet.wallet_id = Token::new("another-wallet").unwrap();
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&another_wallet)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::KeyrefMismatch
+    );
+    let mut excessive_suite = scoped_terms.clone();
+    excessive_suite.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Keccak256Recoverable];
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&excessive_suite)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SuiteNotAllowed
+    );
+    let mut excessive_lifetime = scoped_terms.clone();
+    excessive_lifetime.expires_at_ms = DecimalU64::new(31_000);
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&excessive_lifetime)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ApprovalExpired
+    );
+    let mut wrong_purpose = scoped_terms.clone();
+    wrong_purpose.selector = ApprovalSelector::Petal {
+        package_hash: base_scope.package_hash.clone(),
+        route: base_scope.route.clone(),
+        allowed_operation_classes: vec![Token::new("payment-key").unwrap()],
+        required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+    };
+    wrong_purpose.request_nonce = RequestNonce::new("ca".repeat(16)).unwrap();
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&wrong_purpose)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+    let mut empty_purpose = wrong_purpose.clone();
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut empty_purpose.selector
+    {
+        allowed_operation_classes.clear();
+    }
+    empty_purpose.request_nonce = RequestNonce::new("cf".repeat(16)).unwrap();
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&empty_purpose)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+
+    let mut reusable = scoped_terms.clone();
+    reusable.selector = ApprovalSelector::Petal {
+        package_hash: base_scope.package_hash.clone(),
+        route: base_scope.route.clone(),
+        allowed_operation_classes: vec![base_scope.purpose.clone()],
+        required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+    };
+    reusable.request_nonce = RequestNonce::new("cb".repeat(16)).unwrap();
+    restarted_engine
+        .install_approval_for_test(&reusable)
+        .unwrap();
+    futures::executor::block_on(restarted_registry.activate_key(
+        &reusable.key_ref,
+        SecretBytes::new(authenticator.deterministic_prf().to_vec()),
+    ))
+    .unwrap();
+
+    // Simulate a corrupt/replayed durable approval that bypassed activation.
+    // authorize_sign must independently apply the scope-purpose check rather
+    // than trusting the earlier activation decision.
+    let mut corrupted = reusable.clone();
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut corrupted.selector
+    {
+        *allowed_operation_classes = vec![Token::new("payment-key").unwrap()];
+    }
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE approvals SET terms_jcs = ?2 WHERE approval_id = ?1",
+            rusqlite::params![
+                reusable.approval_id().unwrap().as_str(),
+                serde_jcs::to_string(&corrupted).unwrap()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    let signed = signed_petal_request(&reusable, &broker, operation("cc"));
+    assert_eq!(
+        restarted_engine
+            .authorize_sign(
+                &signed,
+                &ClockDecision {
+                    effective_now_ms: 10_500,
+                    condition: ClockCondition::Healthy,
+                    observed_utc_ms: Some(10_500),
+                    monotonic_anchor_ns: 1_000_000,
+                    boot_epoch: BootEpoch::new("cd".repeat(16)).unwrap(),
+                },
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+    restarted_engine
+        .install_approval_for_test(&scoped_terms)
+        .unwrap();
 }
 
 #[test]
@@ -620,6 +1081,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
         exact_terms_digest: digest("88"),
         expected_input_class: Token::new("passkey-prf").unwrap(),
         browser_output_recipient_key: None,
+        petal_key_scope: None,
     };
     let prepared = service.prepare_custody(prepare, 3_000).unwrap();
     let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
@@ -680,6 +1142,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
         exact_terms_digest: digest("89"),
         expected_input_class: Token::new("passkey-prf").unwrap(),
         browser_output_recipient_key: None,
+        petal_key_scope: None,
     };
     let prepared = service.prepare_custody(retry, 3_600).unwrap();
     let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
@@ -789,6 +1252,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 exact_terms_digest: digest("90"),
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
+                petal_key_scope: None,
             },
             3_900,
         )
@@ -807,6 +1271,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 exact_terms_digest: digest("91"),
                 expected_input_class: Token::new("credential-change-prfs").unwrap(),
                 browser_output_recipient_key: None,
+                petal_key_scope: None,
             },
             4_000,
         )
@@ -867,6 +1332,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 exact_terms_digest: digest("92"),
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
+                petal_key_scope: None,
             },
             4_200,
         )
@@ -940,6 +1406,7 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
                 exact_terms_digest: digest("d2"),
                 expected_input_class: Token::new("recovery-factor-v1").unwrap(),
                 browser_output_recipient_key: None,
+                petal_key_scope: None,
             },
             6_000,
         )
@@ -1007,6 +1474,7 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
                 exact_terms_digest: digest("d3"),
                 expected_input_class: Token::new("passkey-prf").unwrap(),
                 browser_output_recipient_key: None,
+                petal_key_scope: None,
             },
             7_000,
         )

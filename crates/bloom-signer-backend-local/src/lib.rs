@@ -366,12 +366,23 @@ impl LocalSignerBackend {
             .backup
             .clone()
             .ok_or(BackendError::DefinitiveRejected)?;
-        if next
+        if let Some(existing) = next
             .derivation_namespaces
             .iter()
-            .any(|namespace| namespace.namespace_id == grant.namespace_id)
+            .find(|namespace| namespace.namespace_id == grant.namespace_id)
         {
-            return Err(BackendError::InvalidRequest);
+            // Configuration is restart/retry safe only for the exact same
+            // Signer-authenticated authority. A namespace can never be
+            // retargeted to a different prefix or allocation ceiling.
+            return if existing.authority_digest == authority_digest
+                && existing.canonical_prefix == grant.canonical_prefix
+                && existing.maximum_children.get()
+                    == grant.starting_index.get() + grant.maximum_children.get()
+            {
+                Ok(())
+            } else {
+                Err(BackendError::InvalidRequest)
+            };
         }
         next.derivation_namespaces.push(DerivationNamespace {
             namespace_id: grant.namespace_id.clone(),
