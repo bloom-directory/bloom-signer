@@ -716,9 +716,15 @@ impl SignerCeremonyService {
                 LOCAL_PRF_INFO,
                 &aad,
             )?;
+            let credential_key =
+                credential_wrap_key(&secret, &prepare.terms.wallet_id, &assertion.credential_id)?;
+            let backend_activation_secret = self
+                .wallet(&prepare.terms.wallet_id)?
+                .unlock_with_credential(&assertion.credential_id, &credential_key)?
+                .local_backend_activation_secret()?;
             self.engine
                 .backend_registry()
-                .activate_key(&prepare.terms.key_ref, secret)
+                .activate_key(&prepare.terms.key_ref, backend_activation_secret)
                 .await?;
         } else if request.encrypted_local_prf.is_some() {
             return Err(protocol(
@@ -1159,7 +1165,6 @@ impl SignerCeremonyService {
                     (registration.root, input)
                 };
                 let backend_seed = root.expose_to_backend().to_vec();
-                let backend_activation_secret = prf.expose_to_backend().to_vec();
                 let credential_key =
                     credential_wrap_key(&prf, &registration.wallet_id, &credential.credential_id)?;
                 let wallet = Arc::new(WalletCustody::register(
@@ -1174,6 +1179,10 @@ impl SignerCeremonyService {
                     credential_wrap_key(&prf, &registration.wallet_id, &credential.credential_id)?;
                 let unlocked =
                     wallet.unlock_with_credential(&credential.credential_id, &unlock_key)?;
+                let backend_activation_secret = unlocked
+                    .local_backend_activation_secret()?
+                    .expose_to_backend()
+                    .to_vec();
                 let initial_policy = bloom_triad_protocol::CanonicalWalletPolicy {
                     wallet_id: registration.wallet_id.clone(),
                     maximum_approval_lifetime_ms: 30 * 24 * 60 * 60 * 1_000,

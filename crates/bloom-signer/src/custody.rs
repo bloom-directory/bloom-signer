@@ -5,6 +5,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
 };
 use ed25519_dalek::{Signer as _, SigningKey};
+use hkdf::Hkdf;
 use parking_lot::Mutex;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,7 @@ use zeroize::Zeroizing;
 
 const ROOT_AAD: &[u8] = b"bloom-wallet-root/v1";
 const POLICY_KEY_AAD: &[u8] = b"bloom-policy-signing-key/v1";
+const LOCAL_BACKEND_WRAP_INFO: &[u8] = b"bloom-local-backend-wrap/v1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -106,6 +108,23 @@ impl UnlockedWallet {
                 )
             })?;
         Ok(SigningKey::from_bytes(&seed).sign(message).to_bytes())
+    }
+
+    /// Derive the stable local-backend wrapping key from the wallet WKEK.
+    /// Every credential independently unwraps the same WKEK, so backend
+    /// activation remains credential-agnostic across add/replace/recovery.
+    pub(crate) fn local_backend_activation_secret(&self) -> Result<SecretBytes, ProtocolError> {
+        let salt: [u8; 32] = Sha256::digest(self.wallet_id.as_str().as_bytes()).into();
+        let mut key = vec![0_u8; 32];
+        Hkdf::<Sha256>::new(Some(&salt), self.wkek.as_slice())
+            .expand(LOCAL_BACKEND_WRAP_INFO, &mut key)
+            .map_err(|_| {
+                protocol(
+                    ProtocolErrorCode::BackendInvalidRequest,
+                    "local backend wrap-key derivation failed",
+                )
+            })?;
+        Ok(SecretBytes::new(key))
     }
 }
 

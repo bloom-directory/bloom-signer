@@ -499,6 +499,7 @@ version = "0.1.3"
 dependencies = [
  "bloom-triad-protocol",
  "ed25519-dalek",
+ "hex",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -517,15 +518,23 @@ dependencies = [
 name = "bloom-broker-debug-driver"
 version = "0.1.0"
 dependencies = [
+ "bip32",
  "bloom-broker-api",
+ "chacha20poly1305",
  "ciborium",
  "hex",
+ "hkdf",
  "hpke",
+ "k256",
+ "memchr",
  "p256",
  "rand",
+ "rusqlite",
+ "serde",
  "serde_jcs",
  "serde_json",
  "sha2",
+ "zeroize",
 ]
 
 [[package]]

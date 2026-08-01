@@ -193,9 +193,81 @@ fn terms(key_ref: KeyRef) -> SealedApprovalTerms {
         request_nonce: RequestNonce::new("66".repeat(16)).unwrap(),
         issued_at_ms: DecimalU64::new(1_000),
         not_before_ms: DecimalU64::new(1_000),
-        expires_at_ms: DecimalU64::new(20_000),
+        // Exactly the persisted child-scope boundary (derivation committed at
+        // 10_300 plus maximum_lifetime_ms 20_000).
+        expires_at_ms: DecimalU64::new(30_300),
         renewal_of: None,
     }
+}
+
+fn complete_local_approval(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    terms: SealedApprovalTerms,
+    activation_operation_id: OperationId,
+    sign_count: u32,
+    now_ms: u64,
+) -> SignerActivationReceipt {
+    let review_manifest_digest = digest("76");
+    let (exact_ordered_payload_digests, exact_ordered_hashes) = match &terms.selector {
+        ApprovalSelector::Exact {
+            ordered_payload_digests,
+            ordered_hashes,
+        } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
+        ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
+    };
+    let prepared = service
+        .prepare_approval(
+            CeremonyPrepareRequest {
+                activation_operation_id: activation_operation_id.clone(),
+                terms: terms.clone(),
+                review_manifest_digest: review_manifest_digest.clone(),
+                exact_ordered_payload_digests,
+                exact_ordered_hashes,
+                replacement_approval_id: None,
+            },
+            now_ms,
+        )
+        .unwrap();
+    let assertion = authenticator.assertion(
+        &prepared.challenges[0].canonical_bytes().unwrap(),
+        sign_count,
+    );
+    let aad = LocalPrfHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        approval_id: terms.approval_id().unwrap(),
+        approval_digest: terms.approval_digest().unwrap(),
+        review_manifest_digest,
+        key_ref: terms.key_ref.clone(),
+        allowed_crypto_suites: terms.allowed_crypto_suites.clone(),
+        credential_id: assertion.credential_id.clone(),
+        activation_mode: terms.activation_mode.clone(),
+        wallet_revocation_epoch: terms.wallet_revocation_epoch.clone(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let encrypted_local_prf = seal_hpke(
+        prepared
+            .contribution
+            .ephemeral_encryption_public_key
+            .as_ref()
+            .unwrap(),
+        LOCAL_PRF_INFO,
+        &aad,
+        &authenticator.deterministic_prf(),
+    )
+    .unwrap();
+    futures::executor::block_on(service.complete_approval(
+        CeremonyCompleteRequest {
+            activation_operation_id,
+            proof: WebAuthnCeremonyProof::Assertion { assertion },
+            contribution: prepared.contribution,
+            encrypted_local_prf: Some(encrypted_local_prf),
+        },
+        now_ms + 1,
+    ))
+    .unwrap()
 }
 
 fn register_wallet(
@@ -960,14 +1032,82 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
     };
     reusable.request_nonce = RequestNonce::new("cb".repeat(16)).unwrap();
-    restarted_engine
-        .install_approval_for_test(&reusable)
+    complete_local_approval(
+        &restarted_service,
+        &authenticator,
+        reusable.clone(),
+        operation("cc"),
+        10_501,
+        10_400,
+    );
+
+    // Fault injection: losing the immutable child-scope row must make the
+    // public KeyRef unusable, even though the backend still has the private
+    // child active. Restore the exact row afterward so the remaining tamper
+    // cases exercise independent checks.
+    let scope_fingerprint = reusable.key_ref.public_key_fingerprint.as_str();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let retained_scope = connection
+        .query_row(
+            "SELECT wallet_id, custody_operation_id, scope_digest, scope_jcs,
+                    created_at_ms, expires_at_ms
+             FROM petal_key_scopes WHERE key_fingerprint = ?1",
+            [scope_fingerprint],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
         .unwrap();
-    futures::executor::block_on(restarted_registry.activate_key(
-        &reusable.key_ref,
-        SecretBytes::new(authenticator.deterministic_prf().to_vec()),
-    ))
-    .unwrap();
+    connection
+        .execute(
+            "DELETE FROM petal_key_scopes WHERE key_fingerprint = ?1",
+            [scope_fingerprint],
+        )
+        .unwrap();
+    drop(connection);
+    let missing_scope = signed_petal_request(&reusable, &broker, operation("c9"));
+    assert_eq!(
+        restarted_engine
+            .authorize_sign(
+                &missing_scope,
+                &ClockDecision {
+                    effective_now_ms: 10_500,
+                    condition: ClockCondition::Healthy,
+                    observed_utc_ms: Some(10_500),
+                    monotonic_anchor_ns: 999_999,
+                    boot_epoch: BootEpoch::new("ce".repeat(16)).unwrap(),
+                },
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ServiceUnavailable
+    );
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "INSERT INTO petal_key_scopes(
+                key_fingerprint, wallet_id, custody_operation_id, scope_digest,
+                scope_jcs, created_at_ms, expires_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                scope_fingerprint,
+                retained_scope.0,
+                retained_scope.1,
+                retained_scope.2,
+                retained_scope.3,
+                retained_scope.4,
+                retained_scope.5,
+            ],
+        )
+        .unwrap();
+    drop(connection);
 
     // Simulate a corrupt/replayed durable approval that bypassed activation.
     // authorize_sign must independently apply the scope-purpose check rather
@@ -1011,6 +1151,69 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     restarted_engine
         .install_approval_for_test(&scoped_terms)
         .unwrap();
+
+    // Exercise expiry and revocation against the actual persisted Petal child,
+    // rather than relying on the generic approval tests.  The approval is
+    // necessarily bounded by the child scope, so once the scope window has
+    // elapsed no request using that child can remain valid.
+    let mut expired_scoped_request = signed_petal_request(&scoped_terms, &broker, operation("d0"));
+    // Keep the attempt itself live just beyond the child boundary so the
+    // failure is Signer's independent persisted-scope check, not the generic
+    // attempt-expiry guard.
+    expired_scoped_request.unsigned.expires_at_ms = DecimalU64::new(30_400);
+    expired_scoped_request.unsigned.attempt_digest = expired_scoped_request
+        .unsigned
+        .computed_attempt_digest()
+        .unwrap();
+    expired_scoped_request.broker_signature = Base64UrlBytes::from_bytes(
+        &broker
+            .sign(&expired_scoped_request.unsigned.attempt_digest.to_bytes())
+            .to_bytes(),
+    );
+    let scope_expired = restarted_engine
+        .authorize_sign(
+            &expired_scoped_request,
+            &ClockDecision {
+                effective_now_ms: 30_301,
+                condition: ClockCondition::Healthy,
+                observed_utc_ms: Some(30_301),
+                monotonic_anchor_ns: 1_000_000,
+                boot_epoch: BootEpoch::new("d1".repeat(16)).unwrap(),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(scope_expired.code, ProtocolErrorCode::ApprovalExpired);
+    assert_eq!(
+        scope_expired.message,
+        "approval validity exceeds the Petal derived-key scope"
+    );
+
+    let scoped_approval_id = scoped_terms.approval_id().unwrap();
+    restarted_engine
+        .revoke_approval(
+            &scoped_approval_id,
+            "fixture Petal child approval revoked".into(),
+            operation("d2"),
+            10_600,
+        )
+        .unwrap();
+    let revoked_scoped_request = signed_petal_request(&scoped_terms, &broker, operation("d3"));
+    assert_eq!(
+        restarted_engine
+            .authorize_sign(
+                &revoked_scoped_request,
+                &ClockDecision {
+                    effective_now_ms: 10_700,
+                    condition: ClockCondition::Healthy,
+                    observed_utc_ms: Some(10_700),
+                    monotonic_anchor_ns: 1_000_001,
+                    boot_epoch: BootEpoch::new("d4".repeat(16)).unwrap(),
+                },
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ApprovalRevoked
+    );
 }
 
 #[test]
@@ -1106,11 +1309,18 @@ fn hpke_matches_committed_reviewed_vector() {
 #[test]
 fn approval_completion_verifies_raw_proof_decrypts_prf_and_is_idempotent() {
     let authenticator = VirtualAuthenticator::generate();
-    let (service, key_ref, engine, _) = service(&authenticator);
-    service
-        .register_existing_credential(Token::new("wallet-1").unwrap(), authenticator.credential(0))
-        .unwrap();
-    let terms = terms(key_ref);
+    let (service, _, engine, _) = service(&authenticator);
+    let (registration, _) = complete_new_wallet(
+        &service,
+        &authenticator,
+        CeremonyKind::WalletRegistration,
+        operation("0f"),
+        None,
+        None,
+        1_000,
+    );
+    let mut terms = terms(registration.public_key_refs[0].clone());
+    terms.wallet_id = registration.wallet_id.unwrap();
     let prepare_request = CeremonyPrepareRequest {
         activation_operation_id: operation("10"),
         terms: terms.clone(),
@@ -1124,7 +1334,7 @@ fn approval_completion_verifies_raw_proof_decrypts_prf_and_is_idempotent() {
         prepared.contribution.allowed_crypto_suites,
         terms.allowed_crypto_suites
     );
-    let assertion = authenticator.assertion(&prepared.challenges[0].canonical_bytes().unwrap(), 1);
+    let assertion = authenticator.assertion(&prepared.challenges[0].canonical_bytes().unwrap(), 2);
     let aad = LocalPrfHpkeAad {
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         signer_nonce: prepared.contribution.signer_nonce.clone(),
@@ -1337,11 +1547,16 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
     )
     .unwrap();
     assert!(!registry.key_is_available(&registered_root).unwrap());
-    futures::executor::block_on(registry.activate_key(
-        &registered_root,
-        SecretBytes::new(authenticator.deterministic_prf().to_vec()),
-    ))
-    .unwrap();
+    let mut activation_terms = terms(registered_root.clone());
+    activation_terms.wallet_id = registered_wallet_id.clone();
+    complete_local_approval(
+        &restarted,
+        &authenticator,
+        activation_terms,
+        operation("2f"),
+        2,
+        3_900,
+    );
     assert!(registry.key_is_available(&registered_root).unwrap());
     assert_eq!(
         restarted
@@ -1384,7 +1599,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
         )
         .unwrap();
     let authority_assertion =
-        authenticator.assertion(&add.challenges[0].canonical_bytes().unwrap(), 2);
+        authenticator.assertion(&add.challenges[0].canonical_bytes().unwrap(), 3);
     let new_attestation = second.attestation(&add.challenges[1].canonical_bytes().unwrap());
     let new_prf_assertion = second.assertion(&add.challenges[2].canonical_bytes().unwrap(), 1);
     let add_aad = CustodyHpkeAad {
@@ -1451,7 +1666,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
 fn registration_returns_signed_public_projection_and_enables_one_time_recovery() {
     let authenticator = VirtualAuthenticator::generate();
     let replacement = VirtualAuthenticator::generate();
-    let (service, _, _, _) = service(&authenticator);
+    let (service, _, _, registry) = service(&authenticator);
     let output_recipient = HpkeRecipient::generate();
     let registration_operation = operation("a8");
     let (result, contribution) = complete_new_wallet(
@@ -1571,6 +1786,24 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
             .credential(&wallet_id, &replacement.credential(0).credential_id)
             .is_ok()
     );
+    let recovered_root = result.public_key_refs[0].clone();
+    let raw_prf_error = futures::executor::block_on(registry.activate_key(
+        &recovered_root,
+        SecretBytes::new(replacement.deterministic_prf().to_vec()),
+    ))
+    .unwrap_err();
+    assert_eq!(raw_prf_error.code, ProtocolErrorCode::BackendInvalidRequest);
+    let mut recovery_terms = terms(recovered_root.clone());
+    recovery_terms.wallet_id = wallet_id.clone();
+    complete_local_approval(
+        &service,
+        &replacement,
+        recovery_terms,
+        operation("ab"),
+        2,
+        6_200,
+    );
+    assert!(registry.key_is_available(&recovered_root).unwrap());
     let forged_registration = service
         .prepare_custody(
             CustodyPrepareRequest {
@@ -1641,7 +1874,7 @@ fn credential_replace_remove_and_backend_enrollment_do_not_spend_approval_capaci
     let original = VirtualAuthenticator::generate();
     let replacement = VirtualAuthenticator::generate();
     let removable = VirtualAuthenticator::generate();
-    let (service, approval_key_ref, engine, _) = service(&original);
+    let (service, approval_key_ref, engine, registry) = service(&original);
     let approval_id = engine
         .install_approval_for_test(&terms(approval_key_ref))
         .unwrap();
@@ -1659,6 +1892,13 @@ fn credential_replace_remove_and_backend_enrollment_do_not_spend_approval_capaci
     let wallet_id = registration.wallet_id.unwrap();
     let root_key_ref = registration.public_key_refs[0].clone();
     let original_credential = original.credential(0);
+    let raw_prf_error = futures::executor::block_on(registry.activate_key(
+        &root_key_ref,
+        SecretBytes::new(original.deterministic_prf().to_vec()),
+    ))
+    .unwrap_err();
+    assert_eq!(raw_prf_error.code, ProtocolErrorCode::BackendInvalidRequest);
+    assert!(!registry.key_is_available(&root_key_ref).unwrap());
 
     let replaced = complete_credential_change(
         &service,
@@ -1681,6 +1921,17 @@ fn credential_replace_remove_and_backend_enrollment_do_not_spend_approval_capaci
             .credential(&wallet_id, &replacement.credential(0).credential_id)
             .is_ok()
     );
+    let mut replacement_terms = terms(root_key_ref.clone());
+    replacement_terms.wallet_id = wallet_id.clone();
+    complete_local_approval(
+        &service,
+        &replacement,
+        replacement_terms,
+        operation("ef"),
+        2,
+        21_100,
+    );
+    assert!(registry.key_is_available(&root_key_ref).unwrap());
     assert_approval_capacity_unused(&engine, &approval_id);
 
     let added = complete_credential_change(
@@ -1690,7 +1941,7 @@ fn credential_replace_remove_and_backend_enrollment_do_not_spend_approval_capaci
         &wallet_id,
         CeremonyKind::CredentialAdd,
         operation("e4"),
-        2,
+        3,
         22_000,
     );
     assert_eq!(added.public_status, CeremonyState::Succeeded);
@@ -1700,6 +1951,24 @@ fn credential_replace_remove_and_backend_enrollment_do_not_spend_approval_capaci
             .credential(&wallet_id, &removable_credential.credential_id)
             .is_ok()
     );
+    let raw_prf_error = futures::executor::block_on(registry.activate_key(
+        &root_key_ref,
+        SecretBytes::new(removable.deterministic_prf().to_vec()),
+    ))
+    .unwrap_err();
+    assert_eq!(raw_prf_error.code, ProtocolErrorCode::BackendInvalidRequest);
+    let mut added_terms = terms(root_key_ref.clone());
+    added_terms.wallet_id = wallet_id.clone();
+    added_terms.request_nonce = RequestNonce::new("67".repeat(16)).unwrap();
+    complete_local_approval(
+        &service,
+        &removable,
+        added_terms,
+        operation("ee"),
+        2,
+        22_100,
+    );
+    assert!(registry.key_is_available(&root_key_ref).unwrap());
 
     let mut removal_target = root_key_ref.clone();
     removal_target.locator = removable_credential.credential_id.encoded().to_owned();
@@ -1721,7 +1990,7 @@ fn credential_replace_remove_and_backend_enrollment_do_not_spend_approval_capaci
         )
         .unwrap();
     let authority_assertion =
-        replacement.assertion(&remove_prepared.challenges[0].canonical_bytes().unwrap(), 3);
+        replacement.assertion(&remove_prepared.challenges[0].canonical_bytes().unwrap(), 4);
     let removed = service
         .complete_custody(
             CustodyCompleteRequest {

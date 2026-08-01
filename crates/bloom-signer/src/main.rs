@@ -12,7 +12,10 @@ use std::{
     time::Duration,
 };
 
-use bloom_audit_checkpoint::{CheckpointSink, CheckpointStore, PinnedAuditKey};
+use bloom_audit_checkpoint::{
+    AppendOutcome, AuthorityEdgeHistory, CheckpointError, CheckpointSink, CheckpointStore,
+    PinnedAuditKey,
+};
 use bloom_signer::{
     ceremony::SignerCeremonyService,
     clock::SignerClock,
@@ -165,26 +168,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if revoke_client_acl.service_id.as_str() != "bloom-revoke-client" {
         return Err("edge manifest does not pin the dedicated revoke client".into());
     }
-    let checkpoint_store = Arc::new(CheckpointStore::open(
-        env_path(
-            "BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR",
-            "/var/db/bloom/signer/audit-checkpoints",
-        ),
-        signer_effective_uid,
-        identity.service_id.clone(),
-        [
-            PinnedAuditKey {
-                service_id: broker_acl.service_id.clone(),
-                key_id: broker_acl.application_key_id.clone(),
-                verifying_key: VerifyingKey::from_bytes(&broker_acl.application_public_key)?,
-            },
-            PinnedAuditKey {
-                service_id: identity.service_id.clone(),
-                key_id: identity.application_key_id.clone(),
-                verifying_key: identity.signing_key.verifying_key(),
-            },
-        ],
-    )?);
+    #[cfg(feature = "triad-dev-harness")]
+    let history_owner = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
+        signer_effective_uid
+    } else {
+        0
+    };
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let history_owner = 0;
+    let checkpoint_store = (|| -> Result<CheckpointStore, CheckpointError> {
+        let history = AuthorityEdgeHistory::load_trusted(
+            env_path(
+                "BLOOM_AUTHORITY_EDGE_HISTORY",
+                "/etc/bloom/authority-edge-history.json",
+            ),
+            history_owner,
+        )?;
+        let services = [&broker_acl.service_id, &identity.service_id];
+        CheckpointStore::open_with_history(
+            env_path(
+                "BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR",
+                "/var/db/bloom/signer/audit-checkpoints",
+            ),
+            signer_effective_uid,
+            identity.service_id.clone(),
+            [
+                PinnedAuditKey {
+                    service_id: broker_acl.service_id.clone(),
+                    key_id: broker_acl.application_key_id.clone(),
+                    verifying_key: VerifyingKey::from_bytes(&broker_acl.application_public_key)
+                        .map_err(|_| CheckpointError::InvalidSignature)?,
+                },
+                PinnedAuditKey {
+                    service_id: identity.service_id.clone(),
+                    key_id: identity.application_key_id.clone(),
+                    verifying_key: identity.signing_key.verifying_key(),
+                },
+            ],
+            history.historical_pins_for(&services)?,
+            history.handovers_for(&services),
+        )
+    })();
+    let checkpoint_store: Arc<dyn CheckpointSink> = match checkpoint_store {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            eprintln!("Bloom Signer authority-edge checkpoint degradation: {error}");
+            Arc::new(UnavailableCheckpointSink {
+                reason: error.to_string(),
+            })
+        }
+    };
     let mut config = load_config(&config_path)?;
     let broker_public_key = verifying_key(&config.broker_signing_public_key_hex)?;
     let ceremony_public_key = verifying_key(&config.ceremony_verifying_public_key_hex)?;
@@ -517,8 +550,74 @@ fn select_initial_self_head(
             // audit degradation, not permission to fabricate a zero head or
             // to discard read/status availability.
             engine.latch_audit_degraded();
-            Ok(retained)
+            Ok(retained.or(Some(head)))
         }
+    }
+}
+
+struct UnavailableCheckpointSink {
+    reason: String,
+}
+
+impl SignerJournalExchange {
+    fn response_journal_head(
+        &self,
+        allow_uncheckpointed_read: bool,
+    ) -> Result<(u64, Digest32), ProtocolError> {
+        match self.engine.verified_audit_head() {
+            Ok((sequence, head_hash)) => {
+                let signed = bloom_triad_local_transport::sign_journal_head(
+                    &self.identity,
+                    sequence,
+                    head_hash.clone(),
+                );
+                let checkpoint = self.checkpoints.append_peer_head(&signed);
+                *self.last_verified_head.lock().map_err(|_| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "Signer last verified audit head lock is poisoned",
+                    )
+                })? = Some(signed);
+                if let Err(error) = checkpoint {
+                    self.engine.latch_audit_degraded();
+                    if !allow_uncheckpointed_read {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::ServiceUnavailable,
+                            format!(
+                                "persist Signer local audit checkpoint before response: {error}"
+                            ),
+                        ));
+                    }
+                }
+                Ok((sequence, head_hash))
+            }
+            Err(_) => self
+                .last_verified_head
+                .lock()
+                .map_err(|_| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "Signer last verified audit head lock is poisoned",
+                    )
+                })?
+                .as_ref()
+                .map(|head| (head.sequence.get(), head.head_hash.clone()))
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "Signer audit is degraded and has no independently retained local head",
+                    )
+                }),
+        }
+    }
+}
+
+impl CheckpointSink for UnavailableCheckpointSink {
+    fn append_peer_head(
+        &self,
+        _peer_head: &SignedJournalHead,
+    ) -> Result<AppendOutcome, CheckpointError> {
+        Err(CheckpointError::Malformed(self.reason.clone()))
     }
 }
 
@@ -540,51 +639,8 @@ impl BrokerSignerJournalExchange for SignerJournalExchange {
         Ok(())
     }
 
-    fn local_journal_head(&self) -> Result<(u64, Digest32), ProtocolError> {
-        match self.engine.verified_audit_head() {
-            Ok((sequence, head_hash)) => {
-                let signed = bloom_triad_local_transport::sign_journal_head(
-                    &self.identity,
-                    sequence,
-                    head_hash.clone(),
-                );
-                self.checkpoints
-                    .append_peer_head(&signed)
-                    .map_err(|error| {
-                        self.engine.latch_audit_degraded();
-                        ProtocolError::new(
-                            ProtocolErrorCode::ServiceUnavailable,
-                            format!(
-                                "persist Signer local audit checkpoint before response: {error}"
-                            ),
-                        )
-                    })?;
-                *self.last_verified_head.lock().map_err(|_| {
-                    ProtocolError::new(
-                        ProtocolErrorCode::ServiceUnavailable,
-                        "Signer last verified audit head lock is poisoned",
-                    )
-                })? = Some(signed);
-                Ok((sequence, head_hash))
-            }
-            Err(_) => self
-                .last_verified_head
-                .lock()
-                .map_err(|_| {
-                    ProtocolError::new(
-                        ProtocolErrorCode::ServiceUnavailable,
-                        "Signer last verified audit head lock is poisoned",
-                    )
-                })?
-                .as_ref()
-                .map(|head| (head.sequence.get(), head.head_hash.clone()))
-                .ok_or_else(|| {
-                    ProtocolError::new(
-                        ProtocolErrorCode::ServiceUnavailable,
-                        "Signer audit is degraded and has no independently retained local head",
-                    )
-                }),
-        }
+    fn local_journal_head(&self, method: &Token) -> Result<(u64, Digest32), ProtocolError> {
+        self.response_journal_head(bloom_triad_local_transport::is_read_only_method(method))
     }
 }
 
@@ -641,7 +697,7 @@ impl RevocationControlService for CheckpointingControlService {
             if !is_read_only {
                 // The local OS checkpoint is part of publishing a security
                 // mutation outcome, including durable-effect error outcomes.
-                self.journals.local_journal_head()?;
+                self.journals.response_journal_head(false)?;
             }
             result
         })
@@ -1060,7 +1116,13 @@ mod tests {
                 .checkpoint_request_head(&Token::new("signer.readiness").unwrap(), &broker_head(),)
                 .is_ok()
         );
-        assert_eq!(exchange.local_journal_head().unwrap().0, 0);
+        assert_eq!(
+            exchange
+                .local_journal_head(&Token::new("signer.readiness").unwrap())
+                .unwrap()
+                .0,
+            0
+        );
         assert_eq!(
             exchange
                 .checkpoint_request_head(&Token::new("signer.sign").unwrap(), &broker_head())
@@ -1208,7 +1270,9 @@ mod tests {
             identity: identity.clone(),
             last_verified_head: Mutex::new(None),
         };
-        let retained = exchange.local_journal_head().unwrap();
+        let retained = exchange
+            .local_journal_head(&Token::new("signer.readiness").unwrap())
+            .unwrap();
         assert!(retained.0 > 0);
         rusqlite::Connection::open(&database_path)
             .unwrap()
@@ -1252,11 +1316,16 @@ mod tests {
             identity,
             last_verified_head: Mutex::new(retained_signed),
         };
-        assert_eq!(degraded_exchange.local_journal_head().unwrap(), retained);
+        assert_eq!(
+            degraded_exchange
+                .local_journal_head(&Token::new("signer.readiness").unwrap())
+                .unwrap(),
+            retained
+        );
     }
 
     #[test]
-    fn self_checkpoint_failure_suppresses_head_and_latches_mutations() {
+    fn self_checkpoint_failure_preserves_read_head_and_suppresses_mutations() {
         let engine = test_engine();
         let exchange = SignerJournalExchange {
             engine: engine.clone(),
@@ -1265,7 +1334,17 @@ mod tests {
             last_verified_head: Mutex::new(None),
         };
         assert_eq!(
-            exchange.local_journal_head().unwrap_err().code,
+            exchange
+                .local_journal_head(&Token::new("signer.readiness").unwrap())
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(
+            exchange
+                .local_journal_head(&Token::new("signer.sign").unwrap())
+                .unwrap_err()
+                .code,
             ProtocolErrorCode::ServiceUnavailable
         );
         assert!(engine.audit_is_degraded());
