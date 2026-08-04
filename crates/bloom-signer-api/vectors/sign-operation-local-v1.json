@@ -1,0 +1,68 @@
+{
+  "name": "local-secp256k1-keccak256-v1",
+  "operation_identity": {
+    "operation_id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "approval_id": "2222222222222222222222222222222222222222222222222222222222222222",
+    "key_ref": {
+      "backend": "local",
+      "backend_instance": "local-default",
+      "locator": "wallet-key-1",
+      "key_spec": "secp256k1",
+      "public_key_fingerprint": "4444444444444444444444444444444444444444444444444444444444444444",
+      "derivation": {
+        "scheme": "bip32-secp256k1",
+        "root_key_id": "root-1",
+        "path": "m/44'/60'/0'/0/7"
+      }
+    },
+    "crypto_suite": "secp256k1-keccak256-recoverable",
+    "ordered_payload_digests": ["3333333333333333333333333333333333333333333333333333333333333333"],
+    "ordered_hashes": ["5555555555555555555555555555555555555555555555555555555555555555"],
+    "petal_use_claim_digest": null,
+    "claim_assurance_digest": null,
+    "policy_version": "7",
+    "policy_digest": "6666666666666666666666666666666666666666666666666666666666666666"
+  },
+  "operation_canonical_jcs": "{\"approval_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"claim_assurance_digest\":null,\"crypto_suite\":\"secp256k1-keccak256-recoverable\",\"key_ref\":{\"backend\":\"local\",\"backend_instance\":\"local-default\",\"derivation\":{\"path\":\"m/44'/60'/0'/0/7\",\"root_key_id\":\"root-1\",\"scheme\":\"bip32-secp256k1\"},\"key_spec\":\"secp256k1\",\"locator\":\"wallet-key-1\",\"public_key_fingerprint\":\"4444444444444444444444444444444444444444444444444444444444444444\"},\"operation_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"ordered_hashes\":[\"5555555555555555555555555555555555555555555555555555555555555555\"],\"ordered_payload_digests\":[\"3333333333333333333333333333333333333333333333333333333333333333\"],\"petal_use_claim_digest\":null,\"policy_digest\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"policy_version\":\"7\"}",
+  "operation_digest": "e1819d706255f4617f4ee12eaebc5db3e93379be7a8d7af52b4210de61937765",
+  "unsigned_request": {
+    "schema": "bloom.sign-request/1",
+    "attempt_id": "7777777777777777777777777777777777777777777777777777777777777777",
+    "operation_id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "operation_digest": "e1819d706255f4617f4ee12eaebc5db3e93379be7a8d7af52b4210de61937765",
+    "attempt_digest": "cf09339fcce3d44ad24741270b60adf72bf71beb9679753d4fbe03637da7f9c1",
+    "audience": "bloom-signer",
+    "issuer_service_id": "bloom-broker",
+    "issuer_boot_epoch": "88888888888888888888888888888888",
+    "broker_signing_key_id": "broker-app-1",
+    "approval_id": "2222222222222222222222222222222222222222222222222222222222222222",
+    "wallet_id": "wallet-1",
+    "key_ref": {
+      "backend": "local",
+      "backend_instance": "local-default",
+      "locator": "wallet-key-1",
+      "key_spec": "secp256k1",
+      "public_key_fingerprint": "4444444444444444444444444444444444444444444444444444444444444444",
+      "derivation": {
+        "scheme": "bip32-secp256k1",
+        "root_key_id": "root-1",
+        "path": "m/44'/60'/0'/0/7"
+      }
+    },
+    "crypto_suite": "secp256k1-keccak256-recoverable",
+    "selector_kind": "exact",
+    "ordered_payload_digests": ["3333333333333333333333333333333333333333333333333333333333333333"],
+    "ordered_hashes": ["5555555555555555555555555555555555555555555555555555555555555555"],
+    "signature_count": "1",
+    "petal_use_claim_digest": null,
+    "claim_assurance_digest": null,
+    "policy_version": "7",
+    "policy_digest": "6666666666666666666666666666666666666666666666666666666666666666",
+    "validation_receipt_digest": "9999999999999999999999999999999999999999999999999999999999999999",
+    "issued_at_ms": "1900000000000",
+    "not_before_ms": "1900000000000",
+    "expires_at_ms": "1900000030000"
+  },
+  "attempt_canonical_jcs": "{\"approval_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"attempt_id\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"audience\":\"bloom-signer\",\"broker_signing_key_id\":\"broker-app-1\",\"claim_assurance_digest\":null,\"crypto_suite\":\"secp256k1-keccak256-recoverable\",\"expires_at_ms\":\"1900000030000\",\"issued_at_ms\":\"1900000000000\",\"issuer_boot_epoch\":\"88888888888888888888888888888888\",\"issuer_service_id\":\"bloom-broker\",\"key_ref\":{\"backend\":\"local\",\"backend_instance\":\"local-default\",\"derivation\":{\"path\":\"m/44'/60'/0'/0/7\",\"root_key_id\":\"root-1\",\"scheme\":\"bip32-secp256k1\"},\"key_spec\":\"secp256k1\",\"locator\":\"wallet-key-1\",\"public_key_fingerprint\":\"4444444444444444444444444444444444444444444444444444444444444444\"},\"not_before_ms\":\"1900000000000\",\"operation_digest\":\"e1819d706255f4617f4ee12eaebc5db3e93379be7a8d7af52b4210de61937765\",\"operation_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"ordered_hashes\":[\"5555555555555555555555555555555555555555555555555555555555555555\"],\"ordered_payload_digests\":[\"3333333333333333333333333333333333333333333333333333333333333333\"],\"petal_use_claim_digest\":null,\"policy_digest\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"policy_version\":\"7\",\"schema\":\"bloom.sign-request/1\",\"selector_kind\":\"exact\",\"signature_count\":\"1\",\"validation_receipt_digest\":\"9999999999999999999999999999999999999999999999999999999999999999\",\"wallet_id\":\"wallet-1\"}",
+  "attempt_digest": "cf09339fcce3d44ad24741270b60adf72bf71beb9679753d4fbe03637da7f9c1"
+}

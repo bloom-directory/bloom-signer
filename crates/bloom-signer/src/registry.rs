@@ -1,5 +1,5 @@
+use bloom_signer_api::{Base64UrlBytes, KeyRef, ProtocolError, ProtocolErrorCode, Token};
 use bloom_signer_backend_api::{SecretBytes, SignerBackend, SignerBackendActivation};
-use bloom_triad_protocol::{Base64UrlBytes, KeyRef, ProtocolError, ProtocolErrorCode, Token};
 use parking_lot::RwLock;
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -94,7 +94,7 @@ impl BackendRegistry {
 
     pub fn key_is_available(
         &self,
-        key_ref: &bloom_triad_protocol::KeyRef,
+        key_ref: &bloom_signer_api::KeyRef,
     ) -> Result<bool, ProtocolError> {
         let backend = self
             .backends
@@ -125,7 +125,7 @@ impl BackendRegistry {
 
     pub fn key_is_registered(
         &self,
-        key_ref: &bloom_triad_protocol::KeyRef,
+        key_ref: &bloom_signer_api::KeyRef,
     ) -> Result<bool, ProtocolError> {
         let backend = self
             .backends
@@ -151,7 +151,7 @@ impl BackendRegistry {
 
     pub async fn activate_key(
         &self,
-        key_ref: &bloom_triad_protocol::KeyRef,
+        key_ref: &bloom_signer_api::KeyRef,
         secret: SecretBytes,
     ) -> Result<(), ProtocolError> {
         let backend = self
@@ -354,9 +354,9 @@ impl BackendRegistry {
     #[cfg(feature = "local")]
     pub fn configure_local_derivation_namespace(
         &self,
-        root: &bloom_triad_protocol::KeyRef,
+        root: &bloom_signer_api::KeyRef,
         grant: bloom_signer_backend_local::DerivationGrant,
-        signature: bloom_triad_protocol::Base64UrlBytes,
+        signature: bloom_signer_api::Base64UrlBytes,
     ) -> Result<(), ProtocolError> {
         let backend = self
             .backends
@@ -391,11 +391,11 @@ impl BackendRegistry {
     #[cfg(feature = "local")]
     pub fn allocate_local_derived_key(
         &self,
-        root: &bloom_triad_protocol::KeyRef,
+        root: &bloom_signer_api::KeyRef,
         namespace_id: &Token,
         grant: bloom_signer_backend_local::DerivationGrant,
-        signature: bloom_triad_protocol::Base64UrlBytes,
-        operation_id: &bloom_triad_protocol::OperationId,
+        signature: bloom_signer_api::Base64UrlBytes,
+        operation_id: &bloom_signer_api::OperationId,
     ) -> Result<bloom_signer_backend_api::KeyDescription, ProtocolError> {
         let backend = self
             .backends
@@ -433,7 +433,7 @@ impl BackendRegistry {
     #[cfg(feature = "local")]
     pub fn rollback_local_derived_key(
         &self,
-        key_ref: &bloom_triad_protocol::KeyRef,
+        key_ref: &bloom_signer_api::KeyRef,
     ) -> Result<(), ProtocolError> {
         let backend = self
             .backends
@@ -466,8 +466,8 @@ impl BackendRegistry {
     #[cfg(feature = "local")]
     pub fn finalize_local_derived_key(
         &self,
-        key_ref: &bloom_triad_protocol::KeyRef,
-        operation_id: &bloom_triad_protocol::OperationId,
+        key_ref: &bloom_signer_api::KeyRef,
+        operation_id: &bloom_signer_api::OperationId,
     ) -> Result<(), ProtocolError> {
         let backend = self
             .backends
@@ -500,10 +500,7 @@ impl BackendRegistry {
     #[cfg(feature = "local")]
     pub fn pending_local_derivations(
         &self,
-    ) -> Vec<(
-        bloom_triad_protocol::OperationId,
-        bloom_triad_protocol::KeyRef,
-    )> {
+    ) -> Vec<(bloom_signer_api::OperationId, bloom_signer_api::KeyRef)> {
         self.backends
             .read()
             .values()

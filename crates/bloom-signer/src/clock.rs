@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bloom_triad_protocol::{BootEpoch, ProtocolError, ProtocolErrorCode, ReadinessState, Token};
+use bloom_signer_api::{BootEpoch, ProtocolError, ProtocolErrorCode, ReadinessState, Token};
 use bloom_trusted_time::{MAX_FORWARD_STEP_MS, PlatformTimeReading, PlatformTimeSampler};
 use parking_lot::Mutex;
 
@@ -136,7 +136,7 @@ impl SignerClock {
 mod tests {
     use super::*;
     use crate::{engine::SignerAuditKeys, registry::BackendRegistry};
-    use bloom_triad_protocol::Token;
+    use bloom_signer_api::Token;
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeMap;
 

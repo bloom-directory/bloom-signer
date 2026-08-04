@@ -324,7 +324,7 @@ mod tests {
     use aws_credential_types::Credentials;
     use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
     use aws_smithy_types::body::SdkBody;
-    use bloom_triad_protocol::{DecimalU64, Digest32};
+    use bloom_signer_api::{DecimalU64, Digest32};
 
     const ARN: &str = "arn:aws:kms:eu-west-2:123456789012:key/11111111-2222-3333-4444-555555555555";
 

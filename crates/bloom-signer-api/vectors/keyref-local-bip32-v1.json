@@ -1,0 +1,16 @@
+{
+  "name": "local-bip32-v1",
+  "key_ref": {
+    "backend": "local",
+    "backend_instance": "local-default",
+    "locator": "key-1",
+    "key_spec": "secp256k1",
+    "public_key_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+    "derivation": {
+      "scheme": "bip32-secp256k1",
+      "root_key_id": "root-1",
+      "path": "m/44'/60'/0'/0/0"
+    }
+  },
+  "canonical_jcs": "{\"backend\":\"local\",\"backend_instance\":\"local-default\",\"derivation\":{\"path\":\"m/44'/60'/0'/0/0\",\"root_key_id\":\"root-1\",\"scheme\":\"bip32-secp256k1\"},\"key_spec\":\"secp256k1\",\"locator\":\"key-1\",\"public_key_fingerprint\":\"1111111111111111111111111111111111111111111111111111111111111111\"}"
+}

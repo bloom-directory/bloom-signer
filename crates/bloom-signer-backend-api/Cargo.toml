@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-bloom-triad-protocol.workspace = true
+bloom-signer-api.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true

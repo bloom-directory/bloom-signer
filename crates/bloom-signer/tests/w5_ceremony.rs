@@ -1,4 +1,6 @@
-use bloom_broker_debug_driver::{VirtualAuthenticator, seal_hpke};
+mod support;
+
+use bloom_signer::webauthn::{verify_webauthn_assertion, verify_webauthn_attestation};
 use bloom_signer::{
     ceremony::SignerCeremonyService,
     clock::{ClockCondition, ClockDecision},
@@ -6,13 +8,14 @@ use bloom_signer::{
     hpke::{CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO},
     registry::{BackendRegistry, CompiledBackend},
 };
+use bloom_signer_api::*;
 use bloom_signer_backend_api::{BackendInput, BackendSignRequest, SecretBytes};
 use bloom_signer_backend_local::{DerivationAuthority, DerivationGrant, LocalSignerBackend};
-use bloom_triad_protocol::*;
 use ed25519_dalek::{Signer as _, SigningKey};
 use k256::pkcs8::EncodePublicKey as _;
 use sha2::Digest as _;
 use std::{collections::BTreeMap, sync::Arc};
+use support::{VirtualAuthenticator, seal_hpke};
 
 fn audit_keys() -> SignerAuditKeys {
     SignerAuditKeys {

@@ -1,5 +1,4 @@
-use bloom_signer_backend_api::SecretBytes;
-use bloom_triad_protocol::{
+use bloom_signer_api::{
     ActivationMode, Base64UrlBytes, CeremonyChallenge, CeremonyCompleteRequest, CeremonyKind,
     CeremonyPhase, CeremonyPrepareRequest, CeremonyPublicStatus, CeremonyState,
     CeremonyWebAuthnOptions, CredentialPrfInput, CredentialSummary, CryptoSuite,
@@ -7,9 +6,9 @@ use bloom_triad_protocol::{
     CustodyResult, CustodySignerContribution, DecimalU64, Digest32, LocalPrfHpkeAad, OperationId,
     PetalKeyScope, PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest,
     ProtocolError, ProtocolErrorCode, SignerActivationReceipt, SignerCeremonyContribution, Token,
-    WebAuthnCeremonyProof, WebAuthnCredential, verify_webauthn_assertion,
-    verify_webauthn_attestation,
+    WebAuthnCeremonyProof, WebAuthnCredential,
 };
+use bloom_signer_backend_api::SecretBytes;
 use ed25519_dalek::{Signer as _, SigningKey};
 use futures::lock::Mutex as AsyncMutex;
 use hkdf::Hkdf;
@@ -28,6 +27,7 @@ use crate::{
     hpke::{
         CUSTODY_INPUT_INFO, CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO, seal_to_recipient,
     },
+    webauthn::{verify_webauthn_assertion, verify_webauthn_attestation},
 };
 
 const CEREMONY_TTL_MS: u64 = 5 * 60 * 1_000;
@@ -122,16 +122,16 @@ struct CustodyApplyContext {
 struct CustodyApplyOutcome {
     sensitive_output: Option<Vec<u8>>,
     database_effect: CeremonyDatabaseEffect,
-    rollback_derived_key: Option<bloom_triad_protocol::KeyRef>,
-    rollback_provisioned_backend: Option<bloom_triad_protocol::KeyRef>,
-    public_key_refs: Vec<bloom_triad_protocol::KeyRef>,
+    rollback_derived_key: Option<bloom_signer_api::KeyRef>,
+    rollback_provisioned_backend: Option<bloom_signer_api::KeyRef>,
+    public_key_refs: Vec<bloom_signer_api::KeyRef>,
 }
 
 struct GenericCustodyOutcome {
     sensitive_output: Option<Vec<u8>>,
     database_effect: CeremonyDatabaseEffect,
-    rollback_derived_key: Option<bloom_triad_protocol::KeyRef>,
-    public_key_refs: Vec<bloom_triad_protocol::KeyRef>,
+    rollback_derived_key: Option<bloom_signer_api::KeyRef>,
+    public_key_refs: Vec<bloom_signer_api::KeyRef>,
 }
 
 /// Signer-owned, single-use ceremony state.
@@ -1183,7 +1183,7 @@ impl SignerCeremonyService {
                     .local_backend_activation_secret()?
                     .expose_to_backend()
                     .to_vec();
-                let initial_policy = bloom_triad_protocol::CanonicalWalletPolicy {
+                let initial_policy = bloom_signer_api::CanonicalWalletPolicy {
                     wallet_id: registration.wallet_id.clone(),
                     maximum_approval_lifetime_ms: 30 * 24 * 60 * 60 * 1_000,
                     allowed_petal_packages: Vec::new(),
@@ -1604,7 +1604,7 @@ impl SignerCeremonyService {
     #[cfg(feature = "local")]
     fn apply_petal_key_derivation(
         &self,
-        root: &bloom_triad_protocol::KeyRef,
+        root: &bloom_signer_api::KeyRef,
         scope: &PetalKeyScope,
     ) -> Result<GenericCustodyOutcome, ProtocolError> {
         let namespace_id = Token::new(PETAL_SUBKEY_NAMESPACE).expect("static token");
@@ -1647,7 +1647,7 @@ impl SignerCeremonyService {
 
     fn rollback_derived_key(
         &self,
-        key_ref: Option<&bloom_triad_protocol::KeyRef>,
+        key_ref: Option<&bloom_signer_api::KeyRef>,
     ) -> Result<(), ProtocolError> {
         let Some(key_ref) = key_ref else {
             return Ok(());
@@ -1668,7 +1668,7 @@ impl SignerCeremonyService {
         }
     }
 
-    fn rollback_provisioned_backend(&self, key_ref: Option<&bloom_triad_protocol::KeyRef>) {
+    fn rollback_provisioned_backend(&self, key_ref: Option<&bloom_signer_api::KeyRef>) {
         let Some(key_ref) = key_ref else {
             return;
         };
@@ -2047,7 +2047,7 @@ fn required_phases(kind: CeremonyKind) -> Vec<CeremonyPhase> {
 
 fn assertion_only(
     proof: &WebAuthnCeremonyProof,
-) -> Result<&bloom_triad_protocol::WebAuthnAssertion, ProtocolError> {
+) -> Result<&bloom_signer_api::WebAuthnAssertion, ProtocolError> {
     match proof {
         WebAuthnCeremonyProof::Assertion { assertion } => Ok(assertion),
         _ => Err(kind_mismatch()),
@@ -2106,7 +2106,7 @@ fn approval_receipt_bytes(receipt: &SignerActivationReceipt) -> Result<Vec<u8>, 
         approval_id: &'a Digest32,
         approval_digest: &'a Digest32,
         review_manifest_digest: &'a Digest32,
-        key_ref: &'a bloom_triad_protocol::KeyRef,
+        key_ref: &'a bloom_signer_api::KeyRef,
         allowed_crypto_suites: &'a [CryptoSuite],
         activation_mode: ActivationMode,
         wallet_revocation_epoch: &'a DecimalU64,

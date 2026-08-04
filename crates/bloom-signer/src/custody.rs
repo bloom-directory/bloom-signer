@@ -1,5 +1,5 @@
+use bloom_signer_api::{Base64UrlBytes, Digest32, ProtocolError, ProtocolErrorCode, Token};
 use bloom_signer_backend_api::SecretBytes;
-use bloom_triad_protocol::{Base64UrlBytes, Digest32, ProtocolError, ProtocolErrorCode, Token};
 use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},

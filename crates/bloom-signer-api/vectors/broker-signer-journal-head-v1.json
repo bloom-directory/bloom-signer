@@ -1,0 +1,27 @@
+{
+  "name": "broker-signer-journal-head-minor-1",
+  "unsigned_envelope": {
+    "protocol": { "major": 1, "minor": 1 },
+    "schema": "bloom.rpc-envelope.1",
+    "kind": "request",
+    "method": "signer.readiness",
+    "operation_id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "request_digest": "094e9c4bc4d6683c18c095280068737253f60aee1c929322df343ca6294a2197",
+    "caller_service_id": "bloom-broker",
+    "caller_boot_epoch": "22222222222222222222222222222222",
+    "audience": "bloom-signer",
+    "sent_at_ms": "10",
+    "deadline_ms": "20",
+    "body": { "value": "bound" },
+    "application_key_id": "broker-app-1",
+    "sender_journal_head": {
+      "service_id": "bloom-broker",
+      "sequence": "7",
+      "head_hash": "0909090909090909090909090909090909090909090909090909090909090909",
+      "key_id": "broker-app-1",
+      "signature": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+    }
+  },
+  "canonical_jcs": "{\"application_key_id\":\"broker-app-1\",\"audience\":\"bloom-signer\",\"body\":{\"value\":\"bound\"},\"caller_boot_epoch\":\"22222222222222222222222222222222\",\"caller_service_id\":\"bloom-broker\",\"deadline_ms\":\"20\",\"kind\":\"request\",\"method\":\"signer.readiness\",\"operation_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"protocol\":{\"major\":1,\"minor\":1},\"request_digest\":\"094e9c4bc4d6683c18c095280068737253f60aee1c929322df343ca6294a2197\",\"schema\":\"bloom.rpc-envelope.1\",\"sender_journal_head\":{\"head_hash\":\"0909090909090909090909090909090909090909090909090909090909090909\",\"key_id\":\"broker-app-1\",\"sequence\":\"7\",\"service_id\":\"bloom-broker\",\"signature\":\"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ\"},\"sent_at_ms\":\"10\"}",
+  "head_signature_message_base64url": "Ymxvb20tYXVkaXQtam91cm5hbC1oZWFkL3YxAGJsb29tLWJyb2tlcgAAAAAAAAAABzA5MDkwOTA5MDkwOTA5MDkwOTA5MDkwOTA5MDkwOTA5MDkwOTA5MDkwOTA5MDkwOTA5MDkwOTA5MDkwOTA5MDkAYnJva2VyLWFwcC0x"
+}

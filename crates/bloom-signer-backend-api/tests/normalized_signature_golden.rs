@@ -1,4 +1,4 @@
-use bloom_triad_protocol::{CryptoInputKind, CryptoSuite, SignatureEncoding};
+use bloom_signer_api::{CryptoInputKind, CryptoSuite, SignatureEncoding};
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier as _, VerifyingKey as Ed25519Key};
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use serde::Deserialize;

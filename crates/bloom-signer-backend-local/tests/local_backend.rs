@@ -1,3 +1,4 @@
+use bloom_signer_api::{Base64UrlBytes, CryptoSuite, DecimalU64, Digest32, Token};
 use bloom_signer_backend_api::{
     ActivationStatus, BackendInput, BackendSignRequest, SecretBytes, SignerBackend,
     SignerBackendActivation,
@@ -5,7 +6,6 @@ use bloom_signer_backend_api::{
 use bloom_signer_backend_local::{
     DerivationAuthority, DerivationGrant, EncryptedLocalBackup, LocalSignerBackend,
 };
-use bloom_triad_protocol::{Base64UrlBytes, CryptoSuite, DecimalU64, Digest32, Token};
 use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
 use k256::pkcs8::DecodePublicKey;
 use serde::Deserialize;
@@ -189,7 +189,7 @@ fn derivation_registry_is_restart_safe_and_tombstoned_paths_are_not_reused() {
         .unwrap();
     assert!(matches!(
         second.key_ref.derivation,
-        Some(bloom_triad_protocol::DerivationRef::Bip32Secp256k1 { ref path, .. })
+        Some(bloom_signer_api::DerivationRef::Bip32Secp256k1 { ref path, .. })
             if path == "m/44'/60'/0'/0/1"
     ));
     let backup = restarted.encrypted_backup().unwrap();

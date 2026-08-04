@@ -1,0 +1,56 @@
+{
+  "name": "exact-local-bip32-v1",
+  "terms": {
+    "subject": {
+      "kind": "cli",
+      "client_id": "bloom-cli",
+      "command_class": "wallet.sign"
+    },
+    "wallet_id": "wallet-1",
+    "key_ref": {
+      "backend": "local",
+      "backend_instance": "local-default",
+      "locator": "key-1",
+      "key_spec": "secp256k1",
+      "public_key_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+      "derivation": {
+        "scheme": "bip32-secp256k1",
+        "root_key_id": "root-1",
+        "path": "m/44'/60'/0'/0/0"
+      }
+    },
+    "allowed_crypto_suites": [
+      "secp256k1-keccak256-recoverable"
+    ],
+    "selector": {
+      "kind": "exact",
+      "ordered_payload_digests": [
+        "2222222222222222222222222222222222222222222222222222222222222222"
+      ],
+      "ordered_hashes": [
+        "3333333333333333333333333333333333333333333333333333333333333333"
+      ]
+    },
+    "limits": {
+      "max_operations": "1",
+      "max_signatures": "1",
+      "operation_rate_limits": [],
+      "signature_rate_limits": [],
+      "value_limits": []
+    },
+    "activation_mode": {
+      "kind": "boot_bound"
+    },
+    "wallet_revocation_epoch": "7",
+    "policy_version": "3",
+    "policy_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+    "provenance_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+    "request_nonce": "00000000000000000000000000000000",
+    "issued_at_ms": "1900000000000",
+    "not_before_ms": "1900000000000",
+    "expires_at_ms": "1900000600000",
+    "renewal_of": null
+  },
+  "canonical_jcs": "{\"activation_mode\":{\"kind\":\"boot_bound\"},\"allowed_crypto_suites\":[\"secp256k1-keccak256-recoverable\"],\"expires_at_ms\":\"1900000600000\",\"issued_at_ms\":\"1900000000000\",\"key_ref\":{\"backend\":\"local\",\"backend_instance\":\"local-default\",\"derivation\":{\"path\":\"m/44'/60'/0'/0/0\",\"root_key_id\":\"root-1\",\"scheme\":\"bip32-secp256k1\"},\"key_spec\":\"secp256k1\",\"locator\":\"key-1\",\"public_key_fingerprint\":\"1111111111111111111111111111111111111111111111111111111111111111\"},\"limits\":{\"max_operations\":\"1\",\"max_signatures\":\"1\",\"operation_rate_limits\":[],\"signature_rate_limits\":[],\"value_limits\":[]},\"not_before_ms\":\"1900000000000\",\"policy_digest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"policy_version\":\"3\",\"provenance_digest\":\"5555555555555555555555555555555555555555555555555555555555555555\",\"renewal_of\":null,\"request_nonce\":\"00000000000000000000000000000000\",\"selector\":{\"kind\":\"exact\",\"ordered_hashes\":[\"3333333333333333333333333333333333333333333333333333333333333333\"],\"ordered_payload_digests\":[\"2222222222222222222222222222222222222222222222222222222222222222\"]},\"subject\":{\"client_id\":\"bloom-cli\",\"command_class\":\"wallet.sign\",\"kind\":\"cli\"},\"wallet_id\":\"wallet-1\",\"wallet_revocation_epoch\":\"7\"}",
+  "approval_digest": "ee43cae12df068751c9aee67c6f260d343aa851319ede8fb54d8cfbd1862b4ef"
+}

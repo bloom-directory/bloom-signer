@@ -1,6 +1,6 @@
 use bloom_signer::custody::{WalletCustody, WalletCustodyBackup};
+use bloom_signer_api::{Base64UrlBytes, ProtocolErrorCode, Token};
 use bloom_signer_backend_api::SecretBytes;
-use bloom_triad_protocol::{Base64UrlBytes, ProtocolErrorCode, Token};
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 

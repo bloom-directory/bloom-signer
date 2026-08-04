@@ -1,4 +1,4 @@
-use bloom_triad_protocol::{
+use bloom_signer_api::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
     ApprovalTombstone, Base64UrlBytes, CeremonyPublicStatus, CredentialPublic, CredentialState,
     CustodyResult, DecimalU64, Digest32, KeyRef, OperationId, OperationPublicStatus,
@@ -28,7 +28,6 @@ use crate::custody::{WalletCustody, WalletCustodyBackup};
 use crate::registry::BackendRegistry;
 
 const POLICY_SIGNATURE_DOMAIN: &[u8] = b"bloom-policy-snapshot/v1";
-const POLICY_RECEIPT_DOMAIN: &[u8] = b"bloom-policy-commit-receipt/v1";
 const POLICY_VALIDATION_DOMAIN: &[u8] = b"bloom-policy-validation-receipt/v1";
 const APPROVAL_TOMBSTONE_DOMAIN: &[u8] = b"bloom-approval-tombstone/v1";
 const WALLET_TOMBSTONE_DOMAIN: &[u8] = b"bloom-wallet-tombstone/v1";
@@ -146,7 +145,7 @@ pub struct OperationStateBackup {
     #[serde(default = "zero_decimal_u64")]
     pub monotonic_anchor_ns: DecimalU64,
     #[serde(default = "zero_boot_epoch")]
-    pub clock_boot_epoch: bloom_triad_protocol::BootEpoch,
+    pub clock_boot_epoch: bloom_signer_api::BootEpoch,
     pub state: BackupOperationState,
     pub normalized_result: Option<Base64UrlBytes>,
 }
@@ -155,8 +154,8 @@ fn zero_decimal_u64() -> DecimalU64 {
     DecimalU64::new(0)
 }
 
-fn zero_boot_epoch() -> bloom_triad_protocol::BootEpoch {
-    bloom_triad_protocol::BootEpoch::from_bytes([0; 16])
+fn zero_boot_epoch() -> bloom_signer_api::BootEpoch {
+    bloom_signer_api::BootEpoch::from_bytes([0; 16])
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -908,7 +907,7 @@ impl SignerEngine {
     pub(crate) fn observe_time(
         &self,
         reading: bloom_trusted_time::PlatformTimeReading,
-        boot_epoch: bloom_triad_protocol::BootEpoch,
+        boot_epoch: bloom_signer_api::BootEpoch,
         max_forward_step_ms: u64,
         rate_limited_mutation: bool,
     ) -> Result<ClockDecision, ProtocolError> {
@@ -1068,7 +1067,7 @@ impl SignerEngine {
     pub(crate) fn observe_time_read_only(
         &self,
         reading: bloom_trusted_time::PlatformTimeReading,
-        boot_epoch: bloom_triad_protocol::BootEpoch,
+        boot_epoch: bloom_signer_api::BootEpoch,
         max_forward_step_ms: u64,
     ) -> Result<ClockDecision, ProtocolError> {
         let connection = self.connection.lock();
@@ -1138,7 +1137,7 @@ impl SignerEngine {
             ));
         }
         let monotonic_anchor_ns = monotonic_anchor_ns.parse::<u64>().map_err(malformed)?;
-        let boot_epoch: bloom_triad_protocol::BootEpoch = boot_epoch.parse().map_err(malformed)?;
+        let boot_epoch: bloom_signer_api::BootEpoch = boot_epoch.parse().map_err(malformed)?;
         let reading = bloom_trusted_time::PlatformTimeReading {
             utc_ms: Some(accepted_utc_ms),
             monotonic_elapsed_ms: 0,
@@ -1332,9 +1331,9 @@ impl SignerEngine {
                 .map_err(storage)?;
             let status = CeremonyPublicStatus {
                 ceremony_id: receipt.ceremony_id.clone(),
-                ceremony_kind: bloom_triad_protocol::CeremonyKind::SealedApproval,
+                ceremony_kind: bloom_signer_api::CeremonyKind::SealedApproval,
                 operation_id: receipt.activation_operation_id.clone(),
-                state: bloom_triad_protocol::CeremonyState::Succeeded,
+                state: bloom_signer_api::CeremonyState::Succeeded,
                 expires_at_ms: receipt.expires_at_ms.clone(),
                 ceremony_url: None,
                 receipt_digest: Some(Digest32::from_bytes(
@@ -2233,10 +2232,9 @@ impl SignerEngine {
         };
         let result = row
             .2
-            .map(|encoded| {
-                Base64UrlBytes::parse(encoded).and_then(|bytes| {
-                    serde_json::from_slice::<SigningResult>(&bytes.decode()).map_err(malformed)
-                })
+            .map(|encoded| -> Result<SigningResult, ProtocolError> {
+                let bytes = Base64UrlBytes::parse(encoded)?;
+                serde_json::from_slice::<SigningResult>(&bytes.decode()).map_err(malformed)
             })
             .transpose()?;
         Ok(OperationPublicStatus {
@@ -2263,7 +2261,7 @@ impl SignerEngine {
             )
             .optional()
             .map_err(storage)?;
-        result.flatten().map(Base64UrlBytes::parse).transpose()
+        Ok(result.flatten().map(Base64UrlBytes::parse).transpose()?)
     }
 
     pub fn approval_public_status(
@@ -2774,7 +2772,7 @@ impl SignerEngine {
         &self,
         request: &PolicyUpdateCeremonyPrepareRequest,
     ) -> Result<(), ProtocolError> {
-        if request.custody.ceremony_kind != bloom_triad_protocol::CeremonyKind::PolicyUpdate
+        if request.custody.ceremony_kind != bloom_signer_api::CeremonyKind::PolicyUpdate
             || request.custody.custody_operation_id != request.update.operation_id
             || request.custody.wallet_id.as_ref() != Some(&request.update.wallet_id)
             || request.custody.key_ref.is_some()
@@ -2908,10 +2906,9 @@ impl SignerEngine {
             signer_key_id: policy_signing_key_id,
             signer_signature: Base64UrlBytes::from_bytes(&[]),
         };
-        let mut message = POLICY_RECEIPT_DOMAIN.to_vec();
-        message.extend_from_slice(&serde_jcs::to_vec(&receipt).map_err(malformed)?);
-        receipt.signer_signature =
-            Base64UrlBytes::from_bytes(&unlocked.sign_policy_message(&message)?);
+        receipt.signer_signature = Base64UrlBytes::from_bytes(
+            &unlocked.sign_policy_message(&receipt.signature_message()?)?,
+        );
         Ok((
             receipt.clone(),
             CeremonyDatabaseEffect::PolicyUpdatePending(Box::new(CeremonyPolicyUpdate {
@@ -3027,7 +3024,7 @@ impl SignerEngine {
             || authorization.validation != request.broker_validation_receipt
             || authorization.ceremony_receipt != request.ceremony_receipt
             || request.ceremony_receipt.ceremony_kind
-                != bloom_triad_protocol::CeremonyKind::PolicyUpdate
+                != bloom_signer_api::CeremonyKind::PolicyUpdate
             || request.ceremony_receipt.custody_operation_id != update.operation_id
         {
             return Err(error(
@@ -3802,12 +3799,14 @@ impl SignerEngine {
             .optional()
             .map_err(storage)?;
         let policy = policy
-            .map(|(snapshot, verifying_key)| {
-                Ok(PolicyBackup {
-                    snapshot: serde_json::from_str(&snapshot).map_err(malformed)?,
-                    policy_verifying_key: Base64UrlBytes::parse(verifying_key)?,
-                })
-            })
+            .map(
+                |(snapshot, verifying_key)| -> Result<PolicyBackup, ProtocolError> {
+                    Ok(PolicyBackup {
+                        snapshot: serde_json::from_str(&snapshot).map_err(malformed)?,
+                        policy_verifying_key: Base64UrlBytes::parse(verifying_key)?,
+                    })
+                },
+            )
             .transpose()?;
         let mut statement = connection
             .prepare(
@@ -4770,7 +4769,7 @@ fn write_clock_state(
     effective_now_ms: u64,
     condition: ClockCondition,
     reading: &bloom_trusted_time::PlatformTimeReading,
-    boot_epoch: &bloom_triad_protocol::BootEpoch,
+    boot_epoch: &bloom_signer_api::BootEpoch,
 ) -> Result<(), ProtocolError> {
     let condition = match condition {
         ClockCondition::Healthy => "HEALTHY",
@@ -5253,7 +5252,7 @@ fn audit_degraded_error() -> ProtocolError {
 }
 
 fn retry_binding_digest(
-    request: &bloom_triad_protocol::UnsignedSignRequest,
+    request: &bloom_signer_api::UnsignedSignRequest,
 ) -> Result<Digest32, ProtocolError> {
     let mut value = serde_json::to_value(request).map_err(malformed)?;
     let object = value.as_object_mut().ok_or_else(|| {
@@ -5446,7 +5445,7 @@ mod clock_tests {
                     monotonic_elapsed_ms: 0,
                     monotonic_anchor_ns: 1,
                 },
-                bloom_triad_protocol::BootEpoch::from_bytes([1; 16]),
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
                 10_000,
                 false,
             )
@@ -5524,7 +5523,7 @@ mod clock_tests {
                     monotonic_elapsed_ms: 0,
                     monotonic_anchor_ns: 1,
                 },
-                bloom_triad_protocol::BootEpoch::from_bytes([1; 16]),
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
                 10_000,
                 false,
             )
@@ -5601,7 +5600,7 @@ mod clock_tests {
                     monotonic_elapsed_ms: 0,
                     monotonic_anchor_ns: 1_000_000,
                 },
-                bloom_triad_protocol::BootEpoch::from_bytes([1; 16]),
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
                 3_600_000,
                 true,
             )
@@ -5615,7 +5614,7 @@ mod clock_tests {
                     monotonic_elapsed_ms: 100,
                     monotonic_anchor_ns: 101_000_000,
                 },
-                bloom_triad_protocol::BootEpoch::from_bytes([1; 16]),
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
                 3_600_000,
                 true,
             )
@@ -5629,7 +5628,7 @@ mod clock_tests {
                     monotonic_elapsed_ms: 100,
                     monotonic_anchor_ns: 201_000_000,
                 },
-                bloom_triad_protocol::BootEpoch::from_bytes([1; 16]),
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
                 3_600_000,
                 true,
             )
@@ -5647,7 +5646,7 @@ mod clock_tests {
                     monotonic_elapsed_ms: 0,
                     monotonic_anchor_ns: 1_000_000,
                 },
-                bloom_triad_protocol::BootEpoch::from_bytes([1; 16]),
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
                 1_000,
                 false,
             )
@@ -5659,7 +5658,7 @@ mod clock_tests {
                     monotonic_elapsed_ms: 125,
                     monotonic_anchor_ns: 126_000_000,
                 },
-                bloom_triad_protocol::BootEpoch::from_bytes([1; 16]),
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
                 1_000,
                 false,
             )
@@ -5673,7 +5672,7 @@ mod clock_tests {
                     monotonic_elapsed_ms: 1,
                     monotonic_anchor_ns: 127_000_000,
                 },
-                bloom_triad_protocol::BootEpoch::from_bytes([1; 16]),
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
                 1_000,
                 false,
             )
@@ -5764,7 +5763,7 @@ mod clock_tests {
                     monotonic_elapsed_ms: 1,
                     monotonic_anchor_ns: 2_000_000,
                 },
-                bloom_triad_protocol::BootEpoch::from_bytes([3; 16]),
+                bloom_signer_api::BootEpoch::from_bytes([3; 16]),
                 3_600_000,
                 false,
             )
@@ -5791,7 +5790,7 @@ mod clock_tests {
                     monotonic_elapsed_ms: 1,
                     monotonic_anchor_ns: 3_000_000,
                 },
-                bloom_triad_protocol::BootEpoch::from_bytes([3; 16]),
+                bloom_signer_api::BootEpoch::from_bytes([3; 16]),
                 1_000,
                 false,
             )
@@ -5842,7 +5841,7 @@ mod clock_tests {
                         monotonic_elapsed_ms: 1,
                         monotonic_anchor_ns: 4_000_000,
                     },
-                    bloom_triad_protocol::BootEpoch::from_bytes([3; 16]),
+                    bloom_signer_api::BootEpoch::from_bytes([3; 16]),
                     1_000,
                     false,
                 )
@@ -5929,9 +5928,9 @@ mod clock_tests {
             .unwrap();
         let status = CeremonyPublicStatus {
             ceremony_id: Digest32::from_bytes([43; 32]),
-            ceremony_kind: bloom_triad_protocol::CeremonyKind::WalletDelete,
+            ceremony_kind: bloom_signer_api::CeremonyKind::WalletDelete,
             operation_id: OperationId::from_bytes([44; 32]),
-            state: bloom_triad_protocol::CeremonyState::Succeeded,
+            state: bloom_signer_api::CeremonyState::Succeeded,
             expires_at_ms: DecimalU64::new(10_000),
             ceremony_url: None,
             receipt_digest: Some(Digest32::from_bytes([45; 32])),

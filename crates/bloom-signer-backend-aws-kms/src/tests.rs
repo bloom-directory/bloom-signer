@@ -1,10 +1,10 @@
 use crate::*;
+use bloom_signer_api::{CryptoSuite, DecimalU64, Digest32, SignatureEncoding, Token};
 use bloom_signer_backend_api::{
     BackendError, BackendInput, BackendSignRequest, SecretBytes, SignerBackend,
     SignerBackendDerivation,
     conformance::{validate_capabilities, validate_signature},
 };
-use bloom_triad_protocol::{CryptoSuite, DecimalU64, Digest32, SignatureEncoding, Token};
 use k256::{
     ecdsa::{Signature, SigningKey, signature::hazmat::PrehashSigner},
     pkcs8::EncodePublicKey,
@@ -168,7 +168,7 @@ fn test_backend(
     AwsKmsSignerBackend::new(config, provider, state_authentication_key())
 }
 
-fn request(key_ref: bloom_triad_protocol::KeyRef) -> BackendSignRequest {
+fn request(key_ref: bloom_signer_api::KeyRef) -> BackendSignRequest {
     BackendSignRequest {
         provider_attempt_id: Digest32::new("22".repeat(32)).unwrap(),
         key_ref,
@@ -284,7 +284,7 @@ fn durable_enrollment_restores_without_provider_reenrollment() {
             .to_public_key_der()
             .unwrap();
     state.payload.enrollments[0].canonical_spki_der =
-        bloom_triad_protocol::Base64UrlBytes::from_bytes(substitute_spki.as_bytes());
+        bloom_signer_api::Base64UrlBytes::from_bytes(substitute_spki.as_bytes());
     state.payload.enrollments[0].public_key_fingerprint =
         Digest32::from_bytes(sha2::Sha256::digest(substitute_spki.as_bytes()).into());
     state.payload.enrollments[0].public_key_address = ethereum_address(substitute_public);

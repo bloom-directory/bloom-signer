@@ -2,9 +2,7 @@
 
 use std::sync::Arc;
 
-use bloom_signer_backend_api::{BackendError, BackendInput, BackendSignRequest};
-use bloom_triad_local_transport::NetworkContainmentGuard;
-use bloom_triad_protocol::{
+use bloom_signer_api::{
     BackendPublicCapability, Base64UrlBytes, BootEpoch, BrokerSignerMethod, BrokerSignerRequest,
     BrokerSignerResponse, BrokerSignerService, ControlRequest, ControlResponse, CryptoInputKind,
     DecimalU64, Digest32, KeyPublic, OperationId, ProtocolError, ProtocolErrorCode,
@@ -13,6 +11,8 @@ use bloom_triad_protocol::{
     SignerCeremonyCompleteResponse, SignerCeremonyPrepareRequest, SignerCeremonyPrepareResponse,
     SignerPreparedApproval, SignerPreparedCustody, SigningResult, Token,
 };
+use bloom_signer_backend_api::{BackendError, BackendInput, BackendSignRequest};
+use bloom_triad_local_transport::NetworkContainmentGuard;
 use k256::pkcs8::DecodePublicKey;
 use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
@@ -63,8 +63,8 @@ fn prepared_custody(
 fn verification_credentials(
     ceremony: &SignerCeremonyService,
     wallet_id: Option<&Token>,
-    options: &bloom_triad_protocol::CeremonyWebAuthnOptions,
-) -> Result<Vec<bloom_triad_protocol::WebAuthnCredential>, ProtocolError> {
+    options: &bloom_signer_api::CeremonyWebAuthnOptions,
+) -> Result<Vec<bloom_signer_api::WebAuthnCredential>, ProtocolError> {
     let Some(wallet_id) = wallet_id else {
         return Ok(Vec::new());
     };
@@ -221,7 +221,7 @@ impl SignerRpcService {
                 let operation_id = OperationId::new(request.id.as_str().to_owned())?;
                 let mut status = self.ceremony.public_status(&operation_id)?;
                 self.ceremony.cancel(&operation_id)?;
-                status.state = bloom_triad_protocol::CeremonyState::Cancelled;
+                status.state = bloom_signer_api::CeremonyState::Cancelled;
                 Ok(Response::CeremonyCancel(status))
             }
             Request::SealedApprovalStatus(request) => Ok(Response::SealedApprovalStatus(
@@ -244,7 +244,7 @@ impl SignerRpcService {
                     .revoke_all(&request.wallet_id, request.operation_id, now_ms)?,
             )),
             Request::RevocationState(request) => Ok(Response::RevocationState(
-                bloom_triad_protocol::RevocationSnapshot {
+                bloom_signer_api::RevocationSnapshot {
                     state: self.engine.revocation_state(&request.wallet_id, now_ms)?,
                     approval_tombstones: self.engine.approval_tombstones(&request.wallet_id)?,
                 },
@@ -403,7 +403,7 @@ impl SignerRpcService {
 
     fn require_network_containment(&self) -> Result<(), ProtocolError> {
         match &self.network_containment {
-            Some(guard) => guard.check(),
+            Some(guard) => Ok(guard.check()?),
             None => Ok(()),
         }
     }
@@ -430,9 +430,9 @@ impl SignerRpcService {
             service_id: Token::new("bloom-signer")?,
             service_version: self.service_version.clone(),
             build_digest: self.build_digest.clone(),
-            protocol_major: bloom_triad_protocol::PROTOCOL_MAJOR,
-            protocol_minor_min: bloom_triad_protocol::PROTOCOL_MINOR_MIN,
-            protocol_minor_max: bloom_triad_protocol::PROTOCOL_MINOR_MAX,
+            protocol_major: bloom_signer_api::SIGNER_API_MAJOR,
+            protocol_minor_min: bloom_signer_api::SIGNER_API_MINOR_MIN,
+            protocol_minor_max: bloom_signer_api::SIGNER_API_MINOR_MAX,
             methods: BrokerSignerMethod::ALL
                 .iter()
                 .map(|method| Token::new(method.as_str()))
@@ -449,7 +449,7 @@ impl SignerRpcService {
 
     async fn describe_key(
         &self,
-        key_ref: &bloom_triad_protocol::KeyRef,
+        key_ref: &bloom_signer_api::KeyRef,
     ) -> Result<KeyPublic, ProtocolError> {
         let description = self
             .engine
@@ -558,7 +558,7 @@ impl SignerRpcService {
                     "backend returned a mismatched signature suite or encoding",
                 ));
             }
-            signatures.push(bloom_triad_protocol::NormalizedSignature {
+            signatures.push(bloom_signer_api::NormalizedSignature {
                 crypto_suite: signature.crypto_suite,
                 bytes: signature.bytes,
             });
@@ -673,13 +673,13 @@ fn provider_attempt_id(
 
 fn signer_receipt_digest(
     request: &SignRequest,
-    signatures: &[bloom_triad_protocol::NormalizedSignature],
+    signatures: &[bloom_signer_api::NormalizedSignature],
 ) -> Result<Digest32, ProtocolError> {
     #[derive(serde::Serialize)]
     struct Receipt<'a> {
         operation_id: &'a OperationId,
         operation_digest: &'a Digest32,
-        signatures: &'a [bloom_triad_protocol::NormalizedSignature],
+        signatures: &'a [bloom_signer_api::NormalizedSignature],
         validation_receipt_digest: &'a Digest32,
     }
     let mut hasher = Sha256::new();
@@ -701,7 +701,7 @@ fn signer_receipt_digest(
 fn ethereum_address(
     description: &bloom_signer_backend_api::KeyDescription,
 ) -> Result<Vec<String>, ProtocolError> {
-    if description.key_ref.key_spec != bloom_triad_protocol::KeySpec::Secp256k1 {
+    if description.key_ref.key_spec != bloom_signer_api::KeySpec::Secp256k1 {
         return Ok(Vec::new());
     }
     let public_key = k256::PublicKey::from_public_key_der(&description.canonical_spki_der.decode())
@@ -718,19 +718,19 @@ fn ethereum_address(
 
 fn signer_ceremony_status(
     status: crate::ceremony::SignerCeremonyStatus,
-) -> bloom_triad_protocol::SignerCeremonyStatus {
+) -> bloom_signer_api::SignerCeremonyStatus {
     match status {
         crate::ceremony::SignerCeremonyStatus::Pending => {
-            bloom_triad_protocol::SignerCeremonyStatus::Pending
+            bloom_signer_api::SignerCeremonyStatus::Pending
         }
         crate::ceremony::SignerCeremonyStatus::CompletedApproval(receipt) => {
-            bloom_triad_protocol::SignerCeremonyStatus::CompletedApproval(receipt)
+            bloom_signer_api::SignerCeremonyStatus::CompletedApproval(receipt)
         }
         crate::ceremony::SignerCeremonyStatus::CompletedCustody(result) => {
-            bloom_triad_protocol::SignerCeremonyStatus::CompletedCustody(result)
+            bloom_signer_api::SignerCeremonyStatus::CompletedCustody(result)
         }
         crate::ceremony::SignerCeremonyStatus::Missing => {
-            bloom_triad_protocol::SignerCeremonyStatus::Missing
+            bloom_signer_api::SignerCeremonyStatus::Missing
         }
     }
 }
@@ -770,13 +770,13 @@ fn now_ms() -> Result<u64, ProtocolError> {
 mod tests {
     use super::*;
     use crate::{custody::WalletCustody, engine::SignerAuditKeys};
-    use bloom_signer_backend_api::{SecretBytes, SignerBackendActivation};
-    use bloom_signer_backend_local::LocalSignerBackend;
-    use bloom_triad_protocol::{
+    use bloom_signer_api::{
         ActivationMode, ApprovalLimits, ApprovalSelector, ApprovalSubject, CryptoSuite, KeyRef,
-        KeySpec, RequestNonce, RevokeRequest, SealedApprovalTerms, SelectorKind,
+        KeySpec, ProtocolVersion, RequestNonce, RevokeRequest, SealedApprovalTerms, SelectorKind,
         SignOperationIdentity, UnsignedSignRequest,
     };
+    use bloom_signer_backend_api::{SecretBytes, SignerBackendActivation};
+    use bloom_signer_backend_local::LocalSignerBackend;
     use ed25519_dalek::{Signer as _, SigningKey};
     use std::collections::BTreeMap;
 
@@ -890,6 +890,75 @@ mod tests {
             broker_key,
             terms,
         )
+    }
+
+    #[tokio::test]
+    async fn signer_service_only_release_preserves_authority_control_and_session_contracts() {
+        let (mut previous, _, _) = fixture().await;
+        let (mut current, _, _) = fixture().await;
+        previous.service_version = "1.0.0".into();
+        previous.build_digest = Digest32::from_bytes([90; 32]);
+        current.service_version = "1.0.1".into();
+        current.build_digest = Digest32::from_bytes([91; 32]);
+
+        let previous_capabilities = previous.capabilities().unwrap();
+        let current_capabilities = current.capabilities().unwrap();
+        assert_ne!(
+            previous_capabilities.service_version,
+            current_capabilities.service_version
+        );
+        assert_ne!(
+            previous_capabilities.build_digest,
+            current_capabilities.build_digest
+        );
+        assert_eq!(
+            (
+                previous_capabilities.protocol_major,
+                previous_capabilities.protocol_minor_min,
+                previous_capabilities.protocol_minor_max,
+            ),
+            (
+                bloom_signer_api::SIGNER_API_MAJOR,
+                bloom_signer_api::SIGNER_API_MINOR_MIN,
+                bloom_signer_api::SIGNER_API_MINOR_MAX,
+            )
+        );
+        assert_eq!(
+            (
+                current_capabilities.protocol_major,
+                current_capabilities.protocol_minor_min,
+                current_capabilities.protocol_minor_max,
+            ),
+            (
+                bloom_signer_api::SIGNER_API_MAJOR,
+                bloom_signer_api::SIGNER_API_MINOR_MIN,
+                bloom_signer_api::SIGNER_API_MINOR_MAX,
+            )
+        );
+        assert_eq!(previous_capabilities.methods, current_capabilities.methods);
+        assert_eq!(previous_capabilities.schemas, current_capabilities.schemas);
+        assert_eq!(
+            previous_capabilities.backends,
+            current_capabilities.backends
+        );
+        assert_eq!(
+            previous_capabilities.assurance_verifiers,
+            current_capabilities.assurance_verifiers
+        );
+        assert_eq!(
+            previous_capabilities.frame_max_bytes,
+            current_capabilities.frame_max_bytes
+        );
+        assert!(bloom_signer_api::SIGNER_API_RANGE.contains(bloom_signer_api::SIGNER_API_CURRENT));
+        assert!(bloom_signer_api::SIGNER_CONTROL_RANGE.contains(ProtocolVersion::new(1, 0)));
+        assert!(
+            bloom_signer_api::SIGNER_CONTROL_RANGE
+                .contains(bloom_signer_api::SIGNER_CONTROL_CURRENT)
+        );
+        assert!(
+            bloom_service_activation::SESSION_PROTOCOL_RANGE
+                .contains(bloom_service_activation::SESSION_PROTOCOL_CURRENT)
+        );
     }
 
     fn sign_request(
@@ -1192,7 +1261,7 @@ mod tests {
         );
         let readiness = match BrokerSignerService::dispatch(
             &service,
-            BrokerSignerRequest::SignerReadiness(bloom_triad_protocol::Empty {}),
+            BrokerSignerRequest::SignerReadiness(bloom_signer_api::Empty {}),
         )
         .await
         .unwrap()
@@ -1220,7 +1289,7 @@ mod tests {
         assert!(matches!(
             RevocationControlService::dispatch(
                 &service,
-                ControlRequest::Status(bloom_triad_protocol::WalletRequest {
+                ControlRequest::Status(bloom_signer_api::WalletRequest {
                     wallet_id: terms.wallet_id.clone(),
                 }),
             )
@@ -1237,7 +1306,7 @@ mod tests {
 
         let readiness = BrokerSignerService::dispatch(
             &service,
-            BrokerSignerRequest::SignerReadiness(bloom_triad_protocol::Empty {}),
+            BrokerSignerRequest::SignerReadiness(bloom_signer_api::Empty {}),
         )
         .await
         .unwrap();
@@ -1255,7 +1324,7 @@ mod tests {
         assert!(matches!(
             BrokerSignerService::dispatch(
                 &service,
-                BrokerSignerRequest::SignerCapabilities(bloom_triad_protocol::Empty {}),
+                BrokerSignerRequest::SignerCapabilities(bloom_signer_api::Empty {}),
             )
             .await
             .unwrap(),
@@ -1264,7 +1333,7 @@ mod tests {
         assert!(matches!(
             BrokerSignerService::dispatch(
                 &service,
-                BrokerSignerRequest::KeyListPublic(bloom_triad_protocol::WalletRequest {
+                BrokerSignerRequest::KeyListPublic(bloom_signer_api::WalletRequest {
                     wallet_id: terms.wallet_id.clone(),
                 }),
             )
@@ -1275,7 +1344,7 @@ mod tests {
         assert!(matches!(
             BrokerSignerService::dispatch(
                 &service,
-                BrokerSignerRequest::SealedApprovalStatus(bloom_triad_protocol::IdRequest {
+                BrokerSignerRequest::SealedApprovalStatus(bloom_signer_api::IdRequest {
                     id: terms.approval_id().unwrap(),
                 }),
             )
@@ -1286,7 +1355,7 @@ mod tests {
         assert!(matches!(
             RevocationControlService::dispatch(
                 &service,
-                ControlRequest::Status(bloom_triad_protocol::WalletRequest {
+                ControlRequest::Status(bloom_signer_api::WalletRequest {
                     wallet_id: terms.wallet_id.clone(),
                 }),
             )
@@ -1337,7 +1406,7 @@ mod tests {
                 .approval_public_status(&approval_id, now_ms().unwrap())
                 .unwrap()
                 .state,
-            bloom_triad_protocol::ApprovalLifecycleState::Revoked
+            bloom_signer_api::ApprovalLifecycleState::Revoked
         );
     }
 }

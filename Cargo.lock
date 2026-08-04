@@ -496,8 +496,9 @@ dependencies = [
 [[package]]
 name = "bloom-audit-checkpoint"
 version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom.git?rev=c05ac0e917b36585fe3051d715a274e1fbc261cc#c05ac0e917b36585fe3051d715a274e1fbc261cc"
 dependencies = [
- "bloom-triad-protocol",
+ "bloom-rpc-wire",
  "ed25519-dalek",
  "hex",
  "serde",
@@ -508,39 +509,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-broker-api"
-version = "0.1.0"
+name = "bloom-rpc-wire"
+version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom.git?rev=c05ac0e917b36585fe3051d715a274e1fbc261cc#c05ac0e917b36585fe3051d715a274e1fbc261cc"
 dependencies = [
- "bloom-triad-protocol",
-]
-
-[[package]]
-name = "bloom-broker-debug-driver"
-version = "0.1.0"
-dependencies = [
- "bip32",
- "bloom-broker-api",
- "chacha20poly1305",
- "ciborium",
+ "base64 0.22.1",
+ "ed25519-dalek",
  "hex",
- "hkdf",
- "hpke",
- "k256",
- "memchr",
- "p256",
- "rand",
- "rusqlite",
  "serde",
  "serde_jcs",
  "serde_json",
  "sha2",
- "zeroize",
+ "thiserror",
 ]
 
 [[package]]
 name = "bloom-service-activation"
 version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom.git?rev=c05ac0e917b36585fe3051d715a274e1fbc261cc#c05ac0e917b36585fe3051d715a274e1fbc261cc"
 dependencies = [
+ "bloom-rpc-wire",
  "libc",
  "thiserror",
 ]
@@ -550,21 +538,22 @@ name = "bloom-signer"
 version = "0.1.0"
 dependencies = [
  "bloom-audit-checkpoint",
- "bloom-broker-debug-driver",
  "bloom-service-activation",
+ "bloom-signer-api",
  "bloom-signer-backend-api",
  "bloom-signer-backend-aws-kms",
  "bloom-signer-backend-local",
  "bloom-triad-local-transport",
- "bloom-triad-protocol",
  "bloom-trusted-time",
  "chacha20poly1305",
+ "ciborium",
  "ed25519-dalek",
  "futures",
  "hex",
  "hkdf",
  "hpke",
  "k256",
+ "p256",
  "parking_lot",
  "rand",
  "rusqlite",
@@ -579,10 +568,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-signer-api"
+version = "0.1.0"
+dependencies = [
+ "bloom-rpc-wire",
+ "ed25519-dalek",
+ "hex",
+ "rand",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "bloom-signer-backend-api"
 version = "0.1.0"
 dependencies = [
- "bloom-triad-protocol",
+ "bloom-signer-api",
  "ed25519-dalek",
  "futures",
  "hex",
@@ -607,8 +611,8 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "aws-types",
+ "bloom-signer-api",
  "bloom-signer-backend-api",
- "bloom-triad-protocol",
  "futures",
  "hex",
  "hmac",
@@ -630,8 +634,8 @@ name = "bloom-signer-backend-local"
 version = "0.1.0"
 dependencies = [
  "bip32",
+ "bloom-signer-api",
  "bloom-signer-backend-api",
- "bloom-triad-protocol",
  "chacha20poly1305",
  "ed25519-dalek",
  "futures",
@@ -650,8 +654,9 @@ dependencies = [
 [[package]]
 name = "bloom-triad-local-transport"
 version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom.git?rev=c05ac0e917b36585fe3051d715a274e1fbc261cc#c05ac0e917b36585fe3051d715a274e1fbc261cc"
 dependencies = [
- "bloom-triad-protocol",
+ "bloom-rpc-wire",
  "bloom-trusted-time",
  "ed25519-dalek",
  "hex",
@@ -665,24 +670,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-triad-protocol"
-version = "0.1.3"
-dependencies = [
- "base64 0.22.1",
- "ciborium",
- "ed25519-dalek",
- "hex",
- "p256",
- "serde",
- "serde_jcs",
- "serde_json",
- "sha2",
- "thiserror",
-]
-
-[[package]]
 name = "bloom-trusted-time"
 version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom.git?rev=c05ac0e917b36585fe3051d715a274e1fbc261cc#c05ac0e917b36585fe3051d715a274e1fbc261cc"
 dependencies = [
  "libc",
  "thiserror",

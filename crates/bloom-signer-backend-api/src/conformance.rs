@@ -3,7 +3,7 @@
 use crate::{
     BackendCapabilities, BackendError, BackendSignRequest, BackendSignature, SignerBackend,
 };
-use bloom_triad_protocol::{CryptoInputKind, SignatureEncoding};
+use bloom_signer_api::{CryptoInputKind, SignatureEncoding};
 use std::collections::HashSet;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,7 +130,7 @@ pub fn expected_input_kind(capabilities: &BackendCapabilities) -> Vec<CryptoInpu
 mod tests {
     use super::*;
     use crate::{BackendFuture, BackendInput, KeyDescription, ProviderIdempotency};
-    use bloom_triad_protocol::{
+    use bloom_signer_api::{
         Base64UrlBytes, CryptoSuite, DecimalU64, Digest32, KeyRef, KeySpec, Token,
     };
 

@@ -6,7 +6,7 @@
 
 pub mod conformance;
 
-use bloom_triad_protocol::{
+use bloom_signer_api::{
     Base64UrlBytes, CryptoInputKind, CryptoSuite, DecimalU64, Digest32, KeyRef, KeySpec,
     SignatureEncoding, Token,
 };

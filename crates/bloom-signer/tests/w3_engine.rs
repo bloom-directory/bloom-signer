@@ -5,9 +5,9 @@ use bloom_signer::engine::{
     SignerBackupSet, SignerEngine, SignerOperationEffect, WalletDerivationStatus,
 };
 use bloom_signer::registry::{BackendRegistry, CompiledBackend};
+use bloom_signer_api::*;
 use bloom_signer_backend_api::{SecretBytes, SignerBackendActivation};
 use bloom_signer_backend_local::{DerivationAuthority, DerivationGrant, LocalSignerBackend};
-use bloom_triad_protocol::*;
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
 use std::{collections::BTreeMap, sync::Arc};

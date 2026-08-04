@@ -24,17 +24,18 @@ use bloom_signer::{
     registry::CompiledBackend,
     service::SignerRpcService,
 };
+use bloom_signer_api::{
+    BrokerSignerRequest, BrokerSignerResponse, BrokerSignerService, ControlRequest,
+    ControlResponse, Digest32, ProtocolError, ProtocolErrorCode, RevocationControlService,
+    ServiceFuture, SignedJournalHead, Token, is_read_only_method,
+};
 #[cfg(feature = "aws-kms")]
 use bloom_signer_backend_api::SecretBytes;
 #[cfg(feature = "triad-dev-harness")]
 use bloom_triad_local_transport::load_developer_identity_and_manifest;
 use bloom_triad_local_transport::{
-    BrokerSignerJournalExchange, EndpointQuota, LocalIdentity, NetworkContainmentGuard, PeerAcl,
+    EndpointQuota, JournalExchange, LocalIdentity, NetworkContainmentGuard, PeerAcl,
     load_identity_and_manifest,
-};
-use bloom_triad_protocol::{
-    ControlRequest, ControlResponse, Digest32, ProtocolError, ProtocolErrorCode,
-    RevocationControlService, ServiceFuture, SignedJournalHead, Token,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Deserialize;
@@ -504,16 +505,23 @@ async fn serve_rpc(
         let journals = journals.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ =
-                bloom_triad_local_transport::dispatch_broker_signer_connection_with_journal_heads(
-                    &mut stream,
-                    &identity,
-                    &broker_acl,
-                    &quota,
-                    service.as_ref(),
-                    journals.as_ref(),
-                )
-                .await;
+            let _ = bloom_triad_local_transport::dispatch_connection_with_journal_heads::<
+                BrokerSignerRequest,
+                BrokerSignerResponse,
+                ProtocolError,
+                _,
+                _,
+            >(
+                &mut stream,
+                &identity,
+                &broker_acl,
+                bloom_signer_api::SIGNER_API_CURRENT,
+                bloom_signer_api::SIGNER_API_RANGE,
+                &quota,
+                journals.as_ref(),
+                |request| BrokerSignerService::dispatch(service.as_ref(), request),
+            )
+            .await;
         });
     }
     drain_connections(connections, maximum_connections, "RPC").await
@@ -621,15 +629,15 @@ impl CheckpointSink for UnavailableCheckpointSink {
     }
 }
 
-impl BrokerSignerJournalExchange for SignerJournalExchange {
+impl JournalExchange<ProtocolError> for SignerJournalExchange {
     fn checkpoint_request_head(
         &self,
         method: &Token,
-        peer_head: &bloom_triad_protocol::SignedJournalHead,
+        peer_head: &bloom_signer_api::SignedJournalHead,
     ) -> Result<(), ProtocolError> {
         if let Err(error) = self.checkpoints.append_peer_head(peer_head) {
             self.engine.latch_audit_degraded();
-            if !bloom_triad_local_transport::is_read_only_method(method) {
+            if !is_read_only_method(method) {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::ServiceUnavailable,
                     format!("persist Broker audit checkpoint before dispatching mutation: {error}"),
@@ -640,7 +648,7 @@ impl BrokerSignerJournalExchange for SignerJournalExchange {
     }
 
     fn local_journal_head(&self, method: &Token) -> Result<(u64, Digest32), ProtocolError> {
-        self.response_journal_head(bloom_triad_local_transport::is_read_only_method(method))
+        self.response_journal_head(is_read_only_method(method))
     }
 }
 
@@ -671,12 +679,20 @@ async fn serve_control(
         let service = service.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = bloom_triad_local_transport::dispatch_control_connection(
+            let _ = bloom_triad_local_transport::dispatch_connection::<
+                ControlRequest,
+                ControlResponse,
+                ProtocolError,
+                _,
+                _,
+            >(
                 &mut stream,
                 &identity,
                 &revoke_client_acl,
+                bloom_signer_api::SIGNER_CONTROL_CURRENT,
+                bloom_signer_api::SIGNER_CONTROL_RANGE,
                 &quota,
-                service.as_ref(),
+                |request| RevocationControlService::dispatch(service.as_ref(), request),
             )
             .await;
         });
@@ -716,6 +732,8 @@ async fn connect_authenticated_session(
                     &mut stream,
                     identity,
                     session_acl,
+                    bloom_service_activation::SESSION_PROTOCOL_CURRENT,
+                    bloom_service_activation::SESSION_PROTOCOL_RANGE,
                 )
                 .await?;
                 return Ok(stream);
@@ -984,7 +1002,10 @@ fn invalid_key(message: &str) -> ProtocolError {
 mod tests {
     use super::*;
     use bloom_audit_checkpoint::{AppendOutcome, CheckpointError};
-    use bloom_triad_protocol::{Base64UrlBytes, DecimalU64, SignedJournalHead};
+    use bloom_signer_api::{
+        Base64UrlBytes, BrokerSignerRequest, BrokerSignerResponse, ControlRequest, ControlResponse,
+        DecimalU64, Empty, ProtocolVersion, ProtocolVersionRange, SignedJournalHead, WalletRequest,
+    };
     use ed25519_dalek::Signer as _;
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -993,6 +1014,28 @@ mod tests {
     struct FailingSelfCheckpointSink;
 
     struct RetainedRollbackSink(SignedJournalHead);
+
+    struct TrackingJournalExchange {
+        touched: std::sync::atomic::AtomicBool,
+    }
+
+    impl bloom_triad_local_transport::JournalExchange<ProtocolError> for TrackingJournalExchange {
+        fn checkpoint_request_head(
+            &self,
+            _method: &Token,
+            _peer_head: &SignedJournalHead,
+        ) -> Result<(), ProtocolError> {
+            self.touched
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn local_journal_head(&self, _method: &Token) -> Result<(u64, Digest32), ProtocolError> {
+            self.touched
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok((0, Digest32::from_bytes([0; 32])))
+        }
+    }
 
     impl CheckpointSink for FailingCheckpointSink {
         fn append_peer_head(
@@ -1069,10 +1112,174 @@ mod tests {
     fn signer_identity() -> LocalIdentity {
         LocalIdentity {
             service_id: Token::new("bloom-signer").unwrap(),
-            boot_epoch: bloom_triad_protocol::BootEpoch::new("01".repeat(16)).unwrap(),
+            boot_epoch: bloom_signer_api::BootEpoch::new("01".repeat(16)).unwrap(),
             application_key_id: Token::new("signer-app").unwrap(),
             signing_key: Arc::new(SigningKey::from_bytes(&[9; 32])),
         }
+    }
+
+    fn peer_acl(identity: &LocalIdentity, effective_uid: u32) -> PeerAcl {
+        PeerAcl {
+            effective_uid,
+            service_id: identity.service_id.clone(),
+            boot_epoch: identity.boot_epoch.clone(),
+            application_key_id: identity.application_key_id.clone(),
+            application_public_key: identity.signing_key.verifying_key().to_bytes(),
+        }
+    }
+
+    #[tokio::test]
+    async fn signer_rejects_authority_protocol_1_0_before_dispatch_or_durable_work() {
+        let signer = signer_identity();
+        let broker = LocalIdentity {
+            service_id: Token::new("bloom-broker").unwrap(),
+            boot_epoch: bloom_signer_api::BootEpoch::new("02".repeat(16)).unwrap(),
+            application_key_id: Token::new("broker-app").unwrap(),
+            signing_key: Arc::new(SigningKey::from_bytes(&[7; 32])),
+        };
+        let temporary = tempfile::tempdir().unwrap();
+        let effective_uid = fs::metadata(temporary.path()).unwrap().uid();
+        let signer_acl = peer_acl(&signer, effective_uid);
+        let broker_acl = peer_acl(&broker, effective_uid);
+        let quota = EndpointQuota::new(1, 10, 1_000, 10, 1_000).unwrap();
+        let journals = TrackingJournalExchange {
+            touched: std::sync::atomic::AtomicBool::new(false),
+        };
+        let dispatched = std::sync::atomic::AtomicBool::new(false);
+        let (mut server_stream, mut client_stream) = UnixStream::pair().unwrap();
+        let rejected_version = ProtocolVersion::new(bloom_signer_api::SIGNER_API_MAJOR, 0);
+        let legacy_range = ProtocolVersionRange::new(bloom_signer_api::SIGNER_API_MAJOR, 0, 1);
+        let broker_head = bloom_triad_local_transport::sign_journal_head(
+            &broker,
+            0,
+            Digest32::from_bytes([0; 32]),
+        );
+
+        let server = async {
+            let result = bloom_triad_local_transport::dispatch_connection_with_journal_heads::<
+                BrokerSignerRequest,
+                BrokerSignerResponse,
+                ProtocolError,
+                _,
+                _,
+            >(
+                &mut server_stream,
+                &signer,
+                &broker_acl,
+                bloom_signer_api::SIGNER_API_CURRENT,
+                bloom_signer_api::SIGNER_API_RANGE,
+                &quota,
+                &journals,
+                |_request| async {
+                    dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Err(ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "dispatch must not run",
+                    ))
+                },
+            )
+            .await;
+            drop(server_stream);
+            result
+        };
+        let client = async {
+            bloom_triad_local_transport::authenticate_client(
+                &mut client_stream,
+                &broker,
+                &signer_acl,
+                bloom_signer_api::SIGNER_API_CURRENT,
+                legacy_range,
+            )
+            .await?;
+            let sent_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let request = bloom_triad_local_transport::sign_request_with_journal_head(
+                &broker,
+                signer.service_id.clone(),
+                rejected_version,
+                legacy_range,
+                bloom_signer_api::OperationId::from_bytes([3; 32]),
+                BrokerSignerRequest::SignerReadiness(Empty::default()),
+                sent_at_ms,
+                sent_at_ms + 1_000,
+                broker_head,
+            )?;
+            let result =
+                bloom_triad_local_transport::write_frame(&mut client_stream, &request).await;
+            drop(client_stream);
+            result
+        };
+        let (server_result, client_result) = tokio::join!(server, client);
+
+        assert_eq!(
+            server_result.unwrap_err().code,
+            ProtocolErrorCode::UnsupportedVersion
+        );
+        client_result.unwrap();
+        assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!journals.touched.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn signer_control_endpoint_accepts_protocol_1_0_and_dispatches() {
+        let signer = signer_identity();
+        let control_client = LocalIdentity {
+            service_id: Token::new("bloom-revoke-client").unwrap(),
+            boot_epoch: bloom_signer_api::BootEpoch::new("03".repeat(16)).unwrap(),
+            application_key_id: Token::new("revoke-client-app").unwrap(),
+            signing_key: Arc::new(SigningKey::from_bytes(&[8; 32])),
+        };
+        let temporary = tempfile::tempdir().unwrap();
+        let effective_uid = fs::metadata(temporary.path()).unwrap().uid();
+        let signer_acl = peer_acl(&signer, effective_uid);
+        let control_acl = peer_acl(&control_client, effective_uid);
+        let quota = EndpointQuota::new(1, 10, 1_000, 10, 1_000).unwrap();
+        let dispatched = std::sync::atomic::AtomicBool::new(false);
+        let (mut server_stream, mut client_stream) = UnixStream::pair().unwrap();
+
+        let server = bloom_triad_local_transport::dispatch_connection::<
+            ControlRequest,
+            ControlResponse,
+            ProtocolError,
+            _,
+            _,
+        >(
+            &mut server_stream,
+            &signer,
+            &control_acl,
+            bloom_signer_api::SIGNER_CONTROL_CURRENT,
+            bloom_signer_api::SIGNER_CONTROL_RANGE,
+            &quota,
+            |_request| async {
+                dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "accepted test request",
+                ))
+            },
+        );
+        let client =
+            bloom_triad_local_transport::call::<ControlRequest, ControlResponse, ProtocolError>(
+                &mut client_stream,
+                &control_client,
+                &signer_acl,
+                ProtocolVersion::new(1, 0),
+                bloom_signer_api::SIGNER_CONTROL_RANGE,
+                ControlRequest::Status(WalletRequest {
+                    wallet_id: Token::new("wallet").unwrap(),
+                }),
+                1_000,
+            );
+        let (server_result, client_result) = tokio::join!(server, client);
+
+        server_result.unwrap();
+        assert_eq!(
+            client_result.unwrap_err().code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
+        assert!(dispatched.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

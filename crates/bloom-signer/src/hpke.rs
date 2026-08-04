@@ -1,5 +1,5 @@
+use bloom_signer_api::{Base64UrlBytes, HpkeEnvelope, ProtocolError, ProtocolErrorCode};
 use bloom_signer_backend_api::SecretBytes;
-use bloom_triad_protocol::{Base64UrlBytes, HpkeEnvelope, ProtocolError, ProtocolErrorCode};
 use hpke::{
     Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable, aead::ChaCha20Poly1305,
     kdf::HkdfSha256, kem::X25519HkdfSha256, setup_receiver, setup_sender,
