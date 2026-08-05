@@ -16,6 +16,7 @@ use bloom_audit_checkpoint::{
     AppendOutcome, AuthorityEdgeHistory, CheckpointError, CheckpointSink, CheckpointStore,
     PinnedAuditKey,
 };
+use bloom_platform_containment::NetworkContainmentGuard;
 use bloom_signer::{
     ceremony::SignerCeremonyService,
     clock::SignerClock,
@@ -34,8 +35,7 @@ use bloom_signer_backend_api::SecretBytes;
 #[cfg(feature = "triad-dev-harness")]
 use bloom_triad_local_transport::load_developer_identity_and_manifest;
 use bloom_triad_local_transport::{
-    EndpointQuota, JournalExchange, LocalIdentity, NetworkContainmentGuard, PeerAcl,
-    load_identity_and_manifest,
+    EndpointQuota, JournalExchange, LocalIdentity, PeerAcl, load_identity_and_manifest,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Deserialize;

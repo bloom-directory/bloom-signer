@@ -58,6 +58,7 @@ fn production_signer_dependency_graph_has_no_machine_broker_or_debug_driver() {
     let allowed = BTreeSet::from_iter(
         [
             "bloom-audit-checkpoint",
+            "bloom-platform-containment",
             "bloom-rpc-wire",
             "bloom-service-activation",
             "bloom-signer",

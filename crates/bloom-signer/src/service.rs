@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use bloom_platform_containment::NetworkContainmentGuard;
 use bloom_signer_api::{
     BackendPublicCapability, Base64UrlBytes, BootEpoch, BrokerSignerMethod, BrokerSignerRequest,
     BrokerSignerResponse, BrokerSignerService, ControlRequest, ControlResponse, CryptoInputKind,
@@ -12,7 +13,6 @@ use bloom_signer_api::{
     SignerPreparedApproval, SignerPreparedCustody, SigningResult, Token,
 };
 use bloom_signer_backend_api::{BackendError, BackendInput, BackendSignRequest};
-use bloom_triad_local_transport::NetworkContainmentGuard;
 use k256::pkcs8::DecodePublicKey;
 use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
