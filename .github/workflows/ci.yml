@@ -16,6 +16,12 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install Rust toolchain
         run: rustup show
+      - name: Assert Bloom product repo is absent
+        run: |
+          if grep -Fq 'source = "git+https://github.com/bloom-directory/bloom.git' Cargo.lock; then
+            echo 'Cargo.lock must not resolve packages from the Bloom product repository' >&2
+            exit 1
+          fi
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run clippy
