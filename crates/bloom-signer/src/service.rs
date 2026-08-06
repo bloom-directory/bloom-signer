@@ -13,6 +13,7 @@ use bloom_signer_api::{
     SignerPreparedApproval, SignerPreparedCustody, SigningResult, Token,
 };
 use bloom_signer_backend_api::{BackendError, BackendInput, BackendSignRequest};
+use k256::elliptic_curve::sec1::ToEncodedPoint as _;
 use k256::pkcs8::DecodePublicKey;
 use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
@@ -708,8 +709,8 @@ fn ethereum_address(
                 "secp256k1 backend returned invalid canonical SPKI",
             )
         })?;
-    let point = public_key.to_sec1_bytes();
-    let digest = Keccak256::digest(&point[1..]);
+    let point = public_key.to_encoded_point(false);
+    let digest = Keccak256::digest(&point.as_bytes()[1..]);
     Ok(vec![format!("0x{}", hex::encode(&digest[12..]))])
 }
 
@@ -780,7 +781,7 @@ mod tests {
         KeySpec, ProtocolVersion, RequestNonce, RevokeRequest, SealedApprovalTerms, SelectorKind,
         SignOperationIdentity, UnsignedSignRequest,
     };
-    use bloom_signer_backend_api::{SecretBytes, SignerBackendActivation};
+    use bloom_signer_backend_api::{SecretBytes, SignerBackend, SignerBackendActivation};
     use bloom_signer_backend_local::LocalSignerBackend;
     use ed25519_dalek::{Signer as _, SigningKey};
     use std::collections::BTreeMap;
@@ -792,6 +793,32 @@ mod tests {
         return "macos-managed-timed";
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         panic!("Signer service tests require a reviewed trusted-time platform");
+    }
+
+    #[tokio::test]
+    async fn ethereum_address_uses_the_uncompressed_sec1_public_key() {
+        let mut private_key = vec![0_u8; 32];
+        private_key[31] = 1;
+        let activation_secret = vec![9_u8; 32];
+        let backend = LocalSignerBackend::provision_imported_secp256k1(
+            Token::new("address-vector").unwrap(),
+            Token::new("root").unwrap(),
+            SecretBytes::new(private_key),
+            SecretBytes::new(activation_secret.clone()),
+            SigningKey::from_bytes(&[5; 32]).verifying_key(),
+        )
+        .unwrap();
+        let key_ref = backend.root_key_ref().unwrap();
+        backend
+            .activate(&key_ref, SecretBytes::new(activation_secret))
+            .await
+            .unwrap();
+        let description = backend.describe_key(&key_ref).await.unwrap();
+
+        assert_eq!(
+            ethereum_address(&description).unwrap(),
+            vec!["0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"]
+        );
     }
 
     async fn fixture() -> (SignerRpcService, SigningKey, SealedApprovalTerms) {
