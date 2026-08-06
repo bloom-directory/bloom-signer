@@ -35,10 +35,12 @@ thiserror = "2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 futures = "0.3"
 bip32 = { version = "0.5", features = ["secp256k1"] }
+blake3 = "1"
 chacha20poly1305 = "0.10"
 ciborium = "0.2"
 ed25519-dalek = "2"
 hex = "0.4"
+libc = "0.2"
 hpke = { version = "0.11", features = ["x25519"] }
 hkdf = "0.12"
 hmac = "0.12"

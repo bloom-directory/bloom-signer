@@ -267,6 +267,50 @@ impl SignerActivationReceipt {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct LegacyPasskeyMigrationPublic {
+    pub schema: Token,
+    pub wallet_name: Token,
+    pub address: String,
+    pub public_key_fingerprint: Digest32,
+    pub credential_id_fingerprint: Digest32,
+    pub legacy_format_version: u8,
+    pub bundle_digest: Digest32,
+    pub policy_mode: Token,
+}
+
+impl LegacyPasskeyMigrationPublic {
+    pub fn terms_digest(&self, operation_id: &OperationId) -> Result<Digest32, ProtocolError> {
+        #[derive(Serialize)]
+        struct Terms<'a> {
+            schema: &'a Token,
+            operation_id: &'a OperationId,
+            wallet_name: &'a Token,
+            address: &'a str,
+            public_key_fingerprint: &'a Digest32,
+            credential_id_fingerprint: &'a Digest32,
+            legacy_format_version: u8,
+            bundle_digest: &'a Digest32,
+            policy_mode: &'a Token,
+        }
+        digest_canonical(
+            serde_jcs::to_vec(&Terms {
+                schema: &self.schema,
+                operation_id,
+                wallet_name: &self.wallet_name,
+                address: &self.address,
+                public_key_fingerprint: &self.public_key_fingerprint,
+                credential_id_fingerprint: &self.credential_id_fingerprint,
+                legacy_format_version: self.legacy_format_version,
+                bundle_digest: &self.bundle_digest,
+                policy_mode: &self.policy_mode,
+            })
+            .map_err(canonical_error)?,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustodyPrepareRequest {
     pub ceremony_kind: CeremonyKind,
     pub custody_operation_id: OperationId,
@@ -277,9 +321,39 @@ pub struct CustodyPrepareRequest {
     pub browser_output_recipient_key: Option<Base64UrlBytes>,
     #[serde(default)]
     pub petal_key_scope: Option<PetalKeyScope>,
+    #[serde(default)]
+    pub legacy_passkey_migration: Option<LegacyPasskeyMigrationPublic>,
 }
 
 impl CustodyPrepareRequest {
+    pub fn validate_legacy_passkey_migration_binding(&self) -> Result<(), ProtocolError> {
+        let Some(migration) = &self.legacy_passkey_migration else {
+            if self.expected_input_class.as_str() == "legacy_passkey_v1_prf" {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::MalformedFrame,
+                    "legacy passkey input class requires public migration terms",
+                ));
+            }
+            return Ok(());
+        };
+        if self.ceremony_kind != CeremonyKind::WalletImport
+            || self.expected_input_class.as_str() != "legacy_passkey_v1_prf"
+            || self.wallet_id.is_some()
+            || self.key_ref.is_some()
+            || self.petal_key_scope.is_some()
+            || migration.schema.as_str() != "bloom.legacy_passkey_migration_receipt.v1"
+            || migration.policy_mode.as_str() != "restrictive_current_policy"
+            || migration.legacy_format_version != 1
+            || self.exact_terms_digest != migration.terms_digest(&self.custody_operation_id)?
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::OperationIdConflict,
+                "legacy passkey migration terms do not match the custody request",
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate the full Petal scope carried by the existing key-derivation
     /// surface. Broker and Signer both call this before accepting the scope.
     pub fn validate_petal_key_scope_binding(&self) -> Result<(), ProtocolError> {
@@ -708,6 +782,7 @@ mod tests {
             expected_input_class: Token::new("petal-key-scope-v1").unwrap(),
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope),
+            legacy_passkey_migration: None,
         }
     }
 

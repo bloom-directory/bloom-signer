@@ -21,6 +21,7 @@ use bloom_signer::{
     ceremony::SignerCeremonyService,
     clock::SignerClock,
     engine::{SignerAuditKeys, SignerEngine},
+    legacy_passkey::LegacyMigrationStore,
     registry::BackendRegistry,
     registry::CompiledBackend,
     service::SignerRpcService,
@@ -265,11 +266,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         previous_audit_signing_key,
         registry,
     )?);
-    let ceremony = Arc::new(SignerCeremonyService::new(
-        engine.clone(),
-        Token::new(config.ceremony_key_id.clone())?,
-        ceremony_signing_key,
+    let migration_root = config
+        .database_path
+        .parent()
+        .ok_or("Signer database path has no parent directory")?
+        .join("legacy-passkey-migrations");
+    let migration_store = Arc::new(LegacyMigrationStore::create_for_current_process(
+        migration_root,
+        signer_effective_uid,
     )?);
+    let ceremony = Arc::new(
+        SignerCeremonyService::new(
+            engine.clone(),
+            Token::new(config.ceremony_key_id.clone())?,
+            ceremony_signing_key,
+        )?
+        .with_legacy_migrations(migration_store),
+    );
     let clock = Arc::new(SignerClock::new(
         engine.clone(),
         &trusted_time_source,

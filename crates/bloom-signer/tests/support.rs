@@ -38,6 +38,35 @@ impl VirtualAuthenticator {
         }
     }
 
+    pub fn generate_with_user_handle(user_handle: &[u8]) -> Self {
+        let mut authenticator = Self::generate();
+        authenticator.user_handle = Base64UrlBytes::from_bytes(user_handle);
+        authenticator
+    }
+
+    pub fn legacy_passkey_json(&self, sign_count: u32) -> serde_json::Value {
+        let point = self.signing_key.verifying_key().to_encoded_point(false);
+        serde_json::json!({
+            "cred": {
+                "cred_id": self.credential_id,
+                "cred": {"type_": "ES256", "key": {"EC_EC2": {
+                    "curve": "SECP256R1",
+                    "x": Base64UrlBytes::from_bytes(point.x().expect("P-256 x coordinate")),
+                    "y": Base64UrlBytes::from_bytes(point.y().expect("P-256 y coordinate"))
+                }}},
+                "counter": sign_count,
+                "transports": null,
+                "user_verified": true,
+                "backup_eligible": true,
+                "backup_state": true,
+                "registration_policy": null,
+                "extensions": null,
+                "attestation": null,
+                "attestation_format": null
+            }
+        })
+    }
+
     pub fn credential(&self, sign_count: u32) -> WebAuthnCredential {
         WebAuthnCredential {
             credential_id: self.credential_id.clone(),

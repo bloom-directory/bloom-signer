@@ -257,6 +257,18 @@ fn canonical_cbor(value: &Value) -> Result<Vec<u8>, ProtocolError> {
     Ok(bytes)
 }
 
+pub(crate) fn es256_cose_public_key(x: &[u8], y: &[u8]) -> Result<Base64UrlBytes, ProtocolError> {
+    let value = Value::Map(vec![
+        (Value::Integer(1.into()), Value::Integer(2.into())),
+        (Value::Integer(3.into()), Value::Integer((-7).into())),
+        (Value::Integer((-1).into()), Value::Integer(1.into())),
+        (Value::Integer((-2).into()), Value::Bytes(x.to_vec())),
+        (Value::Integer((-3).into()), Value::Bytes(y.to_vec())),
+    ]);
+    validate_cose_value(&value)?;
+    Ok(Base64UrlBytes::from_bytes(&canonical_cbor(&value)?))
+}
+
 fn value_map<'a>(value: &'a Value, name: &str) -> Result<&'a Vec<(Value, Value)>, ProtocolError> {
     value
         .as_map()

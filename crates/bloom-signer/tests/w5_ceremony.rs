@@ -6,15 +6,21 @@ use bloom_signer::{
     clock::{ClockCondition, ClockDecision},
     engine::{SignerAuditKeys, SignerEngine},
     hpke::{CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO},
+    legacy_passkey::{LEGACY_PASSKEY_INPUT_CLASS, LegacyMigrationStore, stage_legacy_wallet},
     registry::{BackendRegistry, CompiledBackend},
 };
 use bloom_signer_api::*;
 use bloom_signer_backend_api::{BackendInput, BackendSignRequest, SecretBytes};
 use bloom_signer_backend_local::{DerivationAuthority, DerivationGrant, LocalSignerBackend};
+use chacha20poly1305::{
+    ChaCha20Poly1305, Key, Nonce,
+    aead::{Aead as _, KeyInit as _, Payload},
+};
 use ed25519_dalek::{Signer as _, SigningKey};
 use k256::pkcs8::EncodePublicKey as _;
+use k256::{SecretKey as Secp256k1Secret, elliptic_curve::sec1::ToEncodedPoint as _};
 use sha2::Digest as _;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, os::unix::fs::MetadataExt as _, sync::Arc};
 use support::{VirtualAuthenticator, seal_hpke};
 
 fn audit_keys() -> SignerAuditKeys {
@@ -288,6 +294,7 @@ fn register_wallet(
         expected_input_class: Token::new("passkey-prf").unwrap(),
         browser_output_recipient_key: None,
         petal_key_scope: None,
+        legacy_passkey_migration: None,
     };
     let prepared = service.prepare_custody(prepare, now_ms).unwrap();
     let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
@@ -359,6 +366,7 @@ fn complete_new_wallet(
                 expected_input_class: expected_input_class.clone(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             now_ms,
         )
@@ -447,6 +455,7 @@ fn complete_generic(
             expected_input_class: Token::new("generic-custody-v1").unwrap(),
             browser_output_recipient_key: None,
             petal_key_scope: None,
+            legacy_passkey_migration: None,
         },
         now_ms,
     )?;
@@ -523,6 +532,7 @@ fn complete_credential_change(
                 expected_input_class: Token::new("credential-change-prfs").unwrap(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             now_ms,
         )
@@ -610,6 +620,7 @@ fn complete_petal_key_derivation(
             expected_input_class: Token::new("petal-subkey-v1").unwrap(),
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope.clone()),
+            legacy_passkey_migration: None,
         },
         now_ms,
     )?;
@@ -682,6 +693,7 @@ fn complete_policy_update(
             expected_input_class: Token::new("policy_update_credential_prf").unwrap(),
             browser_output_recipient_key: None,
             petal_key_scope: None,
+            legacy_passkey_migration: None,
         },
         update,
         broker_validation_receipt: validation,
@@ -797,6 +809,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
                     expected_input_class: Token::new("petal-subkey-v1").unwrap(),
                     browser_output_recipient_key: None,
                     petal_key_scope: Some(cross_wallet),
+                    legacy_passkey_migration: None,
                 },
                 10_150,
             )
@@ -1402,6 +1415,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
         expected_input_class: Token::new("passkey-prf").unwrap(),
         browser_output_recipient_key: None,
         petal_key_scope: None,
+        legacy_passkey_migration: None,
     };
     let prepared = service.prepare_custody(prepare, 3_000).unwrap();
     let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
@@ -1463,6 +1477,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
         expected_input_class: Token::new("passkey-prf").unwrap(),
         browser_output_recipient_key: None,
         petal_key_scope: None,
+        legacy_passkey_migration: None,
     };
     let prepared = service.prepare_custody(retry, 3_600).unwrap();
     let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
@@ -1578,6 +1593,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             3_900,
         )
@@ -1597,6 +1613,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 expected_input_class: Token::new("credential-change-prfs").unwrap(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             4_000,
         )
@@ -1658,11 +1675,162 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             4_200,
         )
         .unwrap();
     assert_eq!(after_add.webauthn_options.allowed_credentials.len(), 2);
+}
+
+#[test]
+fn legacy_passkey_import_converts_existing_credential_into_current_custody() {
+    let temporary = tempfile::tempdir().unwrap();
+    let wallet_name = "legacy-wallet";
+    let hash = blake3::hash(wallet_name.as_bytes());
+    let mut user_handle = [0_u8; 16];
+    user_handle.copy_from_slice(&hash.as_bytes()[..16]);
+    user_handle[6] = (user_handle[6] & 0x0f) | 0x50;
+    user_handle[8] = (user_handle[8] & 0x3f) | 0x80;
+    let authenticator = VirtualAuthenticator::generate_with_user_handle(&user_handle);
+    let (service, _, _, _) = service(&authenticator);
+
+    let source = temporary.path().join(wallet_name);
+    std::fs::create_dir(&source).unwrap();
+    let metadata = std::fs::metadata(&source).unwrap();
+    let private = [11_u8; 32];
+    let secret = Secp256k1Secret::from_slice(&private).unwrap();
+    let public = secret.public_key().to_encoded_point(false);
+    let address_hash = sha3::Keccak256::digest(&public.as_bytes()[1..]);
+    let address = format!("0x{}", hex::encode(&address_hash[12..]));
+    let prf = authenticator.deterministic_prf();
+    let nonce = [12_u8; 12];
+    let wrap = blake3::derive_key("bloom passkey wrap key", &prf);
+    let ciphertext = ChaCha20Poly1305::new(Key::from_slice(&wrap))
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &private,
+                aad: b"bloom-keystore-passkey",
+            },
+        )
+        .unwrap();
+    std::fs::write(source.join("kind"), "passkey").unwrap();
+    std::fs::write(source.join("address"), &address).unwrap();
+    std::fs::write(source.join("pubkey"), hex::encode(public.as_bytes())).unwrap();
+    std::fs::write(
+        source.join("prf.salt"),
+        hex::encode(authenticator.credential(0).prf_salt.decode()),
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("encrypted.key"),
+        serde_json::to_vec(&serde_json::json!({
+            "v": 1,
+            "nonce_hex": hex::encode(nonce),
+            "ciphertext_hex": hex::encode(ciphertext)
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("passkey.json"),
+        serde_json::to_vec(&authenticator.legacy_passkey_json(0)).unwrap(),
+    )
+    .unwrap();
+
+    let migration_root = temporary.path().join("migration-store");
+    let receipt = stage_legacy_wallet(
+        &source,
+        &migration_root,
+        metadata.uid(),
+        metadata.uid(),
+        metadata.gid(),
+    )
+    .unwrap();
+    let store = Arc::new(LegacyMigrationStore::open(&migration_root, metadata.uid()).unwrap());
+    let service = service.with_legacy_migrations(store.clone());
+    let request = CustodyPrepareRequest {
+        ceremony_kind: CeremonyKind::WalletImport,
+        custody_operation_id: receipt.operation_id.clone(),
+        wallet_id: None,
+        key_ref: None,
+        exact_terms_digest: receipt.exact_terms_digest.clone(),
+        expected_input_class: Token::new(LEGACY_PASSKEY_INPUT_CLASS).unwrap(),
+        browser_output_recipient_key: None,
+        petal_key_scope: None,
+        legacy_passkey_migration: Some(receipt.public_terms().unwrap()),
+    };
+    let initially_prepared = service.prepare_custody(request, 40_000).unwrap();
+    let output_recipient = HpkeRecipient::generate();
+    let prepared = service
+        .bind_custody_output_recipient(
+            &receipt.operation_id,
+            output_recipient.public_key().clone(),
+            40_000,
+        )
+        .unwrap();
+    assert_eq!(
+        initially_prepared.contribution.ceremony_id,
+        prepared.contribution.ceremony_id
+    );
+    assert_eq!(
+        prepared.contribution.wallet_id.as_ref().unwrap().as_str(),
+        wallet_name
+    );
+    assert_eq!(prepared.challenges.len(), 1);
+    assert_eq!(prepared.verification_credentials.len(), 1);
+    assert!(prepared.webauthn_options.registration_user_handle.is_none());
+    let assertion = authenticator.assertion(&prepared.challenges[0].canonical_bytes().unwrap(), 1);
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&prf)
+    }))
+    .unwrap();
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::WalletImport,
+        custody_operation_id: receipt.operation_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest().unwrap(),
+        wallet_id: prepared.contribution.wallet_id.clone(),
+        key_ref: None,
+        credential_id: Some(assertion.credential_id.clone()),
+        expected_input_class: Token::new(LEGACY_PASSKEY_INPUT_CLASS).unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    let result = service
+        .complete_custody(
+            CustodyCompleteRequest {
+                ceremony_kind: CeremonyKind::WalletImport,
+                custody_operation_id: receipt.operation_id.clone(),
+                ceremony_id: prepared.contribution.ceremony_id,
+                proof: WebAuthnCeremonyProof::Assertion { assertion },
+                encrypted_input: Some(encrypted_input),
+                public_binding_digest: receipt.exact_terms_digest,
+            },
+            40_001,
+        )
+        .unwrap();
+    assert_eq!(result.public_status, CeremonyState::Succeeded);
+    assert_eq!(result.wallet_id.as_ref().unwrap().as_str(), wallet_name);
+    assert_eq!(result.public_key_refs.len(), 1);
+    assert_eq!(result.credential_summaries.len(), 1);
+    assert!(result.encrypted_browser_result.is_some());
+    assert!(store.load(&receipt.operation_id).is_err());
+    match service.status(&receipt.operation_id).unwrap() {
+        bloom_signer::ceremony::SignerCeremonyStatus::CompletedCustody(stored) => {
+            assert_eq!(*stored, result)
+        }
+        _ => panic!("legacy migration result was not durable"),
+    }
 }
 
 #[test]
@@ -1732,6 +1900,7 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
                 expected_input_class: Token::new("recovery-factor-v1").unwrap(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             6_000,
         )
@@ -1818,6 +1987,7 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
                 expected_input_class: Token::new("passkey-prf").unwrap(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             7_000,
         )
@@ -1988,6 +2158,7 @@ fn credential_replace_remove_and_backend_enrollment_do_not_spend_approval_capaci
                 expected_input_class: Token::new("credential-remove-v1").unwrap(),
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
+                legacy_passkey_migration: None,
             },
             23_000,
         )

@@ -12,6 +12,7 @@ aws-kms = ["dep:bloom-signer-backend-aws-kms"]
 triad-dev-harness = ["bloom-triad-local-transport/triad-dev-harness"]
 
 [dependencies]
+blake3.workspace = true
 bloom-signer-api.workspace = true
 bloom-triad-local-transport.workspace = true
 bloom-platform-containment.workspace = true
@@ -26,6 +27,7 @@ ciborium.workspace = true
 ed25519-dalek.workspace = true
 futures.workspace = true
 hex.workspace = true
+libc.workspace = true
 hpke.workspace = true
 hkdf.workspace = true
 k256.workspace = true

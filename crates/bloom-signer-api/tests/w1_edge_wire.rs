@@ -116,6 +116,7 @@ fn custody_prepare() -> CustodyPrepareRequest {
         expected_input_class: token("none"),
         browser_output_recipient_key: None,
         petal_key_scope: None,
+        legacy_passkey_migration: None,
     }
 }
 
@@ -589,12 +590,12 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer requests",
         signer_requests(),
-        "1e693f4af0c9ffe762985f94c2a2d6a4de6187948ea6e41566b0b13613994dcc",
+        "7c4a4d707cb8fcf9abbea5f8737a60301b642c232354d748182a5afc4dcf6344",
     );
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "92a0f9fb00b3a5dbc33e7eef05c66a443775bbe8344b8634c5f2ccae40c60edc",
+        "5cce5c7bcbd6930d62d968a7ac407f8e33d5c8900fd288573c02bc75496c50e9",
     );
     assert_wire_digest(
         "control requests",

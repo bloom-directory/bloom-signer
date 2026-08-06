@@ -45,15 +45,11 @@ fn prepared_approval(
 }
 
 fn prepared_custody(
-    ceremony: &SignerCeremonyService,
+    _ceremony: &SignerCeremonyService,
     prepared: PreparedCustodyCeremony,
 ) -> Result<SignerPreparedCustody, ProtocolError> {
     Ok(SignerPreparedCustody {
-        verification_credentials: verification_credentials(
-            ceremony,
-            prepared.contribution.wallet_id.as_ref(),
-            &prepared.webauthn_options,
-        )?,
+        verification_credentials: prepared.verification_credentials,
         contribution: prepared.contribution,
         challenges: prepared.challenges,
         webauthn_options: prepared.webauthn_options,

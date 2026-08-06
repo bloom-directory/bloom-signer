@@ -38,11 +38,11 @@ pub use bloom_rpc_wire::{
     WireError, WireErrorCode, decode_frame, encode_frame,
 };
 
-/// Broker-to-Signer authority contract. Version 1.2 adds Signer-owned key
-/// roles to public key projections.
+/// Broker-to-Signer authority contract. Version 1.3 adds the bounded legacy
+/// passkey-migration metadata carried by `wallet.import_prepare`.
 pub const SIGNER_API_MAJOR: u16 = 1;
-pub const SIGNER_API_MINOR_MIN: u16 = 2;
-pub const SIGNER_API_MINOR_MAX: u16 = 2;
+pub const SIGNER_API_MINOR_MIN: u16 = 3;
+pub const SIGNER_API_MINOR_MAX: u16 = 3;
 pub const SIGNER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(SIGNER_API_MAJOR, SIGNER_API_MINOR_MAX);
 pub const SIGNER_API_RANGE: ProtocolVersionRange =
