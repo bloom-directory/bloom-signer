@@ -372,6 +372,7 @@ fn prepared_custody() -> SignerPreparedCustody {
 fn key_public() -> KeyPublic {
     KeyPublic {
         key_ref: key_ref(),
+        role: KeyRole::WalletRoot,
         canonical_public_key: Base64UrlBytes::from_bytes(&[63; 33]),
         addresses: vec!["0x1".into()],
         supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
@@ -588,12 +589,12 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer requests",
         signer_requests(),
-        "ed776d6059e0d9d968490dca733cf506b10aed8db7b376236e48dbf9f21e879a",
+        "1e693f4af0c9ffe762985f94c2a2d6a4de6187948ea6e41566b0b13613994dcc",
     );
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "66a51a4ba1843e17b92c862ca36217546f54ad1b09d325deafa0a2bb33d0617b",
+        "92a0f9fb00b3a5dbc33e7eef05c66a443775bbe8344b8634c5f2ccae40c60edc",
     );
     assert_wire_digest(
         "control requests",

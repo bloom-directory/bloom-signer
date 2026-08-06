@@ -469,6 +469,7 @@ impl SignerRpcService {
         let addresses = ethereum_address(&description)?;
         Ok(KeyPublic {
             key_ref: description.key_ref,
+            role: classify_key_role(key_ref),
             canonical_public_key: description.canonical_spki_der,
             addresses,
             supported_crypto_suites: description.supported_crypto_suites,
@@ -716,6 +717,14 @@ fn ethereum_address(
     Ok(vec![format!("0x{}", hex::encode(&digest[12..]))])
 }
 
+fn classify_key_role(key_ref: &bloom_signer_api::KeyRef) -> bloom_signer_api::KeyRole {
+    if key_ref.derivation.is_some() {
+        bloom_signer_api::KeyRole::Derived
+    } else {
+        bloom_signer_api::KeyRole::WalletRoot
+    }
+}
+
 fn signer_ceremony_status(
     status: crate::ceremony::SignerCeremonyStatus,
 ) -> bloom_signer_api::SignerCeremonyStatus {
@@ -890,6 +899,35 @@ mod tests {
             broker_key,
             terms,
         )
+    }
+
+    #[tokio::test]
+    async fn public_key_projection_identifies_wallet_root_and_derived_roles() {
+        let (service, _, terms) = fixture().await;
+        let response = BrokerSignerService::dispatch(
+            &service,
+            BrokerSignerRequest::KeyListPublic(bloom_signer_api::WalletRequest {
+                wallet_id: terms.wallet_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let BrokerSignerResponse::KeyListPublic(keys) = response else {
+            panic!("wrong key-list response");
+        };
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key_ref, terms.key_ref);
+        assert_eq!(keys[0].role, bloom_signer_api::KeyRole::WalletRoot);
+
+        let mut derived = keys[0].key_ref.clone();
+        derived.derivation = Some(bloom_signer_api::DerivationRef::Bip32Secp256k1 {
+            root_key_id: Token::new("root").unwrap(),
+            path: "m/44'/60'/0'/0/1".into(),
+        });
+        assert_eq!(
+            classify_key_role(&derived),
+            bloom_signer_api::KeyRole::Derived
+        );
     }
 
     #[tokio::test]

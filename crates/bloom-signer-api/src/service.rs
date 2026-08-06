@@ -190,10 +190,22 @@ pub struct WalletPublic {
     pub wallet_revocation_epoch: DecimalU64,
 }
 
+/// Signer-owned classification of an enrolled wallet key.
+///
+/// Consumers must use this value instead of interpreting backend locators or
+/// relying on the ordering of key projections.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyRole {
+    WalletRoot,
+    Derived,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyPublic {
     pub key_ref: KeyRef,
+    pub role: KeyRole,
     pub canonical_public_key: Base64UrlBytes,
     pub addresses: Vec<String>,
     pub supported_crypto_suites: Vec<crate::CryptoSuite>,

@@ -1148,7 +1148,11 @@ mod tests {
         let dispatched = std::sync::atomic::AtomicBool::new(false);
         let (mut server_stream, mut client_stream) = UnixStream::pair().unwrap();
         let rejected_version = ProtocolVersion::new(bloom_signer_api::SIGNER_API_MAJOR, 0);
-        let legacy_range = ProtocolVersionRange::new(bloom_signer_api::SIGNER_API_MAJOR, 0, 1);
+        let legacy_range = ProtocolVersionRange::new(
+            bloom_signer_api::SIGNER_API_MAJOR,
+            0,
+            bloom_signer_api::SIGNER_API_MINOR_MAX,
+        );
         let broker_head = bloom_triad_local_transport::sign_journal_head(
             &broker,
             0,
