@@ -660,7 +660,8 @@ impl SignerEngine {
                     key_fingerprint TEXT PRIMARY KEY,
                     key_ref_jcs TEXT NOT NULL,
                     available INTEGER NOT NULL,
-                    authority_class TEXT NOT NULL DEFAULT 'unscoped'
+                    authority_class TEXT NOT NULL DEFAULT 'unscoped',
+                    wallet_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS petal_key_scopes (
                     key_fingerprint TEXT PRIMARY KEY,
@@ -811,6 +812,8 @@ impl SignerEngine {
             "authority_class",
             "TEXT NOT NULL DEFAULT 'unscoped'",
         )?;
+        ensure_column(&connection, "enrolled_keys", "wallet_id", "TEXT")?;
+        backfill_unambiguous_wallet_root_bindings(&connection)?;
         ensure_column(
             &connection,
             "clock_state",
@@ -1594,11 +1597,12 @@ impl SignerEngine {
                     transaction
                         .execute(
                             "INSERT INTO enrolled_keys(
-                                key_fingerprint, key_ref_jcs, available
-                             ) VALUES (?1, ?2, 1)",
+                                key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
+                             ) VALUES (?1, ?2, 1, 'wallet_root', ?3)",
                             params![
                                 key_ref.public_key_fingerprint.as_str(),
                                 serde_jcs::to_string(key_ref).map_err(malformed)?,
+                                snapshot.wallet_id.as_str(),
                             ],
                         )
                         .map_err(storage)?;
@@ -1647,20 +1651,23 @@ impl SignerEngine {
                 } else {
                     "unscoped"
                 };
+                let wallet_id = petal_scope.as_ref().map(|scope| scope.wallet_id.as_str());
                 transaction
                     .execute(
                         "INSERT INTO enrolled_keys(
-                            key_fingerprint, key_ref_jcs, available, authority_class
-                         ) VALUES (?1, ?2, ?3, ?4)
+                            key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
+                         ) VALUES (?1, ?2, ?3, ?4, ?5)
                          ON CONFLICT(key_fingerprint) DO UPDATE SET
                             key_ref_jcs = excluded.key_ref_jcs,
                             available = excluded.available,
-                            authority_class = excluded.authority_class",
+                            authority_class = excluded.authority_class,
+                            wallet_id = excluded.wallet_id",
                         params![
                             key_ref.public_key_fingerprint.as_str(),
                             serde_jcs::to_string(&key_ref).map_err(malformed)?,
                             true,
                             authority_class,
+                            wallet_id,
                         ],
                     )
                     .map_err(storage)?;
@@ -1816,8 +1823,8 @@ impl SignerEngine {
         let transaction = self.mutation_transaction(&mut connection)?;
         transaction
             .execute(
-                "INSERT INTO enrolled_keys(key_fingerprint, key_ref_jcs, available)
-                 VALUES (?1, ?2, ?3)
+                "INSERT INTO enrolled_keys(key_fingerprint, key_ref_jcs, available, authority_class, wallet_id)
+                 VALUES (?1, ?2, ?3, 'unscoped', NULL)
                  ON CONFLICT(key_fingerprint) DO UPDATE SET
                     key_ref_jcs = excluded.key_ref_jcs,
                     available = excluded.available",
@@ -1835,6 +1842,48 @@ impl SignerEngine {
         )?;
         transaction.commit().map_err(storage)?;
         Ok(())
+    }
+
+    /// Test and recovery helper for explicitly associating an already
+    /// registered root with a wallet.  Production registration writes this
+    /// binding atomically with its initial policy.
+    pub fn enroll_wallet_root_key(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+    ) -> Result<(), ProtocolError> {
+        key_ref.validate()?;
+        if !self.backend_registry.key_is_registered(key_ref)? {
+            return Err(error(
+                ProtocolErrorCode::KeyrefMismatch,
+                "key is not registered in a compiled backend",
+            ));
+        }
+        let mut connection = self.connection.lock();
+        let transaction = self.mutation_transaction(&mut connection)?;
+        transaction
+            .execute(
+                "INSERT INTO enrolled_keys(
+                    key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
+                 ) VALUES (?1, ?2, 1, 'wallet_root', ?3)
+                 ON CONFLICT(key_fingerprint) DO UPDATE SET
+                    key_ref_jcs = excluded.key_ref_jcs,
+                    available = 1,
+                    authority_class = 'wallet_root',
+                    wallet_id = excluded.wallet_id",
+                params![
+                    key_ref.public_key_fingerprint.as_str(),
+                    serde_jcs::to_string(key_ref).map_err(malformed)?,
+                    wallet_id.as_str(),
+                ],
+            )
+            .map_err(storage)?;
+        self.append_audit(
+            &transaction,
+            "key.wallet_root_enrolled",
+            &serde_json::json!({ "wallet_id": wallet_id, "key_ref": key_ref }),
+        )?;
+        transaction.commit().map_err(storage)
     }
 
     pub fn authorize_sign(
@@ -2325,20 +2374,67 @@ impl SignerEngine {
         let mut statement = connection
             .prepare(
                 "SELECT key_ref_jcs FROM enrolled_keys
-                 WHERE available = 1 ORDER BY key_fingerprint",
+                 WHERE available = 1 AND authority_class = 'wallet_root' AND wallet_id = ?1
+                 ORDER BY key_fingerprint",
             )
             .map_err(storage)?;
         let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([wallet_id.as_str()], |row| row.get::<_, String>(0))
             .map_err(storage)?;
         let mut keys = Vec::new();
         for row in rows {
             let key: KeyRef = serde_json::from_str(&row.map_err(storage)?).map_err(malformed)?;
-            if &key.backend_instance == wallet_id {
-                keys.push(key);
-            }
+            keys.push(key);
         }
         Ok(keys)
+    }
+
+    pub fn enrolled_derived_key_refs(&self, parent: &KeyRef) -> Result<Vec<KeyRef>, ProtocolError> {
+        let connection = self.connection.lock();
+        let wallet_id: Option<String> = connection
+            .query_row(
+                "SELECT wallet_id FROM enrolled_keys
+                 WHERE key_fingerprint = ?1 AND available = 1 AND authority_class = 'wallet_root'",
+                [parent.public_key_fingerprint.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        let Some(wallet_id) = wallet_id else {
+            return Ok(Vec::new());
+        };
+        let mut statement = connection
+            .prepare(
+                "SELECT key_ref_jcs FROM enrolled_keys
+                 WHERE available = 1 AND authority_class = 'petal' AND wallet_id = ?1
+                 ORDER BY key_fingerprint",
+            )
+            .map_err(storage)?;
+        statement
+            .query_map([wallet_id], |row| row.get::<_, String>(0))
+            .map_err(storage)?
+            .map(|row| serde_json::from_str(&row.map_err(storage)?).map_err(malformed))
+            .collect()
+    }
+
+    pub fn key_role(&self, key_ref: &KeyRef) -> Result<bloom_signer_api::KeyRole, ProtocolError> {
+        let connection = self.connection.lock();
+        let class: Option<String> = connection
+            .query_row(
+                "SELECT authority_class FROM enrolled_keys WHERE key_fingerprint = ?1",
+                [key_ref.public_key_fingerprint.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        match class.as_deref() {
+            Some("wallet_root") => Ok(bloom_signer_api::KeyRole::WalletRoot),
+            Some("petal") if key_ref.derivation.is_some() => Ok(bloom_signer_api::KeyRole::Derived),
+            _ => Err(error(
+                ProtocolErrorCode::KeyrefMismatch,
+                "key is not an enrolled wallet root or Signer-derived key",
+            )),
+        }
     }
 
     pub(crate) fn require_enrolled_parent_key(
@@ -2346,27 +2442,28 @@ impl SignerEngine {
         wallet_id: &Token,
         key_ref: &KeyRef,
     ) -> Result<(), ProtocolError> {
-        if &key_ref.backend_instance != wallet_id {
-            return Err(error(
-                ProtocolErrorCode::KeyrefMismatch,
-                "Petal sub-key parent is not owned by the named wallet",
-            ));
-        }
         let connection = self.connection.lock();
-        let enrolled: Option<(String, bool)> = connection
+        let enrolled: Option<(String, bool, String, Option<String>)> = connection
             .query_row(
-                "SELECT key_ref_jcs, available FROM enrolled_keys
+                "SELECT key_ref_jcs, available, authority_class, wallet_id FROM enrolled_keys
                  WHERE key_fingerprint = ?1",
                 [key_ref.public_key_fingerprint.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(storage)?;
         let expected = serde_jcs::to_string(key_ref).map_err(malformed)?;
         if enrolled
             .as_ref()
-            .map(|(stored, available)| (stored, *available))
-            != Some((&expected, true))
+            .map(|(stored, available, class, enrolled_wallet)| {
+                (
+                    stored,
+                    *available,
+                    class.as_str(),
+                    enrolled_wallet.as_deref(),
+                )
+            })
+            != Some((&expected, true, "wallet_root", Some(wallet_id.as_str())))
             || !self.backend_registry.key_is_available(key_ref)?
         {
             return Err(error(
@@ -3451,12 +3548,17 @@ impl SignerEngine {
             transaction
                 .execute(
                     "INSERT INTO enrolled_keys(
-                        key_fingerprint, key_ref_jcs, available, authority_class
-                     ) VALUES (?1, ?2, 0, 'petal')
+                        key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
+                     ) VALUES (?1, ?2, 0, 'petal', ?3)
                      ON CONFLICT(key_fingerprint) DO UPDATE SET
                         key_ref_jcs = excluded.key_ref_jcs,
-                        authority_class = 'petal'",
-                    params![scoped.key_ref.public_key_fingerprint.as_str(), key_ref_jcs],
+                        authority_class = 'petal',
+                        wallet_id = excluded.wallet_id",
+                    params![
+                        scoped.key_ref.public_key_fingerprint.as_str(),
+                        key_ref_jcs,
+                        scoped.scope.wallet_id.as_str(),
+                    ],
                 )
                 .map_err(storage)?;
             transaction
@@ -3538,14 +3640,18 @@ impl SignerEngine {
                 key_ref.validate()?;
                 transaction
                     .execute(
-                        "INSERT INTO enrolled_keys(key_fingerprint, key_ref_jcs, available)
-                         VALUES (?1, ?2, 0)
+                        "INSERT INTO enrolled_keys(
+                            key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
+                         ) VALUES (?1, ?2, 0, 'wallet_root', ?3)
                          ON CONFLICT(key_fingerprint) DO UPDATE SET
                             key_ref_jcs = excluded.key_ref_jcs,
-                            available = 0",
+                            available = 0,
+                            authority_class = 'wallet_root',
+                            wallet_id = excluded.wallet_id",
                         params![
                             key_ref.public_key_fingerprint.as_str(),
-                            serde_jcs::to_string(key_ref).map_err(malformed)?
+                            serde_jcs::to_string(key_ref).map_err(malformed)?,
+                            backup.wallet_id.as_str(),
                         ],
                     )
                     .map_err(storage)?;
@@ -4159,6 +4265,47 @@ fn ensure_column(
                 [],
             )
             .map_err(storage)?;
+    }
+    Ok(())
+}
+
+/// Older databases recorded a root key without recording which wallet enrolled
+/// it, then reconstructed ownership from `backend_instance`.  That locator is
+/// shared by keys (notably AWS KMS keys) and is not an identity.  We can safely
+/// recover the only unambiguous legacy layout; multi-wallet legacy databases
+/// deliberately remain unbound and fail closed until re-enrolled.
+fn backfill_unambiguous_wallet_root_bindings(connection: &Connection) -> Result<(), ProtocolError> {
+    let wallets = connection
+        .prepare("SELECT wallet_id FROM policies ORDER BY wallet_id")
+        .map_err(storage)?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage)?;
+    let [wallet_id] = wallets.as_slice() else {
+        return Ok(());
+    };
+    let enrollments = connection
+        .prepare("SELECT enrollment_jcs FROM ceremony_backend_enrollments")
+        .map_err(storage)?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage)?;
+    for encoded in enrollments {
+        let enrollment: BackendEnrollmentBackup =
+            serde_json::from_str(&encoded).map_err(malformed)?;
+        for key_ref in enrollment.pinned_keys {
+            connection
+                .execute(
+                    "UPDATE enrolled_keys
+                     SET authority_class = 'wallet_root', wallet_id = ?1
+                     WHERE key_fingerprint = ?2
+                       AND authority_class = 'unscoped' AND wallet_id IS NULL",
+                    [wallet_id, key_ref.public_key_fingerprint.as_str()],
+                )
+                .map_err(storage)?;
+        }
     }
     Ok(())
 }

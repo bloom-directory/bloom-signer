@@ -159,13 +159,8 @@ impl SignerRpcService {
             }
             Request::KeyListDerived(request) => {
                 let mut keys = Vec::new();
-                for key_ref in self
-                    .engine
-                    .enrolled_key_refs(&request.key_ref.backend_instance)?
-                {
-                    if key_ref.derivation.is_some() {
-                        keys.push(self.describe_key(&key_ref).await?);
-                    }
+                for key_ref in self.engine.enrolled_derived_key_refs(&request.key_ref)? {
+                    keys.push(self.describe_key(&key_ref).await?);
                 }
                 Ok(Response::KeyListDerived(keys))
             }
@@ -466,7 +461,7 @@ impl SignerRpcService {
         let addresses = ethereum_address(&description)?;
         Ok(KeyPublic {
             key_ref: description.key_ref,
-            role: classify_key_role(key_ref),
+            role: self.engine.key_role(key_ref)?,
             canonical_public_key: description.canonical_spki_der,
             addresses,
             supported_crypto_suites: description.supported_crypto_suites,
@@ -714,14 +709,6 @@ fn ethereum_address(
     Ok(vec![format!("0x{}", hex::encode(&digest[12..]))])
 }
 
-fn classify_key_role(key_ref: &bloom_signer_api::KeyRef) -> bloom_signer_api::KeyRole {
-    if key_ref.derivation.is_some() {
-        bloom_signer_api::KeyRole::Derived
-    } else {
-        bloom_signer_api::KeyRole::WalletRoot
-    }
-}
-
 fn signer_ceremony_status(
     status: crate::ceremony::SignerCeremonyStatus,
 ) -> bloom_signer_api::SignerCeremonyStatus {
@@ -861,7 +848,6 @@ mod tests {
             )
             .unwrap(),
         );
-        engine.enroll_key(&key_ref).unwrap();
         let current = now_ms().unwrap();
         let terms = SealedApprovalTerms {
             subject: ApprovalSubject::Cli {
@@ -893,6 +879,9 @@ mod tests {
             expires_at_ms: DecimalU64::new(current + 60_000),
             renewal_of: None,
         };
+        engine
+            .enroll_wallet_root_key(&terms.wallet_id, &terms.key_ref)
+            .unwrap();
         engine.install_approval_for_test(&terms).unwrap();
         let ceremony = Arc::new(
             SignerCeremonyService::new(
@@ -941,16 +930,6 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key_ref, terms.key_ref);
         assert_eq!(keys[0].role, bloom_signer_api::KeyRole::WalletRoot);
-
-        let mut derived = keys[0].key_ref.clone();
-        derived.derivation = Some(bloom_signer_api::DerivationRef::Bip32Secp256k1 {
-            root_key_id: Token::new("root").unwrap(),
-            path: "m/44'/60'/0'/0/1".into(),
-        });
-        assert_eq!(
-            classify_key_role(&derived),
-            bloom_signer_api::KeyRole::Derived
-        );
     }
 
     #[tokio::test]
