@@ -289,6 +289,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         identity.boot_epoch.clone(),
     )?);
     if let Some(accepted_utc_ms) = clock_repair_request()? {
+        if !clock.uses_durable_clock_guard() {
+            return Err(
+                "clock repair is unavailable when the host wall clock is authoritative".into(),
+            );
+        }
         let expiring = engine.active_approvals_expiring_by(accepted_utc_ms)?;
         require_clock_repair_confirmation(accepted_utc_ms, &expiring)?;
         let decision = engine.repair_clock(accepted_utc_ms)?;

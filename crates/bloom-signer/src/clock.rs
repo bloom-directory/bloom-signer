@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use bloom_signer_api::{BootEpoch, ProtocolError, ProtocolErrorCode, ReadinessState, Token};
-use bloom_trusted_time::{MAX_FORWARD_STEP_MS, PlatformTimeReading, PlatformTimeSampler};
+use bloom_trusted_time::{
+    MAX_FORWARD_STEP_MS, PlatformTimeReading, PlatformTimeSampler, TrustedTimeSource,
+};
 use parking_lot::Mutex;
 
 use crate::engine::SignerEngine;
@@ -28,6 +30,7 @@ pub struct SignerClock {
     engine: Arc<SignerEngine>,
     sampler: PlatformTimeSampler,
     boot_epoch: BootEpoch,
+    durable_clock_guard: bool,
     observation_lock: Mutex<()>,
 }
 
@@ -40,10 +43,15 @@ impl SignerClock {
         let sampler = PlatformTimeSampler::new(trusted_time_source).map_err(|error| {
             ProtocolError::new(ProtocolErrorCode::ClockUntrusted, error.to_string())
         })?;
+        let durable_clock_guard = match sampler.source() {
+            TrustedTimeSource::LinuxChronyNts => true,
+            TrustedTimeSource::MacosManagedTimed => false,
+        };
         let clock = Self {
             engine,
             sampler,
             boot_epoch,
+            durable_clock_guard,
             observation_lock: Mutex::new(()),
         };
         if clock.engine.audit_is_degraded() {
@@ -65,6 +73,12 @@ impl SignerClock {
         let reading = self.sampler.sample().map_err(|error| {
             ProtocolError::new(ProtocolErrorCode::ClockUntrusted, error.to_string())
         })?;
+        if !self.durable_clock_guard {
+            // macOS administrator/root compromise is outside the service
+            // boundary. Its wall clock is authoritative and legacy durable
+            // clock state must not latch readiness across a restart.
+            return host_wall_clock_decision(reading, self.boot_epoch.clone());
+        }
         self.engine.observe_time(
             PlatformTimeReading {
                 utc_ms: reading.utc_ms,
@@ -85,11 +99,18 @@ impl SignerClock {
         Ok(self.observe_read_only()?.effective_now_ms)
     }
 
+    pub const fn uses_durable_clock_guard(&self) -> bool {
+        self.durable_clock_guard
+    }
+
     fn observe_read_only(&self) -> Result<ClockDecision, ProtocolError> {
         let _observation = self.observation_lock.lock();
         let reading = self.sampler.sample().map_err(|error| {
             ProtocolError::new(ProtocolErrorCode::ClockUntrusted, error.to_string())
         })?;
+        if !self.durable_clock_guard {
+            return host_wall_clock_decision(reading, self.boot_epoch.clone());
+        }
         self.engine.observe_time_read_only(
             PlatformTimeReading {
                 utc_ms: reading.utc_ms,
@@ -132,6 +153,25 @@ impl SignerClock {
     }
 }
 
+fn host_wall_clock_decision(
+    reading: PlatformTimeReading,
+    boot_epoch: BootEpoch,
+) -> Result<ClockDecision, ProtocolError> {
+    let utc_ms = reading.utc_ms.ok_or_else(|| {
+        ProtocolError::new(
+            ProtocolErrorCode::ClockUntrusted,
+            "platform wall clock is unavailable",
+        )
+    })?;
+    Ok(ClockDecision {
+        effective_now_ms: utc_ms,
+        condition: ClockCondition::Healthy,
+        observed_utc_ms: Some(utc_ms),
+        monotonic_anchor_ns: reading.monotonic_anchor_ns,
+        boot_epoch,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +179,24 @@ mod tests {
     use bloom_signer_api::Token;
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn host_wall_clock_accepts_forward_and_backward_changes() {
+        let boot_epoch = BootEpoch::from_bytes([7; 16]);
+        for utc_ms in [10_000, 40_000_000, 5_000] {
+            let decision = host_wall_clock_decision(
+                PlatformTimeReading {
+                    utc_ms: Some(utc_ms),
+                    monotonic_anchor_ns: 123,
+                    monotonic_elapsed_ms: 0,
+                },
+                boot_epoch.clone(),
+            )
+            .unwrap();
+            assert_eq!(decision.effective_now_ms, utc_ms);
+            assert_eq!(decision.condition, ClockCondition::Healthy);
+        }
+    }
 
     #[test]
     fn degraded_audit_still_constructs_clock_for_readiness() {
