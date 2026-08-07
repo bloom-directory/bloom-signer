@@ -387,6 +387,7 @@ impl SignerCeremonyService {
                 "Browser output recipient keys are bound from the authenticated browser session",
             ));
         }
+        request.validate_wallet_creation_binding()?;
         request.validate_legacy_passkey_migration_binding()?;
         request.validate_petal_key_scope_binding()?;
         if let Some(scope) = &request.petal_key_scope {
@@ -452,30 +453,41 @@ impl SignerCeremonyService {
             } else {
                 None
             };
-        let mut registration = if matches!(
+        let registration = if matches!(
             request.ceremony_kind,
             CeremonyKind::WalletRegistration | CeremonyKind::WalletImport
         ) {
-            if request.wallet_id.is_some() {
-                return Err(protocol(
-                    ProtocolErrorCode::CeremonyKindMismatch,
-                    "registration and wallet import cannot name an existing wallet",
-                ));
-            }
             if request.key_ref.is_some() {
                 return Err(protocol(
                     ProtocolErrorCode::KeyrefMismatch,
                     "registration and wallet import derive their root KeyRef inside Signer",
                 ));
             }
-            Some(RegistrationSecrets::generate()?)
+            let wallet_id = legacy_migration
+                .as_ref()
+                .map(|legacy| legacy.receipt.wallet_name.clone())
+                .or_else(|| request.wallet_id.clone())
+                .ok_or_else(|| {
+                    protocol(
+                        ProtocolErrorCode::MalformedFrame,
+                        "registration and wallet import require an authoritative wallet ID",
+                    )
+                })?;
+            self.require_no_live_wallet_session(&wallet_id)?;
+            if self.wallets.lock().contains_key(&wallet_id) {
+                return Err(protocol(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "wallet ID is already enrolled",
+                ));
+            }
+            Some(RegistrationSecrets::generate(wallet_id)?)
         } else {
             None
         };
+        let mut registration = registration;
         if let (Some(registration), Some(legacy)) =
             (registration.as_mut(), legacy_migration.as_ref())
         {
-            registration.wallet_id = legacy.receipt.wallet_name.clone();
             registration.user_handle = legacy.credential.user_handle.clone();
             registration.prf_salt = legacy.credential.prf_salt.clone();
         }
@@ -1361,9 +1373,16 @@ impl SignerCeremonyService {
                         .map_err(malformed)?,
                     );
                 }
-                self.wallets
-                    .lock()
-                    .insert(registration.wallet_id.clone(), wallet);
+                {
+                    let mut wallets = self.wallets.lock();
+                    if wallets.contains_key(&registration.wallet_id) {
+                        return Err(protocol(
+                            ProtocolErrorCode::OperationIdConflict,
+                            "wallet ID is already enrolled",
+                        ));
+                    }
+                    wallets.insert(registration.wallet_id.clone(), wallet);
+                }
                 self.register_existing_credential(registration.wallet_id.clone(), credential)?;
                 #[cfg(feature = "local")]
                 {
@@ -2108,7 +2127,7 @@ impl SignerCeremonyService {
 }
 
 impl RegistrationSecrets {
-    fn generate() -> Result<Self, ProtocolError> {
+    fn generate(wallet_id: Token) -> Result<Self, ProtocolError> {
         let mut root = vec![0_u8; 32];
         let mut policy_seed = vec![0_u8; 32];
         let mut wkek = vec![0_u8; 32];
@@ -2122,7 +2141,7 @@ impl RegistrationSecrets {
         OsRng.fill_bytes(&mut prf_salt);
         OsRng.fill_bytes(&mut recovery_secret);
         Ok(Self {
-            wallet_id: Token::new(format!("wallet-{}", &random_digest().as_str()[..24]))?,
+            wallet_id,
             user_handle: Base64UrlBytes::from_bytes(&user_handle),
             prf_salt: Base64UrlBytes::from_bytes(&prf_salt),
             root: SecretBytes::new(root),

@@ -285,10 +285,11 @@ fn register_wallet(
     operation_id: OperationId,
     now_ms: u64,
 ) -> (Token, WebAuthnCredential) {
+    let wallet_id = Token::new(format!("wallet-{}", &operation_id.as_str()[..12])).unwrap();
     let prepare = CustodyPrepareRequest {
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation_id.clone(),
-        wallet_id: None,
+        wallet_id: Some(wallet_id.clone()),
         key_ref: None,
         exact_terms_digest: digest("a1"),
         expected_input_class: Token::new("passkey-prf").unwrap(),
@@ -321,7 +322,7 @@ fn register_wallet(
         &authenticator.deterministic_prf(),
     )
     .unwrap();
-    let wallet_id = prepared.contribution.wallet_id.clone().unwrap();
+    assert_eq!(prepared.contribution.wallet_id.as_ref(), Some(&wallet_id));
     service
         .complete_custody(
             CustodyCompleteRequest {
@@ -350,6 +351,7 @@ fn complete_new_wallet(
     output_recipient: Option<&HpkeRecipient>,
     now_ms: u64,
 ) -> (CustodyResult, CustodySignerContribution) {
+    let wallet_id = Token::new(format!("wallet-{}", &operation_id.as_str()[..12])).unwrap();
     let expected_input_class = if kind == CeremonyKind::WalletImport {
         Token::new("raw-private-key-v1").unwrap()
     } else {
@@ -360,7 +362,7 @@ fn complete_new_wallet(
             CustodyPrepareRequest {
                 ceremony_kind: kind,
                 custody_operation_id: operation_id.clone(),
-                wallet_id: None,
+                wallet_id: Some(wallet_id.clone()),
                 key_ref: None,
                 exact_terms_digest: digest("d1"),
                 expected_input_class: expected_input_class.clone(),
@@ -1409,7 +1411,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
     let prepare = CustodyPrepareRequest {
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation("20"),
-        wallet_id: None,
+        wallet_id: Some(Token::new("quiet-lilac").unwrap()),
         key_ref: None,
         exact_terms_digest: digest("88"),
         expected_input_class: Token::new("passkey-prf").unwrap(),
@@ -1471,7 +1473,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
     let retry = CustodyPrepareRequest {
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation("21"),
-        wallet_id: None,
+        wallet_id: Some(Token::new("quiet-lilac").unwrap()),
         key_ref: None,
         exact_terms_digest: digest("89"),
         expected_input_class: Token::new("passkey-prf").unwrap(),
@@ -1681,6 +1683,60 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
         )
         .unwrap();
     assert_eq!(after_add.webauthn_options.allowed_credentials.len(), 2);
+}
+
+#[test]
+fn registration_requires_and_reserves_the_requested_wallet_id() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, _, _) = service(&authenticator);
+    let operation_id = operation("c2");
+    let wallet_id = Token::new(format!("wallet-{}", &operation_id.as_str()[..12])).unwrap();
+    let (registered, _) = complete_new_wallet(
+        &service,
+        &authenticator,
+        CeremonyKind::WalletRegistration,
+        operation_id,
+        None,
+        None,
+        4_000,
+    );
+    assert_eq!(registered.wallet_id.as_ref(), Some(&wallet_id));
+
+    let unnamed = service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletRegistration,
+                custody_operation_id: operation("c3"),
+                wallet_id: None,
+                key_ref: None,
+                exact_terms_digest: digest("c3"),
+                expected_input_class: Token::new("passkey-prf").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+            },
+            5_000,
+        )
+        .unwrap_err();
+    assert_eq!(unnamed.code, ProtocolErrorCode::MalformedFrame);
+
+    let duplicate = service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletRegistration,
+                custody_operation_id: operation("c4"),
+                wallet_id: Some(wallet_id),
+                key_ref: None,
+                exact_terms_digest: digest("c4"),
+                expected_input_class: Token::new("passkey-prf").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+            },
+            5_000,
+        )
+        .unwrap_err();
+    assert_eq!(duplicate.code, ProtocolErrorCode::OperationIdConflict);
 }
 
 #[test]
@@ -1981,7 +2037,7 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
             CustodyPrepareRequest {
                 ceremony_kind: CeremonyKind::WalletRegistration,
                 custody_operation_id: operation("ad"),
-                wallet_id: None,
+                wallet_id: Some(Token::new("forged-wallet").unwrap()),
                 key_ref: Some(result.public_key_refs[0].clone()),
                 exact_terms_digest: digest("d3"),
                 expected_input_class: Token::new("passkey-prf").unwrap(),
