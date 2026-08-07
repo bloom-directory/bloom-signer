@@ -2406,7 +2406,7 @@ impl SignerEngine {
         let mut statement = connection
             .prepare(
                 "SELECT key_ref_jcs FROM enrolled_keys
-                 WHERE available = 1 AND authority_class = 'petal' AND wallet_id = ?1
+                 WHERE authority_class = 'petal' AND wallet_id = ?1
                  ORDER BY key_fingerprint",
             )
             .map_err(storage)?;
