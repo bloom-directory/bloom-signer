@@ -419,7 +419,7 @@ impl CustodyPrepareRequest {
                 "Petal key scope parent KeyRef does not match the custody request",
             ));
         }
-        if self.exact_terms_digest != scope.digest()? {
+        if self.exact_terms_digest != scope.request_digest()? {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::OperationIdConflict,
                 "key-derive exact terms digest does not match the Petal key scope",
@@ -796,8 +796,10 @@ mod tests {
             },
             package_hash: digest(2),
             route: "/petals/exchange/orders".into(),
-            agent_id: Some("desk-a".into()),
-            purpose: Token::new("exchange-agent").unwrap(),
+            lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            key_slot: Token::new("desk-a").unwrap(),
+            allowed_routes: vec!["/petals/exchange/orders".into()],
+            allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
             allowed_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
             maximum_lifetime_ms: DecimalU64::new(86_400_000),
             custody_operation_id: operation(3),
@@ -811,7 +813,7 @@ mod tests {
             custody_operation_id: scope.custody_operation_id.clone(),
             wallet_id: Some(scope.wallet_id.clone()),
             key_ref: Some(scope.parent_key_ref.clone()),
-            exact_terms_digest: scope.digest().unwrap(),
+            exact_terms_digest: scope.request_digest().unwrap(),
             expected_input_class: Token::new("petal-key-scope-v1").unwrap(),
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope),
@@ -935,7 +937,11 @@ mod tests {
         );
         let original = contribution.unsigned_canonical_bytes().unwrap();
         let mut tampered = contribution;
-        tampered.petal_key_scope.as_mut().unwrap().purpose = Token::new("payment-key").unwrap();
+        tampered
+            .petal_key_scope
+            .as_mut()
+            .unwrap()
+            .allowed_operation_classes = vec![Token::new("payment-key").unwrap()];
         assert_ne!(original, tampered.unsigned_canonical_bytes().unwrap());
         assert_eq!(
             tampered

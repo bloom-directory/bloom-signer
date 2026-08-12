@@ -611,7 +611,7 @@ fn complete_petal_key_derivation(
     browser_effect: Option<serde_json::Value>,
     now_ms: u64,
 ) -> Result<(CustodyResult, CustodyCompleteRequest), ProtocolError> {
-    let scope_digest = scope.digest()?;
+    let scope_digest = scope.request_digest()?;
     let prepared = service.prepare_custody(
         CustodyPrepareRequest {
             ceremony_kind: CeremonyKind::KeyDerive,
@@ -790,8 +790,10 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         parent_key_ref: parent.clone(),
         package_hash: digest("b2"),
         route: "/petals/exchange/sign".into(),
-        agent_id: Some("account-a".into()),
-        purpose: Token::new("exchange-agent").unwrap(),
+        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        key_slot: Token::new("account-a").unwrap(),
+        allowed_routes: vec!["/petals/exchange/sign".into()],
+        allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
         allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
         maximum_lifetime_ms: DecimalU64::new(20_000),
         custody_operation_id: operation("b3"),
@@ -807,7 +809,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
                     custody_operation_id: cross_wallet.custody_operation_id.clone(),
                     wallet_id: Some(cross_wallet.wallet_id.clone()),
                     key_ref: Some(parent.clone()),
-                    exact_terms_digest: cross_wallet.digest().unwrap(),
+                    exact_terms_digest: cross_wallet.request_digest().unwrap(),
                     expected_input_class: Token::new("petal-subkey-v1").unwrap(),
                     browser_output_recipient_key: None,
                     petal_key_scope: Some(cross_wallet),
@@ -900,7 +902,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         subject: ApprovalSubject::Petal {
             package_hash: base_scope.package_hash.clone(),
             route: base_scope.route.clone(),
-            agent_id: base_scope.agent_id.clone(),
+            agent_id: Some(base_scope.key_slot.as_str().into()),
         },
         wallet_id: wallet_id.clone(),
         key_ref: child,
@@ -961,7 +963,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     another_petal.subject = ApprovalSubject::Petal {
         package_hash: digest("b9"),
         route: base_scope.route.clone(),
-        agent_id: base_scope.agent_id.clone(),
+        agent_id: Some(base_scope.key_slot.as_str().into()),
     };
     assert_eq!(
         restarted_engine
@@ -1046,7 +1048,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     reusable.selector = ApprovalSelector::Petal {
         package_hash: base_scope.package_hash.clone(),
         route: base_scope.route.clone(),
-        allowed_operation_classes: vec![base_scope.purpose.clone()],
+        allowed_operation_classes: base_scope.allowed_operation_classes.clone(),
         required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
     };
     reusable.request_nonce = RequestNonce::new("cb".repeat(16)).unwrap();

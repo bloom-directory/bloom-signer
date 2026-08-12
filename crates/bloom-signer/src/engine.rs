@@ -4695,7 +4695,12 @@ fn validate_petal_key_approval(
             "Petal sub-key requires a Petal approval subject",
         ));
     };
-    if package_hash != &scope.package_hash || route != &scope.route || agent_id != &scope.agent_id {
+    if package_hash != &scope.package_hash
+        || !scope.allowed_routes.contains(route)
+        || agent_id
+            .as_deref()
+            .is_some_and(|agent| agent != scope.key_slot.as_str())
+    {
         return Err(error(
             ProtocolErrorCode::SelectorMismatch,
             "Petal approval identity differs from the derived-key scope",
@@ -4708,7 +4713,7 @@ fn validate_petal_key_approval(
         ..
     } = &terms.selector
     {
-        if selector_package != &scope.package_hash || selector_route != &scope.route {
+        if selector_package != package_hash || selector_route != route {
             return Err(error(
                 ProtocolErrorCode::SelectorMismatch,
                 "Petal selector identity differs from the derived-key scope",
@@ -4717,7 +4722,7 @@ fn validate_petal_key_approval(
         if allowed_operation_classes.is_empty()
             || allowed_operation_classes
                 .iter()
-                .any(|operation_class| operation_class != &scope.purpose)
+                .any(|operation_class| !scope.allowed_operation_classes.contains(operation_class))
         {
             return Err(error(
                 ProtocolErrorCode::SelectorMismatch,

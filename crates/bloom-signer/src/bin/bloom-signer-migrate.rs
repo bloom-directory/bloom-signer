@@ -32,6 +32,13 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut version_probe = std::env::args_os().skip(1);
+    if version_probe.next().as_deref() == Some(std::ffi::OsStr::new("--version"))
+        && version_probe.next().is_none()
+    {
+        println!("bloom-signer-migrate {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let args = parse_args()?;
     let receipt = stage_legacy_wallet(
         &args.source,

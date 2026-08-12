@@ -6,9 +6,11 @@ use crate::{
     CryptoSuite, DecimalU64, Digest32, KeyRef, OperationId, ProtocolError, ProtocolErrorCode, Token,
 };
 
-const PETAL_KEY_SCOPE_DOMAIN: &[u8] = b"bloom-petal-key-scope/v1";
+const PETAL_KEY_SCOPE_DOMAIN: &[u8] = b"bloom-petal-key-scope/v2";
+const PETAL_KEY_REQUEST_DOMAIN: &[u8] = b"bloom-petal-key-request/v2";
 const ROUTE_MAX_BYTES: usize = 2 * 1024;
 const AGENT_ID_MAX_BYTES: usize = 256;
+const LINEAGE_PREFIX: &str = "pln1_";
 
 /// Immutable installer-pinned authority boundary for a Signer-owned Petal key.
 ///
@@ -20,10 +22,14 @@ const AGENT_ID_MAX_BYTES: usize = 256;
 pub struct PetalKeyScope {
     pub wallet_id: Token,
     pub parent_key_ref: KeyRef,
+    /// Current authenticated execution subject. This is verified against the
+    /// installer catalog but deliberately excluded from the stable key digest.
     pub package_hash: Digest32,
     pub route: String,
-    pub agent_id: Option<String>,
-    pub purpose: Token,
+    pub lineage_id: String,
+    pub key_slot: Token,
+    pub allowed_routes: Vec<String>,
+    pub allowed_operation_classes: Vec<Token>,
     pub allowed_crypto_suites: Vec<CryptoSuite>,
     pub maximum_lifetime_ms: DecimalU64,
     pub custody_operation_id: OperationId,
@@ -41,8 +47,10 @@ impl<'de> Deserialize<'de> for PetalKeyScope {
             parent_key_ref: KeyRef,
             package_hash: Digest32,
             route: String,
-            agent_id: Option<String>,
-            purpose: Token,
+            lineage_id: String,
+            key_slot: Token,
+            allowed_routes: Vec<String>,
+            allowed_operation_classes: Vec<Token>,
             allowed_crypto_suites: Vec<CryptoSuite>,
             maximum_lifetime_ms: DecimalU64,
             custody_operation_id: OperationId,
@@ -54,8 +62,10 @@ impl<'de> Deserialize<'de> for PetalKeyScope {
             parent_key_ref: unchecked.parent_key_ref,
             package_hash: unchecked.package_hash,
             route: unchecked.route,
-            agent_id: unchecked.agent_id,
-            purpose: unchecked.purpose,
+            lineage_id: unchecked.lineage_id,
+            key_slot: unchecked.key_slot,
+            allowed_routes: unchecked.allowed_routes,
+            allowed_operation_classes: unchecked.allowed_operation_classes,
             allowed_crypto_suites: unchecked.allowed_crypto_suites,
             maximum_lifetime_ms: unchecked.maximum_lifetime_ms,
             custody_operation_id: unchecked.custody_operation_id,
@@ -68,9 +78,23 @@ impl<'de> Deserialize<'de> for PetalKeyScope {
 impl PetalKeyScope {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.parent_key_ref.validate()?;
-        validate_display_identity("Petal route", &self.route, ROUTE_MAX_BYTES)?;
-        if let Some(agent_id) = &self.agent_id {
-            validate_display_identity("Petal agent_id", agent_id, AGENT_ID_MAX_BYTES)?;
+        validate_display_identity("Petal requesting route", &self.route, ROUTE_MAX_BYTES)?;
+        validate_lineage_id(&self.lineage_id)?;
+        validate_display_identity("Petal key slot", self.key_slot.as_str(), AGENT_ID_MAX_BYTES)?;
+        let unique_routes: HashSet<_> = self.allowed_routes.iter().collect();
+        let unique_classes: HashSet<_> = self.allowed_operation_classes.iter().collect();
+        if self.allowed_routes.is_empty()
+            || unique_routes.len() != self.allowed_routes.len()
+            || self.allowed_operation_classes.is_empty()
+            || unique_classes.len() != self.allowed_operation_classes.len()
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "Petal key scope requires unique non-empty route and operation-class sets",
+            ));
+        }
+        for route in &self.allowed_routes {
+            validate_display_identity("Petal route", route, ROUTE_MAX_BYTES)?;
         }
 
         let unique_suites: HashSet<_> = self.allowed_crypto_suites.iter().copied().collect();
@@ -98,7 +122,30 @@ impl PetalKeyScope {
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
         self.validate()?;
-        serde_jcs::to_vec(self).map_err(|error| {
+        #[derive(Serialize)]
+        struct StableScope<'a> {
+            wallet_id: &'a Token,
+            parent_key_ref: &'a KeyRef,
+            lineage_id: &'a str,
+            key_slot: &'a Token,
+            allowed_routes: &'a [String],
+            allowed_operation_classes: &'a [Token],
+            allowed_crypto_suites: &'a [CryptoSuite],
+            maximum_lifetime_ms: &'a DecimalU64,
+            custody_operation_id: &'a OperationId,
+        }
+        serde_jcs::to_vec(&StableScope {
+            wallet_id: &self.wallet_id,
+            parent_key_ref: &self.parent_key_ref,
+            lineage_id: &self.lineage_id,
+            key_slot: &self.key_slot,
+            allowed_routes: &self.allowed_routes,
+            allowed_operation_classes: &self.allowed_operation_classes,
+            allowed_crypto_suites: &self.allowed_crypto_suites,
+            maximum_lifetime_ms: &self.maximum_lifetime_ms,
+            custody_operation_id: &self.custody_operation_id,
+        })
+        .map_err(|error| {
             ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 format!("Petal key scope JCS encoding failed: {error}"),
@@ -112,6 +159,38 @@ impl PetalKeyScope {
         hasher.update(self.canonical_bytes()?);
         Ok(Digest32::from_bytes(hasher.finalize().into()))
     }
+
+    /// Digest for one derivation attempt. Unlike the stable scope digest this
+    /// also binds the currently executing package and route.
+    pub fn request_digest(&self) -> Result<Digest32, ProtocolError> {
+        self.validate()?;
+        let mut hasher = Sha256::new();
+        hasher.update(PETAL_KEY_REQUEST_DOMAIN);
+        hasher.update(serde_jcs::to_vec(self).map_err(|error| {
+            ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
+        })?);
+        Ok(Digest32::from_bytes(hasher.finalize().into()))
+    }
+}
+
+pub fn validate_lineage_id(value: &str) -> Result<(), ProtocolError> {
+    let encoded = value.strip_prefix(LINEAGE_PREFIX).ok_or_else(|| {
+        ProtocolError::new(
+            ProtocolErrorCode::MalformedFrame,
+            "Petal lineage ID must use the pln1_ prefix",
+        )
+    })?;
+    if encoded.len() != 52
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::MalformedFrame,
+            "Petal lineage ID must contain 256-bit lowercase base32 entropy",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_display_identity(
@@ -158,9 +237,14 @@ mod tests {
                 }),
             },
             package_hash: digest(2),
-            route: "/petals/exchange/orders".into(),
-            agent_id: Some("desk-a".into()),
-            purpose: Token::new("exchange-agent").unwrap(),
+            route: "r000001".into(),
+            lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            key_slot: Token::new("desk-a").unwrap(),
+            allowed_routes: vec!["r000001".into(), "r000002".into()],
+            allowed_operation_classes: vec![
+                Token::new("exchange.order").unwrap(),
+                Token::new("exchange.cancel").unwrap(),
+            ],
             allowed_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
             maximum_lifetime_ms: DecimalU64::new(86_400_000),
             custody_operation_id: operation(3),
@@ -171,12 +255,13 @@ mod tests {
     fn scope_digest_is_canonical_and_domain_separated() {
         let scope = scope();
         let canonical = scope.canonical_bytes().unwrap();
-        let reparsed: PetalKeyScope = serde_json::from_slice(&canonical).unwrap();
+        let encoded = serde_jcs::to_vec(&scope).unwrap();
+        let reparsed: PetalKeyScope = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(scope, reparsed);
         assert_eq!(scope.digest().unwrap(), reparsed.digest().unwrap());
         assert_eq!(
             scope.digest().unwrap().as_str(),
-            "f3cffedb85ce0dd3eac9b44f9766fc0056e6af67296be1d97b120afd895c296a"
+            "08ac8a08bd31e657f3ab6faaabb62c0d16edf2bec946f1a5547d83ea0fa35a79"
         );
 
         let raw_jcs_digest = Digest32::from_bytes(Sha256::digest(canonical).into());
@@ -196,16 +281,16 @@ mod tests {
         changed.parent_key_ref.locator = "wallet/primary/other-root".into();
         variants.push(changed);
         let mut changed = original.clone();
-        changed.package_hash = digest(4);
+        changed.lineage_id = "pln1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
         variants.push(changed);
         let mut changed = original.clone();
-        changed.route = "/petals/exchange/cancel".into();
+        changed.key_slot = Token::new("desk-b").unwrap();
         variants.push(changed);
         let mut changed = original.clone();
-        changed.agent_id = Some("desk-b".into());
+        changed.allowed_routes = vec!["r000003".into()];
         variants.push(changed);
         let mut changed = original.clone();
-        changed.purpose = Token::new("payment-key").unwrap();
+        changed.allowed_operation_classes = vec![Token::new("payment.send").unwrap()];
         variants.push(changed);
         let mut changed = original.clone();
         changed.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Sha256Recoverable];
@@ -220,6 +305,11 @@ mod tests {
         for variant in variants {
             assert_ne!(variant.digest().unwrap(), original_digest);
         }
+
+        let mut successor = scope();
+        successor.package_hash = digest(9);
+        successor.route = "r000002".into();
+        assert_eq!(successor.digest().unwrap(), original_digest);
     }
 
     #[test]
@@ -229,7 +319,7 @@ mod tests {
         assert!(serde_json::from_value::<PetalKeyScope>(value).is_err());
 
         let mut value = serde_json::to_value(scope()).unwrap();
-        value["route"] = serde_json::json!("bad\nroute");
+        value["allowed_routes"] = serde_json::json!(["bad\nroute"]);
         assert!(serde_json::from_value::<PetalKeyScope>(value).is_err());
     }
 }

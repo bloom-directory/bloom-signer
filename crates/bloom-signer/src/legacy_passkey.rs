@@ -253,6 +253,38 @@ pub fn stage_legacy_wallet(
 
     prepare_store_directories(migration_root, signer_uid, signer_gid)?;
     let pending_root = migration_root.join("pending");
+    // Staging is replay-safe. A retry of the exact legacy bundle returns the
+    // already durable receipt; it never creates a second authority operation.
+    // Private temporary directories left by process death are not authority
+    // and are removed before a new atomic write begins.
+    let mut replay_receipt = None;
+    for entry in fs::read_dir(&pending_root).map_err(storage)? {
+        let entry = entry.map_err(storage)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| malformed("legacy migration staging name is not UTF-8"))?;
+        let path = entry.path();
+        require_private_directory(&path, signer_uid)?;
+        if name.starts_with(".tmp-") {
+            fs::remove_dir_all(&path).map_err(storage)?;
+            continue;
+        }
+        let bytes = read_owned_regular(&path.join("staged.json"), signer_uid, MAX_SMALL_FILE)?;
+        let existing: StagedLegacyPasskey = serde_json::from_slice(&bytes).map_err(malformed)?;
+        existing.receipt.validate()?;
+        if existing.receipt.operation_id.as_str() != name
+            || existing.bundle_digest()? != existing.receipt.bundle_digest
+        {
+            return Err(malformed("existing legacy migration staging is invalid"));
+        }
+        if existing.receipt.bundle_digest == staged.receipt.bundle_digest {
+            replay_receipt = Some(existing.receipt);
+        }
+    }
+    if let Some(receipt) = replay_receipt {
+        return Ok(receipt);
+    }
     let temporary = pending_root.join(format!(".tmp-{}", operation_id.as_str()));
     let final_path = pending_root.join(operation_id.as_str());
     if final_path.exists() || temporary.exists() {
@@ -803,6 +835,15 @@ mod tests {
         let root = temporary.path().join("migrations");
         let receipt = stage_legacy_wallet(&source, &root, uid, uid, gid).unwrap();
         receipt.validate().unwrap();
+        let interrupted = root.join("pending/.tmp-interrupted");
+        fs::create_dir(&interrupted).unwrap();
+        fs::set_permissions(&interrupted, fs::Permissions::from_mode(0o700)).unwrap();
+        let repeated = stage_legacy_wallet(&source, &root, uid, uid, gid).unwrap();
+        assert_eq!(repeated.operation_id, receipt.operation_id);
+        assert!(
+            !interrupted.exists(),
+            "retry must clean private incomplete staging without activating it"
+        );
         let store = LegacyMigrationStore::open(&root, uid).unwrap();
         let prepared = store.load(&receipt.operation_id).unwrap();
         assert_eq!(prepared.receipt.address, address);
