@@ -445,10 +445,21 @@ fn acquire_unix_listener(
 
 #[cfg(not(target_os = "macos"))]
 fn acquire_unix_listener(
-    _path_variable: &str,
+    path_variable: &str,
     activation_variable: &str,
     default_activation_name: &str,
 ) -> Result<std::os::unix::net::UnixListener, Box<dyn std::error::Error>> {
+    #[cfg(all(feature = "triad-dev-harness", target_os = "linux"))]
+    if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
+        let path = std::env::var_os(path_variable)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{path_variable} is required by the Linux developer profile"))?;
+        return Ok(bloom_service_activation::bind_owned_unix_listener(&path)?);
+    }
+
+    #[cfg(not(all(feature = "triad-dev-harness", target_os = "linux")))]
+    let _ = path_variable;
+
     let name =
         std::env::var(activation_variable).unwrap_or_else(|_| default_activation_name.to_string());
     Ok(bloom_service_activation::take_unix_listener(&name)?)
