@@ -923,18 +923,19 @@ impl SignerEngine {
             monotonic_anchor_ns: reading.monotonic_anchor_ns,
             boot_epoch: boot_epoch.clone(),
         };
-        let stored: Option<(String, String)> = transaction
+        let stored: Option<(String, String, String)> = transaction
             .query_row(
-                "SELECT last_effective_ms, condition FROM clock_state WHERE singleton = 1",
+                "SELECT last_effective_ms, condition, monotonic_anchor_ns
+                 FROM clock_state WHERE singleton = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(storage)?;
         let Some(utc_ms) = reading.utc_ms else {
             let effective_now_ms = stored
                 .as_ref()
-                .map(|(value, _)| value.parse().map_err(malformed))
+                .map(|(value, _, _)| value.parse().map_err(malformed))
                 .transpose()?
                 .unwrap_or(0);
             write_clock_state(
@@ -962,9 +963,14 @@ impl SignerEngine {
             }
             return Ok(decision(effective_now_ms, ClockCondition::Untrusted));
         };
-        let Some(last_effective_ms) = stored
+        let Some((last_effective_ms, persisted_anchor_ns)) = stored
             .as_ref()
-            .map(|(value, _)| value.parse::<u64>().map_err(malformed))
+            .map(|(value, _, anchor)| {
+                Ok::<_, ProtocolError>((
+                    value.parse::<u64>().map_err(malformed)?,
+                    anchor.parse::<u64>().map_err(malformed)?,
+                ))
+            })
             .transpose()?
         else {
             write_clock_state(
@@ -987,7 +993,7 @@ impl SignerEngine {
             return Ok(decision(utc_ms, ClockCondition::Healthy));
         };
         let monotonic_now = last_effective_ms
-            .checked_add(reading.monotonic_elapsed_ms)
+            .checked_add(monotonic_elapsed_ms(persisted_anchor_ns, &reading))
             .ok_or_else(|| {
                 error(
                     ProtocolErrorCode::ClockUntrusted,
@@ -1074,15 +1080,21 @@ impl SignerEngine {
         max_forward_step_ms: u64,
     ) -> Result<ClockDecision, ProtocolError> {
         let connection = self.connection.lock();
-        let stored = connection
+        let stored: Option<(String, String)> = connection
             .query_row(
-                "SELECT last_effective_ms FROM clock_state WHERE singleton = 1",
+                "SELECT last_effective_ms, monotonic_anchor_ns FROM clock_state WHERE singleton = 1",
                 [],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(storage)?
-            .map(|value| value.parse::<u64>().map_err(malformed))
+            .map_err(storage)?;
+        let stored = stored
+            .map(|(value, anchor)| {
+                Ok::<_, ProtocolError>((
+                    value.parse::<u64>().map_err(malformed)?,
+                    anchor.parse::<u64>().map_err(malformed)?,
+                ))
+            })
             .transpose()?;
         let decision = |effective_now_ms, condition| ClockDecision {
             effective_now_ms,
@@ -1092,13 +1104,16 @@ impl SignerEngine {
             boot_epoch: boot_epoch.clone(),
         };
         let Some(utc_ms) = reading.utc_ms else {
-            return Ok(decision(stored.unwrap_or(0), ClockCondition::Untrusted));
+            return Ok(decision(
+                stored.map(|(value, _)| value).unwrap_or(0),
+                ClockCondition::Untrusted,
+            ));
         };
-        let Some(last_effective_ms) = stored else {
+        let Some((last_effective_ms, persisted_anchor_ns)) = stored else {
             return Ok(decision(utc_ms, ClockCondition::Healthy));
         };
         let monotonic_now = last_effective_ms
-            .checked_add(reading.monotonic_elapsed_ms)
+            .checked_add(monotonic_elapsed_ms(persisted_anchor_ns, &reading))
             .ok_or_else(|| {
                 error(
                     ProtocolErrorCode::ClockUntrusted,
@@ -4916,6 +4931,36 @@ fn wallet_epoch(transaction: &Transaction<'_>, wallet_id: &Token) -> Result<u64,
         .map(|value| value.unwrap_or(0))
 }
 
+/// Determine how much monotonic time has elapsed since the last persisted
+/// clock observation.
+///
+/// `reading.monotonic_elapsed_ms` is process-relative: it resets to 0 across
+/// a Signer/sampler restart because the sampler's internal accumulator is
+/// re-initialized on the first sample of a new process. `monotonic_anchor_ns`
+/// is an absolute reading of the platform's continuous (suspend-aware)
+/// monotonic clock and survives a process restart within the same kernel
+/// boot, so its delta against the previously persisted anchor gives the true
+/// elapsed time across a restart. Fall back to the process-relative reading
+/// when the persisted anchor is the pre-migration sentinel (`0`) or when the
+/// current anchor is behind the persisted one, which signals a kernel reboot
+/// or other monotonic-domain reset; that case must stay fail-closed and be
+/// resolved through the existing operator repair path. Within one process,
+/// retain the sampler's elapsed value when it is larger by a millisecond due
+/// to its carried sub-millisecond remainder.
+fn monotonic_elapsed_ms(
+    persisted_anchor_ns: u64,
+    reading: &bloom_trusted_time::PlatformTimeReading,
+) -> u64 {
+    if persisted_anchor_ns != 0 {
+        if let Some(anchor_elapsed_ns) =
+            reading.monotonic_anchor_ns.checked_sub(persisted_anchor_ns)
+        {
+            return (anchor_elapsed_ns / 1_000_000).max(reading.monotonic_elapsed_ms);
+        }
+    }
+    reading.monotonic_elapsed_ms
+}
+
 fn write_clock_state(
     transaction: &Transaction<'_>,
     effective_now_ms: u64,
@@ -5852,6 +5897,213 @@ mod clock_tests {
                 "clock.repaired"
             ]
         );
+    }
+
+    #[test]
+    fn signer_clock_restart_credits_downtime_via_matching_absolute_monotonic_anchor() {
+        let engine = engine();
+        engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+
+        // Simulate a Signer process restart: the sampler's process-relative
+        // accumulator resets to 0 even though > MAX_FORWARD_STEP_MS of real
+        // downtime elapsed. The UTC delta (2h) and the absolute monotonic
+        // anchor delta (2h, in the same suspend-aware kernel domain) agree,
+        // so the restart must be credited rather than rejected as a forward
+        // jump.
+        let two_hours_ms = 2 * 60 * 60 * 1_000;
+        let two_hours_ns = two_hours_ms * 1_000_000;
+        let restarted = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000 + two_hours_ms),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000_000 + two_hours_ns,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([2; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(restarted.condition, ClockCondition::Healthy);
+        assert_eq!(restarted.effective_now_ms, 10_000 + two_hours_ms);
+    }
+
+    #[test]
+    fn signer_clock_read_only_restart_credits_downtime_via_matching_absolute_monotonic_anchor() {
+        let engine = engine();
+        engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+
+        let two_hours_ms = 2 * 60 * 60 * 1_000;
+        let two_hours_ns = two_hours_ms * 1_000_000;
+        let restarted = engine
+            .observe_time_read_only(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000 + two_hours_ms),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000_000 + two_hours_ns,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+            )
+            .unwrap();
+        assert_eq!(restarted.condition, ClockCondition::Healthy);
+        assert_eq!(restarted.effective_now_ms, 10_000 + two_hours_ms);
+    }
+
+    #[test]
+    fn signer_clock_monotonic_anchor_rollback_stays_fail_closed() {
+        let engine = engine();
+        engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+
+        // A kernel reboot (or other monotonic-domain reset) makes the
+        // absolute anchor go backwards relative to what was persisted. Even
+        // though UTC advanced by more than MAX_FORWARD_STEP_MS, the anchor
+        // can no longer be trusted to attribute that gap to real downtime in
+        // the same monotonic domain, so this must stay fail-closed via the
+        // existing process-relative guard and require an explicit operator
+        // repair.
+        let two_hours_ms = 2 * 60 * 60 * 1_000;
+        let rebooted = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000 + two_hours_ms),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 500_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([2; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(rebooted.condition, ClockCondition::ForwardJumpRejected);
+        assert_eq!(rebooted.effective_now_ms, 10_000);
+
+        let repaired = engine.repair_clock(10_000 + two_hours_ms).unwrap();
+        assert_eq!(repaired.condition, ClockCondition::Repaired);
+        assert_eq!(repaired.effective_now_ms, 10_000 + two_hours_ms);
+    }
+
+    #[test]
+    fn signer_clock_legacy_zero_anchor_does_not_grant_unbounded_forward_credit() {
+        let engine = engine();
+        {
+            let connection = engine.connection.lock();
+            connection
+                .execute(
+                    "INSERT INTO clock_state(
+                         singleton, last_effective_ms, condition, observed_utc_ms,
+                         monotonic_anchor_ns, boot_epoch
+                     ) VALUES (1, '10000', 'HEALTHY', '10000', '0', ?1)",
+                    [bloom_signer_api::BootEpoch::from_bytes([1; 16]).as_str()],
+                )
+                .unwrap();
+        }
+
+        // A pre-migration row persists the '0' sentinel anchor. Treating
+        // that as a real absolute anchor would let an attacker-controlled or
+        // simply very large current anchor manufacture an unbounded forward
+        // credit; the sampler's process-relative elapsed reading must be
+        // used instead, preserving the existing fail-closed behavior.
+        let two_hours_ms = 2 * 60 * 60 * 1_000;
+        let decision = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000 + two_hours_ms),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 9_999_999_999,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(decision.condition, ClockCondition::ForwardJumpRejected);
+        assert_eq!(decision.effective_now_ms, 10_000);
+    }
+
+    #[test]
+    fn signer_clock_same_process_incremental_elapsed_still_advances_healthily() {
+        let engine = engine();
+        engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+
+        // Two further observations within the same process, each advancing
+        // the absolute anchor by exactly as much as the process-relative
+        // elapsed reading reports. Same-process behavior must remain
+        // unchanged: both signals agree, so the effective clock advances by
+        // the same amount either way.
+        let first = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_050),
+                    monotonic_elapsed_ms: 50,
+                    monotonic_anchor_ns: 1_050_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(first.condition, ClockCondition::Healthy);
+        assert_eq!(first.effective_now_ms, 10_050);
+
+        let second = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_100),
+                    monotonic_elapsed_ms: 50,
+                    monotonic_anchor_ns: 1_100_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(second.condition, ClockCondition::Healthy);
+        assert_eq!(second.effective_now_ms, 10_100);
     }
 
     #[test]
