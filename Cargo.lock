@@ -691,6 +691,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-signer-vectors"
+version = "0.1.0"
+
+[[package]]
 name = "bloom-triad-local-transport"
 version = "0.1.3"
 source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=19d0465d53b279e6e1c98bac533510a1e7eb8f44#19d0465d53b279e6e1c98bac533510a1e7eb8f44"

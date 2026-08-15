@@ -15,6 +15,7 @@ mod policy;
 mod revocation;
 mod service;
 mod signing;
+mod wallet_seed;
 mod webauthn;
 
 pub use approval::*;
@@ -28,6 +29,7 @@ pub use policy::*;
 pub use revocation::*;
 pub use service::*;
 pub use signing::*;
+pub use wallet_seed::*;
 pub use webauthn::*;
 
 pub use bloom_rpc_wire::{

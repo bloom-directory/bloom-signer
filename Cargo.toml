@@ -4,6 +4,7 @@ members = [
   "crates/bloom-signer-backend-api",
   "crates/bloom-signer-backend-local",
   "crates/bloom-signer-backend-aws-kms",
+  "crates/bloom-signer-vectors",
   "crates/bloom-signer",
 ]
 resolver = "3"
