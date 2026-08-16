@@ -16,12 +16,12 @@ license = "MIT"
 
 [workspace.dependencies]
 bloom-signer-api = { path = "crates/bloom-signer-api" }
-bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
-bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
-bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
-bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
-bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
-bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
+bloom-rpc-wire = { git = "https://github.com/violet-agent/bloom-service-runtime.git", rev = "18e9c5a8c2faed853a5d8c72e2b3a30500aea2d8" }
+bloom-triad-local-transport = { git = "https://github.com/violet-agent/bloom-service-runtime.git", rev = "18e9c5a8c2faed853a5d8c72e2b3a30500aea2d8" }
+bloom-audit-checkpoint = { git = "https://github.com/violet-agent/bloom-service-runtime.git", rev = "18e9c5a8c2faed853a5d8c72e2b3a30500aea2d8" }
+bloom-service-activation = { git = "https://github.com/violet-agent/bloom-service-runtime.git", rev = "18e9c5a8c2faed853a5d8c72e2b3a30500aea2d8" }
+bloom-trusted-time = { git = "https://github.com/violet-agent/bloom-service-runtime.git", rev = "18e9c5a8c2faed853a5d8c72e2b3a30500aea2d8" }
+bloom-platform-containment = { git = "https://github.com/violet-agent/bloom-service-runtime.git", rev = "18e9c5a8c2faed853a5d8c72e2b3a30500aea2d8" }
 aws-config = { version = "=1.8.1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-credential-types = "1"
 # Exact AWS service pins preserve the workspace's declared Rust 1.85 floor.

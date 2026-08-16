@@ -8,6 +8,7 @@ use bloom_signer_api::{
     SignRequest, SignedPolicySnapshot, SignerActivationReceipt, SigningResult, Token,
     WalletTombstone, WebAuthnCredential,
 };
+use bloom_trusted_time::{DurableClockCondition, PersistedClockState, evaluate_durable_clock};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -932,16 +933,26 @@ impl SignerEngine {
             )
             .optional()
             .map_err(storage)?;
-        let Some(utc_ms) = reading.utc_ms else {
-            let effective_now_ms = stored
-                .as_ref()
-                .map(|(value, _, _)| value.parse().map_err(malformed))
-                .transpose()?
-                .unwrap_or(0);
+        let initializing = stored.is_none();
+        let previous = stored
+            .as_ref()
+            .map(|(value, _, anchor)| {
+                Ok::<_, ProtocolError>(PersistedClockState {
+                    last_effective_ms: value.parse().map_err(malformed)?,
+                    monotonic_anchor_ns: anchor.parse().map_err(malformed)?,
+                })
+            })
+            .transpose()?;
+        let shared = evaluate_durable_clock(previous, &reading, max_forward_step_ms)
+            .map_err(|cause| error(ProtocolErrorCode::ClockUntrusted, cause.to_string()))?;
+        let condition = signer_clock_condition(shared.condition);
+        let effective_now_ms = shared.effective_now_ms;
+
+        if shared.condition == DurableClockCondition::Untrusted {
             write_clock_state(
                 &transaction,
                 effective_now_ms,
-                ClockCondition::Untrusted,
+                condition,
                 &reading,
                 &boot_epoch,
             )?;
@@ -961,113 +972,98 @@ impl SignerEngine {
                     "trusted platform time source is unavailable",
                 ));
             }
-            return Ok(decision(effective_now_ms, ClockCondition::Untrusted));
-        };
-        let Some((last_effective_ms, persisted_anchor_ns)) = stored
-            .as_ref()
-            .map(|(value, _, anchor)| {
-                Ok::<_, ProtocolError>((
-                    value.parse::<u64>().map_err(malformed)?,
-                    anchor.parse::<u64>().map_err(malformed)?,
-                ))
-            })
-            .transpose()?
-        else {
-            write_clock_state(
-                &transaction,
-                utc_ms,
-                ClockCondition::Healthy,
-                &reading,
-                &boot_epoch,
-            )?;
-            self.append_audit(
-                &transaction,
-                "clock.initialized",
-                &serde_json::json!({
-                    "effective_now_ms": utc_ms.to_string(),
-                    "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
-                    "boot_epoch": boot_epoch
-                }),
-            )?;
-            transaction.commit().map_err(storage)?;
-            return Ok(decision(utc_ms, ClockCondition::Healthy));
-        };
-        let monotonic_now = last_effective_ms
-            .checked_add(monotonic_elapsed_ms(persisted_anchor_ns, &reading))
-            .ok_or_else(|| {
-                error(
-                    ProtocolErrorCode::ClockUntrusted,
-                    "monotonic clock arithmetic overflow",
-                )
-            })?;
-        if utc_ms < last_effective_ms {
-            write_clock_state(
-                &transaction,
-                last_effective_ms,
-                ClockCondition::RollbackFrozen,
-                &reading,
-                &boot_epoch,
-            )?;
-            self.append_audit(
-                &transaction,
-                "clock.rollback",
-                &serde_json::json!({
-                    "observed_utc_ms": utc_ms.to_string(),
-                    "effective_now_ms": last_effective_ms.to_string(),
-                    "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
-                    "boot_epoch": boot_epoch
-                }),
-            )?;
-            transaction.commit().map_err(storage)?;
-            if rate_limited_mutation {
-                return Err(error(
-                    ProtocolErrorCode::ClockRollback,
-                    "UTC rollback detected; effective time is frozen",
-                ));
+            return Ok(decision(effective_now_ms, condition));
+        }
+
+        let utc_ms = reading.utc_ms.ok_or_else(|| {
+            error(
+                ProtocolErrorCode::ClockUntrusted,
+                "durable clock returned a trusted decision without UTC",
+            )
+        })?;
+        match shared.condition {
+            DurableClockCondition::Healthy => {
+                write_clock_state(
+                    &transaction,
+                    effective_now_ms,
+                    condition,
+                    &reading,
+                    &boot_epoch,
+                )?;
+                let (event_type, payload) = if initializing {
+                    (
+                        "clock.initialized",
+                        serde_json::json!({
+                            "effective_now_ms": effective_now_ms.to_string(),
+                            "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                            "boot_epoch": boot_epoch
+                        }),
+                    )
+                } else {
+                    (
+                        "clock.observed",
+                        serde_json::json!({
+                            "observed_utc_ms": utc_ms.to_string(),
+                            "effective_now_ms": effective_now_ms.to_string(),
+                            "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                            "boot_epoch": boot_epoch
+                        }),
+                    )
+                };
+                self.append_audit(&transaction, event_type, &payload)?;
+                transaction.commit().map_err(storage)?;
+                Ok(decision(effective_now_ms, condition))
             }
-            return Ok(decision(last_effective_ms, ClockCondition::RollbackFrozen));
+            DurableClockCondition::RollbackFrozen => {
+                write_clock_state(
+                    &transaction,
+                    effective_now_ms,
+                    condition,
+                    &reading,
+                    &boot_epoch,
+                )?;
+                self.append_audit(
+                    &transaction,
+                    "clock.rollback",
+                    &serde_json::json!({
+                        "observed_utc_ms": utc_ms.to_string(),
+                        "effective_now_ms": effective_now_ms.to_string(),
+                        "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                        "boot_epoch": boot_epoch
+                    }),
+                )?;
+                transaction.commit().map_err(storage)?;
+                if rate_limited_mutation {
+                    return Err(error(
+                        ProtocolErrorCode::ClockRollback,
+                        "UTC rollback detected; effective time is frozen",
+                    ));
+                }
+                Ok(decision(effective_now_ms, condition))
+            }
+            DurableClockCondition::ForwardJumpRejected => {
+                write_clock_state(
+                    &transaction,
+                    effective_now_ms,
+                    condition,
+                    &reading,
+                    &boot_epoch,
+                )?;
+                self.append_audit(
+                    &transaction,
+                    "clock.forward_jump",
+                    &serde_json::json!({
+                        "observed_utc_ms": utc_ms.to_string(),
+                        "effective_now_ms": effective_now_ms.to_string(),
+                        "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                        "boot_epoch": boot_epoch
+                    }),
+                )?;
+                transaction.commit().map_err(storage)?;
+                Ok(decision(effective_now_ms, condition))
+            }
+            DurableClockCondition::Untrusted => unreachable!("handled above"),
         }
-        if utc_ms > monotonic_now.saturating_add(max_forward_step_ms) {
-            write_clock_state(
-                &transaction,
-                monotonic_now,
-                ClockCondition::ForwardJumpRejected,
-                &reading,
-                &boot_epoch,
-            )?;
-            self.append_audit(
-                &transaction,
-                "clock.forward_jump",
-                &serde_json::json!({
-                    "observed_utc_ms": utc_ms.to_string(),
-                    "effective_now_ms": monotonic_now.to_string(),
-                    "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
-                    "boot_epoch": boot_epoch
-                }),
-            )?;
-            transaction.commit().map_err(storage)?;
-            return Ok(decision(monotonic_now, ClockCondition::ForwardJumpRejected));
-        }
-        let effective_now_ms = utc_ms.max(monotonic_now);
-        write_clock_state(
-            &transaction,
-            effective_now_ms,
-            ClockCondition::Healthy,
-            &reading,
-            &boot_epoch,
-        )?;
-        self.append_audit(
-            &transaction,
-            "clock.observed",
-            &serde_json::json!({
-                "observed_utc_ms": utc_ms.to_string(),
-                "effective_now_ms": effective_now_ms.to_string(),
-                "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
-                "boot_epoch": boot_epoch
-            }),
-        )?;
-        transaction.commit().map_err(storage)?;
-        Ok(decision(effective_now_ms, ClockCondition::Healthy))
     }
 
     /// Evaluate trusted time for a read/status request without changing clock
@@ -1088,45 +1084,23 @@ impl SignerEngine {
             )
             .optional()
             .map_err(storage)?;
-        let stored = stored
+        let previous = stored
             .map(|(value, anchor)| {
-                Ok::<_, ProtocolError>((
-                    value.parse::<u64>().map_err(malformed)?,
-                    anchor.parse::<u64>().map_err(malformed)?,
-                ))
+                Ok::<_, ProtocolError>(PersistedClockState {
+                    last_effective_ms: value.parse().map_err(malformed)?,
+                    monotonic_anchor_ns: anchor.parse().map_err(malformed)?,
+                })
             })
             .transpose()?;
-        let decision = |effective_now_ms, condition| ClockDecision {
-            effective_now_ms,
-            condition,
+        let shared = evaluate_durable_clock(previous, &reading, max_forward_step_ms)
+            .map_err(|cause| error(ProtocolErrorCode::ClockUntrusted, cause.to_string()))?;
+        Ok(ClockDecision {
+            effective_now_ms: shared.effective_now_ms,
+            condition: signer_clock_condition(shared.condition),
             observed_utc_ms: reading.utc_ms,
             monotonic_anchor_ns: reading.monotonic_anchor_ns,
-            boot_epoch: boot_epoch.clone(),
-        };
-        let Some(utc_ms) = reading.utc_ms else {
-            return Ok(decision(
-                stored.map(|(value, _)| value).unwrap_or(0),
-                ClockCondition::Untrusted,
-            ));
-        };
-        let Some((last_effective_ms, persisted_anchor_ns)) = stored else {
-            return Ok(decision(utc_ms, ClockCondition::Healthy));
-        };
-        let monotonic_now = last_effective_ms
-            .checked_add(monotonic_elapsed_ms(persisted_anchor_ns, &reading))
-            .ok_or_else(|| {
-                error(
-                    ProtocolErrorCode::ClockUntrusted,
-                    "monotonic clock arithmetic overflow",
-                )
-            })?;
-        if utc_ms < last_effective_ms {
-            return Ok(decision(last_effective_ms, ClockCondition::RollbackFrozen));
-        }
-        if utc_ms > monotonic_now.saturating_add(max_forward_step_ms) {
-            return Ok(decision(monotonic_now, ClockCondition::ForwardJumpRejected));
-        }
-        Ok(decision(utc_ms.max(monotonic_now), ClockCondition::Healthy))
+            boot_epoch,
+        })
     }
 
     pub fn repair_clock(&self, accepted_utc_ms: u64) -> Result<ClockDecision, ProtocolError> {
@@ -4931,34 +4905,13 @@ fn wallet_epoch(transaction: &Transaction<'_>, wallet_id: &Token) -> Result<u64,
         .map(|value| value.unwrap_or(0))
 }
 
-/// Determine how much monotonic time has elapsed since the last persisted
-/// clock observation.
-///
-/// `reading.monotonic_elapsed_ms` is process-relative: it resets to 0 across
-/// a Signer/sampler restart because the sampler's internal accumulator is
-/// re-initialized on the first sample of a new process. `monotonic_anchor_ns`
-/// is an absolute reading of the platform's continuous (suspend-aware)
-/// monotonic clock and survives a process restart within the same kernel
-/// boot, so its delta against the previously persisted anchor gives the true
-/// elapsed time across a restart. Fall back to the process-relative reading
-/// when the persisted anchor is the pre-migration sentinel (`0`) or when the
-/// current anchor is behind the persisted one, which signals a kernel reboot
-/// or other monotonic-domain reset; that case must stay fail-closed and be
-/// resolved through the existing operator repair path. Within one process,
-/// retain the sampler's elapsed value when it is larger by a millisecond due
-/// to its carried sub-millisecond remainder.
-fn monotonic_elapsed_ms(
-    persisted_anchor_ns: u64,
-    reading: &bloom_trusted_time::PlatformTimeReading,
-) -> u64 {
-    if persisted_anchor_ns != 0 {
-        if let Some(anchor_elapsed_ns) =
-            reading.monotonic_anchor_ns.checked_sub(persisted_anchor_ns)
-        {
-            return (anchor_elapsed_ns / 1_000_000).max(reading.monotonic_elapsed_ms);
-        }
+fn signer_clock_condition(condition: DurableClockCondition) -> ClockCondition {
+    match condition {
+        DurableClockCondition::Healthy => ClockCondition::Healthy,
+        DurableClockCondition::Untrusted => ClockCondition::Untrusted,
+        DurableClockCondition::RollbackFrozen => ClockCondition::RollbackFrozen,
+        DurableClockCondition::ForwardJumpRejected => ClockCondition::ForwardJumpRejected,
     }
-    reading.monotonic_elapsed_ms
 }
 
 fn write_clock_state(
