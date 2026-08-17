@@ -34,6 +34,39 @@ use bloom_signer_api::{Digest32, ProtocolError, ProtocolErrorCode, Token};
 
 use crate::engine::storage;
 
+/// Canonical audit recorder. Every registry transition must invoke this in
+/// the same SQLite transaction as the mutation; the canonical audit chain is
+/// the authoritative continuity record. `derivation_events` is a local
+/// integrity convenience only and must never be treated as a second audit
+/// authority.
+pub type AuditRecorder<'a> =
+    &'a dyn Fn(&rusqlite::Transaction<'_>, &str, serde_json::Value) -> Result<(), ProtocolError>;
+
+#[allow(clippy::too_many_arguments)]
+fn transition_payload(
+    wallet_id: &Token,
+    operation_id: &str,
+    profile: &str,
+    role: &str,
+    account: u32,
+    index: u32,
+    path: &str,
+    from_state: Option<&str>,
+    to_state: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "wallet_id": wallet_id.as_str(),
+        "operation_id": operation_id,
+        "profile": profile,
+        "role": role,
+        "account": account,
+        "index": index,
+        "path": path,
+        "from_state": from_state,
+        "to_state": to_state,
+    })
+}
+
 pub const PROFILE_EVM: &str = "bip44-evm-secp256k1-v1";
 pub const PROFILE_SOLANA: &str = "bip44-solana-slip10-ed25519-v1";
 
@@ -312,6 +345,7 @@ pub fn prepare_allocation(
     operation_id: &str,
     invalid_child: impl Fn(u32, u32) -> bool,
     now_ms: u64,
+    audit: AuditRecorder<'_>,
 ) -> Result<Reservation, ProtocolError> {
     if let Some(existing) = load_allocation(connection, wallet_id, operation_id)? {
         // Idempotent retry: identical request returns the same reservation.
@@ -447,6 +481,11 @@ pub fn prepare_allocation(
         STATE_PREPARED,
         now_ms,
     )?;
+    audit(
+        &transaction,
+        "derivation.prepared",
+        transition_payload(wallet_id, operation_id, profile, role, account, start, &path, None, STATE_PREPARED),
+    )?;
     transaction.commit().map_err(storage)?;
     Ok(Reservation {
         operation_id: operation_id.to_owned(),
@@ -478,8 +517,10 @@ pub fn commit_index(
     wallet_id: &Token,
     operation_id: &str,
     now_ms: u64,
+    audit: AuditRecorder<'_>,
 ) -> Result<Reservation, ProtocolError> {
     let transaction = immediate_transaction(connection)?;
+    let (profile, role, account, index, path) = allocation_keys(&transaction, wallet_id, operation_id)?;
     transition(
         &transaction,
         wallet_id,
@@ -487,6 +528,11 @@ pub fn commit_index(
         STATE_PREPARED,
         STATE_INDEX_COMMITTED,
         now_ms,
+    )?;
+    audit(
+        &transaction,
+        "derivation.index_committed",
+        transition_payload(wallet_id, operation_id, &profile, &role, account, index, &path, Some(STATE_PREPARED), STATE_INDEX_COMMITTED),
     )?;
     let reservation = reservation_of(&transaction, wallet_id, operation_id)?;
     transaction.commit().map_err(storage)?;
@@ -503,6 +549,7 @@ pub fn commit_account(
     public_key_spki_der: &str,
     public_key_fingerprint: &Digest32,
     now_ms: u64,
+    audit: AuditRecorder<'_>,
 ) -> Result<Reservation, ProtocolError> {
     use sha2::Digest as _;
     let spki = hex_decode(public_key_spki_der)?;
@@ -540,6 +587,13 @@ pub fn commit_account(
         STATE_ACCOUNT_COMMITTED,
         now_ms,
     )?;
+    let (profile, role, account, index, path) =
+        allocation_keys(&transaction, wallet_id, operation_id)?;
+    audit(
+        &transaction,
+        "derivation.account_committed",
+        transition_payload(wallet_id, operation_id, &profile, &role, account, index, &path, Some(STATE_INDEX_COMMITTED), STATE_ACCOUNT_COMMITTED),
+    )?;
     let reservation = reservation_of(&transaction, wallet_id, operation_id)?;
     transaction.commit().map_err(storage)?;
     Ok(reservation)
@@ -552,8 +606,10 @@ pub fn activate(
     wallet_id: &Token,
     operation_id: &str,
     now_ms: u64,
+    audit: AuditRecorder<'_>,
 ) -> Result<PublicAccount, ProtocolError> {
     let transaction = immediate_transaction(connection)?;
+    let (profile, role, account, index, path) = allocation_keys(&transaction, wallet_id, operation_id)?;
     transition(
         &transaction,
         wallet_id,
@@ -561,6 +617,11 @@ pub fn activate(
         STATE_ACCOUNT_COMMITTED,
         STATE_ACTIVATED,
         now_ms,
+    )?;
+    audit(
+        &transaction,
+        "derivation.activated",
+        transition_payload(wallet_id, operation_id, &profile, &role, account, index, &path, Some(STATE_ACCOUNT_COMMITTED), STATE_ACTIVATED),
     )?;
     let public = public_of(&transaction, wallet_id, operation_id)?;
     transaction.commit().map_err(storage)?;
@@ -576,6 +637,7 @@ pub fn tombstone(
     wallet_id: &Token,
     operation_id: &str,
     now_ms: u64,
+    audit: AuditRecorder<'_>,
 ) -> Result<(), ProtocolError> {
     let transaction = immediate_transaction(connection)?;
     let row = transaction
@@ -635,6 +697,18 @@ pub fn tombstone(
         Some(&state),
         STATE_TOMBSTONED,
         now_ms,
+    )?;
+    let path = transaction
+        .query_row(
+            "SELECT path FROM derivation_allocations WHERE wallet_id = ?1 AND operation_id = ?2",
+            rusqlite::params![wallet_id.as_str(), operation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(storage)?;
+    audit(
+        &transaction,
+        "derivation.tombstoned",
+        transition_payload(wallet_id, operation_id, &profile, &role, account as u32, index as u32, &path, Some(&state), STATE_TOMBSTONED),
     )?;
     transaction.commit().map_err(storage)?;
     Ok(())
@@ -723,6 +797,22 @@ fn transition(
     }
     append_event(transaction, wallet_id, operation_id, Some(from), to, now_ms)?;
     Ok(())
+}
+
+fn allocation_keys(
+    connection: &Connection,
+    wallet_id: &Token,
+    operation_id: &str,
+) -> Result<(String, String, u32, u32, String), ProtocolError> {
+    let row = load_allocation(connection, wallet_id, operation_id)?
+        .ok_or_else(|| invalid("allocation was not found"))?;
+    Ok((
+        row.profile,
+        row.role,
+        row.account as u32,
+        row.index as u32,
+        row.path,
+    ))
 }
 
 fn reservation_of(

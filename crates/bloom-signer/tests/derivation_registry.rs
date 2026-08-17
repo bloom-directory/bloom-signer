@@ -15,6 +15,16 @@ fn primary() -> Token {
     Token::new("primary").unwrap()
 }
 
+/// A no-op canonical audit recorder for tests that do not exercise audit
+/// semantics directly.
+fn noop(
+    _transaction: &rusqlite::Transaction<'_>,
+    _event_type: &str,
+    _payload: serde_json::Value,
+) -> Result<(), bloom_signer_api::ProtocolError> {
+    Ok(())
+}
+
 fn spki_fixture(byte: u8) -> (String, Digest32) {
     use sha2::Digest as _;
     let spki = vec![byte; 44];
@@ -38,14 +48,16 @@ fn allocate_activated(
         operation,
         |_, _| false,
         1_000,
+        &noop,
     )
     .unwrap();
     assert_eq!(reservation.index, index_offset);
     assert_eq!(reservation.path, format!("m/44'/60'/0'/0/{index_offset}"));
-    registry::commit_index(connection, &wallet, operation, 1_100).unwrap();
+    registry::commit_index(connection, &wallet, operation, 1_100, &noop).unwrap();
     let (spki, fingerprint) = spki_fixture(2);
-    registry::commit_account(connection, &wallet, operation, &spki, &fingerprint, 1_200).unwrap();
-    registry::activate(connection, &wallet, operation, 1_300).unwrap()
+    registry::commit_account(connection, &wallet, operation, &spki, &fingerprint, 1_200, &noop)
+        .unwrap();
+    registry::activate(connection, &wallet, operation, 1_300, &noop).unwrap()
 }
 
 #[test]
@@ -72,6 +84,7 @@ fn operation_retry_returns_the_same_reservation() {
         "op-1",
         |_, _| false,
         1_000,
+        &noop,
     )
     .unwrap();
     let retry = registry::prepare_allocation(
@@ -83,12 +96,12 @@ fn operation_retry_returns_the_same_reservation() {
         "op-1",
         |_, _| false,
         2_000,
+        &noop,
     )
     .unwrap();
     assert_eq!(first, retry);
     assert_eq!(first.index, 0);
 
-    // A different operation receives the next index.
     let second = registry::prepare_allocation(
         &mut connection,
         &wallet,
@@ -98,11 +111,11 @@ fn operation_retry_returns_the_same_reservation() {
         "op-2",
         |_, _| false,
         2_100,
+        &noop,
     )
     .unwrap();
     assert_eq!(second.index, 1);
 
-    // Reusing an operation id for a different shape fails closed.
     assert!(registry::prepare_allocation(
         &mut connection,
         &wallet,
@@ -112,6 +125,7 @@ fn operation_retry_returns_the_same_reservation() {
         "op-1",
         |_, _| false,
         2_200,
+        &noop,
     )
     .is_err());
 }
@@ -120,7 +134,6 @@ fn operation_retry_returns_the_same_reservation() {
 fn invalid_children_are_tombstoned_and_never_reused() {
     let mut connection = connection();
     let wallet = primary();
-    // Indices 0 and 2 are invalid children: allocation lands on 1 and 3.
     let first = registry::prepare_allocation(
         &mut connection,
         &wallet,
@@ -130,11 +143,10 @@ fn invalid_children_are_tombstoned_and_never_reused() {
         "op-1",
         |_, index| matches!(index, 0 | 2),
         1_000,
+        &noop,
     )
     .unwrap();
     assert_eq!(first.index, 1);
-    // The validity predicate is stable across operations (same seed): op-2
-    // replays the same walk and must skip the tombstoned 2 as well.
     let second = registry::prepare_allocation(
         &mut connection,
         &wallet,
@@ -144,12 +156,11 @@ fn invalid_children_are_tombstoned_and_never_reused() {
         "op-2",
         |_, index| matches!(index, 0 | 2),
         1_100,
+        &noop,
     )
     .unwrap();
     assert_eq!(second.index, 3, "tombstoned 0 and 2 must be skipped forever");
 
-    // A crash-restart that replays the same predicates converges: a new
-    // operation can never receive 0 or 2.
     let third = registry::prepare_allocation(
         &mut connection,
         &wallet,
@@ -159,6 +170,7 @@ fn invalid_children_are_tombstoned_and_never_reused() {
         "op-3",
         |_, index| matches!(index, 0 | 2),
         1_200,
+        &noop,
     )
     .unwrap();
     assert_eq!(third.index, 4);
@@ -177,21 +189,17 @@ fn public_accounts_are_invisible_before_activation() {
         "op-1",
         |_, _| false,
         1_000,
+        &noop,
     )
     .unwrap();
-    assert!(registry::public_accounts(&connection, &primary())
-        .unwrap()
-        .is_empty());
-    registry::commit_index(&mut connection, &wallet, "op-1", 1_100).unwrap();
-    assert!(registry::public_accounts(&connection, &primary())
-        .unwrap()
-        .is_empty());
+    assert!(registry::public_accounts(&connection, &primary()).unwrap().is_empty());
+    registry::commit_index(&mut connection, &wallet, "op-1", 1_100, &noop).unwrap();
+    assert!(registry::public_accounts(&connection, &primary()).unwrap().is_empty());
     let (spki, fingerprint) = spki_fixture(4);
-    registry::commit_account(&mut connection, &wallet, "op-1", &spki, &fingerprint, 1_200).unwrap();
-    assert!(registry::public_accounts(&connection, &primary())
-        .unwrap()
-        .is_empty());
-    registry::activate(&mut connection, &wallet, "op-1", 1_300).unwrap();
+    registry::commit_account(&mut connection, &wallet, "op-1", &spki, &fingerprint, 1_200, &noop)
+        .unwrap();
+    assert!(registry::public_accounts(&connection, &primary()).unwrap().is_empty());
+    registry::activate(&mut connection, &wallet, "op-1", 1_300, &noop).unwrap();
     assert_eq!(registry::public_accounts(&connection, &primary()).unwrap().len(), 1);
 }
 
@@ -208,16 +216,17 @@ fn transitions_refuse_out_of_order_advancement() {
         "op-1",
         |_, _| false,
         1_000,
+        &noop,
     )
     .unwrap();
-    // Cannot skip INDEX_COMMITTED.
     let (spki, fingerprint) = spki_fixture(6);
-    assert!(registry::commit_account(&mut connection, &wallet, "op-1", &spki, &fingerprint, 1_100).is_err());
-    // Cannot activate directly from PREPARED.
-    assert!(registry::activate(&mut connection, &wallet, "op-1", 1_100).is_err());
-    // Double commit is refused.
-    registry::commit_index(&mut connection, &wallet, "op-1", 1_100).unwrap();
-    assert!(registry::commit_index(&mut connection, &wallet, "op-1", 1_150).is_err());
+    assert!(
+        registry::commit_account(&mut connection, &wallet, "op-1", &spki, &fingerprint, 1_100, &noop)
+            .is_err()
+    );
+    assert!(registry::activate(&mut connection, &wallet, "op-1", 1_100, &noop).is_err());
+    registry::commit_index(&mut connection, &wallet, "op-1", 1_100, &noop).unwrap();
+    assert!(registry::commit_index(&mut connection, &wallet, "op-1", 1_150, &noop).is_err());
 }
 
 #[test]
@@ -233,13 +242,14 @@ fn descriptor_fingerprint_mismatch_is_refused() {
         "op-1",
         |_, _| false,
         1_000,
+        &noop,
     )
     .unwrap();
-    registry::commit_index(&mut connection, &wallet, "op-1", 1_100).unwrap();
+    registry::commit_index(&mut connection, &wallet, "op-1", 1_100, &noop).unwrap();
     let (spki, _) = spki_fixture(8);
     let wrong_fingerprint = Digest32::from_bytes([0x11; 32]);
     assert!(
-        registry::commit_account(&mut connection, &wallet, "op-1", &spki, &wrong_fingerprint, 1_200)
+        registry::commit_account(&mut connection, &wallet, "op-1", &spki, &wrong_fingerprint, 1_200, &noop)
             .is_err()
     );
 }
@@ -249,13 +259,10 @@ fn tombstoned_accounts_leave_public_list_and_chain_stays_verified() {
     let mut connection = connection();
     let wallet = primary();
     allocate_activated(&mut connection, "op-1", 0);
-    registry::tombstone(&mut connection, &wallet, "op-1", 2_000).unwrap();
-    assert!(registry::public_accounts(&connection, &primary())
-        .unwrap()
-        .is_empty());
+    registry::tombstone(&mut connection, &wallet, "op-1", 2_000, &noop).unwrap();
+    assert!(registry::public_accounts(&connection, &primary()).unwrap().is_empty());
     registry::verify_event_chain(&connection).unwrap();
 
-    // The index is gone forever.
     let next = registry::prepare_allocation(
         &mut connection,
         &wallet,
@@ -265,6 +272,7 @@ fn tombstoned_accounts_leave_public_list_and_chain_stays_verified() {
         "op-2",
         |_, _| false,
         2_100,
+        &noop,
     )
     .unwrap();
     assert_eq!(next.index, 1);
@@ -283,9 +291,10 @@ fn abandoned_reservations_never_release_their_index() {
         "op-abandoned",
         |_, _| false,
         1_000,
+        &noop,
     )
     .unwrap();
-    registry::tombstone(&mut connection, &wallet, "op-abandoned", 1_500).unwrap();
+    registry::tombstone(&mut connection, &wallet, "op-abandoned", 1_500, &noop).unwrap();
     let next = registry::prepare_allocation(
         &mut connection,
         &wallet,
@@ -295,6 +304,7 @@ fn abandoned_reservations_never_release_their_index() {
         "op-2",
         |_, _| false,
         1_600,
+        &noop,
     )
     .unwrap();
     assert_eq!(next.index, 1, "the abandoned index 0 is not reusable");
@@ -314,32 +324,26 @@ fn crash_at_every_transition_reloads_into_one_valid_state() {
             "op-1",
             |_, _| false,
             1_000,
+            &noop,
         )
         .unwrap();
         if stop_after == "PREPARED" {
-            // Reload: the reservation stands, nothing else is visible.
-            assert!(registry::public_accounts(&connection, &primary())
-                .unwrap()
-                .is_empty());
+            assert!(registry::public_accounts(&connection, &primary()).unwrap().is_empty());
             continue;
         }
-        registry::commit_index(&mut connection, &wallet, "op-1", 1_100).unwrap();
+        registry::commit_index(&mut connection, &wallet, "op-1", 1_100, &noop).unwrap();
         if stop_after == "INDEX_COMMITTED" {
-            assert!(registry::public_accounts(&connection, &primary())
-                .unwrap()
-                .is_empty());
+            assert!(registry::public_accounts(&connection, &primary()).unwrap().is_empty());
             continue;
         }
         let (spki, fingerprint) = spki_fixture(3);
-        registry::commit_account(&mut connection, &wallet, "op-1", &spki, &fingerprint, 1_200)
+        registry::commit_account(&mut connection, &wallet, "op-1", &spki, &fingerprint, 1_200, &noop)
             .unwrap();
         if stop_after == "ACCOUNT_COMMITTED" {
-            assert!(registry::public_accounts(&connection, &primary())
-                .unwrap()
-                .is_empty());
+            assert!(registry::public_accounts(&connection, &primary()).unwrap().is_empty());
             continue;
         }
-        registry::activate(&mut connection, &wallet, "op-1", 1_300).unwrap();
+        registry::activate(&mut connection, &wallet, "op-1", 1_300, &noop).unwrap();
         assert_eq!(registry::public_accounts(&connection, &primary()).unwrap().len(), 1);
         registry::verify_event_chain(&connection).unwrap();
     }
@@ -370,6 +374,7 @@ fn concurrent_operations_never_share_an_index() {
                 &operation,
                 |_, _| false,
                 1_000 + u64::from(worker),
+                &noop,
             )
             .unwrap();
             reservation.index
@@ -386,14 +391,49 @@ fn concurrent_operations_never_share_an_index() {
 }
 
 #[test]
+fn audit_failure_rolls_back_the_transition() {
+    let mut connection = connection();
+    let wallet = primary();
+    let failing = |_tx: &rusqlite::Transaction<'_>, _et: &str, _p: serde_json::Value| {
+        Err::<(), _>(bloom_signer_api::ProtocolError::new(
+            bloom_signer_api::ProtocolErrorCode::ServiceUnavailable,
+            "audit unavailable",
+        ))
+    };
+    let result = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        0,
+        "op-1",
+        |_, _| false,
+        1_000,
+        &failing,
+    );
+    assert!(result.is_err());
+    // Nothing persisted: the reservation is absent and can be retried cleanly.
+    let retry = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        0,
+        "op-1",
+        |_, _| false,
+        1_100,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(retry.index, 0);
+}
+
+#[test]
 fn tampered_event_chain_is_refused() {
     let mut connection = connection();
     allocate_activated(&mut connection, "op-1", 0);
     connection
-        .execute(
-            "UPDATE derivation_events SET to_state = 'HACKED' WHERE sequence = 1",
-            [],
-        )
+        .execute("UPDATE derivation_events SET to_state = 'HACKED' WHERE sequence = 1", [])
         .unwrap();
     assert!(registry::verify_event_chain(&connection).is_err());
 }
@@ -402,9 +442,6 @@ fn tampered_event_chain_is_refused() {
 fn namespace_cap_is_enforced() {
     let mut connection = connection();
     let wallet = primary();
-    // The EVM template carries an index slot, so one account can hold many
-    // allocations; the Solana template is account-scoped (one path per
-    // account), and its cap applies across accounts.
     for operation in 0..registry::DEFAULT_NAMESPACE_CAP {
         registry::prepare_allocation(
             &mut connection,
@@ -415,6 +452,7 @@ fn namespace_cap_is_enforced() {
             &format!("op-{operation}"),
             |_, _| false,
             1_000 + operation,
+            &noop,
         )
         .unwrap();
     }
@@ -427,6 +465,7 @@ fn namespace_cap_is_enforced() {
         "op-over",
         |_, _| false,
         9_999,
+        &noop,
     )
     .unwrap_err();
     assert!(error.message.contains("cap"));

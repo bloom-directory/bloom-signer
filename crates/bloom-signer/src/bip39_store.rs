@@ -25,6 +25,24 @@ pub const ROOT_PROFILE_BIP39_MULTICURVE_V1: &str = "bip39-multicurve-v1";
 pub const WRAP_KIND_CREDENTIAL: &str = "credential";
 pub const WRAP_KIND_RECOVERY: &str = "recovery";
 
+/// Decrypt-time plaintext validation (correction 2). SQLite constraints can
+/// enforce one root row, profile, entropy-length metadata, and allowed
+/// formats — they cannot prove what an opaque ciphertext contains. After the
+/// ciphertext is authenticated (AEAD) and decrypted at unlock/restore, the
+/// plaintext length MUST match the stored `entropy_bits` metadata before any
+/// derivation proceeds; a ciphertext holding a mnemonic, a PBKDF2 seed, an
+/// XPrv, or derived keys has the wrong length and is rejected here.
+pub fn entropy_plaintext_matches_metadata(plaintext: &[u8], entropy_bits: usize) -> bool {
+    match entropy_bits {
+        128 => plaintext.len() == 16,
+        160 => plaintext.len() == 20,
+        192 => plaintext.len() == 24,
+        224 => plaintext.len() == 28,
+        256 => plaintext.len() == 32,
+        _ => false,
+    }
+}
+
 /// WAL + explicit durability for the file-backed database. In-memory
 /// connections (tests) skip journal configuration, which is a no-op there.
 pub fn configure_durability(connection: &Connection) -> Result<(), ProtocolError> {
@@ -639,5 +657,24 @@ mod tests {
             &Token::new("primary").unwrap()
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod entropy_length_tests {
+    use super::entropy_plaintext_matches_metadata;
+
+    #[test]
+    fn entropy_lengths_map_to_their_metadata() {
+        assert!(entropy_plaintext_matches_metadata(&[0u8; 16], 128));
+        assert!(entropy_plaintext_matches_metadata(&[0u8; 20], 160));
+        assert!(entropy_plaintext_matches_metadata(&[0u8; 24], 192));
+        assert!(entropy_plaintext_matches_metadata(&[0u8; 28], 224));
+        assert!(entropy_plaintext_matches_metadata(&[0u8; 32], 256));
+        // A 64-byte plaintext is a PBKDF2 seed, not entropy; 32-byte entropy
+        // declared as 128 bits is a metadata mismatch. Both must fail.
+        assert!(!entropy_plaintext_matches_metadata(&[0u8; 64], 256));
+        assert!(!entropy_plaintext_matches_metadata(&[0u8; 32], 128));
+        assert!(!entropy_plaintext_matches_metadata(&[0u8; 32], 999));
     }
 }
