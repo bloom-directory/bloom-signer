@@ -1,43 +1,50 @@
-//! Hardened and non-hardened BIP-32 secp256k1 derivation for
-//! `bip44-evm-secp256k1-v1`.
+//! BIP-32 secp256k1 derivation for `bip44-evm-secp256k1-v1`.
 //!
 //! Master key: `I = HMAC-SHA512("Bitcoin seed", seed)`; `k = I_L`,
 //! `c = I_R`. Hardened child:
-//! `I = HMAC-SHA512(c_par, 0x00 || k_par || ser32(i + 2^31))`,
-//! `k_i = (I_L + k_par) mod n`, `c_i = I_R`. Non-hardened child (BIP-44
-//! change/index levels only):
-//! `I = HMAC-SHA512(c_par, serP(K_par) || ser32(i))`. Callers cannot pass
-//! arbitrary paths: derivation is exposed per profile canonical template.
+//! `I = HMAC-SHA512(c_par, 0x00 || k_par || ser32(i + 2^31))`. Non-hardened
+//! child (BIP-44 change/index levels only):
+//! `I = HMAC-SHA512(c_par, serP(K_par) || ser32(i))`. In both forms
+//! `k_i = (I_L + k_par) mod n`, `c_i = I_R`.
+//!
+//! Scalar arithmetic uses the `k256` crate's field implementation — no
+//! hand-written limb math (which previously shipped a real ordering bug).
+//! The BIP-32 invalid-child rules are enforced explicitly:
+//! [`Secp256k1DeriveError::InvalidChild`] when `I_L >= n` or when the sum
+//! is zero; callers must deterministically skip (tombstone) such indices
+//! (see [`crate::allocation::next_valid_index`]).
+//!
+//! Callers cannot pass arbitrary paths: derivation is exposed per profile
+//! canonical template only.
 
 use hmac::{Hmac, Mac};
 use k256::ecdsa::SigningKey;
 use k256::pkcs8::EncodePublicKey;
+use k256::{Scalar, elliptic_curve::ops::Reduce};
 use sha2::{Digest as _, Sha256, Sha512};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::seed::SEED_BYTES;
 
-/// secp256k1 group order `n`.
-const N: [u64; 4] = [
-    0xBFD25E8C_D0364141,
-    0xBAAEDCE6_AF48A03B,
-    0xFFFFFFFF_FFFFFFFE,
-    0xFFFFFFFF_FFFFFFFF,
-];
-
 const MASTER_DOMAIN: &[u8] = b"Bitcoin seed";
 const HARDENED_OFFSET: u32 = 1 << 31;
 
-pub const PATH_COIN: u32 = 60;
 pub const PATH_PURPOSE: u32 = 44;
+pub const PATH_COIN: u32 = 60;
 
 #[derive(Debug, Error)]
 pub enum Secp256k1DeriveError {
-    #[error("derived private key is zero or >= n (invalid master seed)")]
-    InvalidKey,
+    #[error("master seed produced an invalid private key")]
+    InvalidMasterKey,
+    #[error("seed length must be 16-64 bytes")]
+    InvalidSeedLength,
     #[error("account or index must be a non-hardened BIP-44 value (< 2^31)")]
     InvalidIndex,
+    /// BIP-32 invalid child: `I_L >= n` or the derived scalar is zero.
+    /// Deterministically skip this index and proceed with the next.
+    #[error("BIP-32 invalid child at this index (I_L >= n or zero scalar); skip deterministically")]
+    InvalidChild,
 }
 
 /// A fully described secp256k1 derived account.
@@ -62,62 +69,41 @@ fn hmac_sha512(key: &[u8], message: &[u8]) -> [u8; 64] {
     mac.finalize().into_bytes().into()
 }
 
-fn valid_private(key: &[u8; 32]) -> bool {
-    if key.iter().all(|byte| *byte == 0) {
-        return false;
+/// Parse 32 bytes as a canonical scalar (less than n). Returns `None` for
+/// values at or above n; canonicality is checked by reduction round-trip,
+/// independent of any single constructor's failure mode.
+fn scalar_from_canonical(bytes: &[u8; 32]) -> Option<Scalar> {
+    let reduced = <Scalar as Reduce<k256::elliptic_curve::bigint::U256>>::reduce_bytes(&(*bytes).into());
+    if reduced.to_bytes().as_slice() == bytes.as_slice() {
+        Some(reduced)
+    } else {
+        None
     }
-    let limbs = limbs_of(key);
-    !exceeds_n(&limbs)
 }
 
-/// Magnitude comparison against n for little-endian limb values: array
-/// ordering compares the least-significant limb first, so compare from the
-/// most significant limb explicitly.
-fn exceeds_n(value: &[u64; 4]) -> bool {
-    for position in (0..4).rev() {
-        if value[position] != N[position] {
-            return value[position] > N[position];
-        }
-    }
-    false
+fn scalar_bytes(value: &Scalar) -> [u8; 32] {
+    let bytes = value.to_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    out
 }
 
-/// (a + b) mod n over 256-bit little-endian limb values.
-fn add_mod_n(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
-    let mut carry: u128 = 0;
-    let mut sum = [0u64; 4];
-    for position in 0..4 {
-        let total = u128::from(a[position]) + u128::from(b[position]) + carry;
-        sum[position] = total as u64;
-        carry = total >> 64;
+/// `(I_L + parent) mod n`, enforcing the invalid-child rules. Exposed for
+/// tests that construct `I_L` directly.
+pub fn child_key_from_tweak(
+    tweak: &[u8; 32],
+    parent_key: &[u8; 32],
+) -> Result<Zeroizing<[u8; 32]>, Secp256k1DeriveError> {
+    let tweak_scalar =
+        scalar_from_canonical(tweak).ok_or(Secp256k1DeriveError::InvalidChild)?;
+    let parent_scalar = scalar_from_canonical(parent_key)
+        .ok_or(Secp256k1DeriveError::InvalidMasterKey)?;
+    let child = tweak_scalar + parent_scalar;
+    let bytes = scalar_bytes(&child);
+    if bytes.iter().all(|byte| *byte == 0) {
+        return Err(Secp256k1DeriveError::InvalidChild);
     }
-    if carry == 1 || exceeds_n(&sum) {
-        // sum - n, borrowing is impossible to underflow given the check.
-        let mut borrow: i128 = 0;
-        for position in 0..4 {
-            let difference = i128::from(sum[position]) - i128::from(N[position]) + borrow;
-            sum[position] = difference as u64;
-            borrow = difference >> 64;
-        }
-    }
-    sum
-}
-
-fn limbs_of(bytes: &[u8; 32]) -> [u64; 4] {
-    let mut limbs = [0u64; 4];
-    for (index, limb) in limbs.iter_mut().enumerate() {
-        let start = 24 - index * 8;
-        *limb = u64::from_be_bytes(bytes[start..start + 8].try_into().unwrap());
-    }
-    limbs
-}
-
-fn bytes_of(limbs: &[u64; 4]) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    for (index, limb) in limbs.iter().enumerate() {
-        bytes[24 - index * 8..32 - index * 8].copy_from_slice(&limb.to_be_bytes());
-    }
-    bytes
+    Ok(Zeroizing::new(bytes))
 }
 
 /// BIP-32 master (private key, chain code). Accepts any seed length
@@ -127,16 +113,14 @@ pub fn master_secp256k1(
     seed: &[u8],
 ) -> Result<(Zeroizing<[u8; 32]>, [u8; 32]), Secp256k1DeriveError> {
     if seed.len() < 16 || seed.len() > SEED_BYTES {
-        return Err(Secp256k1DeriveError::InvalidKey);
+        return Err(Secp256k1DeriveError::InvalidSeedLength);
     }
     let digest = hmac_sha512(MASTER_DOMAIN, seed);
-    let mut private_key = Zeroizing::new([0u8; 32]);
-    private_key.copy_from_slice(&digest[..32]);
+    let mut tweak = [0u8; 32];
+    tweak.copy_from_slice(&digest[..32]);
     let mut chain_code = [0u8; 32];
     chain_code.copy_from_slice(&digest[32..]);
-    if !valid_private(&private_key) {
-        return Err(Secp256k1DeriveError::InvalidKey);
-    }
+    let private_key = child_key_from_tweak(&tweak, &[0u8; 32])?;
     Ok((private_key, chain_code))
 }
 
@@ -154,21 +138,11 @@ pub fn hardened_child(
     message[1..33].copy_from_slice(parent_key);
     message[33..37].copy_from_slice(&(index + HARDENED_OFFSET).to_be_bytes());
     let digest = hmac_sha512(parent_code, &message);
-    let mut tweak = [0u8; 32];
-    tweak.copy_from_slice(&digest[..32]);
-    let mut chain_code = [0u8; 32];
-    chain_code.copy_from_slice(&digest[32..]);
-    let child = add_mod_n(&limbs_of(&tweak), &limbs_of(parent_key));
-    let private_key = Zeroizing::new(bytes_of(&child));
-    if !valid_private(&private_key) {
-        return Err(Secp256k1DeriveError::InvalidKey);
-    }
-    Ok((private_key, chain_code))
+    child_from_digest(&digest, parent_key)
 }
 
 /// One non-hardened child step, used only for the BIP-44 change and index
-/// levels: `I = HMAC-SHA512(c_par, serP(K_par) || ser32(i))`,
-/// `k_i = (I_L + k_par) mod n`, `c_i = I_R`.
+/// levels: `I = HMAC-SHA512(c_par, serP(K_par) || ser32(i))`.
 pub fn non_hardened_child(
     parent_key: &[u8; 32],
     parent_code: &[u8; 32],
@@ -182,18 +156,18 @@ pub fn non_hardened_child(
     message[..33].copy_from_slice(&parent.compressed_public_key);
     message[33..37].copy_from_slice(&index.to_be_bytes());
     let digest = hmac_sha512(parent_code, &message);
+    child_from_digest(&digest, parent_key)
+}
+
+fn child_from_digest(
+    digest: &[u8; 64],
+    parent_key: &[u8; 32],
+) -> Result<(Zeroizing<[u8; 32]>, [u8; 32]), Secp256k1DeriveError> {
     let mut tweak = [0u8; 32];
     tweak.copy_from_slice(&digest[..32]);
-    if tweak.iter().all(|byte| *byte == 0) || exceeds_n(&limbs_of(&tweak)) {
-        return Err(Secp256k1DeriveError::InvalidKey);
-    }
     let mut chain_code = [0u8; 32];
     chain_code.copy_from_slice(&digest[32..]);
-    let child = add_mod_n(&limbs_of(&tweak), &limbs_of(parent_key));
-    let private_key = Zeroizing::new(bytes_of(&child));
-    if !valid_private(&private_key) {
-        return Err(Secp256k1DeriveError::InvalidKey);
-    }
+    let private_key = child_key_from_tweak(&tweak, parent_key)?;
     Ok((private_key, chain_code))
 }
 
@@ -203,10 +177,9 @@ pub fn describe_secp256k1(private_key: &[u8; 32]) -> DerivedSecp256k1 {
     let verifying = signing.verifying_key();
     let mut compressed_public_key = [0u8; 33];
     compressed_public_key.copy_from_slice(verifying.to_encoded_point(true).as_bytes());
-    let public_key = k256::PublicKey::from_sec1_bytes(
-        verifying.to_encoded_point(false).as_bytes(),
-    )
-    .expect("valid SEC1 point");
+    let public_key =
+        k256::PublicKey::from_sec1_bytes(verifying.to_encoded_point(false).as_bytes())
+            .expect("valid SEC1 point");
     let spki_der = public_key
         .to_public_key_der()
         .expect("SPKI encoding of a valid key")
@@ -290,7 +263,10 @@ mod tests {
             hex::encode(child_key.as_slice()),
             "edb2e14f9ee77d26dd93b4ecede8d16ed408ce149b6cd80b0715a2d911a0afea"
         );
-        assert_eq!(hex::encode(child_code), "47fdacbd0f1097043b78c63c20c34ef4ed9a111d980047ad16282c7ae6236141");
+        assert_eq!(
+            hex::encode(child_code),
+            "47fdacbd0f1097043b78c63c20c34ef4ed9a111d980047ad16282c7ae6236141"
+        );
         // m/0'/1 — non-hardened child; constants decoded from the official xprv.
         let (grandchild_key, grandchild_code) =
             non_hardened_child(&child_key, &child_code, 1).unwrap();
@@ -298,6 +274,45 @@ mod tests {
             hex::encode(grandchild_key.as_slice()),
             "3c6cb8d0f6a264c91ea8b5030fadaa8e538b020f0a387421a12de9319dc93368"
         );
-        assert_eq!(hex::encode(grandchild_code), "2a7857631386ba23dacac34180dd1983734e444fdbf774041578e9b6adb37c19");
+        assert_eq!(
+            hex::encode(grandchild_code),
+            "2a7857631386ba23dacac34180dd1983734e444fdbf774041578e9b6adb37c19"
+        );
+    }
+
+    #[test]
+    fn invalid_child_rules_are_enforced_by_construction() {
+        let parent = hex32(
+            "e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35",
+        );
+        // I_L >= n: all-ones is greater than the group order.
+        assert!(matches!(
+            child_key_from_tweak(&[0xFF; 32], &parent),
+            Err(Secp256k1DeriveError::InvalidChild)
+        ));
+        // I_L = n - parent (canonical, since 0 < parent < n): the sum is
+        // exactly n, which reduces to the zero scalar.
+        let n_minus_parent = {
+            let n = hex32(
+                "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+            );
+            let mut borrow: i16 = 0;
+            let mut out = [0u8; 32];
+            for position in (0..32).rev() {
+                let difference = i16::from(n[position]) - i16::from(parent[position]) - borrow;
+                if difference < 0 {
+                    out[position] = (difference + 256) as u8;
+                    borrow = 1;
+                } else {
+                    out[position] = difference as u8;
+                    borrow = 0;
+                }
+            }
+            out
+        };
+        assert!(matches!(
+            child_key_from_tweak(&n_minus_parent, &parent),
+            Err(Secp256k1DeriveError::InvalidChild)
+        ));
     }
 }

@@ -40,7 +40,6 @@ pub const BIP32_EVM_PATH: &str = "m/44'/60'/0'/0/0";
 /// **non-hardened** change and index levels (BIP-44), unlike the hardened
 /// steps above it. The account-level constants pin `m/44'/60'/0'`; the
 /// change-level constants pin the non-hardened `m/44'/60'/0'/0`.
-
 pub const BIP32_EVM_MASTER_PRIVATE_KEY_HEX: &str =
     "235b34cd7c9f6d7e4595ffe9ae4b1cb5606df8aca2b527d20a07c8f56b2342f4";
 pub const BIP32_EVM_MASTER_CHAIN_CODE_HEX: &str =

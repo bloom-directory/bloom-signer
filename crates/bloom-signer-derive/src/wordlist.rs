@@ -34,7 +34,7 @@ mod tests {
     fn wordlist_is_canonical() {
         assert_eq!(word(0), "abandon");
         assert_eq!(word(2047), "zoo");
-        assert_eq!(index("art").is_some(), true);
+        assert!(index("art").is_some());
         assert_eq!(index("zzz"), None);
         // The frozen mnemonic's words are all present.
         for token in ["abandon", "art"] {

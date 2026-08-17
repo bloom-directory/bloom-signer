@@ -17,4 +17,7 @@ thiserror.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+bip32.workspace = true
+bip39 = "2"
 bloom-signer-vectors = { path = "../bloom-signer-vectors" }
+rand.workspace = true

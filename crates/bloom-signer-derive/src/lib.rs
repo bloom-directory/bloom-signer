@@ -28,13 +28,24 @@
 
 #![forbid(unsafe_code)]
 
+pub mod allocation;
 pub mod bip32;
 pub mod mnemonic;
+pub mod policy;
 pub mod seed;
 pub mod slip10;
 pub mod wordlist;
 
-pub use bip32::{DerivedSecp256k1, Secp256k1DeriveError, derive_evm_account};
-pub use mnemonic::{MnemonicError, entropy_from_mnemonic, generate_entropy, mnemonic_from_entropy};
+pub use allocation::next_valid_index;
+pub use bip32::{
+    DerivedSecp256k1, Secp256k1DeriveError, derive_evm_account, master_secp256k1,
+};
+pub use mnemonic::{
+    MnemonicError, entropy_from_mnemonic, generate_entropy, mnemonic_from_entropy,
+};
+pub use policy::{
+    GENERATE_PASSPHRASE, GENERATE_WORDS, IMPORT_WORDS, entropy_bytes_for_words,
+    import_passphrase_allowed,
+};
 pub use seed::seed_from_mnemonic;
 pub use slip10::{DerivedEd25519, Ed25519DeriveError, derive_solana_account};

@@ -22,10 +22,10 @@ fn hex64(value: &str) -> [u8; 64] {
 #[test]
 fn frozen_bip39_entropy_mnemonic_and_seed_reproduce_exactly() {
     let entropy: [u8; 32] = [0u8; 32];
-    let mnemonic = mnemonic_from_entropy(&entropy);
-    assert_eq!(*mnemonic, vectors::BIP39_MNEMONIC);
+    let mnemonic = mnemonic_from_entropy(entropy.as_slice()).unwrap();
+    assert_eq!(mnemonic.as_str(), vectors::BIP39_MNEMONIC);
     let recovered = entropy_from_mnemonic(vectors::BIP39_MNEMONIC).unwrap();
-    assert_eq!(*recovered, entropy);
+    assert_eq!(*recovered, entropy.to_vec());
 
     let seed = seed_from_mnemonic(vectors::BIP39_MNEMONIC, "");
     assert_eq!(*seed, hex64(vectors::BIP39_SEED_HEX));
