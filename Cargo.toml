@@ -50,7 +50,7 @@ k256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 parking_lot = "0.12"
 p256 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.8"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled", "backup"] }
 serde_jcs = "0.2"
 serde_json = "1"
 sha2 = "0.10"

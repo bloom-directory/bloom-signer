@@ -653,6 +653,8 @@ impl SignerEngine {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(storage)?;
+        crate::bip39_store::configure_durability(&connection)?;
+        crate::bip39_store::migrate(&connection)?;
         connection
             .execute_batch(
                 "
@@ -5517,7 +5519,7 @@ fn error(code: ProtocolErrorCode, message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(code, message)
 }
 
-fn storage(cause: impl std::fmt::Display) -> ProtocolError {
+pub(crate) fn storage(cause: impl std::fmt::Display) -> ProtocolError {
     error(
         ProtocolErrorCode::ServiceUnavailable,
         format!("Signer durable state failure: {cause}"),
