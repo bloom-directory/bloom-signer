@@ -46,6 +46,55 @@ impl Unlocked {
     pub(crate) fn wkek(&self) -> &[u8] {
         self.wkek.as_slice()
     }
+
+    /// Decrypt entropy → validate length → transient seed, for signing.
+    fn transient_seed(&self, connection: &rusqlite::Connection) -> Result<Zeroizing<[u8; 64]>, ProtocolError> {
+        let root = bip39_store::load_root(connection, &self.wallet_id)?
+            .ok_or_else(|| invalid(ProtocolErrorCode::ApprovalNotFound, "wallet not found"))?;
+        let entropy = decrypt(
+            &wrap_kind(self.wkek()),
+            &crate::custody::EncryptedBlob {
+                nonce: Base64UrlBytes::from_bytes(&root.wrapped_entropy.nonce),
+                ciphertext: Base64UrlBytes::from_bytes(&root.wrapped_entropy.ciphertext),
+            },
+            &root_aad(&self.wallet_id, root.wrap_format_version),
+        )
+        .map_err(|_| invalid(ProtocolErrorCode::UnauthenticatedPeer, "root authentication failed"))?;
+        if !bip39_store::entropy_plaintext_matches_metadata(&entropy, root.entropy_bits) {
+            return Err(invalid(
+                ProtocolErrorCode::MalformedFrame,
+                "decrypted entropy length does not match metadata",
+            ));
+        }
+        let mnemonic = mnemonic_from_entropy(&entropy)
+            .map_err(|error| invalid(ProtocolErrorCode::MalformedFrame, error.to_string()))?;
+        bloom_signer_derive::seed_from_mnemonic(&mnemonic, "")
+            .map_err(|error| invalid(ProtocolErrorCode::MalformedFrame, error.to_string()))
+    }
+
+    /// Sign a raw message through the registered SLIP-10 Ed25519 child.
+    pub fn sign_ed25519(
+        &self,
+        connection: &rusqlite::Connection,
+        account: &crate::bip39_signing::ActivatedAccount,
+        message: &[u8],
+    ) -> Result<[u8; 64], ProtocolError> {
+        let seed = self.transient_seed(connection)?;
+        crate::bip39_signing::sign_ed25519_message(&seed, account, message)
+            .map_err(|error| invalid(ProtocolErrorCode::BackendInvalidRequest, error.to_string()))
+    }
+
+    /// Sign a 32-byte EVM digest through the registered BIP-32 secp256k1 child.
+    pub fn sign_evm(
+        &self,
+        connection: &rusqlite::Connection,
+        account: &crate::bip39_signing::ActivatedAccount,
+        digest: &[u8; 32],
+    ) -> Result<[u8; 65], ProtocolError> {
+        let seed = self.transient_seed(connection)?;
+        crate::bip39_signing::sign_evm_digest(&seed, account, digest)
+            .map_err(|error| invalid(ProtocolErrorCode::BackendInvalidRequest, error.to_string()))
+    }
 }
 
 fn wrap_kind(wkek: &[u8]) -> SecretBytes {

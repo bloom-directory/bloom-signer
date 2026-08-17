@@ -372,3 +372,83 @@ fn import_reproduces_derived_keys_for_the_canonical_vector() {
     let exported = custody::export_mnemonic(&connection, &unlocked).unwrap();
     assert_eq!(*exported, mnemonic);
 }
+
+// The signing edge reached through the real custody unlock boundary: unlock,
+// derive the frozen child descriptor, sign, and verify against the frozen
+// public key.
+#[test]
+fn unlocked_session_signs_through_the_frozen_vectors() {
+    use bloom_signer::bip39_signing::ActivatedAccount;
+    use bloom_signer_derive::derive_solana_account;
+    use bloom_signer_vectors as vectors;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("signer.db");
+    let mut connection = Connection::open(&path).unwrap();
+    bip39_store::configure_durability(&connection).unwrap();
+    bip39_store::migrate(&connection).unwrap();
+
+    // Register with the frozen canonical entropy.
+    let entropy: [u8; 32] = hex::decode(vectors::BIP39_ENTROPY_HEX)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    custody::register_wallet(
+        &mut connection,
+        &Token::new("frozen").unwrap(),
+        &entropy,
+        WKEK,
+        CRED,
+        CRED_KEY,
+        None,
+        1_000,
+        &noop,
+    )
+    .unwrap();
+
+    let unlocked = custody::unlock_with_credential(
+        &connection,
+        &Token::new("frozen").unwrap(),
+        CRED,
+        CRED_KEY,
+    )
+    .unwrap();
+
+    // The frozen Solana child descriptor (canonical m/44'/501'/0'/0').
+    let seed: [u8; 64] = hex::decode(vectors::BIP39_SEED_HEX).unwrap().try_into().unwrap();
+    let derived = derive_solana_account(&seed, 0).unwrap();
+    let account = ActivatedAccount {
+        profile: "bip44-solana-slip10-ed25519-v1".into(),
+        path: derived.path,
+        spki_der_hex: hex::encode(&derived.spki_der),
+        fingerprint: bloom_signer_api::Digest32::from_bytes(derived.fingerprint),
+    };
+
+    let message = b"solana-native-transfer-v1";
+    let signature = unlocked.sign_ed25519(&connection, &account, message).unwrap();
+    let verifying =
+        ed25519_dalek::VerifyingKey::from_bytes(&derived.public_key).unwrap();
+    verifying
+        .verify_strict(message, &ed25519_dalek::Signature::from_bytes(&signature))
+        .unwrap();
+
+    // The frozen EVM child signs a digest and recovers the same key.
+    use bloom_signer_derive::derive_evm_account;
+    let evm = derive_evm_account(&seed, 0, 0).unwrap();
+    let evm_account = ActivatedAccount {
+        profile: "bip44-evm-secp256k1-v1".into(),
+        path: evm.path,
+        spki_der_hex: hex::encode(&evm.spki_der),
+        fingerprint: bloom_signer_api::Digest32::from_bytes(evm.fingerprint),
+    };
+    let digest: [u8; 32] = [0x5A; 32];
+    let signature = unlocked.sign_evm(&connection, &evm_account, &digest).unwrap();
+    let signing =
+        k256::ecdsa::SigningKey::from_bytes((&*evm.private_key).into()).unwrap();
+    let expected: k256::ecdsa::VerifyingKey = *signing.verifying_key();
+    let sig = k256::ecdsa::Signature::from_slice(&signature[..64]).unwrap();
+    let recovery = k256::ecdsa::RecoveryId::from_byte(signature[64]).unwrap();
+    let recovered =
+        k256::ecdsa::VerifyingKey::recover_from_prehash(&digest, &sig, recovery).unwrap();
+    assert_eq!(recovered, expected);
+}
