@@ -691,6 +691,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-signer-derive"
+version = "0.1.0"
+dependencies = [
+ "bloom-signer-vectors",
+ "ed25519-dalek",
+ "hex",
+ "hmac",
+ "k256",
+ "rand",
+ "sha2",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "bloom-signer-vectors"
 version = "0.1.0"
 

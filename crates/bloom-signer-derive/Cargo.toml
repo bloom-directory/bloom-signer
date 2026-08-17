@@ -1,0 +1,20 @@
+[package]
+name = "bloom-signer-derive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "BIP-39 mnemonic, PBKDF2 seed, BIP-32 secp256k1, and hardened SLIP-10 Ed25519 derivation for the Bloom local Signer"
+
+[dependencies]
+ed25519-dalek.workspace = true
+hex.workspace = true
+hmac.workspace = true
+k256.workspace = true
+rand.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+bloom-signer-vectors = { path = "../bloom-signer-vectors" }
