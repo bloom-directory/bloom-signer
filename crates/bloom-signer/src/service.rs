@@ -406,16 +406,36 @@ impl SignerRpcService {
             .backend_registry()
             .capabilities()
             .into_iter()
-            .map(|capability| BackendPublicCapability {
-                backend_id: capability.backend_id,
-                backend_instance_id: capability.backend_instance_id,
-                crypto_suites: capability.supported_crypto_suites,
-                derivation_schemes: capability
-                    .supported_derivation
-                    .into_iter()
-                    .map(|derivation| derivation.scheme)
-                    .collect(),
-                networked: capability.networked,
+            .map(|capability| {
+                let is_bip39 = capability
+                    .supported_crypto_suites
+                    .contains(&bloom_signer_api::CryptoSuite::Ed25519Message);
+                BackendPublicCapability {
+                    backend_id: capability.backend_id,
+                    backend_instance_id: capability.backend_instance_id,
+                    crypto_suites: capability.supported_crypto_suites,
+                    derivation_schemes: capability
+                        .supported_derivation
+                        .into_iter()
+                        .map(|derivation| derivation.scheme)
+                        .collect(),
+                    networked: capability.networked,
+                    wallet_seed_profiles: if is_bip39 {
+                        vec![bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1]
+                    } else {
+                        Vec::new()
+                    },
+                    derivation_profiles: if is_bip39 {
+                        vec![
+                            bloom_signer_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                            bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                        ]
+                    } else {
+                        Vec::new()
+                    },
+                    mnemonic_export: is_bip39,
+                    derivation_namespace_limits: vec![],
+                }
             })
             .collect();
         Ok(ServiceCapabilities {
@@ -459,12 +479,14 @@ impl SignerRpcService {
             ));
         }
         let addresses = ethereum_address(&description)?;
+        let derived_account = self.engine.derived_account_descriptor(key_ref)?;
         Ok(KeyPublic {
             key_ref: description.key_ref,
             role: self.engine.key_role(key_ref)?,
             canonical_public_key: description.canonical_spki_der,
             addresses,
             supported_crypto_suites: description.supported_crypto_suites,
+            derived_account,
         })
     }
 

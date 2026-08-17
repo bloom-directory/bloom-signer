@@ -296,6 +296,8 @@ fn register_wallet(
         browser_output_recipient_key: None,
         petal_key_scope: None,
         legacy_passkey_migration: None,
+        wallet_seed_profile: None,
+        derivation_request: None,
     };
     let prepared = service.prepare_custody(prepare, now_ms).unwrap();
     let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
@@ -369,6 +371,8 @@ fn complete_new_wallet(
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                derivation_request: None,
+                wallet_seed_profile: None,
             },
             now_ms,
         )
@@ -458,6 +462,8 @@ fn complete_generic(
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: None,
+            derivation_request: None,
+            wallet_seed_profile: None,
         },
         now_ms,
     )?;
@@ -535,6 +541,8 @@ fn complete_credential_change(
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                derivation_request: None,
+                wallet_seed_profile: None,
             },
             now_ms,
         )
@@ -623,6 +631,8 @@ fn complete_petal_key_derivation(
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope.clone()),
             legacy_passkey_migration: None,
+            derivation_request: None,
+            wallet_seed_profile: None,
         },
         now_ms,
     )?;
@@ -696,6 +706,8 @@ fn complete_policy_update(
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: None,
+            derivation_request: None,
+            wallet_seed_profile: None,
         },
         update,
         broker_validation_receipt: validation,
@@ -814,6 +826,8 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
                     browser_output_recipient_key: None,
                     petal_key_scope: Some(cross_wallet),
                     legacy_passkey_migration: None,
+                    derivation_request: None,
+                    wallet_seed_profile: None,
                 },
                 10_150,
             )
@@ -1420,6 +1434,8 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
         browser_output_recipient_key: None,
         petal_key_scope: None,
         legacy_passkey_migration: None,
+        wallet_seed_profile: None,
+        derivation_request: None,
     };
     let prepared = service.prepare_custody(prepare, 3_000).unwrap();
     let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
@@ -1482,6 +1498,8 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
         browser_output_recipient_key: None,
         petal_key_scope: None,
         legacy_passkey_migration: None,
+        wallet_seed_profile: None,
+        derivation_request: None,
     };
     let prepared = service.prepare_custody(retry, 3_600).unwrap();
     let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
@@ -1598,6 +1616,8 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                derivation_request: None,
+                wallet_seed_profile: None,
             },
             3_900,
         )
@@ -1618,6 +1638,8 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                derivation_request: None,
+                wallet_seed_profile: None,
             },
             4_000,
         )
@@ -1680,6 +1702,8 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                derivation_request: None,
+                wallet_seed_profile: None,
             },
             4_200,
         )
@@ -1716,6 +1740,8 @@ fn registration_requires_and_reserves_the_requested_wallet_id() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                derivation_request: None,
+                wallet_seed_profile: None,
             },
             5_000,
         )
@@ -1734,6 +1760,8 @@ fn registration_requires_and_reserves_the_requested_wallet_id() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                derivation_request: None,
+                wallet_seed_profile: None,
             },
             5_000,
         )
@@ -1818,6 +1846,8 @@ fn legacy_passkey_import_converts_existing_credential_into_current_custody() {
         browser_output_recipient_key: None,
         petal_key_scope: None,
         legacy_passkey_migration: Some(receipt.public_terms().unwrap()),
+        wallet_seed_profile: None,
+        derivation_request: None,
     };
     let initially_prepared = service.prepare_custody(request, 40_000).unwrap();
     let output_recipient = HpkeRecipient::generate();
@@ -1959,6 +1989,8 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                derivation_request: None,
+                wallet_seed_profile: None,
             },
             6_000,
         )
@@ -2046,6 +2078,8 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                derivation_request: None,
+                wallet_seed_profile: None,
             },
             7_000,
         )
@@ -2217,6 +2251,8 @@ fn credential_replace_remove_and_backend_enrollment_do_not_spend_approval_capaci
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
+                derivation_request: None,
+                wallet_seed_profile: None,
             },
             23_000,
         )

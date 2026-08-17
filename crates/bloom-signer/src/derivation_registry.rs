@@ -74,6 +74,7 @@ pub const STATE_PREPARED: &str = "PREPARED";
 pub const STATE_INDEX_COMMITTED: &str = "INDEX_COMMITTED";
 pub const STATE_ACCOUNT_COMMITTED: &str = "ACCOUNT_COMMITTED";
 pub const STATE_ACTIVATED: &str = "ACTIVATED";
+pub const STATE_RETIRED: &str = "RETIRED";
 pub const STATE_TOMBSTONED: &str = "TOMBSTONED";
 
 pub const ROLE_EVM_ACCOUNT: &str = "evm-account";
@@ -93,6 +94,7 @@ pub struct PublicAccount {
     pub key_spec: String,
     pub public_key_spki_der: String,
     pub public_key_fingerprint: String,
+    pub lifecycle: String,
 }
 
 fn invalid(message: impl Into<String>) -> ProtocolError {
@@ -126,7 +128,7 @@ pub fn migrate(connection: &Connection) -> Result<(), ProtocolError> {
                 path TEXT NOT NULL,
                 state TEXT NOT NULL CHECK (state IN ('PREPARED', 'INDEX_COMMITTED',
                                                      'ACCOUNT_COMMITTED', 'ACTIVATED',
-                                                     'TOMBSTONED')),
+                                                     'RETIRED', 'TOMBSTONED')),
                 key_spec TEXT NOT NULL,
                 public_key_spki_der TEXT,
                 public_key_fingerprint TEXT,
@@ -670,6 +672,45 @@ pub fn activate(
     Ok(public)
 }
 
+/// Retire an activated account: ACTIVATED → RETIRED. A retired account is
+/// no longer signable but remains publicly listed with `lifecycle = RETIRED`.
+pub fn retire(
+    connection: &mut Connection,
+    wallet_id: &Token,
+    operation_id: &str,
+    now_ms: u64,
+    audit: AuditRecorder<'_>,
+) -> Result<(), ProtocolError> {
+    let transaction = immediate_transaction(connection)?;
+    let (profile, role, account, index, path) =
+        allocation_keys(&transaction, wallet_id, operation_id)?;
+    transition(
+        &transaction,
+        wallet_id,
+        operation_id,
+        STATE_ACTIVATED,
+        STATE_RETIRED,
+        now_ms,
+    )?;
+    audit(
+        &transaction,
+        "derivation.retired",
+        transition_payload(
+            wallet_id,
+            operation_id,
+            &profile,
+            &role,
+            account,
+            index,
+            &path,
+            Some(STATE_ACTIVATED),
+            STATE_RETIRED,
+        ),
+    )?;
+    transaction.commit().map_err(storage)?;
+    Ok(())
+}
+
 /// Tombstone an allocation from any non-terminal state ('retired' when the
 /// account was live, 'abandoned' otherwise). Tombstoned indices are never
 /// reusable: the counter never moves backward and the tombstone row is
@@ -704,7 +745,7 @@ pub fn tombstone(
     if state == STATE_TOMBSTONED {
         return Ok(());
     }
-    let reason = if state == STATE_ACTIVATED {
+    let reason = if state == STATE_ACTIVATED || state == STATE_RETIRED {
         "retired"
     } else {
         "abandoned"
@@ -774,9 +815,9 @@ pub fn public_accounts(
     let mut statement = connection
         .prepare(
             "SELECT operation_id, profile, role, path, account, \"index\", key_spec,
-                    public_key_spki_der, public_key_fingerprint
+                    public_key_spki_der, public_key_fingerprint, state
              FROM derivation_allocations
-              WHERE wallet_id = ?1 AND state = 'ACTIVATED'
+              WHERE wallet_id = ?1 AND state IN ('ACTIVATED', 'RETIRED')
               ORDER BY created_at_ms, operation_id",
         )
         .map_err(storage)?;
@@ -793,6 +834,7 @@ pub fn public_accounts(
                 key_spec: row.get(6)?,
                 public_key_spki_der: row.get(7)?,
                 public_key_fingerprint: row.get(8)?,
+                lifecycle: row.get(9)?,
             })
         })
         .map_err(storage)?;
@@ -906,6 +948,7 @@ fn public_of(
         public_key_fingerprint: row
             .public_key_fingerprint
             .ok_or_else(|| invalid("activated allocation is missing its fingerprint"))?,
+        lifecycle: STATE_ACTIVATED.to_owned(),
     })
 }
 

@@ -1,12 +1,13 @@
 use bloom_signer_api::{
-    ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
-    ApprovalTombstone, Base64UrlBytes, CeremonyPublicStatus, CredentialPublic, CredentialState,
-    CustodyResult, DecimalU64, Digest32, KeyRef, OperationId, OperationPublicStatus,
-    OperationState, PetalKeyScope, PolicyCommitReceipt, PolicyCompareAndSwapRequest,
-    PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest, PolicyValidationReceipt,
-    ProtocolError, ProtocolErrorCode, RevocationState, SealedApprovalTerms, SelectorKind,
-    SignRequest, SignedPolicySnapshot, SignerActivationReceipt, SigningResult, Token,
-    WalletTombstone, WebAuthnCredential,
+    AccountLifecycleState, ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector,
+    ApprovalSubject, ApprovalTombstone, Base64UrlBytes, CeremonyPublicStatus, CredentialPublic,
+    CredentialState, CustodyResult, DecimalU64, DerivationProfile, DerivationRef,
+    DerivedAccountDescriptor, DerivedAccountRequest, Digest32, KeyRef, KeySpec, OperationId,
+    OperationPublicStatus, OperationState, PetalKeyScope, PolicyCommitReceipt,
+    PolicyCompareAndSwapRequest, PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest,
+    PolicyValidationReceipt, ProtocolError, ProtocolErrorCode, PublicKeyEncoding, RevocationState,
+    SealedApprovalTerms, SelectorKind, SignRequest, SignedPolicySnapshot, SignerActivationReceipt,
+    SigningResult, Token, WalletSeedProfile, WalletSeedRef, WalletTombstone, WebAuthnCredential,
 };
 use bloom_trusted_time::{DurableClockCondition, PersistedClockState, evaluate_durable_clock};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
@@ -1937,6 +1938,333 @@ impl SignerEngine {
         transaction.commit().map_err(storage)
     }
 
+    /// Enroll a BIP-39 derived child as a wallet-scoped derived key. The root
+    /// of a BIP-39 wallet is never enrolled and never signable; only
+    /// `ACTIVATED` children reach this point.
+    pub fn enroll_bip39_child(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+    ) -> Result<(), ProtocolError> {
+        key_ref.validate()?;
+        let mut connection = self.connection.lock();
+        let transaction = self.mutation_transaction(&mut connection)?;
+        transaction
+            .execute(
+                "INSERT INTO enrolled_keys(
+                    key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
+                 ) VALUES (?1, ?2, 1, 'derived', ?3)
+                 ON CONFLICT(key_fingerprint) DO UPDATE SET
+                    key_ref_jcs = excluded.key_ref_jcs,
+                    available = 1,
+                    authority_class = 'derived',
+                    wallet_id = excluded.wallet_id",
+                params![
+                    key_ref.public_key_fingerprint.as_str(),
+                    serde_jcs::to_string(key_ref).map_err(malformed)?,
+                    wallet_id.as_str(),
+                ],
+            )
+            .map_err(storage)?;
+        self.append_audit(
+            &transaction,
+            "key.derived_enrolled",
+            &serde_json::json!({ "wallet_id": wallet_id, "key_ref": key_ref }),
+        )?;
+        transaction.commit().map_err(storage)
+    }
+
+    /// Mark a BIP-39 derived child unavailable (retirement).
+    pub fn deactivate_enrolled_bip39_child(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+    ) -> Result<(), ProtocolError> {
+        let mut connection = self.connection.lock();
+        let transaction = self.mutation_transaction(&mut connection)?;
+        let updated = transaction
+            .execute(
+                "UPDATE enrolled_keys SET available = 0
+                  WHERE key_fingerprint = ?1 AND wallet_id = ?2",
+                params![key_ref.public_key_fingerprint.as_str(), wallet_id.as_str()],
+            )
+            .map_err(storage)?;
+        if updated != 1 {
+            return Err(error(
+                ProtocolErrorCode::KeyrefMismatch,
+                "derived child is not enrolled for this wallet",
+            ));
+        }
+        transaction.commit().map_err(storage)
+    }
+
+    /// Drive the full allocation lifecycle for one BIP-39 derived child, in
+    /// separate IMMEDIATE transactions keyed by the ceremony operation id,
+    /// and enroll the resulting `KeyRef`. Returns the child `KeyRef` and its
+    /// `DerivedAccountDescriptor`.
+    pub fn allocate_bip39_account(
+        &self,
+        wallet_id: &Token,
+        operation_id: &OperationId,
+        request: &DerivedAccountRequest,
+        unlocked: &UnlockedWallet,
+        now_ms: u64,
+    ) -> Result<(KeyRef, DerivedAccountDescriptor), ProtocolError> {
+        let profile = request.derivation_profile;
+        let profile_str = profile_id(profile);
+        let role = request.requested_role.as_str().to_owned();
+        let account = request.account.unwrap_or(0);
+        let seed = unlocked.bip39_seed()?;
+
+        let mut connection = self.connection.lock();
+        let audit = |tx: &Transaction, event: &str, payload: serde_json::Value| {
+            self.append_audit(tx, event, &payload)
+        };
+        let reservation = crate::derivation_registry::prepare_allocation(
+            &mut connection,
+            wallet_id,
+            profile_str,
+            &role,
+            account,
+            operation_id.as_str(),
+            |_, _| false,
+            now_ms,
+            &audit,
+        )?;
+
+        let (spki_der, key_spec, encoding) = match profile {
+            DerivationProfile::Bip44EvmSecp256k1V1 => {
+                let derived =
+                    bloom_signer_derive::derive_evm_account(&seed, account, reservation.index)
+                        .map_err(|cause| {
+                            error(ProtocolErrorCode::BackendInvalidRequest, cause.to_string())
+                        })?;
+                (
+                    derived.spki_der,
+                    KeySpec::Secp256k1,
+                    PublicKeyEncoding::Secp256k1SpkiDer,
+                )
+            }
+            DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+                let derived = bloom_signer_derive::derive_solana_account(&seed, account).map_err(
+                    |cause| error(ProtocolErrorCode::BackendInvalidRequest, cause.to_string()),
+                )?;
+                (
+                    derived.spki_der,
+                    KeySpec::Ed25519,
+                    PublicKeyEncoding::Ed25519SpkiDer,
+                )
+            }
+        };
+        let fingerprint = Digest32::from_bytes(Sha256::digest(&spki_der).into());
+
+        crate::derivation_registry::commit_index(
+            &mut connection,
+            wallet_id,
+            operation_id.as_str(),
+            now_ms,
+            &audit,
+        )?;
+        crate::derivation_registry::commit_account(
+            &mut connection,
+            wallet_id,
+            operation_id.as_str(),
+            &hex::encode(&spki_der),
+            &fingerprint,
+            now_ms,
+            &audit,
+        )?;
+        let public = crate::derivation_registry::activate(
+            &mut connection,
+            wallet_id,
+            operation_id.as_str(),
+            now_ms,
+            &audit,
+        )?;
+        drop(connection);
+
+        let locator = hex::encode(Sha256::digest(
+            [
+                wallet_id.as_str().as_bytes(),
+                profile_str.as_bytes(),
+                public.path.as_bytes(),
+            ]
+            .concat(),
+        ));
+        let key_ref = KeyRef {
+            backend: Token::new("local").expect("static token"),
+            backend_instance: wallet_id.clone(),
+            locator,
+            key_spec,
+            public_key_fingerprint: fingerprint.clone(),
+            derivation: Some(DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: wallet_id.clone(),
+                profile,
+                path: public.path.clone(),
+            }),
+        };
+        self.backend_registry.register_bip39_child(
+            wallet_id,
+            &key_ref,
+            Some(operation_id.clone()),
+        )?;
+        self.enroll_bip39_child(wallet_id, &key_ref)?;
+
+        let descriptor = DerivedAccountDescriptor {
+            key_ref: key_ref.clone(),
+            wallet_seed_ref: WalletSeedRef {
+                wallet_id: wallet_id.clone(),
+                profile: WalletSeedProfile::Bip39MulticurveV1,
+            },
+            derivation_profile: profile,
+            path: public.path,
+            canonical_public_key: Base64UrlBytes::from_bytes(&spki_der),
+            public_key_encoding: encoding,
+            public_key_fingerprint: fingerprint,
+            supported_crypto_suites: match profile {
+                DerivationProfile::Bip44EvmSecp256k1V1 => vec![
+                    bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+                    bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable,
+                ],
+                DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+                    vec![bloom_signer_api::CryptoSuite::Ed25519Message]
+                }
+            },
+            lifecycle: AccountLifecycleState::Active,
+        };
+        Ok((key_ref, descriptor))
+    }
+
+    /// Look up the `DerivedAccountDescriptor` for a BIP-39 derived child, or
+    /// `None` for legacy keys. Resolves the registry entry by public-key
+    /// fingerprint and reconstructs the descriptor with its lifecycle state.
+    pub fn derived_account_descriptor(
+        &self,
+        key_ref: &KeyRef,
+    ) -> Result<Option<DerivedAccountDescriptor>, ProtocolError> {
+        let Some(DerivationRef::Bip39Multicurve {
+            wallet_seed_ref,
+            profile,
+            path,
+        }) = &key_ref.derivation
+        else {
+            return Ok(None);
+        };
+        let connection = self.connection.lock();
+        let row = connection
+            .query_row(
+                "SELECT key_spec, public_key_spki_der, public_key_fingerprint, state
+              FROM derivation_allocations
+              WHERE wallet_id = ?1 AND public_key_fingerprint = ?2
+                AND state IN ('ACTIVATED', 'RETIRED')",
+                params![
+                    wallet_seed_ref.as_str(),
+                    key_ref.public_key_fingerprint.as_str()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage)?
+            .ok_or_else(|| {
+                error(
+                    ProtocolErrorCode::KeyrefMismatch,
+                    "no registry entry for this derived child",
+                )
+            })?;
+        let (key_spec, spki_hex, fingerprint, state) = row;
+        let key_spec = if key_spec == "secp256k1" {
+            KeySpec::Secp256k1
+        } else {
+            KeySpec::Ed25519
+        };
+        let encoding = if key_spec == KeySpec::Secp256k1 {
+            PublicKeyEncoding::Secp256k1SpkiDer
+        } else {
+            PublicKeyEncoding::Ed25519SpkiDer
+        };
+        let fingerprint = Digest32::new(&fingerprint).map_err(malformed)?;
+        let lifecycle = if state == "ACTIVATED" {
+            AccountLifecycleState::Active
+        } else {
+            AccountLifecycleState::Retired
+        };
+        Ok(Some(DerivedAccountDescriptor {
+            key_ref: key_ref.clone(),
+            wallet_seed_ref: WalletSeedRef {
+                wallet_id: wallet_seed_ref.clone(),
+                profile: WalletSeedProfile::Bip39MulticurveV1,
+            },
+            derivation_profile: *profile,
+            path: path.clone(),
+            canonical_public_key: Base64UrlBytes::from_bytes(&hex::decode(&spki_hex).map_err(
+                |_| {
+                    error(
+                        ProtocolErrorCode::MalformedFrame,
+                        "stored SPKI is not valid hex",
+                    )
+                },
+            )?),
+            public_key_encoding: encoding,
+            public_key_fingerprint: fingerprint,
+            supported_crypto_suites: if key_spec == KeySpec::Secp256k1 {
+                vec![
+                    bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+                    bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable,
+                ]
+            } else {
+                vec![bloom_signer_api::CryptoSuite::Ed25519Message]
+            },
+            lifecycle,
+        }))
+    }
+
+    /// Retire a BIP-39 derived child: ACTIVATED → RETIRED in the registry,
+    /// then mark the enrolled key and backend child unavailable.
+    pub fn retire_bip39_account(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+        now_ms: u64,
+    ) -> Result<(), ProtocolError> {
+        let mut connection = self.connection.lock();
+        let operation_id: String = connection
+            .query_row(
+                "SELECT operation_id FROM derivation_allocations
+                  WHERE wallet_id = ?1 AND public_key_fingerprint = ?2
+                    AND state IN ('ACTIVATED', 'RETIRED')",
+                params![wallet_id.as_str(), key_ref.public_key_fingerprint.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?
+            .ok_or_else(|| {
+                error(
+                    ProtocolErrorCode::KeyrefMismatch,
+                    "no active allocation for this derived child",
+                )
+            })?;
+        let audit = |tx: &Transaction, event: &str, payload: serde_json::Value| {
+            self.append_audit(tx, event, &payload)
+        };
+        crate::derivation_registry::retire(
+            &mut connection,
+            wallet_id,
+            &operation_id,
+            now_ms,
+            &audit,
+        )?;
+        drop(connection);
+        self.backend_registry.retire_bip39_child(key_ref)?;
+        self.deactivate_enrolled_bip39_child(wallet_id, key_ref)
+    }
+
     pub fn authorize_sign(
         &self,
         request: &SignRequest,
@@ -2480,7 +2808,9 @@ impl SignerEngine {
             .map_err(storage)?;
         match class.as_deref() {
             Some("wallet_root") => Ok(bloom_signer_api::KeyRole::WalletRoot),
-            Some("petal") if key_ref.derivation.is_some() => Ok(bloom_signer_api::KeyRole::Derived),
+            Some("derived") | Some("petal") if key_ref.derivation.is_some() => {
+                Ok(bloom_signer_api::KeyRole::Derived)
+            }
             _ => Err(error(
                 ProtocolErrorCode::KeyrefMismatch,
                 "key is not an enrolled wallet root or Signer-derived key",
@@ -5531,6 +5861,14 @@ fn malformed(cause: impl std::fmt::Display) -> ProtocolError {
         ProtocolErrorCode::MalformedFrame,
         format!("canonical value failure: {cause}"),
     )
+}
+
+/// Canonical registry profile identifier for a derivation profile.
+fn profile_id(profile: DerivationProfile) -> &'static str {
+    match profile {
+        DerivationProfile::Bip44EvmSecp256k1V1 => "bip44-evm-secp256k1-v1",
+        DerivationProfile::Bip44SolanaSlip10Ed25519V1 => "bip44-solana-slip10-ed25519-v1",
+    }
 }
 
 #[cfg(test)]

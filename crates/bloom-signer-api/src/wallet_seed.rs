@@ -20,6 +20,32 @@ pub enum WalletSeedProfile {
     Bip39MulticurveV1,
 }
 
+/// A requested derived-account allocation. Callers select a derivation
+/// profile, a semantic role, and (optionally) an account index; Signer
+/// resolves the canonical path and drives the allocation state machine.
+/// Caller-supplied paths are unrepresentable.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivedAccountRequest {
+    pub derivation_profile: DerivationProfile,
+    pub requested_role: Token,
+    #[serde(default)]
+    pub account: Option<u32>,
+}
+
+fn is_active(value: &AccountLifecycleState) -> bool {
+    matches!(value, AccountLifecycleState::Active)
+}
+
+/// Public lifecycle of a derived account. Only `Active` accounts sign.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountLifecycleState {
+    #[default]
+    Active,
+    Retired,
+}
+
 /// Versioned derivation profile naming a curve, a derivation scheme, and a
 /// canonical path template. Profiles never change silently: a new path, curve,
 /// or scheme becomes a new profile version.
@@ -109,6 +135,8 @@ pub struct DerivedAccountDescriptor {
     pub public_key_encoding: PublicKeyEncoding,
     pub public_key_fingerprint: Digest32,
     pub supported_crypto_suites: Vec<CryptoSuite>,
+    #[serde(default, skip_serializing_if = "is_active")]
+    pub lifecycle: AccountLifecycleState,
 }
 
 impl<'de> Deserialize<'de> for DerivedAccountDescriptor {
@@ -127,6 +155,8 @@ impl<'de> Deserialize<'de> for DerivedAccountDescriptor {
             public_key_encoding: PublicKeyEncoding,
             public_key_fingerprint: Digest32,
             supported_crypto_suites: Vec<CryptoSuite>,
+            #[serde(default)]
+            lifecycle: AccountLifecycleState,
         }
 
         let unchecked = Unchecked::deserialize(deserializer)?;
@@ -139,6 +169,7 @@ impl<'de> Deserialize<'de> for DerivedAccountDescriptor {
             public_key_encoding: unchecked.public_key_encoding,
             public_key_fingerprint: unchecked.public_key_fingerprint,
             supported_crypto_suites: unchecked.supported_crypto_suites,
+            lifecycle: unchecked.lifecycle,
         };
         descriptor.validate().map_err(serde::de::Error::custom)?;
         Ok(descriptor)
@@ -315,6 +346,7 @@ mod tests {
                 ],
                 KeySpec::Ed25519 => vec![CryptoSuite::Ed25519Message],
             },
+            lifecycle: AccountLifecycleState::Active,
         }
     }
 

@@ -44,7 +44,7 @@ pub use bloom_rpc_wire::{
 /// passkey-migration metadata carried by `wallet.import_prepare`.
 pub const SIGNER_API_MAJOR: u16 = 1;
 pub const SIGNER_API_MINOR_MIN: u16 = 3;
-pub const SIGNER_API_MINOR_MAX: u16 = 3;
+pub const SIGNER_API_MINOR_MAX: u16 = 4;
 pub const SIGNER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(SIGNER_API_MAJOR, SIGNER_API_MINOR_MAX);
 pub const SIGNER_API_RANGE: ProtocolVersionRange =
