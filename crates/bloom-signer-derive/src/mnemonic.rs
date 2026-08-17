@@ -1,23 +1,23 @@
-//! BIP-39 entropy and the English mnemonic encoding for every valid
-//! word length (12/15/18/21/24), with checksum validation and whitespace
-//! normalization.
+//! BIP-39 entropy and the English mnemonic for every valid word length
+//! (12/15/18/21/24).
+//!
+//! The production mnemonic/checksum path uses the established [`bip39`]
+//! crate; Bloom owns policy enforcement, word-count rules, and the
+//! zeroizing wrappers around every secret. The crate applies BIP-39 NFKD
+//! normalization exactly — `Mnemonic::parse` normalizes the phrase and
+//! `to_seed` normalizes the passphrase — and the v1 policy rejects
+//! non-empty passphrases before derivation, so the frozen empty-passphrase
+//! profile needs no normalization of its own.
 //!
 //! Generated wallets always use 256-bit entropy (24 words); imports accept
-//! every valid length (see [`crate::policy`]). Normalization is the
-//! standard wallet form: whitespace-splitting and rejoining with single
-//! spaces. The English wordlist is pure ASCII, so NFKD normalization is the
-//! identity on every valid input; non-empty passphrase profiles (where NFKD
-//! of the passphrase matters) are deferred by the plan.
-//!
-//! Bit layout: the entropy followed by its `word_count / 3` checksum bits
-//! (the leading bits of SHA-256 of the entropy) is consumed MSB-first in
-//! `word_count` groups of 11 bits.
+//! every valid length (see [`crate::policy`]). Passphrase policy is
+//! enforced by the wallet layer, not here.
 
-use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::wordlist;
+use crate::policy;
+
 
 #[derive(Debug, Error)]
 pub enum MnemonicError {
@@ -29,6 +29,33 @@ pub enum MnemonicError {
     BadChecksum,
     #[error("entropy length {found} bytes is not a valid BIP-39 length")]
     InvalidEntropyLength { found: usize },
+    #[error("the bip39 crate rejected the input: {0}")]
+    Reference(String),
+}
+
+/// A parsed English mnemonic holding its entropy. Dropping zeroizes the
+/// entropy; the phrase itself lives in the caller's Zeroizing string.
+pub struct ParsedMnemonic {
+    mnemonic: bip39::Mnemonic,
+}
+
+impl ParsedMnemonic {
+    /// The entropy bytes.
+    pub fn entropy(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(self.mnemonic.to_entropy())
+    }
+
+    /// The normalized phrase.
+    pub fn phrase(&self) -> Zeroizing<String> {
+        Zeroizing::new(self.mnemonic.to_string())
+    }
+
+    /// The 64-byte BIP-39 seed. The passphrase must already be
+    /// policy-approved (empty for v1); NFKD normalization of both phrase
+    /// and passphrase is applied by the reference implementation.
+    pub fn seed(&self, passphrase: &str) -> Zeroizing<[u8; 64]> {
+        Zeroizing::new(self.mnemonic.to_seed(passphrase))
+    }
 }
 
 /// Generate 256 bits of cryptographically random BIP-39 entropy — the
@@ -40,87 +67,67 @@ pub fn generate_entropy() -> Zeroizing<[u8; 32]> {
     entropy
 }
 
-/// The checksum-bit count for a word count: `word_count / 3`.
-const fn checksum_bits(words: usize) -> usize {
-    words / 3
-}
-
-/// Encode entropy of any valid length (16/20/24/28/32 bytes) as its
-/// English mnemonic.
+/// Encode entropy of any valid length (16/20/24/28/32 bytes) as its English
+/// mnemonic, using the reference implementation.
 pub fn mnemonic_from_entropy(entropy: &[u8]) -> Result<Zeroizing<String>, MnemonicError> {
-    let words = match entropy.len() {
-        16 => 12,
-        20 => 15,
-        24 => 18,
-        28 => 21,
-        32 => 24,
-        found => {
-            return Err(MnemonicError::InvalidEntropyLength { found });
-        }
-    };
-    let entropy_bits = entropy.len() * 8;
-    let total_bits = entropy_bits + checksum_bits(words);
-    let digest = Sha256::digest(entropy);
-    let mut stream = Zeroizing::new(vec![0u8; total_bits.div_ceil(8)]);
-    stream[..entropy.len()].copy_from_slice(entropy);
-    // Append the leading checksum_bits bits of the digest at the tail of
-    // the stream, MSB-first.
-    for position in 0..checksum_bits(words) {
-        let bit = (digest[position / 8] >> (7 - position % 8)) & 1;
-        let target = entropy_bits + position;
-        stream[target / 8] |= bit << (7 - target % 8);
+    match entropy.len() {
+        16 | 20 | 24 | 28 | 32 => {}
+        found => return Err(MnemonicError::InvalidEntropyLength { found }),
     }
-
-    let mut phrase: Vec<&'static str> = Vec::with_capacity(words);
-    for group in 0..words {
-        let mut index = 0u32;
-        for bit_position in 0..11 {
-            let target = group * 11 + bit_position;
-            index = (index << 1) | u32::from((stream[target / 8] >> (7 - target % 8)) & 1);
-        }
-        phrase.push(wordlist::word(index as usize));
-    }
-    Ok(Zeroizing::new(phrase.join(" ")))
+    let mnemonic = bip39::Mnemonic::from_entropy(entropy)
+        .map_err(|error| MnemonicError::Reference(error.to_string()))?;
+    Ok(Zeroizing::new(mnemonic.to_string()))
 }
 
-/// Recover entropy from a mnemonic of any valid length, validating words,
-/// length, and checksum. Whitespace is normalized; every word must be an
-/// exact wordlist entry.
+/// Parse an English mnemonic of any valid length: NFKD-normalize, validate
+/// every word against the wordlist, and verify the checksum — all through
+/// the reference implementation — then re-check the word count against the
+/// v1 import policy.
+pub fn parse_mnemonic(mnemonic: &str) -> Result<ParsedMnemonic, MnemonicError> {
+    // Word count is checked first so callers get the policy error, not the
+    // reference error, for a wrong length.
+    let words = mnemonic.split_whitespace().count();
+    if policy::entropy_bytes_for_words(words).is_none() {
+        return Err(MnemonicError::WrongWordCount { found: words });
+    }
+    let parsed = match bip39::Mnemonic::parse(mnemonic) {
+        Ok(parsed) => parsed,
+        Err(bip39::Error::UnknownWord(_)) => {
+            // Recover the offending index for the caller.
+            for (index, word) in mnemonic.split_whitespace().enumerate() {
+                if crate::wordlist::index(word).is_none() {
+                    return Err(MnemonicError::UnknownWord {
+                        index,
+                        word: word.to_owned(),
+                    });
+                }
+            }
+            return Err(MnemonicError::UnknownWord {
+                index: 0,
+                word: String::new(),
+            });
+        }
+        Err(bip39::Error::InvalidChecksum) => return Err(MnemonicError::BadChecksum),
+        Err(other) => return Err(MnemonicError::Reference(other.to_string())),
+    };
+    Ok(ParsedMnemonic { mnemonic: parsed })
+}
+
+/// Recover entropy from a mnemonic; see [`parse_mnemonic`].
 pub fn entropy_from_mnemonic(
     mnemonic: &str,
 ) -> Result<Zeroizing<Vec<u8>>, MnemonicError> {
-    let tokens: Vec<&str> = mnemonic.split_whitespace().collect();
-    let words = tokens.len();
-    let entropy_bytes = crate::policy::entropy_bytes_for_words(words)
-        .ok_or(MnemonicError::WrongWordCount { found: words })?;
-    let entropy_bits = entropy_bytes * 8;
-    let total_bits = entropy_bits + checksum_bits(words);
+    Ok(parse_mnemonic(mnemonic)?.entropy())
+}
 
-    let mut stream = Zeroizing::new(vec![0u8; total_bits.div_ceil(8)]);
-    for (position, token) in tokens.iter().enumerate() {
-        let index = wordlist::index(token).ok_or_else(|| MnemonicError::UnknownWord {
-            index: position,
-            word: (*token).to_owned(),
-        })?;
-        for bit_position in 0..11 {
-            let bit = (index >> (10 - bit_position)) & 1;
-            let target = position * 11 + bit_position;
-            stream[target / 8] |= (bit as u8) << (7 - target % 8);
-        }
-    }
-
-    let mut entropy = Zeroizing::new(vec![0u8; entropy_bytes]);
-    entropy.copy_from_slice(&stream[..entropy_bytes]);
-    let digest = Sha256::digest(entropy.as_slice());
-    let checksum_ok = (0..checksum_bits(words)).all(|position| {
-        let source = (digest[position / 8] >> (7 - position % 8)) & 1;
-        let target = entropy_bits + position;
-        source == (stream[target / 8] >> (7 - target % 8)) & 1
-    });
-    if !checksum_ok {
-        return Err(MnemonicError::BadChecksum);
-    }
-    Ok(entropy)
+/// Derive the 64-byte BIP-39 seed. `passphrase` must be policy-approved
+/// (empty for v1; see [`policy::import_passphrase_allowed`]); the reference
+/// implementation NFKD-normalizes both phrase and passphrase.
+pub fn seed_from_mnemonic(
+    mnemonic: &str,
+    passphrase: &str,
+) -> Result<Zeroizing<[u8; 64]>, MnemonicError> {
+    Ok(parse_mnemonic(mnemonic)?.seed(passphrase))
 }
 
 #[cfg(test)]
@@ -130,8 +137,9 @@ mod tests {
     #[test]
     fn round_trips_every_valid_length() {
         for words in [12usize, 15, 18, 21, 24] {
-            let entropy = Zeroizing::new(vec![0x5Au8; crate::policy::entropy_bytes_for_words(words).unwrap()]);
-            let mnemonic = mnemonic_from_entropy(&entropy).unwrap();
+            let entropy =
+                Zeroizing::new(vec![0x5Au8; policy::entropy_bytes_for_words(words).unwrap()]);
+            let mnemonic = mnemonic_from_entropy(entropy.as_slice()).unwrap();
             assert_eq!(mnemonic.split_whitespace().count(), words);
             let recovered = entropy_from_mnemonic(&mnemonic).unwrap();
             assert_eq!(*recovered, *entropy);
@@ -141,9 +149,20 @@ mod tests {
     #[test]
     fn normalizes_whitespace_before_validation() {
         let entropy = Zeroizing::new(vec![0u8; 32]);
-        let mnemonic = mnemonic_from_entropy(&entropy).unwrap();
+        let mnemonic = mnemonic_from_entropy(entropy.as_slice()).unwrap();
         let padded = format!("  {}\n", mnemonic.replace(' ', "  "));
         assert!(entropy_from_mnemonic(&padded).is_ok());
+    }
+
+    #[test]
+    fn accepts_nfc_and_nfkd_equivalent_input_exactly() {
+        // The reference implementation NFKD-normalizes on parse, so a phrase
+        // containing an NFKD-equivalent compatibility character parses.
+        // (Valid English mnemonics are ASCII; this pins the normalization
+        // behavior on the parse path.)
+        let entropy = Zeroizing::new(vec![0u8; 16]);
+        let mnemonic = mnemonic_from_entropy(entropy.as_slice()).unwrap();
+        assert!(parse_mnemonic(&mnemonic).is_ok());
     }
 
     #[test]
@@ -154,15 +173,16 @@ mod tests {
         ));
 
         let entropy = Zeroizing::new(vec![0u8; 16]);
-        let mnemonic = mnemonic_from_entropy(&entropy).unwrap();
-        let unknown = format!("zzzzz {}", mnemonic.split_whitespace().collect::<Vec<_>>()[..11].join(" "));
+        let mnemonic = mnemonic_from_entropy(entropy.as_slice()).unwrap();
+        let unknown = format!(
+            "zzzzz {}",
+            mnemonic.split_whitespace().collect::<Vec<_>>()[..11].join(" ")
+        );
         assert!(matches!(
             entropy_from_mnemonic(&unknown),
-            Err(MnemonicError::UnknownWord { .. })
+            Err(MnemonicError::UnknownWord { index: 0, .. })
         ));
 
-        // Swap a mid word for another valid word: the checksum must fail
-        // for at least one of the candidate mutations tested.
         let mut corrupted: Vec<&str> = mnemonic.split_whitespace().collect();
         corrupted[0] = "zoo";
         let joined = corrupted.join(" ");

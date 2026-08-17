@@ -27,7 +27,7 @@ fn frozen_bip39_entropy_mnemonic_and_seed_reproduce_exactly() {
     let recovered = entropy_from_mnemonic(vectors::BIP39_MNEMONIC).unwrap();
     assert_eq!(*recovered, entropy.to_vec());
 
-    let seed = seed_from_mnemonic(vectors::BIP39_MNEMONIC, "");
+    let seed = seed_from_mnemonic(vectors::BIP39_MNEMONIC, "").unwrap();
     assert_eq!(*seed, hex64(vectors::BIP39_SEED_HEX));
 }
 
