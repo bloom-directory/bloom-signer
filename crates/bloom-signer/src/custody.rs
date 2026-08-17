@@ -592,7 +592,7 @@ fn encrypt(
     })
 }
 
-fn decrypt(key: &SecretBytes, blob: &EncryptedBlob, aad: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+pub(crate) fn decrypt(key: &SecretBytes, blob: &EncryptedBlob, aad: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     validate_key(key)?;
     let nonce: [u8; 24] = blob.nonce.decode().try_into().map_err(|_| {
         protocol(
@@ -643,7 +643,7 @@ fn validate_backup_shape(backup: &WalletCustodyBackup) -> Result<(), ProtocolErr
     Ok(())
 }
 
-fn root_aad(wallet_id: &Token, wrap_format_version: u32) -> Vec<u8> {
+pub fn root_aad(wallet_id: &Token, wrap_format_version: u32) -> Vec<u8> {
     [
         ROOT_AAD,
         wallet_id.as_str().as_bytes(),

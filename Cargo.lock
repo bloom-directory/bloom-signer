@@ -601,6 +601,8 @@ dependencies = [
  "bloom-signer-backend-api",
  "bloom-signer-backend-aws-kms",
  "bloom-signer-backend-local",
+ "bloom-signer-derive",
+ "bloom-signer-vectors",
  "bloom-triad-local-transport",
  "bloom-trusted-time",
  "chacha20poly1305",
@@ -622,6 +624,7 @@ dependencies = [
  "sha2",
  "sha3",
  "tempfile",
+ "thiserror",
  "tokio",
  "zeroize",
 ]
