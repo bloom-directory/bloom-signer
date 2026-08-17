@@ -167,17 +167,31 @@ impl SignerCeremonyService {
     ) -> Result<Self, ProtocolError> {
         #[cfg(feature = "local")]
         for enrollment in engine.load_ceremony_backend_enrollments()? {
-            if enrollment.backend.as_str() != "local" || enrollment.pinned_keys.len() != 1 {
+            if enrollment.backend.as_str() != "local" {
                 return Err(protocol(
                     ProtocolErrorCode::KeyrefMismatch,
                     "persisted ceremony backend enrollment is malformed",
                 ));
             }
-            engine.backend_registry().restore_local_wallet_backend(
-                &enrollment.backend_instance,
-                &enrollment.encrypted_record,
-                &enrollment.pinned_keys[0],
-            )?;
+            if enrollment.pinned_keys.is_empty() {
+                // BIP-39 backend: no signable root, restore entropy-only.
+                engine.backend_registry().restore_bip39_wallet_backend(
+                    &enrollment.backend_instance,
+                    &enrollment.encrypted_record,
+                )?;
+            } else {
+                if enrollment.pinned_keys.len() != 1 {
+                    return Err(protocol(
+                        ProtocolErrorCode::KeyrefMismatch,
+                        "persisted ceremony backend enrollment is malformed",
+                    ));
+                }
+                engine.backend_registry().restore_local_wallet_backend(
+                    &enrollment.backend_instance,
+                    &enrollment.encrypted_record,
+                    &enrollment.pinned_keys[0],
+                )?;
+            }
         }
         #[cfg(feature = "local")]
         for (operation_id, key_ref) in engine.backend_registry().pending_local_derivations() {
@@ -1896,17 +1910,19 @@ impl SignerCeremonyService {
                     .derivation_request
                     .as_ref()
                     .ok_or_else(kind_mismatch)?;
-                let (key_ref, descriptor) = self.engine.allocate_bip39_account(
+                let (key_ref, _descriptor) = self.engine.allocate_bip39_account(
                     wallet_id,
                     &prepare.custody_operation_id,
                     request,
                     _unlocked,
                     now_ms,
                 )?;
+                // The child descriptor is public and projected on the read
+                // side from the registry entry; nothing secret leaves here.
                 Ok(GenericCustodyOutcome {
-                    sensitive_output: Some(serde_jcs::to_vec(&descriptor).map_err(malformed)?),
+                    sensitive_output: None,
                     database_effect: CeremonyDatabaseEffect::None,
-                    rollback_derived_key: Some(key_ref.clone()),
+                    rollback_derived_key: None,
                     public_key_refs: vec![key_ref],
                 })
             }

@@ -341,6 +341,52 @@ impl BackendRegistry {
         Ok(encrypted_record)
     }
 
+    /// Restore a BIP-39 wallet backend (entropy root, no signable root KeyRef)
+    /// from its persisted enrollment at startup.
+    pub fn restore_bip39_wallet_backend(
+        &self,
+        backend_instance: &Token,
+        encrypted_record: &Base64UrlBytes,
+    ) -> Result<(), ProtocolError> {
+        let backend_id = Token::new("local").expect("static token");
+        if self
+            .backends
+            .read()
+            .contains_key(&(backend_id.clone(), backend_instance.clone()))
+        {
+            return Ok(());
+        }
+        let backup: bloom_signer_backend_local::EncryptedLocalBackup =
+            serde_json::from_slice(&encrypted_record.decode()).map_err(|error| {
+                ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
+            })?;
+        if backup.root_material_kind
+            != bloom_signer_backend_local::LocalRootMaterialKind::Bip39Entropy
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "backend enrollment is not a bip39 entropy root",
+            ));
+        }
+        let backend = Arc::new(
+            bloom_signer_backend_local::LocalSignerBackend::restore(
+                backend_instance.clone(),
+                backup,
+            )
+            .map_err(|error| {
+                ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!("local bip39 wallet restore failed: {error:?}"),
+                )
+            })?,
+        );
+        self.backends.write().insert(
+            (backend_id, backend_instance.clone()),
+            CompiledBackend::Local(backend),
+        );
+        Ok(())
+    }
+
     /// Register a BIP-39 derived child in the local backend registry.
     pub fn register_bip39_child(
         &self,

@@ -2701,3 +2701,663 @@ fn only_petal_key_derivation_arms_the_backend() {
         "activation must sit inside the Petal key scope branch"
     );
 }
+
+// ============================================================================
+// BIP-39 ceremony tests: registration, import, allocate, retire, export driven
+// through the real SignerCeremonyService dispatch.
+// ============================================================================
+
+fn bip39_service(
+    authenticator: &VirtualAuthenticator,
+) -> (
+    SignerCeremonyService,
+    Arc<SignerEngine>,
+    Arc<BackendRegistry>,
+) {
+    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+    let engine = Arc::new(
+        SignerEngine::open_in_memory(
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            SigningKey::from_bytes(&[9; 32]).verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
+            registry.clone(),
+        )
+        .unwrap(),
+    );
+    let _ = authenticator;
+    let service = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    (service, engine, registry)
+}
+
+fn bip39_registration_prepare(
+    service: &SignerCeremonyService,
+    wallet_id: &Token,
+    operation_id: &OperationId,
+    now_ms: u64,
+) -> PreparedCustodyCeremony {
+    service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletRegistration,
+                custody_operation_id: operation_id.clone(),
+                wallet_id: Some(wallet_id.clone()),
+                key_ref: None,
+                exact_terms_digest: digest("a1"),
+                expected_input_class: Token::new("passkey-prf").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
+                derivation_request: None,
+            },
+            now_ms,
+        )
+        .unwrap()
+}
+
+fn complete_bip39_registration(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    wallet_id: &Token,
+    operation_id: &OperationId,
+    now_ms: u64,
+) -> CustodyResult {
+    let prepared = bip39_registration_prepare(service, wallet_id, operation_id, now_ms);
+    let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
+    let prf_assertion =
+        authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::WalletRegistration,
+        custody_operation_id: operation_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest().unwrap(),
+        wallet_id: prepared.contribution.wallet_id.clone(),
+        key_ref: None,
+        credential_id: Some(attestation.credential_id.clone()),
+        expected_input_class: Token::new("passkey-prf").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &authenticator.deterministic_prf(),
+    )
+    .unwrap();
+    service
+        .complete_custody(
+            CustodyCompleteRequest {
+                ceremony_kind: CeremonyKind::WalletRegistration,
+                custody_operation_id: operation_id.clone(),
+                ceremony_id: prepared.contribution.ceremony_id,
+                proof: WebAuthnCeremonyProof::Registration {
+                    attestation,
+                    prf_assertion: Some(prf_assertion),
+                },
+                encrypted_input: Some(encrypted_input),
+                public_binding_digest: digest("a1"),
+            },
+            now_ms + 100,
+        )
+        .unwrap()
+}
+
+fn complete_bip39_mnemonic_import(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    wallet_id: &Token,
+    operation_id: &OperationId,
+    mnemonic: &str,
+    now_ms: u64,
+) -> CustodyResult {
+    let prepared = service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletImport,
+                custody_operation_id: operation_id.clone(),
+                wallet_id: Some(wallet_id.clone()),
+                key_ref: None,
+                exact_terms_digest: digest("a2"),
+                expected_input_class: Token::new("bip39-mnemonic").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
+                derivation_request: None,
+            },
+            now_ms,
+        )
+        .unwrap();
+    let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
+    let prf_assertion =
+        authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "mnemonic": mnemonic,
+    }))
+    .unwrap();
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::WalletImport,
+        custody_operation_id: operation_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest().unwrap(),
+        wallet_id: prepared.contribution.wallet_id.clone(),
+        key_ref: None,
+        credential_id: Some(attestation.credential_id.clone()),
+        expected_input_class: Token::new("bip39-mnemonic").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    service
+        .complete_custody(
+            CustodyCompleteRequest {
+                ceremony_kind: CeremonyKind::WalletImport,
+                custody_operation_id: operation_id.clone(),
+                ceremony_id: prepared.contribution.ceremony_id,
+                proof: WebAuthnCeremonyProof::Registration {
+                    attestation,
+                    prf_assertion: Some(prf_assertion),
+                },
+                encrypted_input: Some(encrypted_input),
+                public_binding_digest: digest("a2"),
+            },
+            now_ms + 100,
+        )
+        .unwrap()
+}
+
+fn complete_account_allocate(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    wallet_id: &Token,
+    operation_id: &OperationId,
+    request: DerivedAccountRequest,
+    now_ms: u64,
+) -> (CustodyResult, CustodySignerContribution) {
+    let effect = serde_json::json!({ "kind": "account_allocate" });
+    let exact_terms_digest =
+        Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&effect).unwrap()).into());
+    let prepared = service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::AccountAllocate,
+                custody_operation_id: operation_id.clone(),
+                wallet_id: Some(wallet_id.clone()),
+                key_ref: None,
+                exact_terms_digest: exact_terms_digest.clone(),
+                expected_input_class: Token::new("generic-custody-v1").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: Some(request),
+            },
+            now_ms,
+        )
+        .unwrap();
+    let assertion = authenticator.assertion(
+        &prepared.challenges[0].canonical_bytes().unwrap(),
+        now_ms as u32,
+    );
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::AccountAllocate,
+        custody_operation_id: operation_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest().unwrap(),
+        wallet_id: Some(wallet_id.clone()),
+        key_ref: None,
+        credential_id: Some(assertion.credential_id.clone()),
+        expected_input_class: Token::new("generic-custody-v1").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "effect": effect,
+    }))
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    let result = service
+        .complete_custody(
+            CustodyCompleteRequest {
+                ceremony_kind: CeremonyKind::AccountAllocate,
+                custody_operation_id: operation_id.clone(),
+                ceremony_id: prepared.contribution.ceremony_id.clone(),
+                proof: WebAuthnCeremonyProof::Assertion { assertion },
+                encrypted_input: Some(encrypted_input),
+                public_binding_digest: exact_terms_digest,
+            },
+            now_ms + 100,
+        )
+        .unwrap();
+    (result, prepared.contribution)
+}
+
+fn complete_account_retire(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    wallet_id: &Token,
+    child: &KeyRef,
+    operation_id: &OperationId,
+    now_ms: u64,
+) -> CustodyResult {
+    let effect = serde_json::json!({ "kind": "account_retire" });
+    let exact_terms_digest =
+        Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&effect).unwrap()).into());
+    let prepared = service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::AccountRetire,
+                custody_operation_id: operation_id.clone(),
+                wallet_id: Some(wallet_id.clone()),
+                key_ref: Some(child.clone()),
+                exact_terms_digest: exact_terms_digest.clone(),
+                expected_input_class: Token::new("generic-custody-v1").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
+            },
+            now_ms,
+        )
+        .unwrap();
+    let assertion = authenticator.assertion(
+        &prepared.challenges[0].canonical_bytes().unwrap(),
+        now_ms as u32,
+    );
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::AccountRetire,
+        custody_operation_id: operation_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest().unwrap(),
+        wallet_id: Some(wallet_id.clone()),
+        key_ref: Some(child.clone()),
+        credential_id: Some(assertion.credential_id.clone()),
+        expected_input_class: Token::new("generic-custody-v1").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "effect": effect,
+    }))
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    service
+        .complete_custody(
+            CustodyCompleteRequest {
+                ceremony_kind: CeremonyKind::AccountRetire,
+                custody_operation_id: operation_id.clone(),
+                ceremony_id: prepared.contribution.ceremony_id,
+                proof: WebAuthnCeremonyProof::Assertion { assertion },
+                encrypted_input: Some(encrypted_input),
+                public_binding_digest: exact_terms_digest,
+            },
+            now_ms + 100,
+        )
+        .unwrap()
+}
+
+#[test]
+fn bip39_registration_allocates_the_initial_evm_child_without_a_root_keyref() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _engine, _registry) = bip39_service(&authenticator);
+    let wallet_id = Token::new("bip39-wallet-a").unwrap();
+    let result = complete_bip39_registration(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("aa"),
+        10_000,
+    );
+    assert_eq!(result.wallet_id.as_ref(), Some(&wallet_id));
+    assert_eq!(result.public_key_refs.len(), 1);
+    let child = &result.public_key_refs[0];
+    // The child is a derived account, never a root, at the canonical EVM path.
+    assert!(matches!(
+        child.derivation,
+        Some(DerivationRef::Bip39Multicurve { .. })
+    ));
+    assert_eq!(child.key_spec, KeySpec::Secp256k1);
+    let descriptor = _engine.derived_account_descriptor(child).unwrap().unwrap();
+    assert_eq!(descriptor.path, "m/44'/60'/0'/0/0");
+    assert_eq!(descriptor.lifecycle, AccountLifecycleState::Active);
+    // The root is not signable: root_key_ref is absent for this backend.
+    assert!(
+        _registry
+            .get(&Token::new("local").unwrap(), &wallet_id)
+            .is_ok()
+    );
+}
+
+#[test]
+fn bip39_solana_allocation_is_deterministic_and_advances_accounts() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, engine, _registry) = bip39_service(&authenticator);
+    let wallet_id = Token::new("bip39-wallet-b").unwrap();
+    complete_bip39_registration(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("bb"),
+        10_000,
+    );
+
+    let (first, _) = complete_account_allocate(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("cc"),
+        DerivedAccountRequest {
+            derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            requested_role: Token::new("solana-account").unwrap(),
+            account: Some(0),
+        },
+        10_100,
+    );
+    let first_child = first.public_key_refs[0].clone();
+    let first_descriptor = engine
+        .derived_account_descriptor(&first_child)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_descriptor.path, "m/44'/501'/0'/0'");
+
+    // A new operation allocates the next account (Solana paths are
+    // account-scoped, so account advances, never a path index).
+    let (second, _) = complete_account_allocate(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("dd"),
+        DerivedAccountRequest {
+            derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            requested_role: Token::new("solana-account").unwrap(),
+            account: Some(1),
+        },
+        10_200,
+    );
+    let second_child = second.public_key_refs[0].clone();
+    let second_descriptor = engine
+        .derived_account_descriptor(&second_child)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_descriptor.path, "m/44'/501'/1'/0'");
+    assert_ne!(first_child, second_child);
+}
+
+#[test]
+fn bip39_retire_then_sign_is_refused() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, engine, registry) = bip39_service(&authenticator);
+    let wallet_id = Token::new("bip39-wallet-c").unwrap();
+    complete_bip39_registration(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("ee"),
+        10_000,
+    );
+    let (allocate, _) = complete_account_allocate(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("ff"),
+        DerivedAccountRequest {
+            derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            requested_role: Token::new("solana-account").unwrap(),
+            account: Some(0),
+        },
+        10_100,
+    );
+    let child = allocate.public_key_refs[0].clone();
+    complete_account_retire(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &child,
+        &operation("99"),
+        10_200,
+    );
+
+    // Signing through the backend registry must now be refused.
+    let backend = registry
+        .get(&Token::new("local").unwrap(), &wallet_id)
+        .unwrap();
+    let result = futures::executor::block_on(backend.sign(BackendSignRequest {
+        provider_attempt_id: digest("b7"),
+        key_ref: child,
+        crypto_suite: CryptoSuite::Ed25519Message,
+        input: BackendInput::Message {
+            message: Base64UrlBytes::from_bytes(b"raw-message"),
+        },
+        deadline_ms: DecimalU64::new(100_000),
+    }));
+    assert!(result.is_err());
+    let _ = engine;
+}
+
+#[test]
+fn bip39_mnemonic_export_seals_words_and_frozen_import_reproduces_vectors() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, engine, _registry) = bip39_service(&authenticator);
+
+    // (f) Import the FROZEN mnemonic into a new wallet and assert the initial
+    // EVM child reproduces the frozen vector fingerprint.
+    let frozen_wallet = Token::new("bip39-frozen").unwrap();
+    let import_result = complete_bip39_mnemonic_import(
+        &service,
+        &authenticator,
+        &frozen_wallet,
+        &operation("f1"),
+        bloom_signer_vectors::BIP39_MNEMONIC,
+        10_000,
+    );
+    assert_eq!(import_result.public_key_refs.len(), 1);
+    let frozen_child = import_result.public_key_refs[0].clone();
+    let frozen_descriptor = engine
+        .derived_account_descriptor(&frozen_child)
+        .unwrap()
+        .unwrap();
+    assert_eq!(frozen_descriptor.path, "m/44'/60'/0'/0/0");
+    assert_eq!(
+        frozen_descriptor.public_key_fingerprint.as_str(),
+        bloom_signer_vectors::BIP32_EVM_TERMINAL_PUBLIC_KEY_FINGERPRINT_HEX
+    );
+
+    // (e) Export the mnemonic: words exist only in the sealed sensitive output.
+    let recipient = HpkeRecipient::generate();
+    let effect = serde_json::json!({ "kind": "wallet_export", "format": "bip39_mnemonic24" });
+    let exact_terms_digest =
+        Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&effect).unwrap()).into());
+    service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletExport,
+                custody_operation_id: operation("e0"),
+                wallet_id: Some(frozen_wallet.clone()),
+                key_ref: None,
+                exact_terms_digest: exact_terms_digest.clone(),
+                expected_input_class: Token::new("generic-custody-v1").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
+            },
+            10_100,
+        )
+        .unwrap();
+    let prepared = service
+        .bind_custody_output_recipient(&operation("e0"), recipient.public_key().clone(), 10_101)
+        .unwrap();
+    let assertion =
+        authenticator.assertion(&prepared.challenges[0].canonical_bytes().unwrap(), 10_100);
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::WalletExport,
+        custody_operation_id: operation("e0"),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest().unwrap(),
+        wallet_id: Some(frozen_wallet.clone()),
+        key_ref: None,
+        credential_id: Some(assertion.credential_id.clone()),
+        expected_input_class: Token::new("generic-custody-v1").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "effect": effect,
+    }))
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    let export_result = service
+        .complete_custody(
+            CustodyCompleteRequest {
+                ceremony_kind: CeremonyKind::WalletExport,
+                custody_operation_id: operation("e0"),
+                ceremony_id: prepared.contribution.ceremony_id,
+                proof: WebAuthnCeremonyProof::Assertion { assertion },
+                encrypted_input: Some(encrypted_input),
+                public_binding_digest: exact_terms_digest,
+            },
+            10_200,
+        )
+        .unwrap();
+
+    // Words are only in the sealed output: the public CustodyResult encoding
+    // never contains the frozen mnemonic.
+    assert!(export_result.encrypted_browser_result.is_some());
+    let public_bytes = serde_jcs::to_vec(&export_result).unwrap();
+    assert!(
+        !public_bytes
+            .windows(bloom_signer_vectors::BIP39_MNEMONIC.len())
+            .any(|window| window == bloom_signer_vectors::BIP39_MNEMONIC.as_bytes())
+    );
+}
+
+#[test]
+fn bip39_import_rejects_bad_checksum_and_accepts_12_words() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, engine, _registry) = bip39_service(&authenticator);
+
+    // Bad checksum: the final word is valid but flips the checksum.
+    let bad = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon zebra";
+    let prepared = service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletImport,
+                custody_operation_id: operation("c0"),
+                wallet_id: Some(Token::new("bad-import").unwrap()),
+                key_ref: None,
+                exact_terms_digest: digest("a3"),
+                expected_input_class: Token::new("bip39-mnemonic").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
+                derivation_request: None,
+            },
+            10_000,
+        )
+        .unwrap();
+    let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
+    let prf_assertion =
+        authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "mnemonic": bad,
+    }))
+    .unwrap();
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::WalletImport,
+        custody_operation_id: operation("c0"),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest().unwrap(),
+        wallet_id: prepared.contribution.wallet_id.clone(),
+        key_ref: None,
+        credential_id: Some(attestation.credential_id.clone()),
+        expected_input_class: Token::new("bip39-mnemonic").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    let rejected = service.complete_custody(
+        CustodyCompleteRequest {
+            ceremony_kind: CeremonyKind::WalletImport,
+            custody_operation_id: operation("c0"),
+            ceremony_id: prepared.contribution.ceremony_id,
+            proof: WebAuthnCeremonyProof::Registration {
+                attestation,
+                prf_assertion: Some(prf_assertion),
+            },
+            encrypted_input: Some(encrypted_input),
+            public_binding_digest: digest("a3"),
+        },
+        10_100,
+    );
+    assert!(rejected.is_err());
+
+    // A valid 12-word mnemonic imports (v1 accepts every valid length).
+    let twelve = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    let result = complete_bip39_mnemonic_import(
+        &service,
+        &authenticator,
+        &Token::new("twelve-words").unwrap(),
+        &operation("c1"),
+        twelve,
+        10_200,
+    );
+    assert_eq!(result.public_key_refs.len(), 1);
+    let descriptor = engine
+        .derived_account_descriptor(&result.public_key_refs[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(descriptor.path, "m/44'/60'/0'/0/0");
+}

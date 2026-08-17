@@ -1613,28 +1613,35 @@ impl SignerEngine {
                     )
                     .map_err(storage)?;
                 if let Some(enrollment) = backend_enrollment {
-                    if enrollment.pinned_keys.len() != 1
-                        || enrollment.pinned_keys[0].backend != enrollment.backend
-                        || enrollment.pinned_keys[0].backend_instance != enrollment.backend_instance
-                    {
-                        return Err(error(
-                            ProtocolErrorCode::KeyrefMismatch,
-                            "registration backend enrollment is not bound to one root KeyRef",
-                        ));
+                    // A BIP-39 backend has no signable root, so pinned_keys is
+                    // empty and the initial child is enrolled separately via
+                    // allocate_bip39_account. A legacy backend pins exactly one
+                    // root KeyRef and enrolls it as wallet_root here.
+                    if !enrollment.pinned_keys.is_empty() {
+                        if enrollment.pinned_keys.len() != 1
+                            || enrollment.pinned_keys[0].backend != enrollment.backend
+                            || enrollment.pinned_keys[0].backend_instance
+                                != enrollment.backend_instance
+                        {
+                            return Err(error(
+                                ProtocolErrorCode::KeyrefMismatch,
+                                "registration backend enrollment is not bound to one root KeyRef",
+                            ));
+                        }
+                        let key_ref = &enrollment.pinned_keys[0];
+                        transaction
+                            .execute(
+                                "INSERT INTO enrolled_keys(
+                                    key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
+                                 ) VALUES (?1, ?2, 1, 'wallet_root', ?3)",
+                                params![
+                                    key_ref.public_key_fingerprint.as_str(),
+                                    serde_jcs::to_string(key_ref).map_err(malformed)?,
+                                    snapshot.wallet_id.as_str(),
+                                ],
+                            )
+                            .map_err(storage)?;
                     }
-                    let key_ref = &enrollment.pinned_keys[0];
-                    transaction
-                        .execute(
-                            "INSERT INTO enrolled_keys(
-                                key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
-                             ) VALUES (?1, ?2, 1, 'wallet_root', ?3)",
-                            params![
-                                key_ref.public_key_fingerprint.as_str(),
-                                serde_jcs::to_string(key_ref).map_err(malformed)?,
-                                snapshot.wallet_id.as_str(),
-                            ],
-                        )
-                        .map_err(storage)?;
                     transaction
                         .execute(
                             "INSERT INTO ceremony_backend_enrollments(
