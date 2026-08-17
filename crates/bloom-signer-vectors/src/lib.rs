@@ -36,6 +36,11 @@ pub const BIP39_SEED_HEX: &str = "408b285c123836004f4b8842c89324c1f01382450c0d43
 
 pub const BIP32_EVM_PATH: &str = "m/44'/60'/0'/0/0";
 
+/// The terminal EVM vector is derived at the canonical template path with
+/// **non-hardened** change and index levels (BIP-44), unlike the hardened
+/// steps above it. The account-level constants pin `m/44'/60'/0'`; the
+/// change-level constants pin the non-hardened `m/44'/60'/0'/0`.
+
 pub const BIP32_EVM_MASTER_PRIVATE_KEY_HEX: &str =
     "235b34cd7c9f6d7e4595ffe9ae4b1cb5606df8aca2b527d20a07c8f56b2342f4";
 pub const BIP32_EVM_MASTER_CHAIN_CODE_HEX: &str =
@@ -58,17 +63,21 @@ pub const BIP32_EVM_ACCOUNT0_PRIVATE_KEY_HEX: &str =
 pub const BIP32_EVM_ACCOUNT0_CHAIN_CODE_HEX: &str =
     "8a7bb4e42a4afe8afd3bc74b8a1980da037d96873f5e17004edb78d4c73daa73";
 
+pub const BIP32_EVM_CHANGE0_PRIVATE_KEY_HEX: &str =
+    "904956e25379c509cd20d2bf52f0eac8e871c7e5f5c1d534a86ede3549a3ec49";
+pub const BIP32_EVM_CHANGE0_CHAIN_CODE_HEX: &str =
+    "5fe0bba0f831edc439bda43f2bec33af298594b53be98c716395ae80d4b22450";
+
 pub const BIP32_EVM_TERMINAL_PRIVATE_KEY_HEX: &str =
-    "b090dfbe5c89c359e7092962a0edff1cb977ba65a4170d855496f4e73b7a18e0";
+    "1053fae1b3ac64f178bcc21026fd06a3f4544ec2f35338b001f02d1d8efa3d5f";
 pub const BIP32_EVM_TERMINAL_CHAIN_CODE_HEX: &str =
-    "a92400927960463a4361afbd5db61fb58c6d3f68238f1804839f4ef487f5bebe";
+    "97782609836183f899d640dd4f607eddaf39f72e2fc8aa008c01e02a5aeb21e7";
 pub const BIP32_EVM_TERMINAL_PUBLIC_KEY_COMPRESSED_HEX: &str =
-    "02cfe8374345204b4fada115f67b0e72e4528333e080aa0d81b115173a51cd5dba";
-pub const BIP32_EVM_TERMINAL_PUBLIC_KEY_SPKI_DER_HEX: &str = "3056301006072a8648ce3d020106052b\
-8104000a03420004cfe8374345204b4fada115f67b0e72e4528333e080aa0d81b115173a51cd5dbabeb4db913c58\
-3ba148cad0dd2947d196f63b122e720523d11f5b43a019af234c";
+    "02dc286c821c7490afbe20a79d13123b9f41f3d7ef21e4a9caacd22f5983b28eca";
+pub const BIP32_EVM_TERMINAL_PUBLIC_KEY_SPKI_DER_HEX: &str =
+    "3056301006072a8648ce3d020106052b8104000a03420004dc286c821c7490afbe20a79d13123b9f41f3d7ef21e4a9caacd22f5983b28eca0e4dbd5624505a2c968fec15f25990c7324736890f6d0f74241f98e4259c1d42";
 pub const BIP32_EVM_TERMINAL_PUBLIC_KEY_FINGERPRINT_HEX: &str =
-    "cb06aacbcf5665b27879cf08590d10d3e99b06663476b50c2ed9856bbac2bd54";
+    "0c155f75b55d347054db01beb93ca584bbba691513bd8ace07bc01fa9e1b1399";
 
 pub const SLIP10_SOLANA_PATH: &str = "m/44'/501'/0'/0'";
 
