@@ -752,7 +752,11 @@ pub(crate) fn encrypt(
     })
 }
 
-pub(crate) fn decrypt(key: &SecretBytes, blob: &EncryptedBlob, aad: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+pub(crate) fn decrypt(
+    key: &SecretBytes,
+    blob: &EncryptedBlob,
+    aad: &[u8],
+) -> Result<Vec<u8>, ProtocolError> {
     validate_key(key)?;
     let nonce: [u8; 24] = blob.nonce.decode().try_into().map_err(|_| {
         protocol(

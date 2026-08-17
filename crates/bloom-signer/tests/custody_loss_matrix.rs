@@ -46,16 +46,27 @@ fn bip39_two_passkeys_and_recovery_unlock_the_same_child() {
         RootMaterialProfile::Bip39MulticurveV1
     );
 
-    let unlocked_1 = custody.unlock_with_credential(&cred("cred-1"), &key(0x22)).unwrap();
-    custody.add_credential(&unlocked_1, cred("cred-2"), &key(0x33)).unwrap();
-    custody.set_recovery(&unlocked_1, Token::new(RECOVERY).unwrap(), &key(0x44)).unwrap();
+    let unlocked_1 = custody
+        .unlock_with_credential(&cred("cred-1"), &key(0x22))
+        .unwrap();
+    custody
+        .add_credential(&unlocked_1, cred("cred-2"), &key(0x33))
+        .unwrap();
+    custody
+        .set_recovery(&unlocked_1, Token::new(RECOVERY).unwrap(), &key(0x44))
+        .unwrap();
 
-    let seed: [u8; 64] = hex::decode(vectors::BIP39_SEED_HEX).unwrap().try_into().unwrap();
+    let seed: [u8; 64] = hex::decode(vectors::BIP39_SEED_HEX)
+        .unwrap()
+        .try_into()
+        .unwrap();
     let account = solana_account(&seed);
     let message = b"solana-native-transfer-v1";
     let sig_1 = unlocked_1.sign_ed25519(&account, message).unwrap();
 
-    let unlocked_2 = custody.unlock_with_credential(&cred("cred-2"), &key(0x33)).unwrap();
+    let unlocked_2 = custody
+        .unlock_with_credential(&cred("cred-2"), &key(0x33))
+        .unwrap();
     let sig_2 = unlocked_2.sign_ed25519(&account, message).unwrap();
 
     let unlocked_recovery = custody
@@ -95,16 +106,25 @@ fn bip39_rekey_preserves_the_child_across_restart() {
         key(0x22),
     )
     .unwrap();
-    let unlocked = custody.unlock_with_credential(&cred("cred-1"), &key(0x22)).unwrap();
-    let seed: [u8; 64] = hex::decode(vectors::BIP39_SEED_HEX).unwrap().try_into().unwrap();
+    let unlocked = custody
+        .unlock_with_credential(&cred("cred-1"), &key(0x22))
+        .unwrap();
+    let seed: [u8; 64] = hex::decode(vectors::BIP39_SEED_HEX)
+        .unwrap()
+        .try_into()
+        .unwrap();
     let account = solana_account(&seed);
     let before = unlocked.sign_ed25519(&account, b"msg").unwrap();
 
     let mut keys = std::collections::BTreeMap::new();
     keys.insert(cred("cred-1").encoded().to_owned(), key(0x22));
-    custody.rekey_wrap_format(&unlocked, 2, &keys, None).unwrap();
+    custody
+        .rekey_wrap_format(&unlocked, 2, &keys, None)
+        .unwrap();
 
-    let unlocked_again = custody.unlock_with_credential(&cred("cred-1"), &key(0x22)).unwrap();
+    let unlocked_again = custody
+        .unlock_with_credential(&cred("cred-1"), &key(0x22))
+        .unwrap();
     let after = unlocked_again.sign_ed25519(&account, b"msg").unwrap();
     assert_eq!(before, after);
 }
@@ -120,13 +140,18 @@ fn bip39_mnemonic_export_reconstructs_the_frozen_words() {
         key(0x22),
     )
     .unwrap();
-    let unlocked = custody.unlock_with_credential(&cred("cred-1"), &key(0x22)).unwrap();
+    let unlocked = custody
+        .unlock_with_credential(&cred("cred-1"), &key(0x22))
+        .unwrap();
     let mnemonic = custody.export_mnemonic(&unlocked).unwrap();
     assert_eq!(*mnemonic, vectors::BIP39_MNEMONIC);
 
     // The mnemonic round-trips to the same derived keys (portable recovery).
     let recovered_seed = seed_from_mnemonic(&mnemonic, "").unwrap();
-    let expected: [u8; 64] = hex::decode(vectors::BIP39_SEED_HEX).unwrap().try_into().unwrap();
+    let expected: [u8; 64] = hex::decode(vectors::BIP39_SEED_HEX)
+        .unwrap()
+        .try_into()
+        .unwrap();
     assert_eq!(*recovered_seed, expected);
 }
 
@@ -141,15 +166,24 @@ fn legacy_custody_rejects_mnemonic_export_and_keeps_its_path() {
         key(0x22),
     )
     .unwrap();
-    assert_eq!(custody.root_material_profile(), RootMaterialProfile::LegacySecp);
-    let unlocked = custody.unlock_with_credential(&cred("cred-1"), &key(0x22)).unwrap();
+    assert_eq!(
+        custody.root_material_profile(),
+        RootMaterialProfile::LegacySecp
+    );
+    let unlocked = custody
+        .unlock_with_credential(&cred("cred-1"), &key(0x22))
+        .unwrap();
     assert!(custody.export_mnemonic(&unlocked).is_err());
 
     // Legacy unlock still exposes a 32-byte root (BIP-32 seed) via the
     // backup round-trip, unchanged.
     let backup: WalletCustodyBackup = custody.backup();
     let restored = WalletCustody::restore(backup).unwrap();
-    assert!(restored.unlock_with_credential(&cred("cred-1"), &key(0x22)).is_ok());
+    assert!(
+        restored
+            .unlock_with_credential(&cred("cred-1"), &key(0x22))
+            .is_ok()
+    );
 }
 
 #[test]
@@ -169,7 +203,9 @@ fn backup_round_trip_preserves_the_profile_and_unlocks() {
         restored.root_material_profile(),
         RootMaterialProfile::Bip39MulticurveV1
     );
-    let unlocked = restored.unlock_with_credential(&cred("cred-1"), &key(0x22)).unwrap();
+    let unlocked = restored
+        .unlock_with_credential(&cred("cred-1"), &key(0x22))
+        .unwrap();
     let mnemonic = restored.export_mnemonic(&unlocked).unwrap();
     assert_eq!(*mnemonic, vectors::BIP39_MNEMONIC);
 }
@@ -186,7 +222,9 @@ fn generated_entropy_wallet_is_a_valid_bip39_root() {
         key(0x22),
     )
     .unwrap();
-    let unlocked = custody.unlock_with_credential(&cred("cred-1"), &key(0x22)).unwrap();
+    let unlocked = custody
+        .unlock_with_credential(&cred("cred-1"), &key(0x22))
+        .unwrap();
     let mnemonic = custody.export_mnemonic(&unlocked).unwrap();
     let canonical = mnemonic_from_entropy(&[0x77u8; 32]).unwrap();
     assert_eq!(*mnemonic, *canonical);

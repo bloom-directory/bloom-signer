@@ -18,7 +18,6 @@ use zeroize::Zeroizing;
 
 use crate::policy;
 
-
 #[derive(Debug, Error)]
 pub enum MnemonicError {
     #[error("mnemonic word count {found} is not one of 12/15/18/21/24")]
@@ -114,9 +113,7 @@ pub fn parse_mnemonic(mnemonic: &str) -> Result<ParsedMnemonic, MnemonicError> {
 }
 
 /// Recover entropy from a mnemonic; see [`parse_mnemonic`].
-pub fn entropy_from_mnemonic(
-    mnemonic: &str,
-) -> Result<Zeroizing<Vec<u8>>, MnemonicError> {
+pub fn entropy_from_mnemonic(mnemonic: &str) -> Result<Zeroizing<Vec<u8>>, MnemonicError> {
     Ok(parse_mnemonic(mnemonic)?.entropy())
 }
 
@@ -137,8 +134,10 @@ mod tests {
     #[test]
     fn round_trips_every_valid_length() {
         for words in [12usize, 15, 18, 21, 24] {
-            let entropy =
-                Zeroizing::new(vec![0x5Au8; policy::entropy_bytes_for_words(words).unwrap()]);
+            let entropy = Zeroizing::new(vec![
+                0x5Au8;
+                policy::entropy_bytes_for_words(words).unwrap()
+            ]);
             let mnemonic = mnemonic_from_entropy(entropy.as_slice()).unwrap();
             assert_eq!(mnemonic.split_whitespace().count(), words);
             let recovered = entropy_from_mnemonic(&mnemonic).unwrap();

@@ -55,8 +55,16 @@ fn allocate_activated(
     assert_eq!(reservation.path, format!("m/44'/60'/0'/0/{index_offset}"));
     registry::commit_index(connection, &wallet, operation, 1_100, &noop).unwrap();
     let (spki, fingerprint) = spki_fixture(2);
-    registry::commit_account(connection, &wallet, operation, &spki, &fingerprint, 1_200, &noop)
-        .unwrap();
+    registry::commit_account(
+        connection,
+        &wallet,
+        operation,
+        &spki,
+        &fingerprint,
+        1_200,
+        &noop,
+    )
+    .unwrap();
     registry::activate(connection, &wallet, operation, 1_300, &noop).unwrap()
 }
 
@@ -116,18 +124,20 @@ fn operation_retry_returns_the_same_reservation() {
     .unwrap();
     assert_eq!(second.index, 1);
 
-    assert!(registry::prepare_allocation(
-        &mut connection,
-        &wallet,
-        registry::PROFILE_SOLANA,
-        registry::ROLE_SOLANA_ACCOUNT,
-        0,
-        "op-1",
-        |_, _| false,
-        2_200,
-        &noop,
-    )
-    .is_err());
+    assert!(
+        registry::prepare_allocation(
+            &mut connection,
+            &wallet,
+            registry::PROFILE_SOLANA,
+            registry::ROLE_SOLANA_ACCOUNT,
+            0,
+            "op-1",
+            |_, _| false,
+            2_200,
+            &noop,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -159,7 +169,10 @@ fn invalid_children_are_tombstoned_and_never_reused() {
         &noop,
     )
     .unwrap();
-    assert_eq!(second.index, 3, "tombstoned 0 and 2 must be skipped forever");
+    assert_eq!(
+        second.index, 3,
+        "tombstoned 0 and 2 must be skipped forever"
+    );
 
     let third = registry::prepare_allocation(
         &mut connection,
@@ -192,15 +205,40 @@ fn public_accounts_are_invisible_before_activation() {
         &noop,
     )
     .unwrap();
-    assert!(registry::public_accounts(&connection, &primary()).unwrap().is_empty());
+    assert!(
+        registry::public_accounts(&connection, &primary())
+            .unwrap()
+            .is_empty()
+    );
     registry::commit_index(&mut connection, &wallet, "op-1", 1_100, &noop).unwrap();
-    assert!(registry::public_accounts(&connection, &primary()).unwrap().is_empty());
+    assert!(
+        registry::public_accounts(&connection, &primary())
+            .unwrap()
+            .is_empty()
+    );
     let (spki, fingerprint) = spki_fixture(4);
-    registry::commit_account(&mut connection, &wallet, "op-1", &spki, &fingerprint, 1_200, &noop)
-        .unwrap();
-    assert!(registry::public_accounts(&connection, &primary()).unwrap().is_empty());
+    registry::commit_account(
+        &mut connection,
+        &wallet,
+        "op-1",
+        &spki,
+        &fingerprint,
+        1_200,
+        &noop,
+    )
+    .unwrap();
+    assert!(
+        registry::public_accounts(&connection, &primary())
+            .unwrap()
+            .is_empty()
+    );
     registry::activate(&mut connection, &wallet, "op-1", 1_300, &noop).unwrap();
-    assert_eq!(registry::public_accounts(&connection, &primary()).unwrap().len(), 1);
+    assert_eq!(
+        registry::public_accounts(&connection, &primary())
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -221,8 +259,16 @@ fn transitions_refuse_out_of_order_advancement() {
     .unwrap();
     let (spki, fingerprint) = spki_fixture(6);
     assert!(
-        registry::commit_account(&mut connection, &wallet, "op-1", &spki, &fingerprint, 1_100, &noop)
-            .is_err()
+        registry::commit_account(
+            &mut connection,
+            &wallet,
+            "op-1",
+            &spki,
+            &fingerprint,
+            1_100,
+            &noop
+        )
+        .is_err()
     );
     assert!(registry::activate(&mut connection, &wallet, "op-1", 1_100, &noop).is_err());
     registry::commit_index(&mut connection, &wallet, "op-1", 1_100, &noop).unwrap();
@@ -249,8 +295,16 @@ fn descriptor_fingerprint_mismatch_is_refused() {
     let (spki, _) = spki_fixture(8);
     let wrong_fingerprint = Digest32::from_bytes([0x11; 32]);
     assert!(
-        registry::commit_account(&mut connection, &wallet, "op-1", &spki, &wrong_fingerprint, 1_200, &noop)
-            .is_err()
+        registry::commit_account(
+            &mut connection,
+            &wallet,
+            "op-1",
+            &spki,
+            &wrong_fingerprint,
+            1_200,
+            &noop
+        )
+        .is_err()
     );
 }
 
@@ -260,7 +314,11 @@ fn tombstoned_accounts_leave_public_list_and_chain_stays_verified() {
     let wallet = primary();
     allocate_activated(&mut connection, "op-1", 0);
     registry::tombstone(&mut connection, &wallet, "op-1", 2_000, &noop).unwrap();
-    assert!(registry::public_accounts(&connection, &primary()).unwrap().is_empty());
+    assert!(
+        registry::public_accounts(&connection, &primary())
+            .unwrap()
+            .is_empty()
+    );
     registry::verify_event_chain(&connection).unwrap();
 
     let next = registry::prepare_allocation(
@@ -312,7 +370,12 @@ fn abandoned_reservations_never_release_their_index() {
 
 #[test]
 fn crash_at_every_transition_reloads_into_one_valid_state() {
-    for stop_after in ["PREPARED", "INDEX_COMMITTED", "ACCOUNT_COMMITTED", "ACTIVATED"] {
+    for stop_after in [
+        "PREPARED",
+        "INDEX_COMMITTED",
+        "ACCOUNT_COMMITTED",
+        "ACTIVATED",
+    ] {
         let mut connection = connection();
         let wallet = primary();
         registry::prepare_allocation(
@@ -328,23 +391,48 @@ fn crash_at_every_transition_reloads_into_one_valid_state() {
         )
         .unwrap();
         if stop_after == "PREPARED" {
-            assert!(registry::public_accounts(&connection, &primary()).unwrap().is_empty());
+            assert!(
+                registry::public_accounts(&connection, &primary())
+                    .unwrap()
+                    .is_empty()
+            );
             continue;
         }
         registry::commit_index(&mut connection, &wallet, "op-1", 1_100, &noop).unwrap();
         if stop_after == "INDEX_COMMITTED" {
-            assert!(registry::public_accounts(&connection, &primary()).unwrap().is_empty());
+            assert!(
+                registry::public_accounts(&connection, &primary())
+                    .unwrap()
+                    .is_empty()
+            );
             continue;
         }
         let (spki, fingerprint) = spki_fixture(3);
-        registry::commit_account(&mut connection, &wallet, "op-1", &spki, &fingerprint, 1_200, &noop)
-            .unwrap();
+        registry::commit_account(
+            &mut connection,
+            &wallet,
+            "op-1",
+            &spki,
+            &fingerprint,
+            1_200,
+            &noop,
+        )
+        .unwrap();
         if stop_after == "ACCOUNT_COMMITTED" {
-            assert!(registry::public_accounts(&connection, &primary()).unwrap().is_empty());
+            assert!(
+                registry::public_accounts(&connection, &primary())
+                    .unwrap()
+                    .is_empty()
+            );
             continue;
         }
         registry::activate(&mut connection, &wallet, "op-1", 1_300, &noop).unwrap();
-        assert_eq!(registry::public_accounts(&connection, &primary()).unwrap().len(), 1);
+        assert_eq!(
+            registry::public_accounts(&connection, &primary())
+                .unwrap()
+                .len(),
+            1
+        );
         registry::verify_event_chain(&connection).unwrap();
     }
 }
@@ -433,7 +521,10 @@ fn tampered_event_chain_is_refused() {
     let mut connection = connection();
     allocate_activated(&mut connection, "op-1", 0);
     connection
-        .execute("UPDATE derivation_events SET to_state = 'HACKED' WHERE sequence = 1", [])
+        .execute(
+            "UPDATE derivation_events SET to_state = 'HACKED' WHERE sequence = 1",
+            [],
+        )
         .unwrap();
     assert!(registry::verify_event_chain(&connection).is_err());
 }

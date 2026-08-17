@@ -73,7 +73,8 @@ fn hmac_sha512(key: &[u8], message: &[u8]) -> [u8; 64] {
 /// values at or above n; canonicality is checked by reduction round-trip,
 /// independent of any single constructor's failure mode.
 fn scalar_from_canonical(bytes: &[u8; 32]) -> Option<Scalar> {
-    let reduced = <Scalar as Reduce<k256::elliptic_curve::bigint::U256>>::reduce_bytes(&(*bytes).into());
+    let reduced =
+        <Scalar as Reduce<k256::elliptic_curve::bigint::U256>>::reduce_bytes(&(*bytes).into());
     if reduced.to_bytes().as_slice() == bytes.as_slice() {
         Some(reduced)
     } else {
@@ -94,10 +95,9 @@ pub fn child_key_from_tweak(
     tweak: &[u8; 32],
     parent_key: &[u8; 32],
 ) -> Result<Zeroizing<[u8; 32]>, Secp256k1DeriveError> {
-    let tweak_scalar =
-        scalar_from_canonical(tweak).ok_or(Secp256k1DeriveError::InvalidChild)?;
-    let parent_scalar = scalar_from_canonical(parent_key)
-        .ok_or(Secp256k1DeriveError::InvalidMasterKey)?;
+    let tweak_scalar = scalar_from_canonical(tweak).ok_or(Secp256k1DeriveError::InvalidChild)?;
+    let parent_scalar =
+        scalar_from_canonical(parent_key).ok_or(Secp256k1DeriveError::InvalidMasterKey)?;
     let child = tweak_scalar + parent_scalar;
     let bytes = scalar_bytes(&child);
     if bytes.iter().all(|byte| *byte == 0) {
@@ -177,9 +177,8 @@ pub fn describe_secp256k1(private_key: &[u8; 32]) -> DerivedSecp256k1 {
     let verifying = signing.verifying_key();
     let mut compressed_public_key = [0u8; 33];
     compressed_public_key.copy_from_slice(verifying.to_encoded_point(true).as_bytes());
-    let public_key =
-        k256::PublicKey::from_sec1_bytes(verifying.to_encoded_point(false).as_bytes())
-            .expect("valid SEC1 point");
+    let public_key = k256::PublicKey::from_sec1_bytes(verifying.to_encoded_point(false).as_bytes())
+        .expect("valid SEC1 point");
     let spki_der = public_key
         .to_public_key_der()
         .expect("SPKI encoding of a valid key")
@@ -251,12 +250,8 @@ mod tests {
 
     #[test]
     fn children_match_bip32_test_vector_1() {
-        let key = hex32(
-            "e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35",
-        );
-        let code = hex32(
-            "873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508",
-        );
+        let key = hex32("e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35");
+        let code = hex32("873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508");
         // m/0' — hardened child; constants decoded from the official xprv.
         let (child_key, child_code) = hardened_child(&key, &code, 0).unwrap();
         assert_eq!(
@@ -282,9 +277,7 @@ mod tests {
 
     #[test]
     fn invalid_child_rules_are_enforced_by_construction() {
-        let parent = hex32(
-            "e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35",
-        );
+        let parent = hex32("e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35");
         // I_L >= n: all-ones is greater than the group order.
         assert!(matches!(
             child_key_from_tweak(&[0xFF; 32], &parent),
@@ -293,9 +286,7 @@ mod tests {
         // I_L = n - parent (canonical, since 0 < parent < n): the sum is
         // exactly n, which reduces to the zero scalar.
         let n_minus_parent = {
-            let n = hex32(
-                "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
-            );
+            let n = hex32("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
             let mut borrow: i16 = 0;
             let mut out = [0u8; 32];
             for position in (0..32).rev() {

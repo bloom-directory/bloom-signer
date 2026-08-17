@@ -37,9 +37,7 @@ pub mod slip10;
 pub mod wordlist;
 
 pub use allocation::next_valid_index;
-pub use bip32::{
-    DerivedSecp256k1, Secp256k1DeriveError, derive_evm_account, master_secp256k1,
-};
+pub use bip32::{DerivedSecp256k1, Secp256k1DeriveError, derive_evm_account, master_secp256k1};
 pub use mnemonic::{
     MnemonicError, ParsedMnemonic, entropy_from_mnemonic, generate_entropy, mnemonic_from_entropy,
     parse_mnemonic, seed_from_mnemonic,

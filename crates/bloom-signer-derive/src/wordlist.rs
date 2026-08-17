@@ -9,12 +9,22 @@ pub const WORD_COUNT: usize = 2048;
 
 pub static WORDS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     let words: Vec<&'static str> = ENGLISH.lines().map(str::trim).collect();
-    assert_eq!(words.len(), WORD_COUNT, "BIP-39 wordlist must have 2048 words");
+    assert_eq!(
+        words.len(),
+        WORD_COUNT,
+        "BIP-39 wordlist must have 2048 words"
+    );
     words
 });
 
-static INDEX: LazyLock<HashMap<&'static str, usize>> =
-    LazyLock::new(|| WORDS.iter().copied().enumerate().map(|(i, w)| (w, i)).collect());
+static INDEX: LazyLock<HashMap<&'static str, usize>> = LazyLock::new(|| {
+    WORDS
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, w)| (w, i))
+        .collect()
+});
 
 /// Word at BIP-39 index `index` (0-2047).
 pub fn word(index: usize) -> &'static str {

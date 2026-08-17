@@ -8,8 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Base64UrlBytes, CryptoSuite, Digest32, KeyRef, KeySpec, ProtocolError, ProtocolErrorCode,
-    Token,
+    Base64UrlBytes, CryptoSuite, Digest32, KeyRef, KeySpec, ProtocolError, ProtocolErrorCode, Token,
 };
 
 /// Root seed profile. `bip39-multicurve-v1` uses 256-bit BIP-39 entropy, the
@@ -150,10 +149,14 @@ impl DerivedAccountDescriptor {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.key_ref.validate()?;
         if self.key_ref.key_spec != self.derivation_profile.key_spec() {
-            return Err(invalid("derivation profile curve does not match the child KeyRef"));
+            return Err(invalid(
+                "derivation profile curve does not match the child KeyRef",
+            ));
         }
         if self.public_key_encoding.key_spec() != self.key_ref.key_spec {
-            return Err(invalid("public-key encoding does not match the child KeyRef"));
+            return Err(invalid(
+                "public-key encoding does not match the child KeyRef",
+            ));
         }
         validate_allocated_path(self.derivation_profile, &self.path)?;
         let key_len = self.canonical_public_key.decode().len();
@@ -285,7 +288,11 @@ mod tests {
         }
     }
 
-    fn descriptor(profile: DerivationProfile, key_spec: KeySpec, path: &str) -> DerivedAccountDescriptor {
+    fn descriptor(
+        profile: DerivationProfile,
+        key_spec: KeySpec,
+        path: &str,
+    ) -> DerivedAccountDescriptor {
         let (encoding, public_key) = match key_spec {
             KeySpec::Secp256k1 => (PublicKeyEncoding::Secp256k1SpkiDer, vec![2u8; 88]),
             KeySpec::Ed25519 => (PublicKeyEncoding::Ed25519SpkiDer, vec![3u8; 44]),
@@ -313,20 +320,24 @@ mod tests {
 
     #[test]
     fn canonical_profiles_validate() {
-        assert!(descriptor(
-            DerivationProfile::Bip44EvmSecp256k1V1,
-            KeySpec::Secp256k1,
-            "m/44'/60'/0'/0/0",
-        )
-        .validate()
-        .is_ok());
-        assert!(descriptor(
-            DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-            KeySpec::Ed25519,
-            "m/44'/501'/0'/0'",
-        )
-        .validate()
-        .is_ok());
+        assert!(
+            descriptor(
+                DerivationProfile::Bip44EvmSecp256k1V1,
+                KeySpec::Secp256k1,
+                "m/44'/60'/0'/0/0",
+            )
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            descriptor(
+                DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                KeySpec::Ed25519,
+                "m/44'/501'/0'/0'",
+            )
+            .validate()
+            .is_ok()
+        );
     }
 
     #[test]
@@ -353,27 +364,33 @@ mod tests {
     #[test]
     fn rejects_paths_that_stray_from_the_template() {
         // Solana change step must be hardened.
-        assert!(validate_allocated_path(
-            DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-            "m/44'/501'/0'/0",
-        )
-        .is_err());
+        assert!(
+            validate_allocated_path(
+                DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/0'/0",
+            )
+            .is_err()
+        );
         // EVM account step must be hardened.
-        assert!(validate_allocated_path(
-            DerivationProfile::Bip44EvmSecp256k1V1,
-            "m/44'/60'/0/0/0",
-        )
-        .is_err());
+        assert!(
+            validate_allocated_path(DerivationProfile::Bip44EvmSecp256k1V1, "m/44'/60'/0/0/0",)
+                .is_err()
+        );
         // Wrong coin type.
-        assert!(validate_allocated_path(
-            DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-            "m/44'/501'/0'/1'",
-        )
-        .is_err());
+        assert!(
+            validate_allocated_path(
+                DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/0'/1'",
+            )
+            .is_err()
+        );
         // Wrong element count.
         assert!(
-            validate_allocated_path(DerivationProfile::Bip44EvmSecp256k1V1, "m/44'/60'/0'/0'/0'/0")
-                .is_err()
+            validate_allocated_path(
+                DerivationProfile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0'/0'/0"
+            )
+            .is_err()
         );
     }
 

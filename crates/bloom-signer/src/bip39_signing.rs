@@ -21,16 +21,16 @@
 //! profile and the registry supplies the canonical path. Root references,
 //! unactivated accounts, and mismatched descriptors fail closed.
 
-use k256::ecdsa::{SigningKey, VerifyingKey};
 use ed25519_dalek::Signer as _;
+use k256::ecdsa::{SigningKey, VerifyingKey};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 use bloom_signer_api::Digest32;
 use bloom_signer_derive::{
-    SEED_BYTES, derive_evm_account, derive_solana_account,
-    mnemonic_from_entropy, seed_from_mnemonic,
+    SEED_BYTES, derive_evm_account, derive_solana_account, mnemonic_from_entropy,
+    seed_from_mnemonic,
 };
 
 #[derive(Debug, Error)]
@@ -92,7 +92,8 @@ pub fn entropy_to_seed(
         return Err(SigningEdgeError::EntropyLengthMismatch);
     }
     let mnemonic = Zeroizing::new(
-        mnemonic_from_entropy(&entropy).map_err(|error| SigningEdgeError::Derivation(error.to_string()))?,
+        mnemonic_from_entropy(&entropy)
+            .map_err(|error| SigningEdgeError::Derivation(error.to_string()))?,
     );
     seed_from_mnemonic(&mnemonic, "")
         .map_err(|error| SigningEdgeError::Derivation(error.to_string()))
@@ -109,8 +110,8 @@ fn verify_descriptor(
     derived_spki_der: &[u8],
     account: &ActivatedAccount,
 ) -> Result<(), SigningEdgeError> {
-    let expected_spki = hex::decode(&account.spki_der_hex)
-        .map_err(|_| SigningEdgeError::DescriptorMismatch)?;
+    let expected_spki =
+        hex::decode(&account.spki_der_hex).map_err(|_| SigningEdgeError::DescriptorMismatch)?;
     if derived_spki_der != expected_spki {
         return Err(SigningEdgeError::DescriptorMismatch);
     }
@@ -206,12 +207,8 @@ pub fn sign_evm_digest(
         .sign_prehash_recoverable(digest)
         .map_err(|_| SigningEdgeError::SelfVerificationFailed)?;
     let verifying: VerifyingKey = *signing.verifying_key();
-    let recovered = VerifyingKey::recover_from_prehash(
-        digest,
-        &signature,
-        recovery_id,
-    )
-    .map_err(|_| SigningEdgeError::SelfVerificationFailed)?;
+    let recovered = VerifyingKey::recover_from_prehash(digest, &signature, recovery_id)
+        .map_err(|_| SigningEdgeError::SelfVerificationFailed)?;
     if recovered != verifying {
         return Err(SigningEdgeError::SelfVerificationFailed);
     }
@@ -230,4 +227,3 @@ pub fn ed25519_capability_supported() -> bool {
 pub fn secp256k1_capability_supported() -> bool {
     true
 }
-

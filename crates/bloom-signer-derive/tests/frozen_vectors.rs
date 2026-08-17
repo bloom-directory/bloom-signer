@@ -38,8 +38,14 @@ fn frozen_evm_account_reproduces_every_step() {
     // Account-level checkpoint (m/44'/60'/0') via the exported derivation.
     let evm = derive_evm_account(&seed, 0, 0).unwrap();
     assert_eq!(evm.path, vectors::BIP32_EVM_PATH);
-    assert_eq!(*evm.private_key, hex32(vectors::BIP32_EVM_TERMINAL_PRIVATE_KEY_HEX));
-    assert_eq!(evm.chain_code, hex32(vectors::BIP32_EVM_TERMINAL_CHAIN_CODE_HEX));
+    assert_eq!(
+        *evm.private_key,
+        hex32(vectors::BIP32_EVM_TERMINAL_PRIVATE_KEY_HEX)
+    );
+    assert_eq!(
+        evm.chain_code,
+        hex32(vectors::BIP32_EVM_TERMINAL_CHAIN_CODE_HEX)
+    );
     assert_eq!(
         hex::encode(evm.compressed_public_key),
         vectors::BIP32_EVM_TERMINAL_PUBLIC_KEY_COMPRESSED_HEX

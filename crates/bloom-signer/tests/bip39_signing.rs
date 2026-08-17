@@ -11,7 +11,10 @@ use bloom_signer_derive::{
 use bloom_signer_vectors as vectors;
 
 fn seed() -> [u8; SEED_BYTES] {
-    hex::decode(vectors::BIP39_SEED_HEX).unwrap().try_into().unwrap()
+    hex::decode(vectors::BIP39_SEED_HEX)
+        .unwrap()
+        .try_into()
+        .unwrap()
 }
 
 fn evm_account() -> ActivatedAccount {
@@ -37,13 +40,13 @@ fn solana_account() -> ActivatedAccount {
 #[test]
 fn ed25519_signs_raw_message_and_self_verifies() {
     let message = b"solana-native-transfer-v1";
-    let signature = bip39_signing::sign_ed25519_message(&seed(), &solana_account(), message).unwrap();
+    let signature =
+        bip39_signing::sign_ed25519_message(&seed(), &solana_account(), message).unwrap();
     assert_eq!(signature.len(), 64);
     // Re-verify with the expected public key.
     let derived = derive_solana_account(&seed(), 0).unwrap();
     let _ = &derived.spki_der;
-    let verifying = ed25519_dalek::VerifyingKey::from_bytes(&derived.public_key)
-        .unwrap();
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(&derived.public_key).unwrap();
     verifying
         .verify_strict(message, &ed25519_dalek::Signature::from_bytes(&signature))
         .unwrap();
@@ -75,9 +78,7 @@ fn descriptor_mismatch_fails_closed() {
     // Wrong SPKI bytes.
     let mut wrong_spki = evm_account();
     wrong_spki.spki_der_hex = "00".repeat(44);
-    assert!(
-        bloom_signer::bip39_signing::sign_evm_digest(&seed(), &wrong_spki, &[1; 32]).is_err()
-    );
+    assert!(bloom_signer::bip39_signing::sign_evm_digest(&seed(), &wrong_spki, &[1; 32]).is_err());
 
     // Profile cross-talk: an EVM descriptor never signs Ed25519.
     let cross = evm_account();
@@ -86,14 +87,17 @@ fn descriptor_mismatch_fails_closed() {
 
 #[test]
 fn input_size_limits_are_enforced() {
-    assert!(bloom_signer::bip39_signing::sign_ed25519_message(
-        &seed(),
-        &solana_account(),
-        &vec![0u8; bip39_signing::MAX_ED25519_MESSAGE_BYTES + 1]
-    )
-    .is_err());
-    assert!(bloom_signer::bip39_signing::sign_ed25519_message(&seed(), &solana_account(), b"")
-        .is_err());
+    assert!(
+        bloom_signer::bip39_signing::sign_ed25519_message(
+            &seed(),
+            &solana_account(),
+            &vec![0u8; bip39_signing::MAX_ED25519_MESSAGE_BYTES + 1]
+        )
+        .is_err()
+    );
+    assert!(
+        bloom_signer::bip39_signing::sign_ed25519_message(&seed(), &solana_account(), b"").is_err()
+    );
 }
 
 #[test]
@@ -107,26 +111,25 @@ fn entropy_to_seed_validates_length_against_metadata() {
         .try_into()
         .unwrap();
     let blob = {
-        use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::{Aead, Payload}};
+        use chacha20poly1305::{
+            Key, KeyInit, XChaCha20Poly1305, XNonce,
+            aead::{Aead, Payload},
+        };
         let nonce = [3u8; 24];
         let aad = bloom_signer::custody::root_aad(&wallet, 1);
         let ciphertext = XChaCha20Poly1305::new(Key::from_slice(&wkek))
             .encrypt(
                 XNonce::from_slice(&nonce),
-                Payload { msg: &entropy, aad: &aad },
+                Payload {
+                    msg: &entropy,
+                    aad: &aad,
+                },
             )
             .unwrap();
         (nonce.to_vec(), ciphertext)
     };
-    let transient = bip39_signing::entropy_to_seed(
-        &wkek,
-        &wallet,
-        1,
-        &blob.0,
-        &blob.1,
-        256,
-    )
-    .unwrap();
+    let transient =
+        bip39_signing::entropy_to_seed(&wkek, &wallet, 1, &blob.0, &blob.1, 256).unwrap();
     // The transient seed matches the frozen seed.
     assert_eq!(*transient, seed());
 
@@ -152,7 +155,12 @@ fn the_seed_is_never_a_signable_root() {
     // The frozen entropy's derived accounts match the canonical addresses'
     // keys, pinned by the vectors crate.
     assert_eq!(
-        hex::encode(derive_evm_account(&seed(), 0, 0).unwrap().private_key.as_slice()),
+        hex::encode(
+            derive_evm_account(&seed(), 0, 0)
+                .unwrap()
+                .private_key
+                .as_slice()
+        ),
         vectors::BIP32_EVM_TERMINAL_PRIVATE_KEY_HEX
     );
 }

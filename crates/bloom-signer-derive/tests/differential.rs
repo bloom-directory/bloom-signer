@@ -25,7 +25,7 @@ fn deterministic_rng() -> StdRng {
 // ---------------------------------------------------------------------------
 
 mod reference {
-    use sha2::{Digest as _};
+    use sha2::Digest as _;
 
     pub fn checksum_byte_count(words: usize) -> usize {
         words / 3
@@ -148,7 +148,10 @@ fn randomized_mnemonics_agree_with_the_independent_codec() {
             // normalizes, which is identity for ASCII).
             let crate_seed = seed_from_mnemonic(&phrase, "TREZOR").unwrap();
             let reference_seed = reference::pbkdf2_seed(&phrase, "TREZOR");
-            assert_eq!(*crate_seed, reference_seed, "seed disagreement at {words} words");
+            assert_eq!(
+                *crate_seed, reference_seed,
+                "seed disagreement at {words} words"
+            );
 
             // Empty passphrase too — the v1 profile.
             let crate_empty = seed_from_mnemonic(&phrase, "").unwrap();
@@ -208,7 +211,9 @@ fn nfkd_normalization_is_applied_by_the_reference_path() {
 fn non_empty_passphrase_policy_is_enforced_at_the_wallet_layer() {
     // The codec itself is passphrase-capable (the differentials above use
     // "TREZOR"); v1 policy lives in `policy::import_passphrase_allowed`.
-    assert!(!bloom_signer_derive::policy::import_passphrase_allowed("TREZOR"));
+    assert!(!bloom_signer_derive::policy::import_passphrase_allowed(
+        "TREZOR"
+    ));
     assert!(bloom_signer_derive::policy::import_passphrase_allowed(""));
 }
 
@@ -255,7 +260,9 @@ fn randomized_bip32_paths_agree_with_the_bip32_crate() {
             let hardened = rng.r#gen::<bool>();
             let child_number =
                 bip32::ChildNumber::new(index, hardened).expect("valid child number");
-            walking = walking.derive_child(child_number).expect("reference derivation");
+            walking = walking
+                .derive_child(child_number)
+                .expect("reference derivation");
             let (my_child, my_child_code) = if hardened {
                 hardened_child(&my_key, &my_code, index).unwrap()
             } else {

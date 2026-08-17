@@ -484,7 +484,17 @@ pub fn prepare_allocation(
     audit(
         &transaction,
         "derivation.prepared",
-        transition_payload(wallet_id, operation_id, profile, role, account, start, &path, None, STATE_PREPARED),
+        transition_payload(
+            wallet_id,
+            operation_id,
+            profile,
+            role,
+            account,
+            start,
+            &path,
+            None,
+            STATE_PREPARED,
+        ),
     )?;
     transaction.commit().map_err(storage)?;
     Ok(Reservation {
@@ -520,7 +530,8 @@ pub fn commit_index(
     audit: AuditRecorder<'_>,
 ) -> Result<Reservation, ProtocolError> {
     let transaction = immediate_transaction(connection)?;
-    let (profile, role, account, index, path) = allocation_keys(&transaction, wallet_id, operation_id)?;
+    let (profile, role, account, index, path) =
+        allocation_keys(&transaction, wallet_id, operation_id)?;
     transition(
         &transaction,
         wallet_id,
@@ -532,7 +543,17 @@ pub fn commit_index(
     audit(
         &transaction,
         "derivation.index_committed",
-        transition_payload(wallet_id, operation_id, &profile, &role, account, index, &path, Some(STATE_PREPARED), STATE_INDEX_COMMITTED),
+        transition_payload(
+            wallet_id,
+            operation_id,
+            &profile,
+            &role,
+            account,
+            index,
+            &path,
+            Some(STATE_PREPARED),
+            STATE_INDEX_COMMITTED,
+        ),
     )?;
     let reservation = reservation_of(&transaction, wallet_id, operation_id)?;
     transaction.commit().map_err(storage)?;
@@ -592,7 +613,17 @@ pub fn commit_account(
     audit(
         &transaction,
         "derivation.account_committed",
-        transition_payload(wallet_id, operation_id, &profile, &role, account, index, &path, Some(STATE_INDEX_COMMITTED), STATE_ACCOUNT_COMMITTED),
+        transition_payload(
+            wallet_id,
+            operation_id,
+            &profile,
+            &role,
+            account,
+            index,
+            &path,
+            Some(STATE_INDEX_COMMITTED),
+            STATE_ACCOUNT_COMMITTED,
+        ),
     )?;
     let reservation = reservation_of(&transaction, wallet_id, operation_id)?;
     transaction.commit().map_err(storage)?;
@@ -609,7 +640,8 @@ pub fn activate(
     audit: AuditRecorder<'_>,
 ) -> Result<PublicAccount, ProtocolError> {
     let transaction = immediate_transaction(connection)?;
-    let (profile, role, account, index, path) = allocation_keys(&transaction, wallet_id, operation_id)?;
+    let (profile, role, account, index, path) =
+        allocation_keys(&transaction, wallet_id, operation_id)?;
     transition(
         &transaction,
         wallet_id,
@@ -621,7 +653,17 @@ pub fn activate(
     audit(
         &transaction,
         "derivation.activated",
-        transition_payload(wallet_id, operation_id, &profile, &role, account, index, &path, Some(STATE_ACCOUNT_COMMITTED), STATE_ACTIVATED),
+        transition_payload(
+            wallet_id,
+            operation_id,
+            &profile,
+            &role,
+            account,
+            index,
+            &path,
+            Some(STATE_ACCOUNT_COMMITTED),
+            STATE_ACTIVATED,
+        ),
     )?;
     let public = public_of(&transaction, wallet_id, operation_id)?;
     transaction.commit().map_err(storage)?;
@@ -708,7 +750,17 @@ pub fn tombstone(
     audit(
         &transaction,
         "derivation.tombstoned",
-        transition_payload(wallet_id, operation_id, &profile, &role, account as u32, index as u32, &path, Some(&state), STATE_TOMBSTONED),
+        transition_payload(
+            wallet_id,
+            operation_id,
+            &profile,
+            &role,
+            account as u32,
+            index as u32,
+            &path,
+            Some(&state),
+            STATE_TOMBSTONED,
+        ),
     )?;
     transaction.commit().map_err(storage)?;
     Ok(())
@@ -753,7 +805,11 @@ pub fn public_accounts(
 
 /// Resolve the canonical path for a profile. The only path source in the
 /// system: caller-supplied paths are unrepresentable.
-fn resolve_canonical_path(profile: &str, account: u32, index: u32) -> Result<String, ProtocolError> {
+fn resolve_canonical_path(
+    profile: &str,
+    account: u32,
+    index: u32,
+) -> Result<String, ProtocolError> {
     match profile {
         PROFILE_EVM => Ok(format!("m/44'/60'/{account}'/0/{index}")),
         PROFILE_SOLANA => Ok(format!("m/44'/501'/{account}'/0'")),
@@ -781,19 +837,11 @@ fn transition(
         .execute(
             "UPDATE derivation_allocations SET state = ?3, updated_at_ms = ?4
               WHERE wallet_id = ?1 AND operation_id = ?2 AND state = ?5",
-            rusqlite::params![
-                wallet_id.as_str(),
-                operation_id,
-                to,
-                now_ms as i64,
-                from
-            ],
+            rusqlite::params![wallet_id.as_str(), operation_id, to, now_ms as i64, from],
         )
         .map_err(storage)?;
     if updated != 1 {
-        return Err(invalid(format!(
-            "allocation is not in the {from} state"
-        )));
+        return Err(invalid(format!("allocation is not in the {from} state")));
     }
     append_event(transaction, wallet_id, operation_id, Some(from), to, now_ms)?;
     Ok(())

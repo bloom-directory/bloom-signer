@@ -65,6 +65,9 @@ mod tests {
 
     #[test]
     fn profile_constant_is_stable() {
-        assert_eq!(super::ROOT_PROFILE_BIP39_MULTICURVE_V1, "bip39-multicurve-v1");
+        assert_eq!(
+            super::ROOT_PROFILE_BIP39_MULTICURVE_V1,
+            "bip39-multicurve-v1"
+        );
     }
 }
