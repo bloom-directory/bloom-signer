@@ -654,7 +654,6 @@ impl SignerEngine {
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(storage)?;
         crate::bip39_store::configure_durability(&connection)?;
-        crate::bip39_store::migrate(&connection)?;
         crate::derivation_registry::migrate(&connection)?;
         connection
             .execute_batch(

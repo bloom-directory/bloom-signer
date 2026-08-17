@@ -68,6 +68,8 @@ pub struct ActivatedAccount {
 ///
 /// `wkek` is the already-recovered key-encryption key; `decrypt` is the
 /// custody AEAD unwrap. Every secret is zeroized on return and on error.
+/// (Deprecated in favor of `UnlockedWallet::bip39_seed`; retained for the
+/// raw-AEAD boundary tests.)
 pub fn entropy_to_seed(
     wkek: &[u8],
     wallet_id: &bloom_signer_api::Token,
@@ -94,6 +96,13 @@ pub fn entropy_to_seed(
     );
     seed_from_mnemonic(&mnemonic, "")
         .map_err(|error| SigningEdgeError::Derivation(error.to_string()))
+}
+
+/// The BIP-39 root material can never sign: only a registered, activated
+/// child account is a signable reference.
+#[allow(dead_code)]
+fn root_never_signs(_root: &[u8]) -> Result<(), SigningEdgeError> {
+    Err(SigningEdgeError::RootNotSignable)
 }
 
 fn verify_descriptor(

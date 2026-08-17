@@ -45,6 +45,19 @@ pub struct RecoveryWrap {
     pub wrapped_wkek: EncryptedBlob,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootMaterialProfile {
+    /// Legacy local secp root (raw BIP-32 seed or standalone scalar,
+    /// interpreted by the local backend). Default for pre-BIP-39 backups.
+    #[default]
+    LegacySecp,
+    /// `encrypted_root` holds WKEK-wrapped BIP-39 entropy; `entropy_bits`
+    /// records its length (128/160/192/224/256). The mnemonic, PBKDF2 seed,
+    /// and derived keys are derived transiently, never persisted.
+    Bip39MulticurveV1,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WalletCustodyBackup {
@@ -55,6 +68,10 @@ pub struct WalletCustodyBackup {
     pub encrypted_policy_signing_key: EncryptedBlob,
     pub credential_wraps: Vec<CredentialWrap>,
     pub recovery_wrap: Option<RecoveryWrap>,
+    #[serde(default)]
+    pub root_material_profile: RootMaterialProfile,
+    #[serde(default)]
+    pub entropy_bits: Option<u32>,
 }
 
 struct CustodyState {
@@ -71,6 +88,7 @@ pub struct UnlockedWallet {
     root: Zeroizing<Vec<u8>>,
     policy_signing_seed: Zeroizing<Vec<u8>>,
     wkek: Zeroizing<Vec<u8>>,
+    root_material_profile: RootMaterialProfile,
 }
 
 impl UnlockedWallet {
@@ -125,6 +143,49 @@ impl UnlockedWallet {
                 )
             })?;
         Ok(SecretBytes::new(key))
+    }
+
+    pub fn root_material_profile(&self) -> RootMaterialProfile {
+        self.root_material_profile
+    }
+
+    /// Derive the transient 64-byte BIP-39 seed from the unlocked entropy.
+    /// Only valid for the BIP-39 profile; zeroized on drop.
+    pub(crate) fn bip39_seed(&self) -> Result<Zeroizing<[u8; 64]>, ProtocolError> {
+        if self.root_material_profile != RootMaterialProfile::Bip39MulticurveV1 {
+            return Err(protocol(
+                ProtocolErrorCode::BackendUnsupported,
+                "BIP-39 derivation requires the bip39-multicurve-v1 profile",
+            ));
+        }
+        let mnemonic = bloom_signer_derive::mnemonic_from_entropy(self.root.as_slice())
+            .map_err(|error| protocol(ProtocolErrorCode::MalformedFrame, error.to_string()))?;
+        bloom_signer_derive::seed_from_mnemonic(&mnemonic, "")
+            .map_err(|error| protocol(ProtocolErrorCode::MalformedFrame, error.to_string()))
+    }
+
+    /// Sign a raw message through the registered SLIP-10 Ed25519 child
+    /// (BIP-39 profile only).
+    pub fn sign_ed25519(
+        &self,
+        account: &crate::bip39_signing::ActivatedAccount,
+        message: &[u8],
+    ) -> Result<[u8; 64], ProtocolError> {
+        let seed = self.bip39_seed()?;
+        crate::bip39_signing::sign_ed25519_message(&seed, account, message)
+            .map_err(|error| protocol(ProtocolErrorCode::BackendInvalidRequest, error.to_string()))
+    }
+
+    /// Sign a 32-byte EVM digest through the registered BIP-32 secp256k1
+    /// child (BIP-39 profile only), returning a 65-byte recoverable signature.
+    pub fn sign_evm(
+        &self,
+        account: &crate::bip39_signing::ActivatedAccount,
+        digest: &[u8; 32],
+    ) -> Result<[u8; 65], ProtocolError> {
+        let seed = self.bip39_seed()?;
+        crate::bip39_signing::sign_evm_digest(&seed, account, digest)
+            .map_err(|error| protocol(ProtocolErrorCode::BackendInvalidRequest, error.to_string()))
     }
 }
 
@@ -184,10 +245,85 @@ impl WalletCustody {
                         wrapped_wkek,
                     }],
                     recovery_wrap: None,
+                    root_material_profile: RootMaterialProfile::LegacySecp,
+                    entropy_bits: None,
                 },
                 storage_path: None,
             }),
         })
+    }
+
+    /// Register a BIP-39 wallet: the root is WKEK-wrapped entropy of a valid
+    /// length; the profile and entropy bits are recorded so unlock validates
+    /// the plaintext length and export reconstructs the mnemonic.
+    pub fn register_bip39(
+        wallet_id: Token,
+        entropy: SecretBytes,
+        policy_signing_seed: SecretBytes,
+        wkek: SecretBytes,
+        first_credential_id: Base64UrlBytes,
+        first_credential_key: SecretBytes,
+    ) -> Result<Self, ProtocolError> {
+        let bits = match entropy.expose_to_backend().len() {
+            16 => 128,
+            20 => 160,
+            24 => 192,
+            28 => 224,
+            32 => 256,
+            _ => {
+                return Err(protocol(
+                    ProtocolErrorCode::BackendInvalidRequest,
+                    "BIP-39 entropy length must be 16/20/24/28/32 bytes",
+                ));
+            }
+        };
+        let custody = Self::register(
+            wallet_id,
+            entropy,
+            policy_signing_seed,
+            wkek,
+            first_credential_id,
+            first_credential_key,
+        )?;
+        {
+            let mut state = custody.state.lock();
+            state.backup.root_material_profile = RootMaterialProfile::Bip39MulticurveV1;
+            state.backup.entropy_bits = Some(bits);
+            persist_custody(&state)?;
+        }
+        Ok(custody)
+    }
+
+    pub fn root_material_profile(&self) -> RootMaterialProfile {
+        self.state.lock().backup.root_material_profile
+    }
+
+    /// Export the BIP-39 mnemonic transiently. Only valid for the BIP-39
+    /// profile; the words exist solely in this zeroizing return value and are
+    /// never persisted, logged, or placed in any public field. Callers route
+    /// the result into the custody output recipient, never into audit or DTOs.
+    pub fn export_mnemonic(
+        &self,
+        unlocked: &UnlockedWallet,
+    ) -> Result<Zeroizing<String>, ProtocolError> {
+        let state = self.state.lock();
+        if state.backup.root_material_profile != RootMaterialProfile::Bip39MulticurveV1 {
+            return Err(protocol(
+                ProtocolErrorCode::BackendUnsupported,
+                "mnemonic export is only valid for the BIP-39 profile",
+            ));
+        }
+        if unlocked.wallet_id() != &state.backup.wallet_id {
+            return Err(protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "unlocked session belongs to a different wallet",
+            ));
+        }
+        let entropy: &[u8] = unlocked.root.as_slice();
+        // Root is entropy for this profile; length was validated at unlock.
+        let entropy_array: &[u8] = entropy;
+        bloom_signer_derive::mnemonic_from_entropy(entropy_array)
+            .map_err(|error| protocol(ProtocolErrorCode::MalformedFrame, error.to_string()))
     }
 
     pub fn register_at(
@@ -551,6 +687,29 @@ fn unlock_with_wkek(
         &backup.encrypted_root,
         &root_aad(&backup.wallet_id, backup.wrap_format_version),
     )?;
+    // Decrypt-time plaintext validation: authenticate (done above), then
+    // require the BIP-39 root length to match its recorded metadata.
+    if backup.root_material_profile == RootMaterialProfile::Bip39MulticurveV1 {
+        let expected = match backup.entropy_bits {
+            Some(128) => 16,
+            Some(160) => 20,
+            Some(192) => 24,
+            Some(224) => 28,
+            Some(256) => 32,
+            _ => {
+                return Err(protocol(
+                    ProtocolErrorCode::MalformedFrame,
+                    "BIP-39 root is missing valid entropy-bit metadata",
+                ));
+            }
+        };
+        if root.len() != expected {
+            return Err(protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "decrypted entropy length does not match profile metadata",
+            ));
+        }
+    }
     let policy_signing_seed = decrypt(
         &key,
         &backup.encrypted_policy_signing_key,
@@ -561,6 +720,7 @@ fn unlock_with_wkek(
         root: Zeroizing::new(root),
         policy_signing_seed: Zeroizing::new(policy_signing_seed),
         wkek: Zeroizing::new(wkek.to_vec()),
+        root_material_profile: backup.root_material_profile,
     })
 }
 
