@@ -564,7 +564,7 @@ fn unlock_with_wkek(
     })
 }
 
-fn encrypt(
+pub(crate) fn encrypt(
     key: &SecretBytes,
     plaintext: &[u8],
     aad: &[u8],
@@ -616,7 +616,7 @@ pub(crate) fn decrypt(key: &SecretBytes, blob: &EncryptedBlob, aad: &[u8]) -> Re
         })
 }
 
-fn validate_key(key: &SecretBytes) -> Result<(), ProtocolError> {
+pub(crate) fn validate_key(key: &SecretBytes) -> Result<(), ProtocolError> {
     if key.expose_to_backend().len() != 32 {
         return Err(protocol(
             ProtocolErrorCode::BackendInvalidRequest,
@@ -661,7 +661,7 @@ fn policy_key_aad(wallet_id: &Token, wrap_format_version: u32) -> Vec<u8> {
     .concat()
 }
 
-fn credential_aad(
+pub(crate) fn credential_aad(
     wallet_id: &Token,
     credential_id: &Base64UrlBytes,
     root_ciphertext_fingerprint: &Digest32,
@@ -683,7 +683,7 @@ fn credential_aad(
     .map_err(|error| protocol(ProtocolErrorCode::MalformedFrame, error.to_string()))
 }
 
-fn recovery_aad(
+pub(crate) fn recovery_aad(
     wallet_id: &Token,
     recovery_record_id: &Token,
     root_ciphertext_fingerprint: &Digest32,
@@ -705,7 +705,7 @@ fn recovery_aad(
     .map_err(|error| protocol(ProtocolErrorCode::MalformedFrame, error.to_string()))
 }
 
-fn root_ciphertext_fingerprint(encrypted_root: &EncryptedBlob) -> Digest32 {
+pub(crate) fn root_ciphertext_fingerprint(encrypted_root: &EncryptedBlob) -> Digest32 {
     Digest32::from_bytes(Sha256::digest(encrypted_root.ciphertext.decode()).into())
 }
 

@@ -107,14 +107,13 @@ pub struct WrappedBlob {
 }
 
 impl WrappedBlob {
-    /// SHA-256 over nonce || ciphertext — integrity bookkeeping for the
-    /// stored root, checked on every load.
+    /// SHA-256 of the ciphertext — matching the custody `root_ciphertext_fingerprint`
+    /// convention used in the credential/recovery wrap AAD. This is what
+    /// unlock reconstructs to rebuild the same AAD after restart, so the
+    /// persisted value must be byte-identical to that AAD input.
     pub fn fingerprint(&self) -> Digest32 {
         use sha2::Digest as _;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&self.nonce);
-        hasher.update(&self.ciphertext);
-        Digest32::from_bytes(hasher.finalize().into())
+        Digest32::from_bytes(sha2::Sha256::digest(&self.ciphertext).into())
     }
 }
 
