@@ -269,16 +269,25 @@ impl LocalSignerBackend {
                     || root.derivation.is_some()
             })
             || backup.derivation_registry.iter().any(|key| {
-                !matches!(
-                    &key.derivation,
-                    Some(DerivationRef::Bip32Secp256k1 { root_key_id, .. })
-                        if root_key_id == &backup.root_key_id
-                ) || key.backend.as_str() != "local"
+                let roots_match = match &key.derivation {
+                    Some(DerivationRef::Bip32Secp256k1 { root_key_id, .. }) => {
+                        root_key_id == &backup.root_key_id
+                    }
+                    Some(DerivationRef::Bip39Multicurve {
+                        wallet_seed_ref, ..
+                    }) => wallet_seed_ref == &backup.root_key_id,
+                    None => false,
+                };
+                !roots_match
+                    || key.backend.as_str() != "local"
                     || key.backend_instance != backend_instance_id
                     || !locators.insert(key.locator.clone())
                     || match &key.derivation {
                         Some(DerivationRef::Bip32Secp256k1 { path, .. }) => {
                             !paths.insert(path.clone()) || tombstones.contains(path)
+                        }
+                        Some(DerivationRef::Bip39Multicurve { path, .. }) => {
+                            !paths.insert(path.clone())
                         }
                         _ => true,
                     }

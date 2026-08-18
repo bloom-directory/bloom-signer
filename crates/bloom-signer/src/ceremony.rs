@@ -1451,8 +1451,7 @@ impl SignerCeremonyService {
                 #[cfg(feature = "local")]
                 {
                     if is_bip39 {
-                        let encrypted_record = self
-                            .engine
+                        self.engine
                             .backend_registry()
                             .provision_bip39_wallet_backend(
                                 &registration.wallet_id,
@@ -1460,19 +1459,6 @@ impl SignerCeremonyService {
                                 SecretBytes::new(backend_activation_secret),
                                 self.signing_key.verifying_key(),
                             )?;
-                        let enrollment = crate::engine::BackendEnrollmentBackup {
-                            backend: Token::new("local").expect("static token"),
-                            backend_instance: registration.wallet_id.clone(),
-                            encrypted_record,
-                            pinned_keys: vec![],
-                        };
-                        let CeremonyDatabaseEffect::InitialPolicy {
-                            backend_enrollment, ..
-                        } = &mut database_effect
-                        else {
-                            return Err(kind_mismatch());
-                        };
-                        *backend_enrollment = Some(enrollment);
                         // D1: allocate the canonical initial EVM account
                         // m/44'/60'/0'/0/0 inside the same apply. The root is
                         // never a signable KeyRef, so public_key_refs holds the
@@ -1490,6 +1476,25 @@ impl SignerCeremonyService {
                             &unlocked,
                             now_ms,
                         )?;
+                        // Capture the enrollment with the post-allocation
+                        // backend record so a restart re-registers the child.
+                        let encrypted_record = self
+                            .engine
+                            .backend_registry()
+                            .local_encrypted_backup(&child_key_ref)?;
+                        let enrollment = crate::engine::BackendEnrollmentBackup {
+                            backend: Token::new("local").expect("static token"),
+                            backend_instance: registration.wallet_id.clone(),
+                            encrypted_record,
+                            pinned_keys: vec![],
+                        };
+                        let CeremonyDatabaseEffect::InitialPolicy {
+                            backend_enrollment, ..
+                        } = &mut database_effect
+                        else {
+                            return Err(kind_mismatch());
+                        };
+                        *backend_enrollment = Some(enrollment);
                         public_key_refs = vec![child_key_ref];
                     } else {
                         let (root_key_ref, encrypted_record) = self
@@ -1928,6 +1933,8 @@ impl SignerCeremonyService {
                     _unlocked,
                     now_ms,
                 )?;
+                self.engine
+                    .refresh_backend_enrollment(wallet_id, &key_ref)?;
                 // The child descriptor is public and projected on the read
                 // side from the registry entry; nothing secret leaves here.
                 Ok(GenericCustodyOutcome {
@@ -1941,6 +1948,7 @@ impl SignerCeremonyService {
                 let key_ref = prepare.key_ref.as_ref().ok_or_else(kind_mismatch)?;
                 self.engine
                     .retire_bip39_account(wallet_id, key_ref, now_ms)?;
+                self.engine.refresh_backend_enrollment(wallet_id, key_ref)?;
                 Ok(GenericCustodyOutcome {
                     sensitive_output: None,
                     database_effect: CeremonyDatabaseEffect::None,

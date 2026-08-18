@@ -453,19 +453,29 @@ fn bip39_derived_account_list_is_lock_free_and_stable_across_restart() {
                 .any(|descriptor| descriptor.key_ref == solana_child)
         );
 
-        // Retiring a child removes it from the lock-free list immediately.
+        (evm_child, solana_child)
+    };
+
+    // Restart: reopen the same database; the lock-free read is byte-for-byte
+    // identical and still requires no unlock. The re-registered backend still
+    // carries every allocated child so retirement works across the restart.
+    let (first_child, solana_child) = {
+        let (_service, engine, _registry) = bip39_service(&db_path);
+        let listed = engine.derived_account_descriptors(&wallet_id).unwrap();
+        assert_eq!(listed.len(), 2);
+
+        // Retiring after restart removes the child from the lock-free list and
+        // from the re-registered backend registry.
         engine
             .retire_bip39_account(&wallet_id, &solana_child, 40_200)
             .unwrap();
         let after_retire = engine.derived_account_descriptors(&wallet_id).unwrap();
         assert_eq!(after_retire.len(), 1);
-        assert_eq!(after_retire[0].key_ref, evm_child);
-
-        (evm_child, solana_child)
+        assert_eq!(after_retire[0].key_ref, first_child);
+        (first_child, solana_child)
     };
 
-    // Restart: reopen the same database; the lock-free read is byte-for-byte
-    // identical and still requires no unlock.
+    // Second restart: the retired child stays gone.
     let restarted = {
         let (_service, engine, _registry) = bip39_service(&db_path);
         engine.derived_account_descriptors(&wallet_id).unwrap()

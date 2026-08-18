@@ -2005,6 +2005,49 @@ impl SignerEngine {
         transaction.commit().map_err(storage)
     }
 
+    /// Persist the backend's current encrypted record so a restart re-registers
+    /// the derived children allocated or retired since provisioning. The
+    /// `ceremony_backend_enrollments` row is the durable enrollment source.
+    /// Called by the AccountAllocate/AccountRetire ceremonies after mutating
+    /// the backend; registration writes its own post-allocation record.
+    pub fn refresh_backend_enrollment(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+    ) -> Result<(), ProtocolError> {
+        #[cfg(feature = "local")]
+        {
+            let enrollment = BackendEnrollmentBackup {
+                backend: key_ref.backend.clone(),
+                backend_instance: key_ref.backend_instance.clone(),
+                encrypted_record: self.backend_registry.local_encrypted_backup(key_ref)?,
+                pinned_keys: Vec::new(),
+            };
+            let connection = self.connection.lock();
+            let updated = connection
+                .execute(
+                    "UPDATE ceremony_backend_enrollments
+                     SET enrollment_jcs = ?2 WHERE backend_instance = ?1",
+                    params![
+                        wallet_id.as_str(),
+                        serde_jcs::to_string(&enrollment).map_err(malformed)?,
+                    ],
+                )
+                .map_err(storage)?;
+            if updated != 1 {
+                return Err(error(
+                    ProtocolErrorCode::KeyrefMismatch,
+                    "bip39 backend lacks durable enrollment",
+                ));
+            }
+        }
+        #[cfg(not(feature = "local"))]
+        {
+            let _ = (wallet_id, key_ref);
+        }
+        Ok(())
+    }
+
     /// Drive the full allocation lifecycle for one BIP-39 derived child, in
     /// separate IMMEDIATE transactions keyed by the ceremony operation id,
     /// and enroll the resulting `KeyRef`. Returns the child `KeyRef` and its
