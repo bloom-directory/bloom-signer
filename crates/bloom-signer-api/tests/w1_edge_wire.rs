@@ -126,6 +126,35 @@ fn custody_prepare() -> CustodyPrepareRequest {
     }
 }
 
+fn derived_account_descriptor() -> DerivedAccountDescriptor {
+    DerivedAccountDescriptor {
+        key_ref: KeyRef {
+            backend: token("local"),
+            backend_instance: token("default"),
+            locator: "key-child-1".into(),
+            key_spec: KeySpec::Secp256k1,
+            public_key_fingerprint: digest(2),
+            derivation: Some(DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: token("wallet"),
+                profile: DerivationProfile::Bip44EvmSecp256k1V1,
+                path: "m/44'/60'/0'/0/0".into(),
+            }),
+        },
+        wallet_seed_ref: WalletSeedRef {
+            wallet_id: token("wallet"),
+            profile: WalletSeedProfile::Bip39MulticurveV1,
+            entropy_bits: 256,
+        },
+        derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
+        path: "m/44'/60'/0'/0/0".into(),
+        canonical_public_key: Base64UrlBytes::from_bytes(&[3; 33]),
+        public_key_encoding: PublicKeyEncoding::Secp256k1SpkiDer,
+        public_key_fingerprint: digest(2),
+        supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+        lifecycle: AccountLifecycleState::Active,
+    }
+}
+
 fn policy_snapshot() -> SignedPolicySnapshot {
     SignedPolicySnapshot {
         wallet_id: token("wallet"),
@@ -414,6 +443,7 @@ fn signer_requests() -> Vec<BrokerSignerRequest> {
         BrokerSignerRequest::KeyDerivationCapabilities(key.clone()),
         BrokerSignerRequest::KeyDerivePrepare(custody_prepare()),
         BrokerSignerRequest::KeyListDerived(key),
+        BrokerSignerRequest::DerivedAccountList(wallet.clone()),
         BrokerSignerRequest::KeyEnrollPrepare(custody_prepare()),
         BrokerSignerRequest::KeyEnrollStatus(operation_request.clone()),
         BrokerSignerRequest::CeremonyPrepare(SignerCeremonyPrepareRequest::SealedApproval(
@@ -498,6 +528,7 @@ fn signer_responses() -> Vec<BrokerSignerResponse> {
         BrokerSignerResponse::KeyDerivationCapabilities(vec![token("bip32")]),
         BrokerSignerResponse::KeyDerivePrepare(custody_prepared.clone()),
         BrokerSignerResponse::KeyListDerived(vec![key_public()]),
+        BrokerSignerResponse::DerivedAccountList(vec![derived_account_descriptor()]),
         BrokerSignerResponse::KeyEnrollPrepare(custody_prepared.clone()),
         BrokerSignerResponse::KeyEnrollStatus(ceremony_status()),
         BrokerSignerResponse::CeremonyPrepare(SignerCeremonyPrepareResponse::SealedApproval(
@@ -597,12 +628,12 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer requests",
         signer_requests(),
-        "991df6448dae330b1f6b70e99f22b3966373e2cc27fc8f56f3662aeed84a1552",
+        "1571f26a22d505ebf9024258712e835efebfd9d0114592749291d72254b83f06",
     );
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "aa2974815276cbc0d1ecbca44e9eaf5a1b16f4b5f91d71ca77e2c93053a78aee",
+        "8b1afb04b55f11fecec5f151a1ed0d80c9bf8bbb566cd8dbd34fb98791f79f26",
     );
     assert_wire_digest(
         "control requests",
