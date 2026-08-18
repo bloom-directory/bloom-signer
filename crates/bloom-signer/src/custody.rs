@@ -48,14 +48,17 @@ pub struct RecoveryWrap {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RootMaterialProfile {
-    /// Legacy local secp root (raw BIP-32 seed or standalone scalar,
-    /// interpreted by the local backend). Default for pre-BIP-39 backups.
-    #[default]
-    LegacySecp,
     /// `encrypted_root` holds WKEK-wrapped BIP-39 entropy; `entropy_bits`
     /// records its length (128/160/192/224/256). The mnemonic, PBKDF2 seed,
     /// and derived keys are derived transiently, never persisted.
     Bip39MulticurveV1,
+    /// `encrypted_root` holds one WKEK-wrapped secp256k1 scalar (32 bytes):
+    /// a raw-key import, non-HD. First-class and permanent; the historical
+    /// `legacy_secp` storage name is accepted as an alias so pre-rename
+    /// custody backups still parse.
+    #[default]
+    #[serde(alias = "legacy_secp")]
+    ImportedSecp256k1Scalar,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -197,13 +200,85 @@ impl UnlockedWallet {
 }
 
 impl WalletCustody {
-    pub fn register(
+    /// Register a wallet whose root is one imported secp256k1 scalar
+    /// (raw-key import or a migrated pre-triad single key). Non-HD: this
+    /// profile signs only its own root key and never derives accounts.
+    pub fn register_imported_secp256k1(
+        wallet_id: Token,
+        private_key: SecretBytes,
+        policy_signing_seed: SecretBytes,
+        wkek: SecretBytes,
+        first_credential_id: Base64UrlBytes,
+        first_credential_key: SecretBytes,
+    ) -> Result<Self, ProtocolError> {
+        validate_key(&wkek)?;
+        validate_key(&first_credential_key)?;
+        if private_key.expose_to_backend().len() != 32
+            || policy_signing_seed.expose_to_backend().len() != 32
+        {
+            return Err(protocol(
+                ProtocolErrorCode::BackendInvalidRequest,
+                "imported secp256k1 private key or policy signing key has invalid length",
+            ));
+        }
+        Self::register_with_profile(
+            wallet_id,
+            private_key,
+            policy_signing_seed,
+            wkek,
+            first_credential_id,
+            first_credential_key,
+            RootMaterialProfile::ImportedSecp256k1Scalar,
+            None,
+        )
+    }
+
+    /// Register a BIP-39 wallet: the root is WKEK-wrapped entropy of a valid
+    /// length; the profile and entropy bits are recorded so unlock validates
+    /// the plaintext length and export reconstructs the mnemonic.
+    pub fn register_bip39(
+        wallet_id: Token,
+        entropy: SecretBytes,
+        policy_signing_seed: SecretBytes,
+        wkek: SecretBytes,
+        first_credential_id: Base64UrlBytes,
+        first_credential_key: SecretBytes,
+    ) -> Result<Self, ProtocolError> {
+        let bits = match entropy.expose_to_backend().len() {
+            16 => 128,
+            20 => 160,
+            24 => 192,
+            28 => 224,
+            32 => 256,
+            _ => {
+                return Err(protocol(
+                    ProtocolErrorCode::BackendInvalidRequest,
+                    "BIP-39 entropy length must be 16/20/24/28/32 bytes",
+                ));
+            }
+        };
+        Self::register_with_profile(
+            wallet_id,
+            entropy,
+            policy_signing_seed,
+            wkek,
+            first_credential_id,
+            first_credential_key,
+            RootMaterialProfile::Bip39MulticurveV1,
+            Some(bits),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_with_profile(
         wallet_id: Token,
         root: SecretBytes,
         policy_signing_seed: SecretBytes,
         wkek: SecretBytes,
         first_credential_id: Base64UrlBytes,
         first_credential_key: SecretBytes,
+        root_material_profile: RootMaterialProfile,
+        entropy_bits: Option<u32>,
     ) -> Result<Self, ProtocolError> {
         validate_key(&wkek)?;
         validate_key(&first_credential_key)?;
@@ -252,53 +327,12 @@ impl WalletCustody {
                         wrapped_wkek,
                     }],
                     recovery_wrap: None,
-                    root_material_profile: RootMaterialProfile::LegacySecp,
-                    entropy_bits: None,
+                    root_material_profile,
+                    entropy_bits,
                 },
                 storage_path: None,
             }),
         })
-    }
-
-    /// Register a BIP-39 wallet: the root is WKEK-wrapped entropy of a valid
-    /// length; the profile and entropy bits are recorded so unlock validates
-    /// the plaintext length and export reconstructs the mnemonic.
-    pub fn register_bip39(
-        wallet_id: Token,
-        entropy: SecretBytes,
-        policy_signing_seed: SecretBytes,
-        wkek: SecretBytes,
-        first_credential_id: Base64UrlBytes,
-        first_credential_key: SecretBytes,
-    ) -> Result<Self, ProtocolError> {
-        let bits = match entropy.expose_to_backend().len() {
-            16 => 128,
-            20 => 160,
-            24 => 192,
-            28 => 224,
-            32 => 256,
-            _ => {
-                return Err(protocol(
-                    ProtocolErrorCode::BackendInvalidRequest,
-                    "BIP-39 entropy length must be 16/20/24/28/32 bytes",
-                ));
-            }
-        };
-        let custody = Self::register(
-            wallet_id,
-            entropy,
-            policy_signing_seed,
-            wkek,
-            first_credential_id,
-            first_credential_key,
-        )?;
-        {
-            let mut state = custody.state.lock();
-            state.backup.root_material_profile = RootMaterialProfile::Bip39MulticurveV1;
-            state.backup.entropy_bits = Some(bits);
-            persist_custody(&state)?;
-        }
-        Ok(custody)
     }
 
     pub fn root_material_profile(&self) -> RootMaterialProfile {
@@ -342,7 +376,7 @@ impl WalletCustody {
         first_credential_id: Base64UrlBytes,
         first_credential_key: SecretBytes,
     ) -> Result<Self, ProtocolError> {
-        let custody = Self::register(
+        let custody = Self::register_bip39(
             wallet_id,
             root,
             policy_signing_seed,
@@ -695,26 +729,36 @@ fn unlock_with_wkek(
         &root_aad(&backup.wallet_id, backup.wrap_format_version),
     )?;
     // Decrypt-time plaintext validation: authenticate (done above), then
-    // require the BIP-39 root length to match its recorded metadata.
-    if backup.root_material_profile == RootMaterialProfile::Bip39MulticurveV1 {
-        let expected = match backup.entropy_bits {
-            Some(128) => 16,
-            Some(160) => 20,
-            Some(192) => 24,
-            Some(224) => 28,
-            Some(256) => 32,
-            _ => {
+    // require the decrypted root length to match its recorded profile.
+    match backup.root_material_profile {
+        RootMaterialProfile::Bip39MulticurveV1 => {
+            let expected = match backup.entropy_bits {
+                Some(128) => 16,
+                Some(160) => 20,
+                Some(192) => 24,
+                Some(224) => 28,
+                Some(256) => 32,
+                _ => {
+                    return Err(protocol(
+                        ProtocolErrorCode::MalformedFrame,
+                        "BIP-39 root is missing valid entropy-bit metadata",
+                    ));
+                }
+            };
+            if root.len() != expected {
                 return Err(protocol(
-                    ProtocolErrorCode::MalformedFrame,
-                    "BIP-39 root is missing valid entropy-bit metadata",
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "decrypted entropy length does not match profile metadata",
                 ));
             }
-        };
-        if root.len() != expected {
-            return Err(protocol(
-                ProtocolErrorCode::UnauthenticatedPeer,
-                "decrypted entropy length does not match profile metadata",
-            ));
+        }
+        RootMaterialProfile::ImportedSecp256k1Scalar => {
+            if root.len() != 32 {
+                return Err(protocol(
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "decrypted imported scalar is not 32 bytes",
+                ));
+            }
         }
     }
     let policy_signing_seed = decrypt(

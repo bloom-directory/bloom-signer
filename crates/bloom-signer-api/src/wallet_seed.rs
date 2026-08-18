@@ -13,11 +13,15 @@ use crate::{
 
 /// Root seed profile. `bip39-multicurve-v1` uses 256-bit BIP-39 entropy, the
 /// English 24-word encoding, and the empty BIP-39 passphrase for the
-/// interoperable default profile.
+/// interoperable default profile. `imported-secp256k1-scalar` is a single
+/// imported secp256k1 private key with no HD tree; it is a permanent
+/// first-class profile for raw-key import and for migrated pre-triad
+/// single-key wallets, and it never hosts derived accounts.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WalletSeedProfile {
     Bip39MulticurveV1,
+    ImportedSecp256k1Scalar,
 }
 
 /// A requested derived-account allocation. Callers select a derivation

@@ -132,7 +132,7 @@ fn randomized_mnemonics_agree_with_the_independent_codec() {
             assert_eq!(tokens.len(), words);
             let indices: Vec<usize> = tokens
                 .iter()
-                .map(|token| bloom_signer_derive::wordlist::index(token).unwrap())
+                .map(|token| bip39::Language::English.find_word(token).unwrap() as usize)
                 .collect();
             assert_eq!(indices, reference::indices_from_entropy(&entropy, words));
 

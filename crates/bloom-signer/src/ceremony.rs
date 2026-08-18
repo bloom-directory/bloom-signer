@@ -1389,7 +1389,7 @@ impl SignerCeremonyService {
                         credential_key,
                     )?
                 } else {
-                    WalletCustody::register(
+                    WalletCustody::register_imported_secp256k1(
                         registration.wallet_id.clone(),
                         root,
                         registration.policy_seed,
@@ -1495,10 +1495,9 @@ impl SignerCeremonyService {
                         let (root_key_ref, encrypted_record) = self
                             .engine
                             .backend_registry()
-                            .provision_local_wallet_backend(
+                            .provision_imported_secp256k1_wallet_backend(
                                 &registration.wallet_id,
                                 SecretBytes::new(backend_seed),
-                                prepare.ceremony_kind == CeremonyKind::WalletImport,
                                 SecretBytes::new(backend_activation_secret),
                                 self.signing_key.verifying_key(),
                             )?;
@@ -2299,6 +2298,29 @@ impl SignerCeremonyService {
             return Err(protocol(
                 ProtocolErrorCode::CeremonyKindMismatch,
                 "wallet_seed_profile is valid only for registration and import",
+            ));
+        }
+        // New wallets are always BIP-39; the imported-scalar profile exists
+        // only to import an existing private key, never to create one.
+        if request.ceremony_kind == CeremonyKind::WalletRegistration
+            && request.wallet_seed_profile
+                != Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1)
+        {
+            return Err(protocol(
+                ProtocolErrorCode::CeremonyKindMismatch,
+                "wallet registration requires the bip39-multicurve-v1 seed profile",
+            ));
+        }
+        // An omitted profile on import is legal only for the legacy passkey
+        // migration (validated separately); an ordinary import must name its
+        // profile explicitly.
+        if request.ceremony_kind == CeremonyKind::WalletImport
+            && request.wallet_seed_profile.is_none()
+            && request.legacy_passkey_migration.is_none()
+        {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                "wallet import requires an explicit seed profile",
             ));
         }
         // derivation_request is legal only for AccountAllocate.

@@ -143,6 +143,10 @@ impl SignerRpcService {
                 }
                 Ok(Response::KeyListPublic(keys))
             }
+            Request::DerivedAccountList(request) => Ok(Response::DerivedAccountList(
+                self.engine
+                    .derived_account_descriptors(&request.wallet_id)?,
+            )),
             Request::KeyDerivationCapabilities(request) => {
                 let capabilities = self
                     .engine
@@ -634,6 +638,7 @@ fn broker_signer_request_is_read_only(request: &BrokerSignerRequest) -> bool {
             | Request::KeyListPublic(_)
             | Request::KeyDerivationCapabilities(_)
             | Request::KeyListDerived(_)
+            | Request::DerivedAccountList(_)
             | Request::KeyEnrollStatus(_)
             | Request::CeremonyStatus(_)
             | Request::SealedApprovalStatus(_)
@@ -834,7 +839,7 @@ mod tests {
         let broker_key = SigningKey::from_bytes(&[7; 32]);
         let activation_secret = vec![9; 32];
         let backend = Arc::new(
-            LocalSignerBackend::provision(
+            LocalSignerBackend::provision_imported_secp256k1(
                 Token::new("wallet-service-test").unwrap(),
                 Token::new("root").unwrap(),
                 SecretBytes::new((0_u8..32).collect()),
@@ -1192,7 +1197,7 @@ mod tests {
     #[tokio::test]
     async fn dedicated_policy_key_is_unreachable_through_single_and_batch_signing() {
         let (service, broker_key, terms) = fixture().await;
-        let custody = WalletCustody::register(
+        let custody = WalletCustody::register_imported_secp256k1(
             terms.wallet_id.clone(),
             SecretBytes::new(vec![1; 32]),
             SecretBytes::new(vec![2; 32]),

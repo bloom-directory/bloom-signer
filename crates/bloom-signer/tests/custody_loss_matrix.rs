@@ -156,10 +156,10 @@ fn bip39_mnemonic_export_reconstructs_the_frozen_words() {
 }
 
 #[test]
-fn legacy_custody_rejects_mnemonic_export_and_keeps_its_path() {
-    let custody = WalletCustody::register(
-        Token::new("legacy").unwrap(),
-        key(0x99), // 32-byte legacy seed
+fn imported_scalar_custody_rejects_mnemonic_export_and_keeps_its_path() {
+    let custody = WalletCustody::register_imported_secp256k1(
+        Token::new("imported").unwrap(),
+        key(0x99), // 32-byte imported private key
         key(0xAA),
         key(0x11),
         cred("cred-1"),
@@ -168,15 +168,15 @@ fn legacy_custody_rejects_mnemonic_export_and_keeps_its_path() {
     .unwrap();
     assert_eq!(
         custody.root_material_profile(),
-        RootMaterialProfile::LegacySecp
+        RootMaterialProfile::ImportedSecp256k1Scalar
     );
     let unlocked = custody
         .unlock_with_credential(&cred("cred-1"), &key(0x22))
         .unwrap();
     assert!(custody.export_mnemonic(&unlocked).is_err());
 
-    // Legacy unlock still exposes a 32-byte root (BIP-32 seed) via the
-    // backup round-trip, unchanged.
+    // Imported-scalar unlock still exposes its 32-byte root via the backup
+    // round-trip, unchanged.
     let backup: WalletCustodyBackup = custody.backup();
     let restored = WalletCustody::restore(backup).unwrap();
     assert!(

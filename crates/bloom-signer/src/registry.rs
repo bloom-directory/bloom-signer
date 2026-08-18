@@ -222,33 +222,22 @@ impl BackendRegistry {
     }
 
     #[cfg(feature = "local")]
-    pub fn provision_local_wallet_backend(
+    pub fn provision_imported_secp256k1_wallet_backend(
         &self,
         wallet_id: &Token,
-        root_material: SecretBytes,
-        imported_private_key: bool,
+        private_key: SecretBytes,
         activation_secret: SecretBytes,
         authority_verifying_key: ed25519_dalek::VerifyingKey,
     ) -> Result<(KeyRef, Base64UrlBytes), ProtocolError> {
         let backend_instance = wallet_id.clone();
         let backend = Arc::new(
-            if imported_private_key {
-                bloom_signer_backend_local::LocalSignerBackend::provision_imported_secp256k1(
-                    backend_instance.clone(),
-                    Token::new("wallet-root").expect("static token"),
-                    root_material,
-                    activation_secret,
-                    authority_verifying_key,
-                )
-            } else {
-                bloom_signer_backend_local::LocalSignerBackend::provision(
-                    backend_instance.clone(),
-                    Token::new("wallet-root").expect("static token"),
-                    root_material,
-                    activation_secret,
-                    authority_verifying_key,
-                )
-            }
+            bloom_signer_backend_local::LocalSignerBackend::provision_imported_secp256k1(
+                backend_instance.clone(),
+                Token::new("wallet-root").expect("static token"),
+                private_key,
+                activation_secret,
+                authority_verifying_key,
+            )
             .map_err(|error| {
                 ProtocolError::new(
                     ProtocolErrorCode::BackendInvalidRequest,

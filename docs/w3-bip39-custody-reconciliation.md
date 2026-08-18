@@ -20,10 +20,52 @@ metadata:
 
 ```text
 RootMaterialProfile
-  LegacyBip32Seed          // unchanged legacy profile
-  LegacySecp256k1Scalar    // unchanged legacy profile
-  Bip39MulticurveV1        // new: encrypted_root = WKEK-wrapped entropy
+  Bip39MulticurveV1        // encrypted_root = WKEK-wrapped entropy (16/20/24/28/32 bytes)
+  ImportedSecp256k1Scalar  // encrypted_root = one WKEK-wrapped secp256k1 scalar (32 bytes)
 ```
+
+> **Supersession (2026-08-18).** The profile set above was later collapsed from
+> three (raw-seed HD, raw-scalar, entropy) to the two permanent profiles above.
+> Human decisions, recorded here so they are not reconstructed from git-blame:
+>
+> - **`Bip32Seed` / the generic `WalletCustody::register()` / the local backend's
+>   raw-seed `provision()` are deleted** — "create a new HD wallet directly from a
+>   raw seed, no mnemonic, no import" has no remaining use case. New wallets are
+>   BIP-39; raw-key import is the imported-scalar profile. The `bip32` (iqlusion)
+>   crate remains a *dev-only* differential-testing dependency of
+>   `bloom-signer-derive` (see the BIP-32 note below), not a production path.
+> - **The pre-triad single-passkey migration (`legacy_passkey.rs` /
+>   `bloom-signer-migrate`) is retained, not deleted.** A small number of real
+>   accounts are still on the pre-triad format; migration is an ops action. A
+>   migrated pre-triad wallet is a single 32-byte scalar (validated against one
+>   address), so it lands in `ImportedSecp256k1Scalar`, never in a raw-seed HD
+>   tree. Delete the migration only after migration is confirmed complete (tracked
+>   follow-up).
+> - **The petal/agent subkey derivation subsystem is dormant, not deleted.** With
+>   `Bip32Seed` gone there is no backend that can anchor a derivation namespace, so
+>   no current caller reaches it; the code stays compiling as scaffolding for the
+>   "agent authority" principle, with a tracked follow-up to either re-anchor it or
+>   remove it. Said plainly in the Signer PR body.
+
+### BIP-32 / SLIP-10 crate decisions (2026-08-18)
+
+- **`coins-bip32` was evaluated and rejected as the production BIP-32
+  implementation.** Both 0.8.7 and 0.13.1 contain `_ => return
+  self.derive_child(index + 1)` at `xkeys.rs:231`: an invalid child (`I_L >= n` or
+  zero scalar) is silently retried at the next index rather than surfaced as a
+  distinguishable error. Bloom's `allocation::next_valid_index` tombstone/skip
+  allocator depends on `Secp256k1DeriveError::InvalidChild` being catchable so path
+  labels stay accurate; the silent reindex would mislabel index+1's key as index.
+  Keep the hand-rolled `bip32.rs` (k256-backed) and its permanent differential test
+  against the external `bip32` crate — the project shipped a real scalar-arithmetic
+  ordering bug (`601d905` → `85f0013`) that only that differential caught, which is
+  why the dev-dependency stays.
+- **`slip10.rs` is kept hand-rolled** after a freshness check: the two candidate
+  crates are both 5+ years unmaintained (checked 2026-08-18), and the 167-line
+  vector-pinned implementation has no known caught-bug history. Re-check freshness
+  before reconsidering.
+- **`bip39` (mnemonic) stays as-is** — `coins-bip39` is a lateral move with no
+  capability gain.
 
 Rationale:
 
@@ -53,10 +95,12 @@ Rationale:
 
 ## Mandatory parameterized tests
 
-Every test below runs for both `legacy-secp` and `bip39-multicurve-v1`:
+Every test below runs for both `imported-secp256k1-scalar` and
+`bip39-multicurve-v1` (the raw-seed-HD profile is retired — see supersession
+above):
 
 - registration; unlock with each of two passkeys and the recovery factor
-  (same WKEK/root, byte-identical children);
+  (same WKEK/root, byte-identical children for the bip39 profile);
 - credential add/replace/remove; recovery install; rekey; export; delete
   (tombstones root + registry + wraps atomically);
 - backup -> restore round-trip with identical descriptors; mixed-epoch restore

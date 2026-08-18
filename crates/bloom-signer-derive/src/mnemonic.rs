@@ -103,7 +103,7 @@ pub fn parse_mnemonic(mnemonic: &str) -> Result<ParsedMnemonic, MnemonicError> {
         Err(bip39::Error::UnknownWord(_)) => {
             // Recover the offending index for the caller.
             for (index, word) in mnemonic.split_whitespace().enumerate() {
-                if crate::wordlist::index(word).is_none() {
+                if bip39::Language::English.find_word(word).is_none() {
                     return Err(MnemonicError::UnknownWord {
                         index,
                         word: word.to_owned(),

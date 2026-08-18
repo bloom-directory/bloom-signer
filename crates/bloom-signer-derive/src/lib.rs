@@ -34,7 +34,6 @@ pub mod mnemonic;
 pub mod policy;
 pub mod seed;
 pub mod slip10;
-pub mod wordlist;
 
 pub use allocation::next_valid_index;
 pub use bip32::{DerivedSecp256k1, Secp256k1DeriveError, derive_evm_account, master_secp256k1};

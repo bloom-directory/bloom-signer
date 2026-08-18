@@ -321,6 +321,8 @@ pub enum BrokerSignerRequest {
     KeyDerivePrepare(CustodyPrepareRequest),
     #[serde(rename = "key.list_derived")]
     KeyListDerived(KeyRequest),
+    #[serde(rename = "wallet.derived_accounts")]
+    DerivedAccountList(WalletRequest),
     #[serde(rename = "key.enroll_prepare")]
     KeyEnrollPrepare(CustodyPrepareRequest),
     #[serde(rename = "key.enroll_status")]
@@ -400,6 +402,8 @@ pub enum BrokerSignerResponse {
     KeyDerivationCapabilities(Vec<Token>),
     #[serde(rename = "key.list_derived")]
     KeyListDerived(Vec<KeyPublic>),
+    #[serde(rename = "wallet.derived_accounts")]
+    DerivedAccountList(Vec<crate::DerivedAccountDescriptor>),
     #[serde(rename = "key.derive_prepare")]
     KeyDerivePrepare(crate::SignerPreparedCustody),
     #[serde(rename = "key.enroll_prepare")]

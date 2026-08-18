@@ -405,6 +405,81 @@ fn bip39_process_boundary_end_to_end() {
 }
 
 #[test]
+fn bip39_derived_account_list_is_lock_free_and_stable_across_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("signer.db");
+    let authenticator = VirtualAuthenticator::generate();
+    let wallet_id = Token::new("bip39-list").unwrap();
+
+    // Register (allocates the canonical EVM child) and allocate a Solana
+    // sibling. No unlock happens after these ceremonies: the read below must
+    // succeed purely from the persisted registry.
+    let (first_child, solana_child) = {
+        let (service, engine, _registry) = bip39_service(&db_path);
+        let registration = bip39_register(
+            &service,
+            &authenticator,
+            &wallet_id,
+            &OperationId::new("40".repeat(32)).unwrap(),
+            40_000,
+        );
+        let evm_child = registration.public_key_refs[0].clone();
+        let solana_child = bip39_allocate(
+            &service,
+            &authenticator,
+            &wallet_id,
+            &OperationId::new("41".repeat(32)).unwrap(),
+            DerivedAccountRequest {
+                derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                requested_role: Token::new("solana-account").unwrap(),
+                account: Some(0),
+            },
+            40_100,
+        );
+
+        let listed = engine.derived_account_descriptors(&wallet_id).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|descriptor| {
+            descriptor.lifecycle == bloom_signer_api::AccountLifecycleState::Active
+        }));
+        assert!(
+            listed
+                .iter()
+                .any(|descriptor| descriptor.key_ref == evm_child)
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|descriptor| descriptor.key_ref == solana_child)
+        );
+
+        // Retiring a child removes it from the lock-free list immediately.
+        engine
+            .retire_bip39_account(&wallet_id, &solana_child, 40_200)
+            .unwrap();
+        let after_retire = engine.derived_account_descriptors(&wallet_id).unwrap();
+        assert_eq!(after_retire.len(), 1);
+        assert_eq!(after_retire[0].key_ref, evm_child);
+
+        (evm_child, solana_child)
+    };
+
+    // Restart: reopen the same database; the lock-free read is byte-for-byte
+    // identical and still requires no unlock.
+    let restarted = {
+        let (_service, engine, _registry) = bip39_service(&db_path);
+        engine.derived_account_descriptors(&wallet_id).unwrap()
+    };
+    assert_eq!(restarted.len(), 1);
+    assert_eq!(restarted[0].key_ref, first_child);
+    assert_eq!(
+        restarted[0].derivation_profile,
+        DerivationProfile::Bip44EvmSecp256k1V1
+    );
+    let _ = solana_child;
+}
+
+#[test]
 fn bip39_descriptor_rejects_a_profile_key_spec_mismatch() {
     let directory = tempfile::tempdir().unwrap();
     let db_path = directory.path().join("signer.db");

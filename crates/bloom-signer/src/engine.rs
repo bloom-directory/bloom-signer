@@ -2267,6 +2267,54 @@ impl SignerEngine {
         }))
     }
 
+    /// Lock-free enumeration of a wallet's active BIP-39 derived accounts.
+    ///
+    /// This reads only the persisted `enrolled_keys` + `derivation_allocations`
+    /// registry — no backend activation, no entropy decryption, no
+    /// re-derivation from seed. It answers the public projection question
+    /// ("what accounts does this wallet have") without unlocking anything.
+    /// Only `Active` accounts are returned; retired children leave the list.
+    pub fn derived_account_descriptors(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<Vec<bloom_signer_api::DerivedAccountDescriptor>, ProtocolError> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT key_ref_jcs FROM enrolled_keys
+                 WHERE available = 1 AND authority_class = 'derived' AND wallet_id = ?1
+                 ORDER BY key_fingerprint",
+            )
+            .map_err(storage)?;
+        let rows = statement
+            .query_map([wallet_id.as_str()], |row| row.get::<_, String>(0))
+            .map_err(storage)?;
+        let mut key_refs = Vec::new();
+        for row in rows {
+            let key: KeyRef = serde_json::from_str(&row.map_err(storage)?).map_err(malformed)?;
+            key_refs.push(key);
+        }
+        drop(statement);
+        drop(connection);
+        let mut descriptors = Vec::with_capacity(key_refs.len());
+        for key_ref in key_refs {
+            let descriptor = self.derived_account_descriptor(&key_ref)?.ok_or_else(|| {
+                error(
+                    ProtocolErrorCode::KeyrefMismatch,
+                    "enrolled derived key has no bip39 registry entry",
+                )
+            })?;
+            if descriptor.lifecycle != bloom_signer_api::AccountLifecycleState::Active {
+                return Err(error(
+                    ProtocolErrorCode::KeyrefMismatch,
+                    "enrolled derived key is not active",
+                ));
+            }
+            descriptors.push(descriptor);
+        }
+        Ok(descriptors)
+    }
+
     /// Retire a BIP-39 derived child: ACTIVATED → RETIRED in the registry,
     /// then mark the enrolled key and backend child unavailable.
     pub fn retire_bip39_account(

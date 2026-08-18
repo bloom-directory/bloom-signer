@@ -60,9 +60,12 @@ pub struct EncryptedLocalBackup {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalRootMaterialKind {
+    /// One imported secp256k1 private key, non-HD. A permanent first-class
+    /// profile for raw-key import (and for migrated pre-triad single-key
+    /// wallets); it signs only its own root key and never hosts derived
+    /// accounts or a derivation namespace.
     #[default]
-    Bip32Seed,
-    Secp256k1Scalar,
+    ImportedSecp256k1Scalar,
     /// BIP-39 entropy. The root is never a signable key; only registered
     /// derived children sign, via BIP-32 (secp256k1) or hardened SLIP-10
     /// (Ed25519) dispatched by `DerivationRef::Bip39Multicurve`.
@@ -115,23 +118,6 @@ pub struct LocalSignerBackend {
 }
 
 impl LocalSignerBackend {
-    pub fn provision(
-        backend_instance_id: Token,
-        root_key_id: Token,
-        seed: SecretBytes,
-        kek: SecretBytes,
-        authority_verifying_key: VerifyingKey,
-    ) -> Result<Self, BackendError> {
-        Self::provision_material(
-            backend_instance_id,
-            root_key_id,
-            seed,
-            kek,
-            authority_verifying_key,
-            LocalRootMaterialKind::Bip32Seed,
-        )
-    }
-
     pub fn provision_imported_secp256k1(
         backend_instance_id: Token,
         root_key_id: Token,
@@ -145,7 +131,7 @@ impl LocalSignerBackend {
             private_key,
             kek,
             authority_verifying_key,
-            LocalRootMaterialKind::Secp256k1Scalar,
+            LocalRootMaterialKind::ImportedSecp256k1Scalar,
         )
     }
 
@@ -178,10 +164,7 @@ impl LocalSignerBackend {
         root_material_kind: LocalRootMaterialKind,
     ) -> Result<Self, BackendError> {
         let valid_material = match root_material_kind {
-            LocalRootMaterialKind::Bip32Seed => {
-                (16..=64).contains(&material.expose_to_backend().len())
-            }
-            LocalRootMaterialKind::Secp256k1Scalar => {
+            LocalRootMaterialKind::ImportedSecp256k1Scalar => {
                 SigningKey::from_slice(material.expose_to_backend()).is_ok()
             }
             LocalRootMaterialKind::Bip39Entropy => {
@@ -250,29 +233,6 @@ impl LocalSignerBackend {
             .as_mut()
             .ok_or(BackendError::DefinitiveRejected)?
             .public_descriptions = vec![description];
-        Ok(backend)
-    }
-
-    pub fn provision_at(
-        storage_path: impl AsRef<Path>,
-        backend_instance_id: Token,
-        root_key_id: Token,
-        seed: SecretBytes,
-        kek: SecretBytes,
-        authority_verifying_key: VerifyingKey,
-    ) -> Result<Self, BackendError> {
-        let backend = Self::provision(
-            backend_instance_id,
-            root_key_id,
-            seed,
-            kek,
-            authority_verifying_key,
-        )?;
-        {
-            let mut state = backend.state.write();
-            state.storage_path = Some(storage_path.as_ref().to_path_buf());
-            persist_backup(&state)?;
-        }
         Ok(backend)
     }
 
@@ -457,7 +417,7 @@ impl LocalSignerBackend {
 
     pub fn configure_namespace(&self, authority: &DerivationAuthority) -> Result<(), BackendError> {
         if self.state.read().backup.as_ref().is_some_and(|backup| {
-            backup.root_material_kind == LocalRootMaterialKind::Secp256k1Scalar
+            backup.root_material_kind == LocalRootMaterialKind::ImportedSecp256k1Scalar
         }) {
             return Err(BackendError::Unsupported);
         }
@@ -754,15 +714,10 @@ impl LocalSignerBackend {
             .ok_or(BackendError::DefinitiveRejected)?;
         let material = self.active_seed()?;
         match material_kind {
-            LocalRootMaterialKind::Bip32Seed => {
-                let path =
-                    DerivationPath::from_str("m").map_err(|_| BackendError::InvalidRequest)?;
-                XPrv::derive_from_path(material.as_slice(), &path)
-                    .map(SigningKey::from)
-                    .map_err(|_| BackendError::DefinitiveRejected)
+            LocalRootMaterialKind::ImportedSecp256k1Scalar => {
+                SigningKey::from_slice(material.as_slice())
+                    .map_err(|_| BackendError::InvalidRequest)
             }
-            LocalRootMaterialKind::Secp256k1Scalar => SigningKey::from_slice(material.as_slice())
-                .map_err(|_| BackendError::InvalidRequest),
             LocalRootMaterialKind::Bip39Entropy => Err(BackendError::InvalidRequest),
         }
     }
@@ -898,7 +853,7 @@ impl LocalSignerBackend {
         let signing_key = if canonical_path == "m" {
             self.root_signing_key()?
         } else {
-            if backup.root_material_kind == LocalRootMaterialKind::Secp256k1Scalar {
+            if backup.root_material_kind == LocalRootMaterialKind::ImportedSecp256k1Scalar {
                 return Err(BackendError::Unsupported);
             }
             let seed = self.active_seed()?;
@@ -999,7 +954,6 @@ impl SignerBackend for LocalSignerBackend {
             .as_ref()
             .map(|backup| backup.root_material_kind)
             .unwrap_or_default();
-        let supports_derivation = material_kind == LocalRootMaterialKind::Bip32Seed;
         let is_bip39 = material_kind == LocalRootMaterialKind::Bip39Entropy;
         BackendCapabilities {
             backend_id: self.backend_id(),
@@ -1021,14 +975,12 @@ impl SignerBackend for LocalSignerBackend {
                     CryptoSuite::Secp256k1Sha256Recoverable,
                 ]
             },
-            supported_derivation: supports_derivation
-                .then(|| DerivationCapability {
-                    scheme: Token::new("bip32-secp256k1").expect("static token"),
-                    maximum_depth: 10,
-                    maximum_index: 0x7fff_ffff,
-                })
-                .into_iter()
-                .collect(),
+            // Petal/agent subkey derivation is dormant: with the raw-seed-HD
+            // (`Bip32Seed`) root profile retired there is no backend that can
+            // anchor a derivation namespace, so no backend advertises the
+            // `bip32-secp256k1` derivation capability. The machinery stays
+            // compiled (see the Signer PR body) but reports no support.
+            supported_derivation: Vec::new(),
             input_kinds: if is_bip39 {
                 vec![CryptoInputKind::Digest32, CryptoInputKind::Message]
             } else {
