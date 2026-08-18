@@ -403,3 +403,39 @@ fn bip39_process_boundary_end_to_end() {
     let _ = first_child_key_ref;
     let _ = solana_child_key_ref;
 }
+
+#[test]
+fn bip39_descriptor_rejects_a_profile_key_spec_mismatch() {
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("signer.db");
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, engine, _registry) = bip39_service(&db_path);
+    let wallet_id = Token::new("bip39-keyspec").unwrap();
+    let registration = bip39_register(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &OperationId::new("30".repeat(32)).unwrap(),
+        30_000,
+    );
+    let child = registration.public_key_refs[0].clone();
+    let descriptor = engine.derived_account_descriptor(&child).unwrap().unwrap();
+    assert_eq!(
+        descriptor.derivation_profile,
+        DerivationProfile::Bip44EvmSecp256k1V1
+    );
+
+    // Corrupt the stored key spec so it contradicts the EVM derivation profile.
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    let updated = connection
+        .execute(
+            "UPDATE derivation_allocations SET key_spec = 'ed25519'
+              WHERE wallet_id = ?1 AND public_key_fingerprint = ?2",
+            rusqlite::params![wallet_id.as_str(), child.public_key_fingerprint.as_str()],
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    let result = engine.derived_account_descriptor(&child);
+    assert_eq!(result.unwrap_err().code, ProtocolErrorCode::KeyrefMismatch);
+}

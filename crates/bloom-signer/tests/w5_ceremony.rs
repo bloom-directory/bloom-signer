@@ -2884,6 +2884,78 @@ fn complete_bip39_mnemonic_import(
         .unwrap()
 }
 
+fn attempt_bip39_mnemonic_import(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    wallet_id: &Token,
+    operation_id: &OperationId,
+    mnemonic: &str,
+    passphrase: &str,
+    now_ms: u64,
+) -> Result<CustodyResult, ProtocolError> {
+    let prepared = service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletImport,
+                custody_operation_id: operation_id.clone(),
+                wallet_id: Some(wallet_id.clone()),
+                key_ref: None,
+                exact_terms_digest: digest("a2"),
+                expected_input_class: Token::new("bip39-mnemonic").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
+                derivation_request: None,
+            },
+            now_ms,
+        )
+        .unwrap();
+    let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
+    let prf_assertion =
+        authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "mnemonic": mnemonic,
+        "passphrase": passphrase,
+    }))
+    .unwrap();
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::WalletImport,
+        custody_operation_id: operation_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest().unwrap(),
+        wallet_id: prepared.contribution.wallet_id.clone(),
+        key_ref: None,
+        credential_id: Some(attestation.credential_id.clone()),
+        expected_input_class: Token::new("bip39-mnemonic").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    service.complete_custody(
+        CustodyCompleteRequest {
+            ceremony_kind: CeremonyKind::WalletImport,
+            custody_operation_id: operation_id.clone(),
+            ceremony_id: prepared.contribution.ceremony_id,
+            proof: WebAuthnCeremonyProof::Registration {
+                attestation,
+                prf_assertion: Some(prf_assertion),
+            },
+            encrypted_input: Some(encrypted_input),
+            public_binding_digest: digest("a2"),
+        },
+        now_ms + 100,
+    )
+}
+
 fn complete_account_allocate(
     service: &SignerCeremonyService,
     authenticator: &VirtualAuthenticator,
@@ -3276,7 +3348,7 @@ fn bip39_mnemonic_export_seals_words_and_frozen_import_reproduces_vectors() {
 }
 
 #[test]
-fn bip39_import_rejects_bad_checksum_and_accepts_12_words() {
+fn bip39_import_accepts_12_to_24_words_and_records_the_entropy_bits() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, engine, _registry) = bip39_service(&authenticator);
 
@@ -3360,4 +3432,57 @@ fn bip39_import_rejects_bad_checksum_and_accepts_12_words() {
         .unwrap()
         .unwrap();
     assert_eq!(descriptor.path, "m/44'/60'/0'/0/0");
+    // The imported 12-word count is recorded so export reproduces it exactly.
+    assert_eq!(descriptor.wallet_seed_ref.entropy_bits, 128);
+
+    // A valid 24-word mnemonic imports and records 256 entropy bits.
+    let authenticator_24 = VirtualAuthenticator::generate();
+    let result = complete_bip39_mnemonic_import(
+        &service,
+        &authenticator_24,
+        &Token::new("twenty-four-words").unwrap(),
+        &operation("c2"),
+        bloom_signer_vectors::BIP39_MNEMONIC,
+        10_300,
+    );
+    let descriptor = engine
+        .derived_account_descriptor(&result.public_key_refs[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(descriptor.wallet_seed_ref.entropy_bits, 256);
+}
+
+#[test]
+fn bip39_import_rejects_nfkd_unnormalized_mnemonic() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _engine, _registry) = bip39_service(&authenticator);
+    // A fullwidth compatibility 'a' folds to ASCII 'a' under NFKD, so the
+    // phrase is otherwise valid but not in canonical form.
+    let unnormalized = bloom_signer_vectors::BIP39_MNEMONIC.replace('a', "\u{ff41}");
+    let result = attempt_bip39_mnemonic_import(
+        &service,
+        &authenticator,
+        &Token::new("unnormalized").unwrap(),
+        &operation("d0"),
+        &unnormalized,
+        "",
+        20_000,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn bip39_import_rejects_non_empty_passphrase() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _engine, _registry) = bip39_service(&authenticator);
+    let result = attempt_bip39_mnemonic_import(
+        &service,
+        &authenticator,
+        &Token::new("passphrase").unwrap(),
+        &operation("d1"),
+        bloom_signer_vectors::BIP39_MNEMONIC,
+        "TREZOR",
+        20_000,
+    );
+    assert!(result.is_err());
 }

@@ -114,6 +114,9 @@ impl PublicKeyEncoding {
 pub struct WalletSeedRef {
     pub wallet_id: Token,
     pub profile: WalletSeedProfile,
+    /// Entropy length of the root mnemonic in bits (128/160/192/224/256).
+    /// Recorded so export reproduces the imported word count exactly.
+    pub entropy_bits: u32,
 }
 
 const PUBLIC_KEY_MAX_BYTES: usize = 128;
@@ -333,6 +336,7 @@ mod tests {
             wallet_seed_ref: WalletSeedRef {
                 wallet_id: token("primary"),
                 profile: WalletSeedProfile::Bip39MulticurveV1,
+                entropy_bits: 256,
             },
             derivation_profile: profile,
             path: path.into(),

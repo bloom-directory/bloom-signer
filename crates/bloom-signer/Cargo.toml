@@ -42,6 +42,7 @@ serde_json.workspace = true
 sha2.workspace = true
 sha3.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+tracing.workspace = true
 zeroize.workspace = true
 thiserror.workspace = true
 
@@ -49,3 +50,5 @@ thiserror.workspace = true
 bloom-signer-vectors = { path = "../bloom-signer-vectors" }
 tempfile = "3"
 k256.workspace = true
+rusqlite.workspace = true
+tracing-subscriber = "0.3"

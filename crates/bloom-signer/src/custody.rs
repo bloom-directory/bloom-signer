@@ -89,6 +89,7 @@ pub struct UnlockedWallet {
     policy_signing_seed: Zeroizing<Vec<u8>>,
     wkek: Zeroizing<Vec<u8>>,
     root_material_profile: RootMaterialProfile,
+    entropy_bits: Option<u32>,
 }
 
 impl UnlockedWallet {
@@ -147,6 +148,12 @@ impl UnlockedWallet {
 
     pub fn root_material_profile(&self) -> RootMaterialProfile {
         self.root_material_profile
+    }
+
+    /// Entropy length of the BIP-39 root in bits. Only meaningful for the
+    /// `Bip39MulticurveV1` profile; legacy roots report 0.
+    pub fn entropy_bits(&self) -> u32 {
+        self.entropy_bits.unwrap_or(0)
     }
 
     /// Derive the transient 64-byte BIP-39 seed from the unlocked entropy.
@@ -721,6 +728,7 @@ fn unlock_with_wkek(
         policy_signing_seed: Zeroizing::new(policy_signing_seed),
         wkek: Zeroizing::new(wkek.to_vec()),
         root_material_profile: backup.root_material_profile,
+        entropy_bits: backup.entropy_bits,
     })
 }
 

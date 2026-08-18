@@ -626,6 +626,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "zeroize",
 ]
 
@@ -728,6 +730,7 @@ dependencies = [
  "rand",
  "sha2",
  "thiserror",
+ "unicode-normalization",
  "zeroize",
 ]
 

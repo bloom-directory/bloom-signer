@@ -392,6 +392,12 @@ impl SignerCeremonyService {
         request: CustodyPrepareRequest,
         now_ms: u64,
     ) -> Result<PreparedCustodyCeremony, ProtocolError> {
+        tracing::info!(
+            operation_id = %request.custody_operation_id,
+            ceremony_kind = ?request.ceremony_kind,
+            wallet_id = ?request.wallet_id.as_ref().map(|id| id.as_str()),
+            "custody prepare"
+        );
         if request.ceremony_kind == CeremonyKind::SealedApproval {
             return Err(kind_mismatch());
         }
@@ -1333,6 +1339,12 @@ impl SignerCeremonyService {
                             // v1 imports accept every valid English length with
                             // the empty passphrase. Non-empty passphrases are
                             // rejected by the profile policy.
+                            if !bloom_signer_derive::import_passphrase_allowed(&import.passphrase) {
+                                return Err(protocol(
+                                    ProtocolErrorCode::BackendInvalidRequest,
+                                    "bip39-multicurve-v1 rejects non-empty passphrases",
+                                ));
+                            }
                             let parsed = bloom_signer_derive::parse_mnemonic(&import.mnemonic)
                                 .map_err(|cause| {
                                     protocol(ProtocolErrorCode::MalformedFrame, cause.to_string())
@@ -2318,9 +2330,20 @@ impl SignerCeremonyService {
                 "AccountRetire requires the derived-account KeyRef",
             ));
         }
-        // A bip39 prepare against a backend that does not advertise bip39
-        // fails closed at apply time; here we reject clearly unsupported
-        // requests early only when no local bip39 backend is compiled.
+        // A bip39 wallet can only be provisioned on the local derivation
+        // backend. Reject the prepare early (and cleanly) when that backend is
+        // not compiled into this Signer artifact.
+        if request.wallet_seed_profile
+            == Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1)
+        {
+            #[cfg(not(feature = "local"))]
+            {
+                return Err(protocol(
+                    ProtocolErrorCode::BackendUnsupported,
+                    "bip39 wallets require the local derivation backend",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -2389,6 +2412,8 @@ struct RawWalletImportInput {
 struct Bip39MnemonicImportInput {
     credential_prf: Base64UrlBytes,
     mnemonic: String,
+    #[serde(default)]
+    passphrase: String,
 }
 
 #[derive(Deserialize)]

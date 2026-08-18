@@ -26,6 +26,8 @@ pub enum MnemonicError {
     UnknownWord { index: usize, word: String },
     #[error("mnemonic checksum is invalid")]
     BadChecksum,
+    #[error("mnemonic is not already NFKD-normalized")]
+    Unnormalized,
     #[error("entropy length {found} bytes is not a valid BIP-39 length")]
     InvalidEntropyLength { found: usize },
     #[error("the bip39 crate rejected the input: {0}")]
@@ -88,6 +90,13 @@ pub fn parse_mnemonic(mnemonic: &str) -> Result<ParsedMnemonic, MnemonicError> {
     let words = mnemonic.split_whitespace().count();
     if policy::entropy_bytes_for_words(words).is_none() {
         return Err(MnemonicError::WrongWordCount { found: words });
+    }
+    // Strict NFKD: the reference parser normalizes before validating, so an
+    // unnormalized phrase (for example a compatibility character that folds
+    // to an ASCII word) would otherwise be silently accepted. Reject it.
+    use unicode_normalization::UnicodeNormalization as _;
+    if mnemonic.nfkd().collect::<String>() != mnemonic {
+        return Err(MnemonicError::Unnormalized);
     }
     let parsed = match bip39::Mnemonic::parse(mnemonic) {
         Ok(parsed) => parsed,
@@ -154,13 +163,17 @@ mod tests {
     }
 
     #[test]
-    fn accepts_nfc_and_nfkd_equivalent_input_exactly() {
-        // The reference implementation NFKD-normalizes on parse, so a phrase
-        // containing an NFKD-equivalent compatibility character parses.
-        // (Valid English mnemonics are ASCII; this pins the normalization
-        // behavior on the parse path.)
+    fn rejects_nfkd_unnormalized_mnemonic() {
         let entropy = Zeroizing::new(vec![0u8; 16]);
         let mnemonic = mnemonic_from_entropy(entropy.as_slice()).unwrap();
+        // A fullwidth compatibility 'a' NFKD-normalizes to ASCII 'a'; the
+        // phrase is otherwise a valid mnemonic, so only the strict NFKD check
+        // can reject it.
+        let unnormalized = mnemonic.replace('a', "\u{ff41}");
+        assert!(matches!(
+            parse_mnemonic(&unnormalized),
+            Err(MnemonicError::Unnormalized)
+        ));
         assert!(parse_mnemonic(&mnemonic).is_ok());
     }
 

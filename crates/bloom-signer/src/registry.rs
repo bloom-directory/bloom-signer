@@ -292,6 +292,7 @@ impl BackendRegistry {
     /// signable key, so this returns no root `KeyRef` — only the encrypted
     /// backend record for the backup set. Derived children are registered
     /// later via [`BackendRegistry::register_bip39_child`].
+    #[cfg(feature = "local")]
     pub fn provision_bip39_wallet_backend(
         &self,
         wallet_id: &Token,
@@ -341,8 +342,24 @@ impl BackendRegistry {
         Ok(encrypted_record)
     }
 
+    /// BIP-39 derivation requires the local backend; without it, fail closed.
+    #[cfg(not(feature = "local"))]
+    pub fn provision_bip39_wallet_backend(
+        &self,
+        _wallet_id: &Token,
+        _entropy: SecretBytes,
+        _activation_secret: SecretBytes,
+        _authority_verifying_key: ed25519_dalek::VerifyingKey,
+    ) -> Result<Base64UrlBytes, ProtocolError> {
+        Err(ProtocolError::new(
+            ProtocolErrorCode::BackendUnsupported,
+            "bip39 wallets require the local derivation backend",
+        ))
+    }
+
     /// Restore a BIP-39 wallet backend (entropy root, no signable root KeyRef)
     /// from its persisted enrollment at startup.
+    #[cfg(feature = "local")]
     pub fn restore_bip39_wallet_backend(
         &self,
         backend_instance: &Token,

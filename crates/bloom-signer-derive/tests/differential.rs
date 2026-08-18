@@ -10,6 +10,7 @@
 //! not catch; these gates are the standing defense.
 
 use bloom_signer_derive::{
+    MnemonicError,
     bip32::{hardened_child, master_secp256k1, non_hardened_child},
     mnemonic_from_entropy, parse_mnemonic, seed_from_mnemonic,
 };
@@ -192,18 +193,20 @@ fn official_trezor_vectors_reproduce_for_every_available_length() {
     }
 }
 
-/// Unicode normalization: the crate applies BIP-39 NFKD exactly. A phrase
-/// whose separators are compatibility whitespace (U+00A0 NBSP) is
-/// normalized to plain spaces on parse, so it must parse to the same
-/// wallet as the canonical phrase.
+/// Unicode normalization: the crate enforces the strict v1 NFKD policy. A
+/// phrase whose separators are compatibility whitespace (U+00A0 NBSP) is not
+/// in canonical NFKD form, so it is rejected rather than silently folded to
+/// a different-looking phrase.
 #[test]
-fn nfkd_normalization_is_applied_by_the_reference_path() {
+fn nfkd_unnormalized_separators_are_rejected() {
     let entropy: Vec<u8> = vec![0x77u8; 20];
     let canonical = mnemonic_from_entropy(&entropy).unwrap();
     let nbsp_joined = canonical.replace(' ', "\u{00a0}");
-    // `split_whitespace` in the word-count check treats NBSP as whitespace,
-    // and the crate's NFKD parse folds it; both views must agree.
-    let parsed = parse_mnemonic(&nbsp_joined).unwrap();
+    assert!(matches!(
+        parse_mnemonic(&nbsp_joined),
+        Err(MnemonicError::Unnormalized)
+    ));
+    let parsed = parse_mnemonic(&canonical).unwrap();
     assert_eq!(*parsed.entropy(), entropy);
 }
 

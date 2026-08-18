@@ -2122,6 +2122,7 @@ impl SignerEngine {
             wallet_seed_ref: WalletSeedRef {
                 wallet_id: wallet_id.clone(),
                 profile: WalletSeedProfile::Bip39MulticurveV1,
+                entropy_bits: unlocked.entropy_bits(),
             },
             derivation_profile: profile,
             path: public.path,
@@ -2191,12 +2192,45 @@ impl SignerEngine {
         } else {
             KeySpec::Ed25519
         };
+        // A stored key spec that contradicts the derivation profile is a
+        // registry integrity failure, never a valid projection.
+        if profile.key_spec() != key_spec {
+            return Err(error(
+                ProtocolErrorCode::KeyrefMismatch,
+                "derivation profile and stored key spec disagree",
+            ));
+        }
         let encoding = if key_spec == KeySpec::Secp256k1 {
             PublicKeyEncoding::Secp256k1SpkiDer
         } else {
             PublicKeyEncoding::Ed25519SpkiDer
         };
         let fingerprint = Digest32::new(&fingerprint).map_err(malformed)?;
+        let entropy_bits = connection
+            .query_row(
+                "SELECT custody_jcs FROM ceremony_wallets WHERE wallet_id = ?1",
+                params![wallet_seed_ref.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?
+            .map(|encoded| {
+                let backup: WalletCustodyBackup =
+                    serde_json::from_str(&encoded).map_err(malformed)?;
+                backup.entropy_bits.ok_or_else(|| {
+                    error(
+                        ProtocolErrorCode::MalformedFrame,
+                        "BIP-39 wallet custody is missing entropy-bit metadata",
+                    )
+                })
+            })
+            .transpose()?
+            .ok_or_else(|| {
+                error(
+                    ProtocolErrorCode::KeyrefMismatch,
+                    "no custody record for this BIP-39 wallet",
+                )
+            })?;
         let lifecycle = if state == "ACTIVATED" {
             AccountLifecycleState::Active
         } else {
@@ -2207,6 +2241,7 @@ impl SignerEngine {
             wallet_seed_ref: WalletSeedRef {
                 wallet_id: wallet_seed_ref.clone(),
                 profile: WalletSeedProfile::Bip39MulticurveV1,
+                entropy_bits,
             },
             derivation_profile: *profile,
             path: path.clone(),
