@@ -832,4 +832,53 @@ fn bip39_restored_wallet_signs_from_its_restored_derived_account() {
         .to_public_key_der()
         .unwrap();
     assert_eq!(descriptor.canonical_public_key.decode(), spki.as_bytes());
+
+    // A real Ed25519 signature also succeeds from the restored Solana child
+    // and verifies under its restored descriptor's public key — the Solana
+    // variant of the backup/restore-then-signs proof.
+    let solana_terms = bip39_terms(solana_child.clone(), &wallet_id);
+    let solana_terms = SealedApprovalTerms {
+        allowed_crypto_suites: vec![CryptoSuite::Ed25519Message],
+        ..solana_terms
+    };
+    complete_local_approval(
+        &restored_service,
+        &authenticator,
+        solana_terms,
+        operation("84"),
+        3,
+        80_300,
+    );
+
+    let message = b"solana-native-transfer";
+    let solana_signature = futures::executor::block_on(backend.sign(BackendSignRequest {
+        provider_attempt_id: digest("85"),
+        key_ref: solana_child.clone(),
+        crypto_suite: CryptoSuite::Ed25519Message,
+        input: BackendInput::Message {
+            message: Base64UrlBytes::from_bytes(message),
+        },
+        deadline_ms: DecimalU64::new(1_000_000),
+    }))
+    .unwrap();
+    assert_eq!(
+        solana_signature.encoding,
+        bloom_signer_api::SignatureEncoding::Ed25519Raw64
+    );
+    let solana_descriptor = engine
+        .derived_account_descriptor(&solana_child)
+        .unwrap()
+        .unwrap();
+    // The descriptor's canonical public key is the Ed25519 SPKI DER
+    // (RFC 8410, 12-byte prefix + 32-byte raw key).
+    let spki = solana_descriptor.canonical_public_key.decode();
+    assert_eq!(spki.len(), 44, "Ed25519 SPKI DER is 44 bytes");
+    let raw_key: [u8; 32] = spki[12..].try_into().unwrap();
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(&raw_key).unwrap();
+    verifying
+        .verify_strict(
+            message,
+            &ed25519_dalek::Signature::from_slice(&solana_signature.bytes.decode()).unwrap(),
+        )
+        .unwrap();
 }
