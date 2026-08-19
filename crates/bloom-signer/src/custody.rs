@@ -53,12 +53,14 @@ pub enum RootMaterialProfile {
     /// and derived keys are derived transiently, never persisted.
     Bip39MulticurveV1,
     /// `encrypted_root` holds one WKEK-wrapped secp256k1 scalar (32 bytes):
-    /// a raw-key import, non-HD. First-class and permanent; the historical
-    /// `legacy_secp` storage name is accepted as an alias so pre-rename
-    /// custody backups still parse.
-    #[default]
-    #[serde(alias = "legacy_secp")]
+    /// a raw-key import, non-HD. First-class and permanent.
     ImportedSecp256k1Scalar,
+    /// `encrypted_root` holds a raw BIP-32 secp256k1 seed (16-64 bytes).
+    /// A temporary keep-until-migrated profile for the few pre-launch wallets
+    /// still on the legacy format; the backend validates the exact seed
+    /// length, so custody applies no length check here.
+    #[default]
+    LegacySecp,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -760,6 +762,9 @@ fn unlock_with_wkek(
                 ));
             }
         }
+        // Legacy raw BIP-32 seed: the backend validates the exact length
+        // (16-64 bytes) at unlock/sign; custody applies no check here.
+        RootMaterialProfile::LegacySecp => {}
     }
     let policy_signing_seed = decrypt(
         &key,
