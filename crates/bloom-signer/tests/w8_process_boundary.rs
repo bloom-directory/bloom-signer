@@ -97,6 +97,7 @@ use std::sync::Arc;
 use bloom_signer::{
     ceremony::SignerCeremonyService,
     engine::{SignerAuditKeys, SignerEngine},
+    hpke::LOCAL_PRF_INFO,
     registry::BackendRegistry,
 };
 use bloom_signer_api::*;
@@ -112,6 +113,122 @@ fn bip39_audit_keys() -> SignerAuditKeys {
         current_signing_key: SigningKey::from_bytes(&[14; 32]),
         historical_verifying_keys: BTreeMap::new(),
     }
+}
+
+fn digest(byte: &str) -> Digest32 {
+    Digest32::new(byte.repeat(32)).unwrap()
+}
+
+fn operation(byte: &str) -> OperationId {
+    OperationId::new(byte.repeat(32)).unwrap()
+}
+
+/// Approval terms for one restored derived child, so a full sign ceremony can
+/// activate the backend after restore and produce a real signature.
+fn bip39_terms(key_ref: KeyRef, wallet_id: &Token) -> SealedApprovalTerms {
+    SealedApprovalTerms {
+        subject: ApprovalSubject::Cli {
+            client_id: Token::new("bloom-cli").unwrap(),
+            command_class: Token::new("wallet.sign").unwrap(),
+        },
+        wallet_id: wallet_id.clone(),
+        key_ref,
+        allowed_crypto_suites: vec![
+            CryptoSuite::Secp256k1Sha256Recoverable,
+            CryptoSuite::Secp256k1Keccak256Recoverable,
+        ],
+        selector: ApprovalSelector::Exact {
+            ordered_payload_digests: vec![digest("22")],
+            ordered_hashes: vec![digest("33")],
+        },
+        limits: ApprovalLimits {
+            max_operations: DecimalU64::new(1),
+            max_signatures: DecimalU64::new(1),
+            operation_rate_limits: vec![],
+            signature_rate_limits: vec![],
+            value_limits: vec![],
+        },
+        activation_mode: ActivationMode::BootBound,
+        wallet_revocation_epoch: DecimalU64::new(0),
+        policy_version: DecimalU64::new(1),
+        policy_digest: digest("44"),
+        provenance_digest: digest("55"),
+        request_nonce: RequestNonce::new("66".repeat(16)).unwrap(),
+        issued_at_ms: DecimalU64::new(1_000),
+        not_before_ms: DecimalU64::new(1_000),
+        expires_at_ms: DecimalU64::new(30_303),
+        renewal_of: None,
+    }
+}
+
+fn complete_local_approval(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    terms: SealedApprovalTerms,
+    activation_operation_id: OperationId,
+    sign_count: u32,
+    now_ms: u64,
+) -> SignerActivationReceipt {
+    let review_manifest_digest = digest("76");
+    let (exact_ordered_payload_digests, exact_ordered_hashes) = match &terms.selector {
+        ApprovalSelector::Exact {
+            ordered_payload_digests,
+            ordered_hashes,
+        } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
+        ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
+    };
+    let prepared = service
+        .prepare_approval(
+            CeremonyPrepareRequest {
+                activation_operation_id: activation_operation_id.clone(),
+                terms: terms.clone(),
+                review_manifest_digest: review_manifest_digest.clone(),
+                exact_ordered_payload_digests,
+                exact_ordered_hashes,
+                replacement_approval_id: None,
+            },
+            now_ms,
+        )
+        .unwrap();
+    let assertion = authenticator.assertion(
+        &prepared.challenges[0].canonical_bytes().unwrap(),
+        sign_count,
+    );
+    let aad = LocalPrfHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        approval_id: terms.approval_id().unwrap(),
+        approval_digest: terms.approval_digest().unwrap(),
+        review_manifest_digest,
+        key_ref: terms.key_ref.clone(),
+        allowed_crypto_suites: terms.allowed_crypto_suites.clone(),
+        credential_id: assertion.credential_id.clone(),
+        activation_mode: terms.activation_mode.clone(),
+        wallet_revocation_epoch: terms.wallet_revocation_epoch.clone(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let encrypted_local_prf = seal_hpke(
+        prepared
+            .contribution
+            .ephemeral_encryption_public_key
+            .as_ref()
+            .unwrap(),
+        LOCAL_PRF_INFO,
+        &aad,
+        &authenticator.deterministic_prf(),
+    )
+    .unwrap();
+    futures::executor::block_on(service.complete_approval(
+        CeremonyCompleteRequest {
+            activation_operation_id,
+            proof: WebAuthnCeremonyProof::Assertion { assertion },
+            contribution: prepared.contribution,
+            encrypted_local_prf: Some(encrypted_local_prf),
+        },
+        now_ms + 1,
+    ))
+    .unwrap()
 }
 
 fn bip39_service(
@@ -591,4 +708,128 @@ fn bip39_export_restore_round_trips_allocated_accounts() {
     let restored_backup = backend.encrypted_backup().unwrap();
     assert_eq!(restored_backup.derivation_registry.len(), 2);
     let _ = expected;
+}
+
+#[test]
+fn bip39_restored_wallet_signs_from_its_restored_derived_account() {
+    let directory = tempfile::tempdir().unwrap();
+    let db_a = directory.path().join("a.db");
+    let db_b = directory.path().join("b.db");
+    let authenticator = VirtualAuthenticator::generate();
+    let wallet_id = Token::new("bip39-restore-sign").unwrap();
+
+    // Phase 1: register (canonical EVM child) and allocate a Solana sibling.
+    let (evm_child, solana_child, exported) = {
+        let (service, engine, _registry) = bip39_service(&db_a);
+        let registration = bip39_register(
+            &service,
+            &authenticator,
+            &wallet_id,
+            &operation("80"),
+            80_000,
+        );
+        let evm_child = registration.public_key_refs[0].clone();
+        let solana_child = bip39_allocate(
+            &service,
+            &authenticator,
+            &wallet_id,
+            &operation("81"),
+            DerivedAccountRequest {
+                derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                requested_role: Token::new("solana-account").unwrap(),
+                account: Some(0),
+            },
+            80_100,
+        );
+        (
+            evm_child,
+            solana_child,
+            engine.export_wallet_backup(&wallet_id).unwrap(),
+        )
+    };
+
+    // Phase 2: wipe/reload into a fresh engine and restore the backup.
+    let (_service, engine, registry) = bip39_service(&db_b);
+    engine.restore_backup(&exported).unwrap();
+
+    // The descriptor projection round-trips: both children are listed with
+    // their original SPKI / fingerprint / lifecycle.
+    let descriptors = engine.derived_account_descriptors(&wallet_id).unwrap();
+    assert_eq!(descriptors.len(), 2);
+    for (child, profile) in [
+        (evm_child.clone(), DerivationProfile::Bip44EvmSecp256k1V1),
+        (
+            solana_child.clone(),
+            DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+        ),
+    ] {
+        let descriptor = engine.derived_account_descriptor(&child).unwrap().unwrap();
+        assert_eq!(
+            descriptor.public_key_fingerprint,
+            child.public_key_fingerprint
+        );
+        assert_eq!(descriptor.derivation_profile, profile);
+        assert_eq!(descriptor.lifecycle, AccountLifecycleState::Active);
+    }
+    // The restored child is enrolled (role 'derived', available), which is
+    // exactly what the lock-free listing above already depends on.
+
+    // Re-register the restored backend from the durable enrollment so the
+    // backend can actually sign, then drive a real sign ceremony.
+    let restored_service = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    restored_service
+        .register_existing_credential(wallet_id.clone(), authenticator.credential(0))
+        .unwrap();
+
+    let evm_terms = bip39_terms(evm_child.clone(), &wallet_id);
+    complete_local_approval(
+        &restored_service,
+        &authenticator,
+        evm_terms,
+        operation("82"),
+        2,
+        80_200,
+    );
+
+    // A real signature succeeds from the restored derived account and
+    // verifies under the restored descriptor's public key.
+    let backend = registry
+        .get(&Token::new("local").unwrap(), &wallet_id)
+        .unwrap();
+    let digest_bytes = [0x5Au8; 32];
+    let signature = futures::executor::block_on(backend.sign(BackendSignRequest {
+        provider_attempt_id: digest("83"),
+        key_ref: evm_child.clone(),
+        crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+        input: BackendInput::Digest32 {
+            digest: Digest32::from_bytes(digest_bytes),
+        },
+        deadline_ms: DecimalU64::new(1_000_000),
+    }))
+    .unwrap();
+    assert_eq!(
+        signature.encoding,
+        bloom_signer_api::SignatureEncoding::Secp256k1Recoverable65
+    );
+    let bytes = signature.bytes.decode();
+    let sig = k256::ecdsa::Signature::from_slice(&bytes[..64]).unwrap();
+    let recovery = k256::ecdsa::RecoveryId::from_byte(bytes[64]).unwrap();
+    let recovered =
+        k256::ecdsa::VerifyingKey::recover_from_prehash(&digest_bytes, &sig, recovery).unwrap();
+    let descriptor = engine
+        .derived_account_descriptor(&evm_child)
+        .unwrap()
+        .unwrap();
+    // The recovered key's SPKI must byte-match the restored descriptor.
+    use k256::pkcs8::EncodePublicKey as _;
+    let spki = k256::PublicKey::from_sec1_bytes(recovered.to_encoded_point(false).as_bytes())
+        .unwrap()
+        .to_public_key_der()
+        .unwrap();
+    assert_eq!(descriptor.canonical_public_key.decode(), spki.as_bytes());
 }

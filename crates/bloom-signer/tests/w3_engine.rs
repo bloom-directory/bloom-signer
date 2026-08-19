@@ -522,6 +522,7 @@ fn ac32_backup_restore_refuses_missing_registry_for_derivation_and_lower_state()
         wallet_revocation_epoch: terms.wallet_revocation_epoch.clone(),
         custody: None,
         derivation_registry: None,
+        derivation_allocations: vec![],
         backend_enrollments: vec![],
         policy: None,
         petal_key_scopes: vec![],

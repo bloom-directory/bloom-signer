@@ -244,6 +244,24 @@ pub struct DerivationRegistryBackup {
     pub namespaces: Vec<DerivationNamespaceBackup>,
 }
 
+/// One durable `derivation_allocations` row for a BIP-39 derived child, plus
+/// the enrolled `KeyRef` it resolves to. Carried so `restore_backup` can
+/// reconstruct the descriptor projection (SPKI / fingerprint / lifecycle) and
+/// re-enroll the child without re-deriving from a locked backend.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivationAllocationBackup {
+    pub key_ref: KeyRef,
+    pub operation_id: OperationId,
+    pub role: Token,
+    pub account: u32,
+    pub index: u32,
+    pub public_key_spki_der: Base64UrlBytes,
+    pub lifecycle: AccountLifecycleState,
+    pub created_at_ms: DecimalU64,
+    pub updated_at_ms: DecimalU64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendEnrollmentBackup {
@@ -308,6 +326,8 @@ pub struct SignerBackupSet {
     pub wallet_revocation_epoch: DecimalU64,
     pub custody: Option<WalletCustodyBackup>,
     pub derivation_registry: Option<DerivationRegistryBackup>,
+    #[serde(default)]
+    pub derivation_allocations: Vec<DerivationAllocationBackup>,
     pub backend_enrollments: Vec<BackendEnrollmentBackup>,
     pub policy: Option<PolicyBackup>,
     #[serde(default)]
@@ -4218,6 +4238,107 @@ impl SignerEngine {
                     )
                     .map_err(storage)?;
             }
+            transaction
+                .execute(
+                    "INSERT INTO ceremony_backend_enrollments(
+                        backend_instance, enrollment_jcs
+                     ) VALUES (?1, ?2)
+                     ON CONFLICT(backend_instance) DO UPDATE SET
+                        enrollment_jcs = excluded.enrollment_jcs",
+                    params![
+                        enrollment.backend_instance.as_str(),
+                        serde_jcs::to_string(&restored_enrollment(enrollment)?)
+                            .map_err(malformed)?,
+                    ],
+                )
+                .map_err(storage)?;
+        }
+        if let Some(custody) = &backup.custody {
+            transaction
+                .execute(
+                    "INSERT INTO ceremony_wallets(wallet_id, custody_jcs)
+                     VALUES (?1, ?2)
+                     ON CONFLICT(wallet_id) DO UPDATE SET
+                        custody_jcs = excluded.custody_jcs",
+                    params![
+                        backup.wallet_id.as_str(),
+                        serde_jcs::to_string(custody).map_err(malformed)?,
+                    ],
+                )
+                .map_err(storage)?;
+        }
+        for allocation in &backup.derivation_allocations {
+            let Some(DerivationRef::Bip39Multicurve { profile, path, .. }) =
+                &allocation.key_ref.derivation
+            else {
+                return Err(error(
+                    ProtocolErrorCode::MalformedFrame,
+                    "backup derivation allocation has no bip39 derivation",
+                ));
+            };
+            let key_spec = match allocation.key_ref.key_spec {
+                KeySpec::Secp256k1 => "secp256k1",
+                KeySpec::Ed25519 => "ed25519",
+            };
+            let state = match allocation.lifecycle {
+                AccountLifecycleState::Active => "ACTIVATED",
+                AccountLifecycleState::Retired => "RETIRED",
+            };
+            let fingerprint = allocation.key_ref.public_key_fingerprint.as_str();
+            transaction
+                .execute(
+                    "INSERT INTO derivation_allocations(
+                        wallet_id, operation_id, profile, role, account, \"index\", path,
+                        state, key_spec, public_key_spki_der, public_key_fingerprint,
+                        created_at_ms, updated_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                     ON CONFLICT(wallet_id, operation_id) DO UPDATE SET
+                        profile = excluded.profile,
+                        role = excluded.role,
+                        account = excluded.account,
+                        \"index\" = excluded.\"index\",
+                        path = excluded.path,
+                        state = excluded.state,
+                        key_spec = excluded.key_spec,
+                        public_key_spki_der = excluded.public_key_spki_der,
+                        public_key_fingerprint = excluded.public_key_fingerprint,
+                        created_at_ms = excluded.created_at_ms,
+                        updated_at_ms = excluded.updated_at_ms",
+                    params![
+                        backup.wallet_id.as_str(),
+                        allocation.operation_id.as_str(),
+                        profile_id(*profile),
+                        allocation.role.as_str(),
+                        i64::from(allocation.account),
+                        i64::from(allocation.index),
+                        path,
+                        state,
+                        key_spec,
+                        hex::encode(allocation.public_key_spki_der.decode()),
+                        fingerprint,
+                        allocation.created_at_ms.get() as i64,
+                        allocation.updated_at_ms.get() as i64,
+                    ],
+                )
+                .map_err(storage)?;
+            transaction
+                .execute(
+                    "INSERT INTO enrolled_keys(
+                        key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
+                     ) VALUES (?1, ?2, ?3, 'derived', ?4)
+                     ON CONFLICT(key_fingerprint) DO UPDATE SET
+                        key_ref_jcs = excluded.key_ref_jcs,
+                        available = excluded.available,
+                        authority_class = 'derived',
+                        wallet_id = excluded.wallet_id",
+                    params![
+                        fingerprint,
+                        serde_jcs::to_string(&allocation.key_ref).map_err(malformed)?,
+                        matches!(allocation.lifecycle, AccountLifecycleState::Active),
+                        backup.wallet_id.as_str(),
+                    ],
+                )
+                .map_err(storage)?;
         }
         for operation in &backup.operations {
             if !backup
@@ -4691,6 +4812,7 @@ impl SignerEngine {
             });
         }
         drop(scope_statement);
+        let derivation_allocations = export_derivation_allocations(&connection, wallet_id)?;
         let audit_entries = load_audit_entries(&connection)?;
         let audit_rotations = load_audit_rotations(&connection)?
             .into_values()
@@ -4710,6 +4832,7 @@ impl SignerEngine {
             wallet_revocation_epoch,
             custody,
             derivation_registry,
+            derivation_allocations,
             backend_enrollments,
             policy,
             petal_key_scopes,
@@ -5152,6 +5275,133 @@ fn derivation_registry_from_enrollments(
     _enrollments: &[BackendEnrollmentBackup],
 ) -> Result<Option<DerivationRegistryBackup>, ProtocolError> {
     Ok(None)
+}
+
+/// Normalize a restored backend enrollment: the enrolled encrypted record may
+/// still carry `pending_derivations` entries whose custody receipt was already
+/// committed but not yet reconciled at the next startup. A restore is a fully
+/// finalized snapshot — every derived child is already in `derivation_registry`
+/// — so the transient pending map is cleared rather than leaving stale
+/// operations for startup to roll back (which would tombstone live children).
+#[cfg(feature = "local")]
+fn restored_enrollment(
+    enrollment: &BackendEnrollmentBackup,
+) -> Result<BackendEnrollmentBackup, ProtocolError> {
+    let mut record: bloom_signer_backend_local::EncryptedLocalBackup =
+        serde_json::from_slice(&enrollment.encrypted_record.decode()).map_err(malformed)?;
+    record.pending_derivations.clear();
+    let mut normalized = enrollment.clone();
+    normalized.encrypted_record =
+        Base64UrlBytes::from_bytes(&serde_jcs::to_vec(&record).map_err(malformed)?);
+    Ok(normalized)
+}
+
+#[cfg(not(feature = "local"))]
+fn restored_enrollment(
+    enrollment: &BackendEnrollmentBackup,
+) -> Result<BackendEnrollmentBackup, ProtocolError> {
+    Ok(enrollment.clone())
+}
+
+/// Read every ACTIVATED/RETIRED `derivation_allocations` row for a wallet and
+/// join it with its enrolled `KeyRef`, producing the descriptor projection
+/// that `restore_backup` re-inserts so a restored wallet can still describe
+/// and sign from its own derived accounts.
+fn export_derivation_allocations(
+    connection: &Connection,
+    wallet_id: &Token,
+) -> Result<Vec<DerivationAllocationBackup>, ProtocolError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT e.key_ref_jcs, a.operation_id, a.role, a.account, a.\"index\",
+                    a.path, a.state, a.key_spec, a.public_key_spki_der,
+                    a.created_at_ms, a.updated_at_ms
+             FROM derivation_allocations a
+             JOIN enrolled_keys e ON e.key_fingerprint = a.public_key_fingerprint
+                AND e.authority_class = 'derived'
+             WHERE a.wallet_id = ?1 AND a.state IN ('ACTIVATED', 'RETIRED')
+             ORDER BY a.public_key_fingerprint",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map([wallet_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+            ))
+        })
+        .map_err(storage)?;
+    let mut allocations = Vec::new();
+    for row in rows {
+        let (
+            key_ref_jcs,
+            operation_id,
+            role,
+            account,
+            index,
+            path,
+            state,
+            key_spec,
+            spki_hex,
+            created_at_ms,
+            updated_at_ms,
+        ) = row.map_err(storage)?;
+        let key_ref: KeyRef = serde_json::from_str(&key_ref_jcs).map_err(malformed)?;
+        // The enrolled KeyRef's derivation path and key spec must agree with
+        // the durable allocation row; a mismatch is a registry integrity
+        // failure, never something to round-trip silently.
+        let Some(DerivationRef::Bip39Multicurve {
+            path: derived_path, ..
+        }) = &key_ref.derivation
+        else {
+            return Err(malformed("derived allocation has no bip39 derivation"));
+        };
+        if derived_path != &path {
+            return Err(malformed(
+                "enrolled child path differs from allocation path",
+            ));
+        }
+        let expected_spec = if key_spec == "secp256k1" {
+            KeySpec::Secp256k1
+        } else {
+            KeySpec::Ed25519
+        };
+        if key_ref.key_spec != expected_spec {
+            return Err(malformed("enrolled child key spec differs from allocation"));
+        }
+        let lifecycle = match state.as_str() {
+            "ACTIVATED" => AccountLifecycleState::Active,
+            "RETIRED" => AccountLifecycleState::Retired,
+            _ => return Err(malformed("allocation has a non-durable state")),
+        };
+        allocations.push(DerivationAllocationBackup {
+            key_ref,
+            operation_id: OperationId::new(operation_id).map_err(malformed)?,
+            role: Token::new(role).map_err(malformed)?,
+            account: u32::try_from(account).map_err(|_| malformed("account index out of range"))?,
+            index: u32::try_from(index).map_err(|_| malformed("address index out of range"))?,
+            public_key_spki_der: Base64UrlBytes::from_bytes(
+                &hex::decode(&spki_hex).map_err(|_| malformed("stored SPKI is not valid hex"))?,
+            ),
+            lifecycle,
+            created_at_ms: DecimalU64::new(
+                u64::try_from(created_at_ms).map_err(|_| malformed("timestamp out of range"))?,
+            ),
+            updated_at_ms: DecimalU64::new(
+                u64::try_from(updated_at_ms).map_err(|_| malformed("timestamp out of range"))?,
+            ),
+        });
+    }
+    Ok(allocations)
 }
 
 fn validate_against_approval(
