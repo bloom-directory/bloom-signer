@@ -114,9 +114,10 @@ pub fn migrate(connection: &Connection) -> Result<(), ProtocolError> {
                 profile TEXT NOT NULL CHECK (profile IN ('bip44-evm-secp256k1-v1',
                                                          'bip44-solana-slip10-ed25519-v1')),
                 role TEXT NOT NULL,
+                account INTEGER NOT NULL CHECK (account >= 0),
                 next_index INTEGER NOT NULL CHECK (next_index >= 0),
                 maximum_children INTEGER NOT NULL CHECK (maximum_children >= 1),
-                PRIMARY KEY (wallet_id, profile, role)
+                PRIMARY KEY (wallet_id, profile, role, account)
             );
             CREATE TABLE IF NOT EXISTS derivation_allocations (
                 wallet_id TEXT NOT NULL,
@@ -305,11 +306,28 @@ fn load_allocation(
         .map_err(storage)
 }
 
+fn state_of(
+    connection: &Connection,
+    wallet_id: &Token,
+    operation_id: &str,
+) -> Result<String, ProtocolError> {
+    connection
+        .query_row(
+            "SELECT state FROM derivation_allocations WHERE wallet_id = ?1 AND operation_id = ?2",
+            rusqlite::params![wallet_id.as_str(), operation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?
+        .ok_or_else(|| invalid("allocation was not found"))
+}
+
 fn ensure_namespace(
     transaction: &rusqlite::Transaction<'_>,
     wallet_id: &Token,
     profile: &str,
     role: &str,
+    account: u32,
 ) -> Result<(), ProtocolError> {
     if !matches!(profile, PROFILE_EVM | PROFILE_SOLANA) {
         return Err(invalid("unknown derivation profile"));
@@ -317,12 +335,13 @@ fn ensure_namespace(
     transaction
         .execute(
             "INSERT OR IGNORE INTO derivation_namespaces
-                (wallet_id, profile, role, next_index, maximum_children)
-             VALUES (?1, ?2, ?3, 0, ?4)",
+                (wallet_id, profile, role, account, next_index, maximum_children)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
             rusqlite::params![
                 wallet_id.as_str(),
                 profile,
                 role,
+                i64::from(account),
                 DEFAULT_NAMESPACE_CAP as i64
             ],
         )
@@ -371,15 +390,16 @@ pub fn prepare_allocation(
     }
 
     let transaction = immediate_transaction(connection)?;
-    ensure_namespace(&transaction, wallet_id, profile, role)?;
+    ensure_namespace(&transaction, wallet_id, profile, role, account)?;
     let capacity: (i64, i64) = transaction
         .query_row(
             "SELECT maximum_children,
                     (SELECT COUNT(*) FROM derivation_allocations
-                      WHERE wallet_id = ?1 AND profile = ?2 AND role = ?3
+                      WHERE wallet_id = ?1 AND profile = ?2 AND role = ?3 AND account = ?4
                         AND state != 'TOMBSTONED')
-             FROM derivation_namespaces WHERE wallet_id = ?1 AND profile = ?2 AND role = ?3",
-            rusqlite::params![wallet_id.as_str(), profile, role],
+             FROM derivation_namespaces
+              WHERE wallet_id = ?1 AND profile = ?2 AND role = ?3 AND account = ?4",
+            rusqlite::params![wallet_id.as_str(), profile, role, i64::from(account)],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(storage)?;
@@ -391,11 +411,11 @@ pub fn prepare_allocation(
     }
 
     // Deterministic skip of invalid children, with tombstones.
-    let mut start: u32 = transaction
+    let start: u32 = transaction
         .query_row(
             "SELECT next_index FROM derivation_namespaces
-             WHERE wallet_id = ?1 AND profile = ?2 AND role = ?3",
-            rusqlite::params![wallet_id.as_str(), profile, role],
+             WHERE wallet_id = ?1 AND profile = ?2 AND role = ?3 AND account = ?4",
+            rusqlite::params![wallet_id.as_str(), profile, role, i64::from(account)],
             |row| row.get::<_, i64>(0),
         )
         .map_err(storage)? as u32;
@@ -418,11 +438,9 @@ pub fn prepare_allocation(
         }
         set
     };
-    let mut skipped: Vec<u32> = Vec::new();
-    while tombstoned.contains(&i64::from(start)) || invalid_child(account, start) {
-        skipped.push(start);
-        start += 1;
-    }
+    let (start, skipped) = bloom_signer_derive::next_valid_index(start, |candidate| {
+        tombstoned.contains(&i64::from(candidate)) || invalid_child(account, candidate)
+    });
 
     let path = resolve_canonical_path(profile, account, start)?;
     for skipped_index in &skipped {
@@ -444,13 +462,14 @@ pub fn prepare_allocation(
     }
     transaction
         .execute(
-            "UPDATE derivation_namespaces SET next_index = ?4
-              WHERE wallet_id = ?1 AND profile = ?2 AND role = ?3
-                AND next_index = ?5",
+            "UPDATE derivation_namespaces SET next_index = ?5
+              WHERE wallet_id = ?1 AND profile = ?2 AND role = ?3 AND account = ?4
+                AND next_index = ?6",
             rusqlite::params![
                 wallet_id.as_str(),
                 profile,
                 role,
+                i64::from(account),
                 i64::from(start) + 1,
                 i64::from(start) - skipped.len() as i64,
             ],
@@ -532,6 +551,23 @@ pub fn commit_index(
     audit: AuditRecorder<'_>,
 ) -> Result<Reservation, ProtocolError> {
     let transaction = immediate_transaction(connection)?;
+    // Idempotent retry: if the allocation already advanced past PREPARED (a
+    // crash between a later step and the ceremony completion-cache update),
+    // the index-commit step has effectively happened; return success.
+    let current = state_of(&transaction, wallet_id, operation_id)?;
+    if current != STATE_PREPARED {
+        if matches!(
+            current.as_str(),
+            STATE_INDEX_COMMITTED | STATE_ACCOUNT_COMMITTED | STATE_ACTIVATED
+        ) {
+            let reservation = reservation_of(&transaction, wallet_id, operation_id)?;
+            transaction.commit().map_err(storage)?;
+            return Ok(reservation);
+        }
+        return Err(invalid(format!(
+            "allocation is not in the {STATE_PREPARED} state"
+        )));
+    }
     let (profile, role, account, index, path) =
         allocation_keys(&transaction, wallet_id, operation_id)?;
     transition(
@@ -583,6 +619,13 @@ pub fn commit_account(
         ));
     }
     let transaction = immediate_transaction(connection)?;
+    // Idempotent retry: already past the account-commit step.
+    let current = state_of(&transaction, wallet_id, operation_id)?;
+    if matches!(current.as_str(), STATE_ACCOUNT_COMMITTED | STATE_ACTIVATED) {
+        let reservation = reservation_of(&transaction, wallet_id, operation_id)?;
+        transaction.commit().map_err(storage)?;
+        return Ok(reservation);
+    }
     let updated = transaction
         .execute(
             "UPDATE derivation_allocations SET
@@ -642,6 +685,13 @@ pub fn activate(
     audit: AuditRecorder<'_>,
 ) -> Result<PublicAccount, ProtocolError> {
     let transaction = immediate_transaction(connection)?;
+    // Idempotent retry: already ACTIVATED.
+    let current = state_of(&transaction, wallet_id, operation_id)?;
+    if current == STATE_ACTIVATED {
+        let public = public_of(&transaction, wallet_id, operation_id)?;
+        transaction.commit().map_err(storage)?;
+        return Ok(public);
+    }
     let (profile, role, account, index, path) =
         allocation_keys(&transaction, wallet_id, operation_id)?;
     transition(

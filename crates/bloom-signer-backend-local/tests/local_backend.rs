@@ -70,3 +70,27 @@ fn imported_scalar_roots_reject_derivation_namespaces() {
         Err(BackendError::InvalidRequest)
     ));
 }
+
+#[test]
+fn pre_rename_secp256k1_scalar_backups_still_parse() {
+    // The permanent imported-scalar profile must keep reading on-disk backups
+    // written before the `Secp256k1Scalar` -> `ImportedSecp256k1Scalar` rename.
+    let backend = backend([4_u8; 32]);
+    let backup: EncryptedLocalBackup = backend.encrypted_backup().unwrap();
+    let mut encoded = serde_json::to_string(&backup).unwrap();
+    assert!(
+        encoded.contains("imported_secp256k1_scalar"),
+        "fixture should serialize the current tag: {encoded}"
+    );
+    encoded = encoded.replace("imported_secp256k1_scalar", "secp256k1_scalar");
+    let parsed: EncryptedLocalBackup = serde_json::from_str(&encoded).unwrap();
+    assert!(matches!(
+        parsed.root_material_kind,
+        bloom_signer_backend_local::LocalRootMaterialKind::ImportedSecp256k1Scalar
+    ));
+    // The restored backend still resolves its root from the pinned record.
+    let restored =
+        LocalSignerBackend::restore(Token::new("local-default").unwrap(), parsed).unwrap();
+    let root = restored.root_key_ref().unwrap();
+    assert_eq!(root, backend.root_key_ref().unwrap());
+}

@@ -173,24 +173,33 @@ impl SignerCeremonyService {
                     "persisted ceremony backend enrollment is malformed",
                 ));
             }
-            if enrollment.pinned_keys.is_empty() {
-                // BIP-39 backend: no signable root, restore entropy-only.
-                engine.backend_registry().restore_bip39_wallet_backend(
-                    &enrollment.backend_instance,
-                    &enrollment.encrypted_record,
-                )?;
-            } else {
-                if enrollment.pinned_keys.len() != 1 {
-                    return Err(protocol(
-                        ProtocolErrorCode::KeyrefMismatch,
-                        "persisted ceremony backend enrollment is malformed",
-                    ));
+            match enrollment
+                .pinned_keys
+                .iter()
+                .find(|key| key.derivation.is_none())
+            {
+                // Legacy / imported-scalar backend: exactly one root KeyRef.
+                Some(root) => {
+                    if enrollment.pinned_keys.len() != 1 {
+                        return Err(protocol(
+                            ProtocolErrorCode::KeyrefMismatch,
+                            "persisted ceremony backend enrollment is malformed",
+                        ));
+                    }
+                    engine.backend_registry().restore_local_wallet_backend(
+                        &enrollment.backend_instance,
+                        &enrollment.encrypted_record,
+                        root,
+                    )?;
                 }
-                engine.backend_registry().restore_local_wallet_backend(
-                    &enrollment.backend_instance,
-                    &enrollment.encrypted_record,
-                    &enrollment.pinned_keys[0],
-                )?;
+                // BIP-39 backend: no signable root; pinned keys are derived
+                // children (or none yet) and the root is entropy-only.
+                None => {
+                    engine.backend_registry().restore_bip39_wallet_backend(
+                        &enrollment.backend_instance,
+                        &enrollment.encrypted_record,
+                    )?;
+                }
             }
         }
         #[cfg(feature = "local")]
@@ -1486,7 +1495,7 @@ impl SignerCeremonyService {
                             backend: Token::new("local").expect("static token"),
                             backend_instance: registration.wallet_id.clone(),
                             encrypted_record,
-                            pinned_keys: vec![],
+                            pinned_keys: vec![child_key_ref.clone()],
                         };
                         let CeremonyDatabaseEffect::InitialPolicy {
                             backend_enrollment, ..
@@ -2331,6 +2340,13 @@ impl SignerCeremonyService {
                 "wallet import requires an explicit seed profile",
             ));
         }
+        // A seed profile and a legacy passkey migration are mutually exclusive:
+        // the migration decrypts a single secp256k1 scalar, while the seed
+        // profile selects a BIP-39 derivation tree. Both present would let a
+        // crafted request register the decrypted scalar as if it were BIP-39
+        // entropy under a different derivation tree than the migration receipt
+        // authorized.
+        reject_seed_profile_with_migration(request)?;
         // derivation_request is legal only for AccountAllocate.
         if request.derivation_request.is_some()
             && request.ceremony_kind != CeremonyKind::AccountAllocate
@@ -2686,4 +2702,73 @@ fn malformed(error: impl std::fmt::Display) -> ProtocolError {
 
 fn protocol(code: ProtocolErrorCode, message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(code, message)
+}
+
+/// A wallet import cannot combine a seed profile with a legacy passkey
+/// migration: the former selects a BIP-39 derivation tree, the latter
+/// decrypts a single secp256k1 scalar from the legacy envelope. Treating both
+/// as present would register the scalar as if it were BIP-39 entropy under a
+/// different tree than the migration receipt authorized.
+fn reject_seed_profile_with_migration(
+    request: &CustodyPrepareRequest,
+) -> Result<(), ProtocolError> {
+    if request.wallet_seed_profile.is_some() && request.legacy_passkey_migration.is_some() {
+        return Err(protocol(
+            ProtocolErrorCode::MalformedFrame,
+            "wallet import cannot combine a seed profile with a legacy passkey migration",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloom_signer_api::{Digest32, Token};
+
+    fn migration() -> bloom_signer_api::LegacyPasskeyMigrationPublic {
+        bloom_signer_api::LegacyPasskeyMigrationPublic {
+            schema: Token::new("bloom.legacy_passkey_migration_receipt.v1").unwrap(),
+            wallet_name: Token::new("legacy-wallet").unwrap(),
+            address: "0x0000000000000000000000000000000000000000".into(),
+            public_key_fingerprint: Digest32::from_bytes([1; 32]),
+            credential_id_fingerprint: Digest32::from_bytes([2; 32]),
+            legacy_format_version: 1,
+            bundle_digest: Digest32::from_bytes([3; 32]),
+            policy_mode: Token::new("restrictive_current_policy").unwrap(),
+        }
+    }
+
+    fn import_request() -> CustodyPrepareRequest {
+        CustodyPrepareRequest {
+            ceremony_kind: CeremonyKind::WalletImport,
+            custody_operation_id: OperationId::from_bytes([9; 32]),
+            wallet_id: Some(Token::new("wallet").unwrap()),
+            key_ref: None,
+            exact_terms_digest: Digest32::from_bytes([4; 32]),
+            expected_input_class: Token::new("none").unwrap(),
+            browser_output_recipient_key: None,
+            petal_key_scope: None,
+            legacy_passkey_migration: None,
+            derivation_request: None,
+            wallet_seed_profile: None,
+        }
+    }
+
+    #[test]
+    fn seed_profile_and_legacy_migration_are_mutually_exclusive() {
+        let mut request = import_request();
+        request.legacy_passkey_migration = Some(migration());
+        assert!(reject_seed_profile_with_migration(&request).is_ok());
+
+        request.wallet_seed_profile = Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1);
+        let error = reject_seed_profile_with_migration(&request).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::MalformedFrame);
+
+        // A seed profile alone (no migration) is fine.
+        let mut mnemonic_only = import_request();
+        mnemonic_only.wallet_seed_profile =
+            Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1);
+        assert!(reject_seed_profile_with_migration(&mnemonic_only).is_ok());
+    }
 }

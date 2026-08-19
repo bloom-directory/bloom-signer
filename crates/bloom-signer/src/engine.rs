@@ -1613,30 +1613,34 @@ impl SignerEngine {
                     )
                     .map_err(storage)?;
                 if let Some(enrollment) = backend_enrollment {
-                    // A BIP-39 backend has no signable root, so pinned_keys is
-                    // empty and the initial child is enrolled separately via
-                    // allocate_bip39_account. A legacy backend pins exactly one
-                    // root KeyRef and enrolls it as wallet_root here.
-                    if !enrollment.pinned_keys.is_empty() {
-                        if enrollment.pinned_keys.len() != 1
-                            || enrollment.pinned_keys[0].backend != enrollment.backend
-                            || enrollment.pinned_keys[0].backend_instance
-                                != enrollment.backend_instance
+                    // A legacy/imported-scalar backend pins exactly one root
+                    // KeyRef (derivation None) and enrolls it as wallet_root
+                    // here. A BIP-39 backend pins only derived children
+                    // (derivation Some), enrolled separately via
+                    // enroll_bip39_child; it has no root to enroll.
+                    let roots: Vec<&bloom_signer_api::KeyRef> = enrollment
+                        .pinned_keys
+                        .iter()
+                        .filter(|key| key.derivation.is_none())
+                        .collect();
+                    if let Some(root) = roots.first() {
+                        if roots.len() != 1
+                            || root.backend != enrollment.backend
+                            || root.backend_instance != enrollment.backend_instance
                         {
                             return Err(error(
                                 ProtocolErrorCode::KeyrefMismatch,
                                 "registration backend enrollment is not bound to one root KeyRef",
                             ));
                         }
-                        let key_ref = &enrollment.pinned_keys[0];
                         transaction
                             .execute(
                                 "INSERT INTO enrolled_keys(
                                     key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
                                  ) VALUES (?1, ?2, 1, 'wallet_root', ?3)",
                                 params![
-                                    key_ref.public_key_fingerprint.as_str(),
-                                    serde_jcs::to_string(key_ref).map_err(malformed)?,
+                                    root.public_key_fingerprint.as_str(),
+                                    serde_jcs::to_string(root).map_err(malformed)?,
                                     snapshot.wallet_id.as_str(),
                                 ],
                             )
@@ -2017,11 +2021,18 @@ impl SignerEngine {
     ) -> Result<(), ProtocolError> {
         #[cfg(feature = "local")]
         {
+            let encrypted_record = self.backend_registry.local_encrypted_backup(key_ref)?;
+            // The enrollment's pinned_keys must equal the backend's actual
+            // derivation registry (its derived-key subset, no root) so the
+            // export/restore cross-check in `derivation_registry_from_enrollments`
+            // matches. Record the real accumulated set, not a blank slate.
+            let backup: bloom_signer_backend_local::EncryptedLocalBackup =
+                serde_json::from_slice(&encrypted_record.decode()).map_err(malformed)?;
             let enrollment = BackendEnrollmentBackup {
                 backend: key_ref.backend.clone(),
                 backend_instance: key_ref.backend_instance.clone(),
-                encrypted_record: self.backend_registry.local_encrypted_backup(key_ref)?,
-                pinned_keys: Vec::new(),
+                encrypted_record,
+                pinned_keys: backup.derivation_registry.clone(),
             };
             let connection = self.connection.lock();
             let updated = connection
@@ -2077,7 +2088,18 @@ impl SignerEngine {
             &role,
             account,
             operation_id.as_str(),
-            |_, _| false,
+            |candidate_account: u32, candidate_index: u32| match profile {
+                DerivationProfile::Bip44EvmSecp256k1V1 => matches!(
+                    bloom_signer_derive::derive_evm_account(
+                        &seed,
+                        candidate_account,
+                        candidate_index
+                    ),
+                    Err(bloom_signer_derive::Secp256k1DeriveError::InvalidChild)
+                ),
+                // SLIP-10 Ed25519 clamps its scalar and has no invalid-child case.
+                DerivationProfile::Bip44SolanaSlip10Ed25519V1 => false,
+            },
             now_ms,
             &audit,
         )?;
@@ -2347,11 +2369,11 @@ impl SignerEngine {
                     "enrolled derived key has no bip39 registry entry",
                 )
             })?;
-            if descriptor.lifecycle != bloom_signer_api::AccountLifecycleState::Active {
-                return Err(error(
-                    ProtocolErrorCode::KeyrefMismatch,
-                    "enrolled derived key is not active",
-                ));
+            if descriptor.lifecycle == bloom_signer_api::AccountLifecycleState::Retired {
+                // The account retired between the enrolled_keys read and this
+                // descriptor read; omit it rather than failing the whole
+                // listing (the documented contract is "active accounts").
+                continue;
             }
             descriptors.push(descriptor);
         }
@@ -4719,6 +4741,25 @@ impl SignerEngine {
         Ok(backup)
     }
 
+    /// Export one wallet's complete backup set from its persisted custody and
+    /// backend enrollment. This is the read side of the
+    /// [`Self::restore_backup`] round-trip.
+    pub fn export_wallet_backup(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<SignerBackupSet, ProtocolError> {
+        let (wallets, _) = self.load_ceremony_custody()?;
+        let custody = wallets
+            .into_iter()
+            .find(|record| &record.wallet_id == wallet_id);
+        let enrollments = self
+            .load_ceremony_backend_enrollments()?
+            .into_iter()
+            .filter(|enrollment| &enrollment.backend_instance == wallet_id)
+            .collect();
+        self.export_backup(wallet_id, custody, enrollments)
+    }
+
     pub fn derivation_status(
         &self,
         wallet_id: &Token,
@@ -5320,6 +5361,33 @@ fn require_key_available(
             ProtocolErrorCode::KeyrefMismatch,
             "approval key is absent, inactive, or differs from compiled backend enrollment",
         ));
+    }
+    // A BIP-39 derived child must still be ACTIVATED in the durable registry.
+    // Retirement commits that transition before it deactivates enrolled_keys,
+    // so a sign request that slips into that gap must fail closed here rather
+    // than authorize a retired account.
+    if let Some(DerivationRef::Bip39Multicurve {
+        wallet_seed_ref, ..
+    }) = &key_ref.derivation
+    {
+        let state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM derivation_allocations
+                  WHERE wallet_id = ?1 AND public_key_fingerprint = ?2",
+                params![
+                    wallet_seed_ref.as_str(),
+                    key_ref.public_key_fingerprint.as_str()
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        if state.as_deref() != Some("ACTIVATED") {
+            return Err(error(
+                ProtocolErrorCode::KeyrefMismatch,
+                "approval key is not an active derived account",
+            ));
+        }
     }
     Ok(())
 }
@@ -6971,5 +7039,94 @@ mod clock_tests {
             ProtocolErrorCode::ServiceUnavailable
         );
         assert!(engine.audit_degraded.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod require_key_tests {
+    use super::*;
+    use bloom_signer_backend_api::SecretBytes;
+
+    fn retired_bip39_child_engine() -> (SignerEngine, KeyRef, Arc<BackendRegistry>) {
+        let wallet = Token::new("bip39-wallet").unwrap();
+        let backend = Arc::new(
+            bloom_signer_backend_local::LocalSignerBackend::provision_bip39(
+                wallet.clone(),
+                wallet.clone(),
+                SecretBytes::new(vec![7_u8; 16]),
+                SecretBytes::new(vec![8_u8; 32]),
+                SigningKey::from_bytes(&[5; 32]).verifying_key(),
+            )
+            .unwrap(),
+        );
+        // A synthetic derived child: derivation points at the wallet seed, and
+        // the fingerprint is arbitrary (the state check only looks it up).
+        let child = KeyRef {
+            backend: Token::new("local").unwrap(),
+            backend_instance: wallet.clone(),
+            locator: "child-evm-0".into(),
+            key_spec: KeySpec::Secp256k1,
+            public_key_fingerprint: Digest32::from_bytes([0x11; 32]),
+            derivation: Some(DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: wallet.clone(),
+                profile: DerivationProfile::Bip44EvmSecp256k1V1,
+                path: "m/44'/60'/0'/0/0".into(),
+            }),
+        };
+        backend.register_bip39_child(child.clone(), None).unwrap();
+        let registry = Arc::new(
+            BackendRegistry::from_compiled(vec![crate::registry::CompiledBackend::Local(backend)])
+                .unwrap(),
+        );
+        let engine = SignerEngine::open_in_memory(
+            Token::new("broker-key").unwrap(),
+            SigningKey::from_bytes(&[1; 32]).verifying_key(),
+            SigningKey::from_bytes(&[2; 32]).verifying_key(),
+            Token::new("revocation-key").unwrap(),
+            SigningKey::from_bytes(&[3; 32]),
+            SignerAuditKeys {
+                current_key_id: Token::new("audit-key").unwrap(),
+                current_signing_key: SigningKey::from_bytes(&[30; 32]),
+                historical_verifying_keys: BTreeMap::new(),
+            },
+            registry.clone(),
+        )
+        .unwrap();
+        engine.enroll_bip39_child(&wallet, &child).unwrap();
+        // Simulate the narrow retire/sign window: the durable allocation is
+        // already RETIRED, but enrolled_keys.available is still 1 and the
+        // backend still has the child.
+        let connection = engine.connection.lock();
+        connection
+            .execute(
+                "INSERT INTO derivation_allocations(
+                    wallet_id, operation_id, profile, role, account, \"index\", path,
+                    state, key_spec, public_key_spki_der, public_key_fingerprint,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, 'RETIRED', 'secp256k1', NULL, ?6, 0, 0)",
+                rusqlite::params![
+                    wallet.as_str(),
+                    "op-retired",
+                    "bip44-evm-secp256k1-v1",
+                    "primary-evm",
+                    "m/44'/60'/0'/0/0",
+                    child.public_key_fingerprint.as_str(),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        (engine, child, registry)
+    }
+
+    #[test]
+    fn require_key_available_rejects_a_durably_retired_child() {
+        let (engine, child, registry) = retired_bip39_child_engine();
+        let mut connection = engine.connection.lock();
+        let transaction = engine.mutation_transaction(&mut connection).unwrap();
+        let error = require_key_available(&transaction, &registry, &child).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+        assert!(error.message.contains("not an active derived account"));
+        drop(transaction);
+        drop(connection);
     }
 }

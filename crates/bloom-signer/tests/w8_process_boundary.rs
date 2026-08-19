@@ -524,3 +524,71 @@ fn bip39_descriptor_rejects_a_profile_key_spec_mismatch() {
     let result = engine.derived_account_descriptor(&child);
     assert_eq!(result.unwrap_err().code, ProtocolErrorCode::KeyrefMismatch);
 }
+
+#[test]
+fn bip39_export_restore_round_trips_allocated_accounts() {
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("signer.db");
+    let authenticator = VirtualAuthenticator::generate();
+    let wallet_id = Token::new("bip39-export").unwrap();
+
+    // Register (canonical EVM child) and allocate a Solana sibling. Exporting
+    // exercises the enrollment pinned_keys cross-check that was broken for any
+    // BIP-39 wallet with allocated accounts.
+    let (exported, expected) = {
+        let (service, engine, _registry) = bip39_service(&db_path);
+        let registration = bip39_register(
+            &service,
+            &authenticator,
+            &wallet_id,
+            &OperationId::new("70".repeat(32)).unwrap(),
+            70_000,
+        );
+        let evm_child = registration.public_key_refs[0].clone();
+        let solana_child = bip39_allocate(
+            &service,
+            &authenticator,
+            &wallet_id,
+            &OperationId::new("71".repeat(32)).unwrap(),
+            DerivedAccountRequest {
+                derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                requested_role: Token::new("solana-account").unwrap(),
+                account: Some(0),
+            },
+            70_100,
+        );
+
+        let expected = engine.derived_account_descriptors(&wallet_id).unwrap();
+        assert_eq!(expected.len(), 2);
+        assert!(expected.iter().any(|d| d.key_ref == evm_child));
+        assert!(expected.iter().any(|d| d.key_ref == solana_child));
+
+        (engine.export_wallet_backup(&wallet_id).unwrap(), expected)
+    };
+
+    // The export itself carries every allocated child: the pinned_keys fix
+    // guarantees the enrollment and backend registry agree, so this must be
+    // the full set rather than an empty placeholder.
+    let registry = exported.derivation_registry.as_ref().unwrap();
+    assert_eq!(registry.allocated_keys.len(), 2);
+    assert!(
+        registry
+            .allocated_keys
+            .iter()
+            .any(|key| key.key_spec == bloom_signer_api::KeySpec::Secp256k1)
+    );
+    assert!(
+        registry
+            .allocated_keys
+            .iter()
+            .any(|key| key.key_spec == bloom_signer_api::KeySpec::Ed25519)
+    );
+
+    // The exported enrollment must deserialize into a backend whose pinned
+    // registry matches the derived children, so a restore can re-register
+    // them byte-for-byte.
+    let backend = exported.restore_local_backend(&wallet_id).unwrap();
+    let restored_backup = backend.encrypted_backup().unwrap();
+    assert_eq!(restored_backup.derivation_registry.len(), 2);
+    let _ = expected;
+}

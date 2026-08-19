@@ -272,7 +272,9 @@ fn transitions_refuse_out_of_order_advancement() {
     );
     assert!(registry::activate(&mut connection, &wallet, "op-1", 1_100, &noop).is_err());
     registry::commit_index(&mut connection, &wallet, "op-1", 1_100, &noop).unwrap();
-    assert!(registry::commit_index(&mut connection, &wallet, "op-1", 1_150, &noop).is_err());
+    // Idempotent retry: re-committing an already-advanced index step succeeds
+    // (crash recovery between commit_index and the ceremony completion cache).
+    registry::commit_index(&mut connection, &wallet, "op-1", 1_150, &noop).unwrap();
 }
 
 #[test]
@@ -560,4 +562,72 @@ fn namespace_cap_is_enforced() {
     )
     .unwrap_err();
     assert!(error.message.contains("cap"));
+}
+
+#[test]
+fn retried_allocation_after_full_activation_is_idempotent() {
+    let mut connection = connection();
+    let wallet = primary();
+    // First full lifecycle succeeds.
+    let public = allocate_activated(&mut connection, "op-1", 0);
+    assert_eq!(public.path, "m/44'/60'/0'/0/0");
+
+    // A retry of the same operation id re-runs each step against an already-
+    // advanced allocation and must succeed idempotently (crash between
+    // activation and the ceremony completion-cache update).
+    let reservation = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        0,
+        "op-1",
+        |_, _| false,
+        1_400,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(reservation.index, 0);
+    registry::commit_index(&mut connection, &wallet, "op-1", 1_500, &noop).unwrap();
+    let (spki, fingerprint) = spki_fixture(2);
+    registry::commit_account(
+        &mut connection,
+        &wallet,
+        "op-1",
+        &spki,
+        &fingerprint,
+        1_600,
+        &noop,
+    )
+    .unwrap();
+    let retried = registry::activate(&mut connection, &wallet, "op-1", 1_700, &noop).unwrap();
+    assert_eq!(retried.path, "m/44'/60'/0'/0/0");
+    // The retry must not have double-issued an index or a second allocation row.
+    let listed = registry::public_accounts(&connection, &wallet).unwrap();
+    assert_eq!(listed.len(), 1);
+    registry::verify_event_chain(&connection).unwrap();
+}
+
+#[test]
+fn address_index_counter_is_per_account() {
+    let mut connection = connection();
+    let wallet = primary();
+    // Account 0 consumes indices 0 and 1.
+    allocate_activated(&mut connection, "op-a0", 0);
+    allocate_activated(&mut connection, "op-a1", 1);
+    // Account 1 starts its own index sequence at 0, not at account 0's counter.
+    let reservation = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        1,
+        "op-b0",
+        |_, _| false,
+        2_000,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(reservation.index, 0);
+    assert_eq!(reservation.path, "m/44'/60'/1'/0/0");
 }
