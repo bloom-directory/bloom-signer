@@ -67,6 +67,7 @@ fn production_signer_dependency_graph_has_no_machine_broker_or_debug_driver() {
             "bloom-signer-backend-aws-kms",
             "bloom-signer-backend-local",
             "bloom-signer-derive",
+            "bloom-signer-process-hardening",
             "bloom-triad-local-transport",
             "bloom-trusted-time",
         ]

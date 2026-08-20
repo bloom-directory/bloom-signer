@@ -131,6 +131,7 @@ pub fn derive_solana_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{RngCore as _, SeedableRng as _};
 
     fn seed_tv1() -> Vec<u8> {
         (0u8..16).collect()
@@ -163,5 +164,28 @@ mod tests {
             hex::encode(child_code),
             "8b59aa11380b624e81507a27fedda59fea6d0b779a778918a2fd3590e16e9c69"
         );
+    }
+
+    #[test]
+    fn solana_derivation_matches_independent_ows_implementation() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x51_1f_10);
+        let edge_accounts = [0, 1, 2, 501, 65_535, (1 << 31) - 1];
+        for case in 0..256_u32 {
+            let mut seed = [0_u8; SEED_BYTES];
+            rng.fill_bytes(&mut seed);
+            let account = edge_accounts
+                .get(case as usize)
+                .copied()
+                .unwrap_or_else(|| rand::Rng::gen_range(&mut rng, 0..(1 << 31)));
+            let ours = derive_solana_account(&seed, account).unwrap();
+            let path = format!("m/44'/501'/{account}'/0'");
+            let oracle =
+                ows_signer::HdDeriver::derive(&seed, &path, ows_signer::Curve::Ed25519).unwrap();
+            assert_eq!(
+                ours.private_key.as_slice(),
+                oracle.expose(),
+                "SLIP-10 divergence for account {account}"
+            );
+        }
     }
 }

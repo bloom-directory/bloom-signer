@@ -15,6 +15,7 @@ triad-dev-harness = ["bloom-triad-local-transport/triad-dev-harness"]
 blake3.workspace = true
 bloom-signer-api.workspace = true
 bloom-signer-derive.workspace = true
+bloom-signer-process-hardening.workspace = true
 bloom-triad-local-transport.workspace = true
 bloom-platform-containment.workspace = true
 bloom-audit-checkpoint.workspace = true

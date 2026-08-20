@@ -133,6 +133,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("bloom-signer {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    bloom_signer_process_hardening::harden_process()
+        .map_err(|error| format!("Signer process hardening failed: {error}"))?;
     let identity_path = env_path(
         "BLOOM_SIGNER_IDENTITY",
         "/var/run/bloom/signer-identity.json",

@@ -5,6 +5,7 @@ members = [
   "crates/bloom-signer-backend-local",
   "crates/bloom-signer-backend-aws-kms",
   "crates/bloom-signer-derive",
+  "crates/bloom-signer-process-hardening",
   "crates/bloom-signer-vectors",
   "crates/bloom-signer",
 ]
@@ -19,6 +20,7 @@ license = "MIT"
 [workspace.dependencies]
 bloom-signer-api = { path = "crates/bloom-signer-api" }
 bloom-signer-derive = { path = "crates/bloom-signer-derive" }
+bloom-signer-process-hardening = { path = "crates/bloom-signer-process-hardening" }
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "19d0465d53b279e6e1c98bac533510a1e7eb8f44" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "19d0465d53b279e6e1c98bac533510a1e7eb8f44" }
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "19d0465d53b279e6e1c98bac533510a1e7eb8f44" }
