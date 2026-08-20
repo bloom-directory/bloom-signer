@@ -329,6 +329,26 @@ impl LocalSignerBackend {
             || self.state.read().registry.get(&key_ref.locator) == Some(key_ref)
     }
 
+    /// Activation body shared by the async `SignerBackendActivation::activate`
+    /// and by callers on Signer's synchronous custody-apply path, which holds
+    /// `parking_lot` guards and so cannot await. Keeping one body ensures the
+    /// two entry points cannot drift apart.
+    pub fn activate_blocking(&self, secret: SecretBytes) -> Result<(), BackendError> {
+        if secret.expose_to_backend().len() != 32 {
+            return Err(BackendError::InvalidRequest);
+        }
+        self.state.write().active_kek = Some(secret);
+        if self
+            .active_seed()
+            .and_then(|_| self.validate_registered_derivations())
+            .is_err()
+        {
+            self.state.write().active_kek = None;
+            return Err(BackendError::DefinitiveRejected);
+        }
+        Ok(())
+    }
+
     pub fn key_is_available(&self, key_ref: &KeyRef) -> Result<bool, BackendError> {
         if !self.key_is_registered(key_ref) {
             return Ok(false);
@@ -907,21 +927,7 @@ impl SignerBackendActivation for LocalSignerBackend {
         _key: &'a KeyRef,
         secret: SecretBytes,
     ) -> BackendFuture<'a, Result<(), BackendError>> {
-        Box::pin(async move {
-            if secret.expose_to_backend().len() != 32 {
-                return Err(BackendError::InvalidRequest);
-            }
-            self.state.write().active_kek = Some(secret);
-            if self
-                .active_seed()
-                .and_then(|_| self.validate_registered_derivations())
-                .is_err()
-            {
-                self.state.write().active_kek = None;
-                return Err(BackendError::DefinitiveRejected);
-            }
-            Ok(())
-        })
+        Box::pin(async move { self.activate_blocking(secret) })
     }
 
     fn deactivate<'a>(&'a self, _key: &'a KeyRef) -> BackendFuture<'a, Result<(), BackendError>> {

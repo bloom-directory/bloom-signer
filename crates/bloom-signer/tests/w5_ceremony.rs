@@ -2570,3 +2570,98 @@ fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
         )
         .expect("staging a key-derive ceremony must not require an activated backend");
 }
+
+#[test]
+fn key_derive_activates_the_local_backend_from_its_own_ceremony() {
+    // A Petal session is a KeyDerive followed by a SealedApproval that
+    // registers the derived key. Only the second used to activate the local
+    // backend, and they cannot be reordered, so on a Signer with no owner
+    // ceremony since boot the derivation failed outright. KeyDerive now arms
+    // the backend from the credential PRF it already carries.
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let authenticator = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
+    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+    let engine = Arc::new(
+        SignerEngine::open(
+            &database,
+            Token::new("broker-app-1").unwrap(),
+            broker.verifying_key(),
+            ceremony_key.verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
+            registry.clone(),
+        )
+        .unwrap(),
+    );
+    let service = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        ceremony_key.clone(),
+    )
+    .unwrap();
+    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("e1"), 10_000);
+    let parent = engine.enrolled_key_refs(&wallet_id).unwrap().remove(0);
+
+    // Restoring leaves the parent enrolled but the backend unarmed: the state a
+    // Signer holds until some ceremony supplies an activation secret.
+    let backup = registry.local_encrypted_backup(&parent).unwrap();
+    registry.remove_local_wallet_backend(&parent);
+    registry
+        .restore_local_wallet_backend(&parent.backend_instance, &backup, &parent)
+        .unwrap();
+    assert!(
+        !registry.key_is_available(&parent).unwrap(),
+        "test precondition: the restored backend must not be armed"
+    );
+
+    let scope = PetalKeyScope {
+        wallet_id: wallet_id.clone(),
+        parent_key_ref: parent.clone(),
+        package_hash: digest("e2"),
+        route: "/petals/exchange/sign".into(),
+        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        key_slot: Token::new("account-a").unwrap(),
+        allowed_routes: vec!["/petals/exchange/sign".into()],
+        allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+        maximum_lifetime_ms: DecimalU64::new(20_000),
+        custody_operation_id: operation("e3"),
+    };
+
+    complete_petal_key_derivation(&service, &authenticator, scope, None, 10_100)
+        .expect("KeyDerive must arm the backend from its own credential PRF");
+
+    assert!(
+        registry.key_is_available(&parent).unwrap(),
+        "the derivation must leave the backend armed"
+    );
+}
+
+#[test]
+fn only_petal_key_derivation_arms_the_backend() {
+    // The block that decrypts the credential PRF is shared by WalletExport,
+    // WalletDelete, BackendEnrollment, KeyDerive and PolicyUpdate. Arming
+    // belongs to the innermost Petal-scope branch alone; hooking it into the
+    // shared prefix would silently make the other four activation vectors.
+    let source = std::fs::read_to_string("src/ceremony.rs").unwrap();
+    let armings = source.matches("activate_key_blocking(").count();
+    assert_eq!(
+        armings, 1,
+        "exactly one activation call belongs on the custody apply path"
+    );
+    let petal_branch = source
+        .split("if let Some(scope) = &prepare.petal_key_scope")
+        .nth(1)
+        .expect("Petal key scope branch must exist");
+    let branch_end = petal_branch
+        .find("return self.apply_petal_key_derivation")
+        .expect("branch must apply the derivation");
+    assert!(
+        petal_branch[..branch_end].contains("activate_key_blocking("),
+        "activation must sit inside the Petal key scope branch"
+    );
+}

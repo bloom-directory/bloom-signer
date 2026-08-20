@@ -1648,7 +1648,7 @@ impl SignerCeremonyService {
         &self,
         prepare: &CustodyPrepareRequest,
         effect: GenericCustodyEffect,
-        _unlocked: &UnlockedWallet,
+        unlocked: &UnlockedWallet,
     ) -> Result<GenericCustodyOutcome, ProtocolError> {
         let wallet_id = prepare.wallet_id.as_ref().ok_or_else(kind_mismatch)?;
         match (prepare.ceremony_kind, effect) {
@@ -1721,9 +1721,30 @@ impl SignerCeremonyService {
                                 "Petal key derivation parameters are owned by Signer",
                             ));
                         }
-                        // Applying the derivation uses the parent immediately,
-                        // so the backend must be activated by now. The ceremony
-                        // that reached this point is what activated it.
+                        // Activate from this ceremony's own credential PRF.
+                        //
+                        // A Petal session is created by a KeyDerive followed by
+                        // a SealedApproval that registers the derived key with
+                        // the venue. Only the second activates the local
+                        // backend, and they cannot be reordered because the
+                        // approval registers the address this step mints. Every
+                        // other activating ceremony arms the backend itself;
+                        // KeyDerive was added later and never did, so on a
+                        // Signer with no owner ceremony since boot this failed
+                        // outright.
+                        //
+                        // Scoped deliberately to this branch. The enclosing
+                        // block also serves WalletExport, WalletDelete,
+                        // BackendEnrollment and PolicyUpdate; arming there would
+                        // make all of them activation vectors.
+                        self.engine.backend_registry().activate_key_blocking(
+                            root,
+                            unlocked.local_backend_activation_secret()?,
+                        )?;
+                        self.engine
+                            .record_backend_activation(&scope.wallet_id, root)?;
+                        // Still checked: activation can legitimately fail, and
+                        // the distinct error keeps that case diagnosable.
                         self.engine
                             .require_activated_parent_key(&scope.wallet_id, root)?;
                         return self.apply_petal_key_derivation(root, scope);

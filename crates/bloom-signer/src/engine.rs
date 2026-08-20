@@ -1800,6 +1800,29 @@ impl SignerEngine {
         Ok(())
     }
 
+    /// Journal that a ceremony armed a wallet's local backend.
+    ///
+    /// Activation is otherwise invisible in the audit trail: the sealed-approval
+    /// path records `approval.activation`, and a derivation records
+    /// `key.enrolled`, so an operator asking when a wallet's signing capability
+    /// was armed cannot distinguish a ceremony that activated the backend from
+    /// one that ran on an already-armed boot.
+    pub fn record_backend_activation(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+    ) -> Result<(), ProtocolError> {
+        let mut connection = self.connection.lock();
+        let transaction = self.mutation_transaction(&mut connection)?;
+        self.append_audit(
+            &transaction,
+            "backend.activated",
+            &serde_json::json!({ "wallet_id": wallet_id, "key_ref": key_ref }),
+        )?;
+        transaction.commit().map_err(storage)?;
+        Ok(())
+    }
+
     pub fn enroll_key(&self, key_ref: &KeyRef) -> Result<(), ProtocolError> {
         key_ref.validate()?;
         if !self.backend_registry.key_is_registered(key_ref)? {
