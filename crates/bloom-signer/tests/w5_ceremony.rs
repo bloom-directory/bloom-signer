@@ -2489,3 +2489,84 @@ fn generic_custody_export_policy_and_delete_apply_exact_typed_effects() {
             .is_err()
     );
 }
+
+#[test]
+fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
+    // Staging a key-derive ceremony must not require an already activated
+    // backend. Completing that very ceremony is what activates it, so
+    // demanding activation up front makes Petal session creation impossible on
+    // a Signer that has not performed some other owner ceremony recently --
+    // for example any time after a restart. Before this was split, staging
+    // shared one check with application and failed with KEYREF_MISMATCH.
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let authenticator = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
+    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+    let engine = Arc::new(
+        SignerEngine::open(
+            &database,
+            Token::new("broker-app-1").unwrap(),
+            broker.verifying_key(),
+            ceremony_key.verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
+            registry.clone(),
+        )
+        .unwrap(),
+    );
+    let service = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        ceremony_key.clone(),
+    )
+    .unwrap();
+    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("c1"), 10_000);
+    let parent = engine.enrolled_key_refs(&wallet_id).unwrap().remove(0);
+
+    // Restoring from the encrypted backup leaves the parent enrolled but not
+    // activated, which is the state a Signer holds until a ceremony supplies
+    // the activation secret.
+    let backup = registry.local_encrypted_backup(&parent).unwrap();
+    registry.remove_local_wallet_backend(&parent);
+    registry
+        .restore_local_wallet_backend(&parent.backend_instance, &backup, &parent)
+        .unwrap();
+    assert!(
+        !registry.key_is_available(&parent).unwrap(),
+        "test precondition: the restored backend must not be activated"
+    );
+
+    let scope = PetalKeyScope {
+        wallet_id: wallet_id.clone(),
+        parent_key_ref: parent.clone(),
+        package_hash: digest("c2"),
+        route: "/petals/exchange/sign".into(),
+        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        key_slot: Token::new("account-a").unwrap(),
+        allowed_routes: vec!["/petals/exchange/sign".into()],
+        allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+        maximum_lifetime_ms: DecimalU64::new(20_000),
+        custody_operation_id: operation("c3"),
+    };
+
+    service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::KeyDerive,
+                custody_operation_id: scope.custody_operation_id.clone(),
+                wallet_id: Some(scope.wallet_id.clone()),
+                key_ref: Some(parent.clone()),
+                exact_terms_digest: scope.request_digest().unwrap(),
+                expected_input_class: Token::new("petal-subkey-v1").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: Some(scope.clone()),
+                legacy_passkey_migration: None,
+            },
+            10_100,
+        )
+        .expect("staging a key-derive ceremony must not require an activated backend");
+}

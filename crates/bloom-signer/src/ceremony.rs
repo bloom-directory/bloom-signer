@@ -1721,8 +1721,11 @@ impl SignerCeremonyService {
                                 "Petal key derivation parameters are owned by Signer",
                             ));
                         }
+                        // Applying the derivation uses the parent immediately,
+                        // so the backend must be activated by now. The ceremony
+                        // that reached this point is what activated it.
                         self.engine
-                            .require_enrolled_parent_key(&scope.wallet_id, root)?;
+                            .require_activated_parent_key(&scope.wallet_id, root)?;
                         return self.apply_petal_key_derivation(root, scope);
                     }
                     let namespace_id = namespace_id.ok_or_else(kind_mismatch)?;

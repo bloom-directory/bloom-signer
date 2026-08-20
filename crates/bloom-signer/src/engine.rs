@@ -2426,6 +2426,14 @@ impl SignerEngine {
         }
     }
 
+    /// Durable enrollment of a Petal sub-key parent.
+    ///
+    /// This asserts only facts that survive a restart: the parent is enrolled,
+    /// its KeyRef is byte-identical to the enrolled one, it is not withdrawn,
+    /// it is a wallet root, and it belongs to this wallet. It deliberately does
+    /// not assert that the backend is currently activated, because staging a
+    /// ceremony is what later produces that activation. Callers that are about
+    /// to use the parent must use `require_activated_parent_key` instead.
     pub(crate) fn require_enrolled_parent_key(
         &self,
         wallet_id: &Token,
@@ -2453,11 +2461,29 @@ impl SignerEngine {
                 )
             })
             != Some((&expected, true, "wallet_root", Some(wallet_id.as_str())))
-            || !self.backend_registry.key_is_available(key_ref)?
         {
             return Err(error(
                 ProtocolErrorCode::KeyrefMismatch,
                 "Petal sub-key parent is absent or unavailable for the named wallet",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Durable enrollment plus a currently activated backend.
+    ///
+    /// Use this immediately before deriving from the parent, where an inactive
+    /// backend genuinely cannot serve the request.
+    pub(crate) fn require_activated_parent_key(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+    ) -> Result<(), ProtocolError> {
+        self.require_enrolled_parent_key(wallet_id, key_ref)?;
+        if !self.backend_registry.key_is_available(key_ref)? {
+            return Err(error(
+                ProtocolErrorCode::KeyrefMismatch,
+                "Petal sub-key parent backend is not activated for the named wallet",
             ));
         }
         Ok(())
