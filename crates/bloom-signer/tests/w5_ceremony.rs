@@ -3,7 +3,6 @@ mod support;
 use bloom_signer::webauthn::{verify_webauthn_assertion, verify_webauthn_attestation};
 use bloom_signer::{
     ceremony::{PreparedCustodyCeremony, SignerCeremonyService},
-    clock::{ClockCondition, ClockDecision},
     engine::{BackendEnrollmentBackup, SignerAuditKeys, SignerEngine},
     hpke::{CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO},
     legacy_passkey::{LEGACY_PASSKEY_INPUT_CLASS, LegacyMigrationStore, stage_legacy_wallet},
@@ -544,6 +543,68 @@ fn assert_approval_capacity_unused(engine: &SignerEngine, approval_id: &Digest32
         .expect("test approval counter must be exported");
     assert_eq!(counter.committed_operations.get(), 0);
     assert_eq!(counter.committed_signatures.get(), 0);
+}
+
+fn complete_petal_key_derivation(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    scope: PetalKeyScope,
+    browser_effect: Option<serde_json::Value>,
+    now_ms: u64,
+) -> Result<(CustodyResult, CustodyCompleteRequest), ProtocolError> {
+    let scope_digest = scope.request_digest()?;
+    let prepared = service.prepare_custody(
+        CustodyPrepareRequest {
+            ceremony_kind: CeremonyKind::KeyDerive,
+            custody_operation_id: scope.custody_operation_id.clone(),
+            wallet_id: Some(scope.wallet_id.clone()),
+            key_ref: Some(scope.parent_key_ref.clone()),
+            exact_terms_digest: scope_digest.clone(),
+            expected_input_class: Token::new("petal-subkey-v1").unwrap(),
+            browser_output_recipient_key: None,
+            petal_key_scope: Some(scope.clone()),
+            legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
+        },
+        now_ms,
+    )?;
+    assert_eq!(prepared.contribution.petal_key_scope, Some(scope.clone()));
+    let assertion =
+        authenticator.assertion(&prepared.challenges[0].canonical_bytes()?, now_ms as u32);
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::KeyDerive,
+        custody_operation_id: scope.custody_operation_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest()?,
+        wallet_id: Some(scope.wallet_id.clone()),
+        key_ref: Some(scope.parent_key_ref.clone()),
+        credential_id: Some(assertion.credential_id.clone()),
+        expected_input_class: Token::new("petal-subkey-v1").unwrap(),
+    }
+    .canonical_bytes()?;
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "effect": browser_effect.unwrap_or_else(|| serde_json::json!({"kind": "key_derive"})),
+    }))
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )?;
+    let complete = CustodyCompleteRequest {
+        ceremony_kind: CeremonyKind::KeyDerive,
+        custody_operation_id: scope.custody_operation_id,
+        ceremony_id: prepared.contribution.ceremony_id,
+        proof: WebAuthnCeremonyProof::Assertion { assertion },
+        encrypted_input: Some(encrypted_input),
+        public_binding_digest: scope_digest,
+    };
+    let result = service.complete_custody(complete.clone(), now_ms + 100)?;
+    Ok((result, complete))
 }
 
 fn complete_policy_update(
@@ -1634,6 +1695,8 @@ fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
                 browser_output_recipient_key: None,
                 petal_key_scope: Some(scope.clone()),
                 legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
             },
             10_100,
         )

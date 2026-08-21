@@ -1801,7 +1801,7 @@ impl SignerCeremonyService {
                         // enter public fields, audit, or logs.
                         let mnemonic = self
                             .wallet(wallet_id)?
-                            .export_mnemonic(_unlocked)
+                            .export_mnemonic(unlocked)
                             .map_err(|_| kind_mismatch())?;
                         Ok(GenericCustodyOutcome {
                             sensitive_output: Some(mnemonic.as_bytes().to_vec()),
@@ -1939,7 +1939,7 @@ impl SignerCeremonyService {
                     wallet_id,
                     &prepare.custody_operation_id,
                     request,
-                    _unlocked,
+                    unlocked,
                     now_ms,
                 )?;
                 self.engine
