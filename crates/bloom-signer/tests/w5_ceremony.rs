@@ -1653,17 +1653,19 @@ fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
         ceremony_key.clone(),
     )
     .unwrap();
-    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("c1"), 10_000);
-    let parent = engine.enrolled_key_refs(&wallet_id).unwrap().remove(0);
+    let wallet_id = Token::new("petal-staging-wallet").unwrap();
+    let registration = complete_bip39_registration(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("c1"),
+        10_000,
+    );
+    let parent = registration.public_key_refs[0].clone();
 
-    // Restoring from the encrypted backup leaves the parent enrolled but not
-    // activated, which is the state a Signer holds until a ceremony supplies
-    // the activation secret.
-    let backup = registry.local_encrypted_backup(&parent).unwrap();
-    registry.remove_local_wallet_backend(&parent);
-    registry
-        .restore_local_wallet_backend(&parent.backend_instance, &backup, &parent)
-        .unwrap();
+    // Deactivation matches the state a Signer holds after restart until a
+    // ceremony supplies the activation secret.
+    futures::executor::block_on(registry.deactivate_key(&parent)).unwrap();
     assert!(
         !registry.key_is_available(&parent).unwrap(),
         "test precondition: the restored backend must not be activated"
@@ -1735,16 +1737,19 @@ fn key_derive_activates_the_local_backend_from_its_own_ceremony() {
         ceremony_key.clone(),
     )
     .unwrap();
-    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("e1"), 10_000);
-    let parent = engine.enrolled_key_refs(&wallet_id).unwrap().remove(0);
+    let wallet_id = Token::new("petal-activation-wallet").unwrap();
+    let registration = complete_bip39_registration(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("e1"),
+        10_000,
+    );
+    let parent = registration.public_key_refs[0].clone();
 
-    // Restoring leaves the parent enrolled but the backend unarmed: the state a
-    // Signer holds until some ceremony supplies an activation secret.
-    let backup = registry.local_encrypted_backup(&parent).unwrap();
-    registry.remove_local_wallet_backend(&parent);
-    registry
-        .restore_local_wallet_backend(&parent.backend_instance, &backup, &parent)
-        .unwrap();
+    // Deactivation matches the state a Signer holds after restart until some
+    // ceremony supplies an activation secret.
+    futures::executor::block_on(registry.deactivate_key(&parent)).unwrap();
     assert!(
         !registry.key_is_available(&parent).unwrap(),
         "test precondition: the restored backend must not be armed"

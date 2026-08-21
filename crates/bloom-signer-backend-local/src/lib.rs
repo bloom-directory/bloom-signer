@@ -512,15 +512,21 @@ impl LocalSignerBackend {
         operation_id: Option<&OperationId>,
     ) -> Result<KeyDescription, BackendError> {
         let authority_digest = self.verify_derivation_authority(authority)?;
-        if self.root_key_ref()? != *root {
-            return Err(BackendError::InvalidRequest);
-        }
         let snapshot = self
             .state
             .read()
             .backup
             .clone()
             .ok_or(BackendError::DefinitiveRejected)?;
+        let valid_parent = if snapshot.root_material_kind == LocalRootMaterialKind::Bip39Entropy {
+            root.key_spec == KeySpec::Secp256k1
+                && snapshot.derivation_registry.iter().any(|key| key == root)
+        } else {
+            self.root_key_ref()? == *root
+        };
+        if !valid_parent {
+            return Err(BackendError::InvalidRequest);
+        }
         if let Some(existing) = operation_id
             .and_then(|operation_id| snapshot.pending_derivations.get(operation_id.as_str()))
         {

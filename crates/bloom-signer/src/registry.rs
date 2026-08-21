@@ -221,6 +221,37 @@ impl BackendRegistry {
         }
     }
 
+    pub async fn deactivate_key(
+        &self,
+        key_ref: &bloom_signer_api::KeyRef,
+    ) -> Result<(), ProtocolError> {
+        let backend = self
+            .backends
+            .read()
+            .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
+            .cloned()
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::BackendUnsupported,
+                    "activation backend is not compiled into this Signer",
+                )
+            })?;
+        match backend {
+            #[cfg(feature = "local")]
+            CompiledBackend::Local(local) => local.deactivate(key_ref).await.map_err(|cause| {
+                ProtocolError::new(
+                    ProtocolErrorCode::BackendInvalidRequest,
+                    format!("local backend deactivation failed: {cause:?}"),
+                )
+            }),
+            #[cfg(feature = "aws-kms")]
+            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "AWS KMS keys do not use Signer activation",
+            )),
+        }
+    }
+
     #[cfg(feature = "local")]
     pub fn provision_imported_secp256k1_wallet_backend(
         &self,

@@ -2997,10 +2997,11 @@ impl SignerEngine {
     ///
     /// This asserts only facts that survive a restart: the parent is enrolled,
     /// its KeyRef is byte-identical to the enrolled one, it is not withdrawn,
-    /// it is a wallet root, and it belongs to this wallet. It deliberately does
-    /// not assert that the backend is currently activated, because staging a
-    /// ceremony is what later produces that activation. Callers that are about
-    /// to use the parent must use `require_activated_parent_key` instead.
+    /// it is a wallet root or Signer-derived account, and it belongs to this
+    /// wallet. It deliberately does not assert that the backend is currently
+    /// activated, because staging a ceremony is what later produces that
+    /// activation. Callers that are about to use the parent must use
+    /// `require_activated_parent_key` instead.
     pub(crate) fn require_enrolled_parent_key(
         &self,
         wallet_id: &Token,
@@ -3027,11 +3028,16 @@ impl SignerEngine {
                     enrolled_wallet.as_deref(),
                 )
             })
-            != Some((&expected, true, "wallet_root", Some(wallet_id.as_str())))
+            .is_none_or(|(stored, available, class, enrolled_wallet)| {
+                stored != &expected
+                    || !available
+                    || !matches!(class, "wallet_root" | "derived")
+                    || enrolled_wallet != Some(wallet_id.as_str())
+            })
         {
             return Err(error(
                 ProtocolErrorCode::KeyrefMismatch,
-                "Petal sub-key parent is absent or unavailable for the named wallet",
+                "Petal sub-key parent is absent, unavailable, or not owned by the named wallet",
             ));
         }
         Ok(())
