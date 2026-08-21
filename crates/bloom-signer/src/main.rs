@@ -445,13 +445,14 @@ fn acquire_unix_listener(
 
 #[cfg(not(target_os = "macos"))]
 fn acquire_unix_listener(
-    _path_variable: &str,
-    activation_variable: &str,
-    default_activation_name: &str,
+    path_variable: &str,
+    _activation_variable: &str,
+    _default_activation_name: &str,
 ) -> Result<std::os::unix::net::UnixListener, Box<dyn std::error::Error>> {
-    let name =
-        std::env::var(activation_variable).unwrap_or_else(|_| default_activation_name.to_string());
-    Ok(bloom_service_activation::take_unix_listener(&name)?)
+    let path = std::env::var_os(path_variable)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{path_variable} is required by the Linux service profile"))?;
+    Ok(bloom_service_activation::bind_owned_unix_listener(&path)?)
 }
 
 fn require_clock_repair_confirmation(
