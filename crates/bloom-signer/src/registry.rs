@@ -149,6 +149,44 @@ impl BackendRegistry {
         }
     }
 
+    /// Activate without awaiting, for the synchronous custody-apply path.
+    ///
+    /// That path holds `parking_lot` guards, whose guards are not `Send`, so it
+    /// cannot use `activate_key`. Both entry points funnel into the same backend
+    /// body, and this one keeps the AWS-KMS rejection so nothing widens what is
+    /// activatable.
+    pub fn activate_key_blocking(
+        &self,
+        key_ref: &bloom_signer_api::KeyRef,
+        secret: SecretBytes,
+    ) -> Result<(), ProtocolError> {
+        let backend = self
+            .backends
+            .read()
+            .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
+            .cloned()
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::BackendUnsupported,
+                    "activation backend is not compiled into this Signer",
+                )
+            })?;
+        match backend {
+            #[cfg(feature = "local")]
+            CompiledBackend::Local(local) => local.activate_blocking(secret).map_err(|cause| {
+                ProtocolError::new(
+                    ProtocolErrorCode::BackendInvalidRequest,
+                    format!("local backend activation failed: {cause:?}"),
+                )
+            }),
+            #[cfg(feature = "aws-kms")]
+            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "AWS KMS keys do not use Signer activation",
+            )),
+        }
+    }
+
     pub async fn activate_key(
         &self,
         key_ref: &bloom_signer_api::KeyRef,

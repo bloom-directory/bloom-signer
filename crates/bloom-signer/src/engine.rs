@@ -8,6 +8,7 @@ use bloom_signer_api::{
     SignRequest, SignedPolicySnapshot, SignerActivationReceipt, SigningResult, Token,
     WalletTombstone, WebAuthnCredential,
 };
+use bloom_trusted_time::{DurableClockCondition, PersistedClockState, evaluate_durable_clock};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -156,6 +157,21 @@ fn zero_decimal_u64() -> DecimalU64 {
 
 fn zero_boot_epoch() -> bloom_signer_api::BootEpoch {
     bloom_signer_api::BootEpoch::from_bytes([0; 16])
+}
+
+/// A boot epoch usable for comparing monotonic domains, or `None` when the
+/// domain is unknown. The all-zero sentinel means "not recorded" and must not
+/// compare equal to itself, or two unknown boots would look like one.
+fn comparable_boot_epoch(epoch: &bloom_signer_api::BootEpoch) -> Option<[u8; 16]> {
+    let bytes = epoch.to_bytes();
+    (bytes != [0; 16]).then_some(bytes)
+}
+
+fn malformed_boot_epoch() -> ProtocolError {
+    error(
+        ProtocolErrorCode::ClockUntrusted,
+        "persisted clock state has a malformed boot epoch",
+    )
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -923,24 +939,47 @@ impl SignerEngine {
             monotonic_anchor_ns: reading.monotonic_anchor_ns,
             boot_epoch: boot_epoch.clone(),
         };
-        let stored: Option<(String, String)> = transaction
+        let stored: Option<(String, String, String, String)> = transaction
             .query_row(
-                "SELECT last_effective_ms, condition FROM clock_state WHERE singleton = 1",
+                "SELECT last_effective_ms, condition, monotonic_anchor_ns, boot_epoch
+                 FROM clock_state WHERE singleton = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(storage)?;
-        let Some(utc_ms) = reading.utc_ms else {
-            let effective_now_ms = stored
-                .as_ref()
-                .map(|(value, _)| value.parse().map_err(malformed))
-                .transpose()?
-                .unwrap_or(0);
+        let initializing = stored.is_none();
+        let previous = stored
+            .as_ref()
+            .map(|(value, _, anchor, persisted_epoch)| {
+                Ok::<_, ProtocolError>(PersistedClockState {
+                    last_effective_ms: value.parse().map_err(malformed)?,
+                    monotonic_anchor_ns: anchor.parse().map_err(malformed)?,
+                    // The absolute anchor is only comparable within the boot it
+                    // was sampled in. Rows written before this was read back,
+                    // and the zero sentinel, are unknown rather than matching.
+                    boot_epoch: comparable_boot_epoch(
+                        &bloom_signer_api::BootEpoch::new(persisted_epoch.clone())
+                            .map_err(|_| malformed_boot_epoch())?,
+                    ),
+                })
+            })
+            .transpose()?;
+        let shared = evaluate_durable_clock(
+            previous,
+            &reading,
+            comparable_boot_epoch(&boot_epoch),
+            max_forward_step_ms,
+        )
+        .map_err(|cause| error(ProtocolErrorCode::ClockUntrusted, cause.to_string()))?;
+        let condition = signer_clock_condition(shared.condition);
+        let effective_now_ms = shared.effective_now_ms;
+
+        if shared.condition == DurableClockCondition::Untrusted {
             write_clock_state(
                 &transaction,
                 effective_now_ms,
-                ClockCondition::Untrusted,
+                condition,
                 &reading,
                 &boot_epoch,
             )?;
@@ -960,108 +999,98 @@ impl SignerEngine {
                     "trusted platform time source is unavailable",
                 ));
             }
-            return Ok(decision(effective_now_ms, ClockCondition::Untrusted));
-        };
-        let Some(last_effective_ms) = stored
-            .as_ref()
-            .map(|(value, _)| value.parse::<u64>().map_err(malformed))
-            .transpose()?
-        else {
-            write_clock_state(
-                &transaction,
-                utc_ms,
-                ClockCondition::Healthy,
-                &reading,
-                &boot_epoch,
-            )?;
-            self.append_audit(
-                &transaction,
-                "clock.initialized",
-                &serde_json::json!({
-                    "effective_now_ms": utc_ms.to_string(),
-                    "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
-                    "boot_epoch": boot_epoch
-                }),
-            )?;
-            transaction.commit().map_err(storage)?;
-            return Ok(decision(utc_ms, ClockCondition::Healthy));
-        };
-        let monotonic_now = last_effective_ms
-            .checked_add(reading.monotonic_elapsed_ms)
-            .ok_or_else(|| {
-                error(
-                    ProtocolErrorCode::ClockUntrusted,
-                    "monotonic clock arithmetic overflow",
-                )
-            })?;
-        if utc_ms < last_effective_ms {
-            write_clock_state(
-                &transaction,
-                last_effective_ms,
-                ClockCondition::RollbackFrozen,
-                &reading,
-                &boot_epoch,
-            )?;
-            self.append_audit(
-                &transaction,
-                "clock.rollback",
-                &serde_json::json!({
-                    "observed_utc_ms": utc_ms.to_string(),
-                    "effective_now_ms": last_effective_ms.to_string(),
-                    "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
-                    "boot_epoch": boot_epoch
-                }),
-            )?;
-            transaction.commit().map_err(storage)?;
-            if rate_limited_mutation {
-                return Err(error(
-                    ProtocolErrorCode::ClockRollback,
-                    "UTC rollback detected; effective time is frozen",
-                ));
+            return Ok(decision(effective_now_ms, condition));
+        }
+
+        let utc_ms = reading.utc_ms.ok_or_else(|| {
+            error(
+                ProtocolErrorCode::ClockUntrusted,
+                "durable clock returned a trusted decision without UTC",
+            )
+        })?;
+        match shared.condition {
+            DurableClockCondition::Healthy => {
+                write_clock_state(
+                    &transaction,
+                    effective_now_ms,
+                    condition,
+                    &reading,
+                    &boot_epoch,
+                )?;
+                let (event_type, payload) = if initializing {
+                    (
+                        "clock.initialized",
+                        serde_json::json!({
+                            "effective_now_ms": effective_now_ms.to_string(),
+                            "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                            "boot_epoch": boot_epoch
+                        }),
+                    )
+                } else {
+                    (
+                        "clock.observed",
+                        serde_json::json!({
+                            "observed_utc_ms": utc_ms.to_string(),
+                            "effective_now_ms": effective_now_ms.to_string(),
+                            "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                            "boot_epoch": boot_epoch
+                        }),
+                    )
+                };
+                self.append_audit(&transaction, event_type, &payload)?;
+                transaction.commit().map_err(storage)?;
+                Ok(decision(effective_now_ms, condition))
             }
-            return Ok(decision(last_effective_ms, ClockCondition::RollbackFrozen));
+            DurableClockCondition::RollbackFrozen => {
+                write_clock_state(
+                    &transaction,
+                    effective_now_ms,
+                    condition,
+                    &reading,
+                    &boot_epoch,
+                )?;
+                self.append_audit(
+                    &transaction,
+                    "clock.rollback",
+                    &serde_json::json!({
+                        "observed_utc_ms": utc_ms.to_string(),
+                        "effective_now_ms": effective_now_ms.to_string(),
+                        "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                        "boot_epoch": boot_epoch
+                    }),
+                )?;
+                transaction.commit().map_err(storage)?;
+                if rate_limited_mutation {
+                    return Err(error(
+                        ProtocolErrorCode::ClockRollback,
+                        "UTC rollback detected; effective time is frozen",
+                    ));
+                }
+                Ok(decision(effective_now_ms, condition))
+            }
+            DurableClockCondition::ForwardJumpRejected => {
+                write_clock_state(
+                    &transaction,
+                    effective_now_ms,
+                    condition,
+                    &reading,
+                    &boot_epoch,
+                )?;
+                self.append_audit(
+                    &transaction,
+                    "clock.forward_jump",
+                    &serde_json::json!({
+                        "observed_utc_ms": utc_ms.to_string(),
+                        "effective_now_ms": effective_now_ms.to_string(),
+                        "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
+                        "boot_epoch": boot_epoch
+                    }),
+                )?;
+                transaction.commit().map_err(storage)?;
+                Ok(decision(effective_now_ms, condition))
+            }
+            DurableClockCondition::Untrusted => unreachable!("handled above"),
         }
-        if utc_ms > monotonic_now.saturating_add(max_forward_step_ms) {
-            write_clock_state(
-                &transaction,
-                monotonic_now,
-                ClockCondition::ForwardJumpRejected,
-                &reading,
-                &boot_epoch,
-            )?;
-            self.append_audit(
-                &transaction,
-                "clock.forward_jump",
-                &serde_json::json!({
-                    "observed_utc_ms": utc_ms.to_string(),
-                    "effective_now_ms": monotonic_now.to_string(),
-                    "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
-                    "boot_epoch": boot_epoch
-                }),
-            )?;
-            transaction.commit().map_err(storage)?;
-            return Ok(decision(monotonic_now, ClockCondition::ForwardJumpRejected));
-        }
-        let effective_now_ms = utc_ms.max(monotonic_now);
-        write_clock_state(
-            &transaction,
-            effective_now_ms,
-            ClockCondition::Healthy,
-            &reading,
-            &boot_epoch,
-        )?;
-        self.append_audit(
-            &transaction,
-            "clock.observed",
-            &serde_json::json!({
-                "observed_utc_ms": utc_ms.to_string(),
-                "effective_now_ms": effective_now_ms.to_string(),
-                "monotonic_anchor_ns": reading.monotonic_anchor_ns.to_string(),
-                "boot_epoch": boot_epoch
-            }),
-        )?;
-        transaction.commit().map_err(storage)?;
-        Ok(decision(effective_now_ms, ClockCondition::Healthy))
     }
 
     /// Evaluate trusted time for a read/status request without changing clock
@@ -1074,44 +1103,41 @@ impl SignerEngine {
         max_forward_step_ms: u64,
     ) -> Result<ClockDecision, ProtocolError> {
         let connection = self.connection.lock();
-        let stored = connection
+        let stored: Option<(String, String, String)> = connection
             .query_row(
-                "SELECT last_effective_ms FROM clock_state WHERE singleton = 1",
+                "SELECT last_effective_ms, monotonic_anchor_ns, boot_epoch
+                 FROM clock_state WHERE singleton = 1",
                 [],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
-            .map_err(storage)?
-            .map(|value| value.parse::<u64>().map_err(malformed))
+            .map_err(storage)?;
+        let previous = stored
+            .map(|(value, anchor, persisted_epoch)| {
+                Ok::<_, ProtocolError>(PersistedClockState {
+                    last_effective_ms: value.parse().map_err(malformed)?,
+                    monotonic_anchor_ns: anchor.parse().map_err(malformed)?,
+                    boot_epoch: comparable_boot_epoch(
+                        &bloom_signer_api::BootEpoch::new(persisted_epoch)
+                            .map_err(|_| malformed_boot_epoch())?,
+                    ),
+                })
+            })
             .transpose()?;
-        let decision = |effective_now_ms, condition| ClockDecision {
-            effective_now_ms,
-            condition,
+        let shared = evaluate_durable_clock(
+            previous,
+            &reading,
+            comparable_boot_epoch(&boot_epoch),
+            max_forward_step_ms,
+        )
+        .map_err(|cause| error(ProtocolErrorCode::ClockUntrusted, cause.to_string()))?;
+        Ok(ClockDecision {
+            effective_now_ms: shared.effective_now_ms,
+            condition: signer_clock_condition(shared.condition),
             observed_utc_ms: reading.utc_ms,
             monotonic_anchor_ns: reading.monotonic_anchor_ns,
-            boot_epoch: boot_epoch.clone(),
-        };
-        let Some(utc_ms) = reading.utc_ms else {
-            return Ok(decision(stored.unwrap_or(0), ClockCondition::Untrusted));
-        };
-        let Some(last_effective_ms) = stored else {
-            return Ok(decision(utc_ms, ClockCondition::Healthy));
-        };
-        let monotonic_now = last_effective_ms
-            .checked_add(reading.monotonic_elapsed_ms)
-            .ok_or_else(|| {
-                error(
-                    ProtocolErrorCode::ClockUntrusted,
-                    "monotonic clock arithmetic overflow",
-                )
-            })?;
-        if utc_ms < last_effective_ms {
-            return Ok(decision(last_effective_ms, ClockCondition::RollbackFrozen));
-        }
-        if utc_ms > monotonic_now.saturating_add(max_forward_step_ms) {
-            return Ok(decision(monotonic_now, ClockCondition::ForwardJumpRejected));
-        }
-        Ok(decision(utc_ms.max(monotonic_now), ClockCondition::Healthy))
+            boot_epoch,
+        })
     }
 
     pub fn repair_clock(&self, accepted_utc_ms: u64) -> Result<ClockDecision, ProtocolError> {
@@ -1811,6 +1837,29 @@ impl SignerEngine {
         Ok(())
     }
 
+    /// Journal that a ceremony armed a wallet's local backend.
+    ///
+    /// Activation is otherwise invisible in the audit trail: the sealed-approval
+    /// path records `approval.activation`, and a derivation records
+    /// `key.enrolled`, so an operator asking when a wallet's signing capability
+    /// was armed cannot distinguish a ceremony that activated the backend from
+    /// one that ran on an already-armed boot.
+    pub fn record_backend_activation(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+    ) -> Result<(), ProtocolError> {
+        let mut connection = self.connection.lock();
+        let transaction = self.mutation_transaction(&mut connection)?;
+        self.append_audit(
+            &transaction,
+            "backend.activated",
+            &serde_json::json!({ "wallet_id": wallet_id, "key_ref": key_ref }),
+        )?;
+        transaction.commit().map_err(storage)?;
+        Ok(())
+    }
+
     pub fn enroll_key(&self, key_ref: &KeyRef) -> Result<(), ProtocolError> {
         key_ref.validate()?;
         if !self.backend_registry.key_is_registered(key_ref)? {
@@ -2437,6 +2486,14 @@ impl SignerEngine {
         }
     }
 
+    /// Durable enrollment of a Petal sub-key parent.
+    ///
+    /// This asserts only facts that survive a restart: the parent is enrolled,
+    /// its KeyRef is byte-identical to the enrolled one, it is not withdrawn,
+    /// it is a wallet root, and it belongs to this wallet. It deliberately does
+    /// not assert that the backend is currently activated, because staging a
+    /// ceremony is what later produces that activation. Callers that are about
+    /// to use the parent must use `require_activated_parent_key` instead.
     pub(crate) fn require_enrolled_parent_key(
         &self,
         wallet_id: &Token,
@@ -2464,11 +2521,29 @@ impl SignerEngine {
                 )
             })
             != Some((&expected, true, "wallet_root", Some(wallet_id.as_str())))
-            || !self.backend_registry.key_is_available(key_ref)?
         {
             return Err(error(
                 ProtocolErrorCode::KeyrefMismatch,
                 "Petal sub-key parent is absent or unavailable for the named wallet",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Durable enrollment plus a currently activated backend.
+    ///
+    /// Use this immediately before deriving from the parent, where an inactive
+    /// backend genuinely cannot serve the request.
+    pub(crate) fn require_activated_parent_key(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+    ) -> Result<(), ProtocolError> {
+        self.require_enrolled_parent_key(wallet_id, key_ref)?;
+        if !self.backend_registry.key_is_available(key_ref)? {
+            return Err(error(
+                ProtocolErrorCode::KeyrefMismatch,
+                "Petal sub-key parent backend is not activated for the named wallet",
             ));
         }
         Ok(())
@@ -4916,6 +4991,15 @@ fn wallet_epoch(transaction: &Transaction<'_>, wallet_id: &Token) -> Result<u64,
         .map(|value| value.unwrap_or(0))
 }
 
+fn signer_clock_condition(condition: DurableClockCondition) -> ClockCondition {
+    match condition {
+        DurableClockCondition::Healthy => ClockCondition::Healthy,
+        DurableClockCondition::Untrusted => ClockCondition::Untrusted,
+        DurableClockCondition::RollbackFrozen => ClockCondition::RollbackFrozen,
+        DurableClockCondition::ForwardJumpRejected => ClockCondition::ForwardJumpRejected,
+    }
+}
+
 fn write_clock_state(
     transaction: &Transaction<'_>,
     effective_now_ms: u64,
@@ -5852,6 +5936,257 @@ mod clock_tests {
                 "clock.repaired"
             ]
         );
+    }
+
+    #[test]
+    fn signer_clock_rejects_downtime_credited_across_a_boot_change() {
+        // A reboot restarts the kernel's suspend-aware clock, so a current
+        // anchor can exceed a persisted one while belonging to a different
+        // boot. Crediting that delta would advance effective time by downtime
+        // that never elapsed and let a large UTC step pass the forward guard.
+        let engine = engine();
+        engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000),
+                    monotonic_elapsed_ms: 0,
+                    // One minute into the prior boot.
+                    monotonic_anchor_ns: 60 * 1_000_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+
+        let two_hours_ms = 2 * 60 * 60 * 1_000;
+        let rebooted = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000 + two_hours_ms),
+                    monotonic_elapsed_ms: 0,
+                    // Two hours into the new boot: numerically larger, so the
+                    // rollback check cannot catch it.
+                    monotonic_anchor_ns: 2 * 60 * 60 * 1_000_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([2; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(rebooted.condition, ClockCondition::ForwardJumpRejected);
+        assert_eq!(rebooted.effective_now_ms, 10_000);
+    }
+
+    #[test]
+    fn signer_clock_restart_credits_downtime_via_matching_absolute_monotonic_anchor() {
+        let engine = engine();
+        engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+
+        // Simulate a Signer process restart: the sampler's process-relative
+        // accumulator resets to 0 even though > MAX_FORWARD_STEP_MS of real
+        // downtime elapsed. The UTC delta (2h) and the absolute monotonic
+        // anchor delta (2h, in the same suspend-aware kernel domain) agree,
+        // so the restart must be credited rather than rejected as a forward
+        // jump.
+        let two_hours_ms = 2 * 60 * 60 * 1_000;
+        let two_hours_ns = two_hours_ms * 1_000_000;
+        let restarted = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000 + two_hours_ms),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000_000 + two_hours_ns,
+                },
+                // Same boot: this models a Signer *process* restart, which is
+                // what the anchor delta is allowed to credit. A different boot
+                // is covered by the rejection test below.
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(restarted.condition, ClockCondition::Healthy);
+        assert_eq!(restarted.effective_now_ms, 10_000 + two_hours_ms);
+    }
+
+    #[test]
+    fn signer_clock_read_only_restart_credits_downtime_via_matching_absolute_monotonic_anchor() {
+        let engine = engine();
+        engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+
+        let two_hours_ms = 2 * 60 * 60 * 1_000;
+        let two_hours_ns = two_hours_ms * 1_000_000;
+        let restarted = engine
+            .observe_time_read_only(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000 + two_hours_ms),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000_000 + two_hours_ns,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+            )
+            .unwrap();
+        assert_eq!(restarted.condition, ClockCondition::Healthy);
+        assert_eq!(restarted.effective_now_ms, 10_000 + two_hours_ms);
+    }
+
+    #[test]
+    fn signer_clock_monotonic_anchor_rollback_stays_fail_closed() {
+        let engine = engine();
+        engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+
+        // A kernel reboot (or other monotonic-domain reset) makes the
+        // absolute anchor go backwards relative to what was persisted. Even
+        // though UTC advanced by more than MAX_FORWARD_STEP_MS, the anchor
+        // can no longer be trusted to attribute that gap to real downtime in
+        // the same monotonic domain, so this must stay fail-closed via the
+        // existing process-relative guard and require an explicit operator
+        // repair.
+        let two_hours_ms = 2 * 60 * 60 * 1_000;
+        let rebooted = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000 + two_hours_ms),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 500_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([2; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(rebooted.condition, ClockCondition::ForwardJumpRejected);
+        assert_eq!(rebooted.effective_now_ms, 10_000);
+
+        let repaired = engine.repair_clock(10_000 + two_hours_ms).unwrap();
+        assert_eq!(repaired.condition, ClockCondition::Repaired);
+        assert_eq!(repaired.effective_now_ms, 10_000 + two_hours_ms);
+    }
+
+    #[test]
+    fn signer_clock_legacy_zero_anchor_does_not_grant_unbounded_forward_credit() {
+        let engine = engine();
+        {
+            let connection = engine.connection.lock();
+            connection
+                .execute(
+                    "INSERT INTO clock_state(
+                         singleton, last_effective_ms, condition, observed_utc_ms,
+                         monotonic_anchor_ns, boot_epoch
+                     ) VALUES (1, '10000', 'HEALTHY', '10000', '0', ?1)",
+                    [bloom_signer_api::BootEpoch::from_bytes([1; 16]).as_str()],
+                )
+                .unwrap();
+        }
+
+        // A pre-migration row persists the '0' sentinel anchor. Treating
+        // that as a real absolute anchor would let an attacker-controlled or
+        // simply very large current anchor manufacture an unbounded forward
+        // credit; the sampler's process-relative elapsed reading must be
+        // used instead, preserving the existing fail-closed behavior.
+        let two_hours_ms = 2 * 60 * 60 * 1_000;
+        let decision = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000 + two_hours_ms),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 9_999_999_999,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(decision.condition, ClockCondition::ForwardJumpRejected);
+        assert_eq!(decision.effective_now_ms, 10_000);
+    }
+
+    #[test]
+    fn signer_clock_same_process_incremental_elapsed_still_advances_healthily() {
+        let engine = engine();
+        engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+
+        // Two further observations within the same process, each advancing
+        // the absolute anchor by exactly as much as the process-relative
+        // elapsed reading reports. Same-process behavior must remain
+        // unchanged: both signals agree, so the effective clock advances by
+        // the same amount either way.
+        let first = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_050),
+                    monotonic_elapsed_ms: 50,
+                    monotonic_anchor_ns: 1_050_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(first.condition, ClockCondition::Healthy);
+        assert_eq!(first.effective_now_ms, 10_050);
+
+        let second = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_100),
+                    monotonic_elapsed_ms: 50,
+                    monotonic_anchor_ns: 1_100_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(second.condition, ClockCondition::Healthy);
+        assert_eq!(second.effective_now_ms, 10_100);
     }
 
     #[test]
