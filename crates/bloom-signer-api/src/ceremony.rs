@@ -19,6 +19,8 @@ pub enum CeremonyKind {
     CredentialRemove,
     BackendEnrollment,
     KeyDerive,
+    AccountAllocate,
+    AccountRetire,
     PolicyUpdate,
 }
 
@@ -39,6 +41,8 @@ impl CeremonyKind {
             | Self::CredentialRemove
             | Self::BackendEnrollment
             | Self::KeyDerive
+            | Self::AccountAllocate
+            | Self::AccountRetire
             | Self::PolicyUpdate => Some(crate::CeremonyState::Succeeded),
         }
     }
@@ -326,6 +330,14 @@ pub struct CustodyPrepareRequest {
     pub petal_key_scope: Option<PetalKeyScope>,
     #[serde(default)]
     pub legacy_passkey_migration: Option<LegacyPasskeyMigrationPublic>,
+    /// Selected root seed profile for wallet registration/import. `None`
+    /// keeps the legacy secp behavior; `Some(Bip39MulticurveV1)` provisions a
+    /// BIP-39 root. Broker selects; Signer validates against capabilities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet_seed_profile: Option<crate::WalletSeedProfile>,
+    /// Derived-account allocation request (AccountAllocate custody only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation_request: Option<crate::DerivedAccountRequest>,
 }
 
 impl CustodyPrepareRequest {
@@ -818,6 +830,8 @@ mod tests {
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope),
             legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
         }
     }
 
@@ -832,6 +846,8 @@ mod tests {
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
         }
     }
 

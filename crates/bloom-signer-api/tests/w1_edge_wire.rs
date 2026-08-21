@@ -97,6 +97,10 @@ fn capabilities() -> ServiceCapabilities {
             crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
             derivation_schemes: vec![token("bip32")],
             networked: false,
+            wallet_seed_profiles: vec![],
+            derivation_profiles: vec![],
+            mnemonic_export: false,
+            derivation_namespace_limits: vec![],
         }],
         assurance_verifiers: vec![VerifierPublicCapability {
             verifier_id: token("webauthn"),
@@ -117,6 +121,37 @@ fn custody_prepare() -> CustodyPrepareRequest {
         browser_output_recipient_key: None,
         petal_key_scope: None,
         legacy_passkey_migration: None,
+        derivation_request: None,
+        wallet_seed_profile: None,
+    }
+}
+
+fn derived_account_descriptor() -> DerivedAccountDescriptor {
+    DerivedAccountDescriptor {
+        key_ref: KeyRef {
+            backend: token("local"),
+            backend_instance: token("default"),
+            locator: "key-child-1".into(),
+            key_spec: KeySpec::Secp256k1,
+            public_key_fingerprint: digest(2),
+            derivation: Some(DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: token("wallet"),
+                profile: DerivationProfile::Bip44EvmSecp256k1V1,
+                path: "m/44'/60'/0'/0/0".into(),
+            }),
+        },
+        wallet_seed_ref: WalletSeedRef {
+            wallet_id: token("wallet"),
+            profile: WalletSeedProfile::Bip39MulticurveV1,
+            entropy_bits: 256,
+        },
+        derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
+        path: "m/44'/60'/0'/0/0".into(),
+        canonical_public_key: Base64UrlBytes::from_bytes(&[3; 33]),
+        public_key_encoding: PublicKeyEncoding::Secp256k1SpkiDer,
+        public_key_fingerprint: digest(2),
+        supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+        lifecycle: AccountLifecycleState::Active,
     }
 }
 
@@ -377,6 +412,7 @@ fn key_public() -> KeyPublic {
         canonical_public_key: Base64UrlBytes::from_bytes(&[63; 33]),
         addresses: vec!["0x1".into()],
         supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+        derived_account: None,
     }
 }
 
@@ -407,6 +443,7 @@ fn signer_requests() -> Vec<BrokerSignerRequest> {
         BrokerSignerRequest::KeyDerivationCapabilities(key.clone()),
         BrokerSignerRequest::KeyDerivePrepare(custody_prepare()),
         BrokerSignerRequest::KeyListDerived(key),
+        BrokerSignerRequest::DerivedAccountList(wallet.clone()),
         BrokerSignerRequest::KeyEnrollPrepare(custody_prepare()),
         BrokerSignerRequest::KeyEnrollStatus(operation_request.clone()),
         BrokerSignerRequest::CeremonyPrepare(SignerCeremonyPrepareRequest::SealedApproval(
@@ -491,6 +528,7 @@ fn signer_responses() -> Vec<BrokerSignerResponse> {
         BrokerSignerResponse::KeyDerivationCapabilities(vec![token("bip32")]),
         BrokerSignerResponse::KeyDerivePrepare(custody_prepared.clone()),
         BrokerSignerResponse::KeyListDerived(vec![key_public()]),
+        BrokerSignerResponse::DerivedAccountList(vec![derived_account_descriptor()]),
         BrokerSignerResponse::KeyEnrollPrepare(custody_prepared.clone()),
         BrokerSignerResponse::KeyEnrollStatus(ceremony_status()),
         BrokerSignerResponse::CeremonyPrepare(SignerCeremonyPrepareResponse::SealedApproval(
@@ -590,12 +628,12 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer requests",
         signer_requests(),
-        "7c4a4d707cb8fcf9abbea5f8737a60301b642c232354d748182a5afc4dcf6344",
+        "1571f26a22d505ebf9024258712e835efebfd9d0114592749291d72254b83f06",
     );
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "5cce5c7bcbd6930d62d968a7ac407f8e33d5c8900fd288573c02bc75496c50e9",
+        "8b1afb04b55f11fecec5f151a1ed0d80c9bf8bbb566cd8dbd34fb98791f79f26",
     );
     assert_wire_digest(
         "control requests",

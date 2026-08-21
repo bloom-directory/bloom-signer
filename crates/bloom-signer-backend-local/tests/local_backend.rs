@@ -1,47 +1,29 @@
-use bloom_signer_api::{Base64UrlBytes, CryptoSuite, DecimalU64, Digest32, Token};
+use bloom_signer_api::{
+    Base64UrlBytes, CryptoSuite, DecimalU64, DerivationRef, Digest32, KeyRef, KeySpec, Token,
+};
 use bloom_signer_backend_api::{
-    ActivationStatus, BackendInput, BackendSignRequest, SecretBytes, SignerBackend,
-    SignerBackendActivation,
+    ActivationStatus, BackendError, BackendInput, BackendSignRequest, SecretBytes, SignerBackend,
+    SignerBackendActivation, SignerBackendDerivation,
 };
-use bloom_signer_backend_local::{
-    DerivationAuthority, DerivationGrant, EncryptedLocalBackup, LocalSignerBackend,
-};
-use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
-use k256::pkcs8::DecodePublicKey;
-use serde::Deserialize;
-use std::time::{SystemTime, UNIX_EPOCH};
+use bloom_signer_backend_local::{EncryptedLocalBackup, LocalSignerBackend};
+use ed25519_dalek::SigningKey as Ed25519SigningKey;
+use k256::pkcs8::EncodePublicKey as _;
+use sha2::Digest as _;
+use std::str::FromStr as _;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Bip32Vector {
-    name: String,
-    seed_hex: String,
-    path: String,
-    compressed_public_key_hex: String,
-    canonical_spki_der: Base64UrlBytes,
-    public_key_fingerprint: Digest32,
-    locator: String,
+fn spki_fingerprint(verifying: &k256::ecdsa::VerifyingKey) -> (Vec<u8>, Digest32) {
+    let public =
+        k256::PublicKey::from_sec1_bytes(verifying.to_encoded_point(false).as_bytes()).unwrap();
+    let spki = public.to_public_key_der().unwrap().as_bytes().to_vec();
+    let fingerprint = Digest32::from_bytes(sha2::Sha256::digest(&spki).into());
+    (spki, fingerprint)
 }
 
-fn authority(prefix: &str, starting_index: u64, maximum_children: u64) -> DerivationAuthority {
-    let grant = DerivationGrant {
-        authority_kind: Token::new("ceremony").unwrap(),
-        namespace_id: Token::new("ethereum-account-0").unwrap(),
-        canonical_prefix: prefix.into(),
-        starting_index: DecimalU64::new(starting_index),
-        maximum_children: DecimalU64::new(maximum_children),
-    };
-    let mut message = b"bloom-key-derive-authority/v1".to_vec();
-    message.extend_from_slice(&serde_jcs::to_vec(&grant).unwrap());
-    let signature = Ed25519SigningKey::from_bytes(&[5; 32]).sign(&message);
-    DerivationAuthority::from_signed(grant, Base64UrlBytes::from_bytes(&signature.to_bytes()))
-}
-
-fn backend(seed: Vec<u8>) -> LocalSignerBackend {
-    LocalSignerBackend::provision(
+fn backend(private_key: [u8; 32]) -> LocalSignerBackend {
+    LocalSignerBackend::provision_imported_secp256k1(
         Token::new("local-default").unwrap(),
         Token::new("root-1").unwrap(),
-        SecretBytes::new(seed),
+        SecretBytes::new(private_key.to_vec()),
         SecretBytes::new(vec![7; 32]),
         Ed25519SigningKey::from_bytes(&[5; 32]).verifying_key(),
     )
@@ -49,75 +31,14 @@ fn backend(seed: Vec<u8>) -> LocalSignerBackend {
 }
 
 #[test]
-fn ac25_bip32_derivation_and_registry_match_reviewed_vector() {
-    let vector: Bip32Vector =
-        serde_json::from_str(include_str!("../vectors/bip32-vector-1-final.json")).unwrap();
-    assert_eq!(vector.name, "bip32-vector-1-final");
-    let backend = backend(hex::decode(&vector.seed_hex).unwrap());
+fn imported_scalar_roots_sign_deactivate_and_restart() {
+    let backend = backend([1_u8; 32]);
     let root = backend.root_key_ref().unwrap();
-    let authority = authority("m/0'/1/2'/2", 1_000_000_000, 2);
-    backend.configure_namespace(&authority).unwrap();
-    let first = backend
-        .allocate_derived_key(
-            &root,
-            &Token::new("ethereum-account-0").unwrap(),
-            &authority,
-        )
-        .unwrap();
-    assert_eq!(vector.path, "m/0'/1/2'/2/1000000000");
-    assert_eq!(first.key_ref.locator, vector.locator);
-    assert_eq!(first.public_key_fingerprint, vector.public_key_fingerprint);
-    assert_eq!(first.canonical_spki_der, vector.canonical_spki_der);
-    let public = k256::PublicKey::from_public_key_der(&first.canonical_spki_der.decode()).unwrap();
-    assert_eq!(
-        hex::encode(public.to_sec1_bytes()),
-        vector.compressed_public_key_hex
-    );
+    assert!(root.derivation.is_none());
 
-    let backup = backend.encrypted_backup().unwrap();
-    assert_eq!(backup.derivation_registry, vec![first.key_ref.clone()]);
-    assert!(
-        !serde_json::to_string(&backup)
-            .unwrap()
-            .contains(&vector.seed_hex)
-    );
-
-    let restored =
-        LocalSignerBackend::restore(Token::new("local-default").unwrap(), backup).unwrap();
-    assert_eq!(
-        futures::executor::block_on(restored.activation_status(&first.key_ref)).unwrap(),
-        ActivationStatus::Inactive
-    );
-    assert_eq!(
-        futures::executor::block_on(restored.describe_key(&first.key_ref)).unwrap(),
-        first,
-        "public projection must not require custody activation after restart"
-    );
-    futures::executor::block_on(restored.activate(&first.key_ref, SecretBytes::new(vec![7; 32])))
-        .unwrap();
-    assert_eq!(
-        futures::executor::block_on(restored.describe_key(&first.key_ref)).unwrap(),
-        first
-    );
-}
-
-#[test]
-fn ac15_deactivation_and_restart_remove_plaintext_key_availability() {
-    let backend = backend((0_u8..16).collect());
-    let root = backend.root_key_ref().unwrap();
-    let authority = authority("m/44'/60'/0'/0", 0, 2);
-    backend.configure_namespace(&authority).unwrap();
-    let key = backend
-        .allocate_derived_key(
-            &root,
-            &Token::new("ethereum-account-0").unwrap(),
-            &authority,
-        )
-        .unwrap()
-        .key_ref;
     let request = BackendSignRequest {
         provider_attempt_id: Digest32::new("11".repeat(32)).unwrap(),
-        key_ref: key.clone(),
+        key_ref: root.clone(),
         crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
         input: BackendInput::Digest32 {
             digest: Digest32::new("22".repeat(32)).unwrap(),
@@ -126,9 +47,10 @@ fn ac15_deactivation_and_restart_remove_plaintext_key_availability() {
     };
     let signature = futures::executor::block_on(backend.sign(request.clone())).unwrap();
     assert_eq!(signature.bytes.decode().len(), 65);
-    futures::executor::block_on(backend.deactivate(&key)).unwrap();
+
+    futures::executor::block_on(backend.deactivate(&root)).unwrap();
     assert_eq!(
-        futures::executor::block_on(backend.activation_status(&key)).unwrap(),
+        futures::executor::block_on(backend.activation_status(&root)).unwrap(),
         ActivationStatus::Inactive
     );
     assert!(futures::executor::block_on(backend.sign(request.clone())).is_err());
@@ -141,7 +63,7 @@ fn ac15_deactivation_and_restart_remove_plaintext_key_availability() {
 
 #[test]
 fn restarted_public_projection_rejects_an_spki_fingerprint_mismatch() {
-    let backend = backend((0_u8..32).collect());
+    let backend = backend([2_u8; 32]);
     let root = backend.root_key_ref().unwrap();
     let mut backup = backend.encrypted_backup().unwrap();
     backup.public_descriptions[0].canonical_spki_der = Base64UrlBytes::from_bytes(&[9; 33]);
@@ -151,70 +73,209 @@ fn restarted_public_projection_rejects_an_spki_fingerprint_mismatch() {
 }
 
 #[test]
-fn derivation_registry_is_restart_safe_and_tombstoned_paths_are_not_reused() {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "bloom-local-backend-{}-{unique}.json",
-        std::process::id()
-    ));
-    let backend = LocalSignerBackend::provision_at(
-        &path,
-        Token::new("local-default").unwrap(),
-        Token::new("root-1").unwrap(),
-        SecretBytes::new((0_u8..16).collect()),
-        SecretBytes::new(vec![7; 32]),
-        Ed25519SigningKey::from_bytes(&[5; 32]).verifying_key(),
-    )
-    .unwrap();
+fn imported_scalar_roots_reject_derivation_namespaces() {
+    // The imported-scalar profile is a single key, not a seed: it can never
+    // host a derivation namespace.
+    let backend = backend([3_u8; 32]);
     let root = backend.root_key_ref().unwrap();
-    let namespace = Token::new("ethereum-account-0").unwrap();
-    let authority = authority("m/44'/60'/0'/0", 0, 3);
-    backend.configure_namespace(&authority).unwrap();
-    let first = backend
-        .allocate_derived_key(&root, &namespace, &authority)
-        .unwrap();
-    backend.tombstone_derived_key(&first.key_ref).unwrap();
-    drop(backend);
-
-    let restarted =
-        LocalSignerBackend::open_at(&path, Token::new("local-default").unwrap()).unwrap();
-    futures::executor::block_on(restarted.activate(&first.key_ref, SecretBytes::new(vec![7; 32])))
-        .unwrap();
-    let root = restarted.root_key_ref().unwrap();
-    let second = restarted
-        .allocate_derived_key(&root, &namespace, &authority)
-        .unwrap();
     assert!(matches!(
-        second.key_ref.derivation,
-        Some(bloom_signer_api::DerivationRef::Bip32Secp256k1 { ref path, .. })
-            if path == "m/44'/60'/0'/0/1"
+        futures::executor::block_on(backend.derive_public(&root, "m/44'/60'/0'/0/0")),
+        Err(BackendError::InvalidRequest)
     ));
-    let backup = restarted.encrypted_backup().unwrap();
-    assert_eq!(backup.derivation_namespaces[0].next_index.get(), 2);
-    assert_eq!(backup.derivation_tombstones, vec!["m/44'/60'/0'/0/0"]);
-    std::fs::remove_file(&path).unwrap();
 }
 
 #[test]
-fn namespace_configuration_rejects_unauthenticated_authority() {
-    let backend = backend((0_u8..16).collect());
-    let grant = DerivationGrant {
-        authority_kind: Token::new("policy").unwrap(),
-        namespace_id: Token::new("ethereum-account-0").unwrap(),
-        canonical_prefix: "m/44'/60'/0'/0".into(),
-        starting_index: DecimalU64::new(0),
-        maximum_children: DecimalU64::new(10),
+fn pre_rename_secp256k1_scalar_backups_still_parse() {
+    // The permanent imported-scalar profile must keep reading on-disk backups
+    // written before the `Secp256k1Scalar` -> `ImportedSecp256k1Scalar` rename.
+    let backend = backend([4_u8; 32]);
+    let backup: EncryptedLocalBackup = backend.encrypted_backup().unwrap();
+    let mut encoded = serde_json::to_string(&backup).unwrap();
+    assert!(
+        encoded.contains("imported_secp256k1_scalar"),
+        "fixture should serialize the current tag: {encoded}"
+    );
+    encoded = encoded.replace("imported_secp256k1_scalar", "secp256k1_scalar");
+    let parsed: EncryptedLocalBackup = serde_json::from_str(&encoded).unwrap();
+    assert!(matches!(
+        parsed.root_material_kind,
+        bloom_signer_backend_local::LocalRootMaterialKind::ImportedSecp256k1Scalar
+    ));
+    // The restored backend still resolves its root from the pinned record.
+    let restored =
+        LocalSignerBackend::restore(Token::new("local-default").unwrap(), parsed).unwrap();
+    let root = restored.root_key_ref().unwrap();
+    assert_eq!(root, backend.root_key_ref().unwrap());
+}
+
+/// Construct a legacy BIP-32-seed backend the way an existing wallet's on-disk
+/// enrollment would: an encrypted seed plus a pinned root, restored from the
+/// `EncryptedLocalBackup` (there is no creation entry point anymore).
+fn bip32_seed_backend(seed: &[u8], kek: &[u8]) -> LocalSignerBackend {
+    use bip32::{DerivationPath, XPrv};
+    use chacha20poly1305::{
+        Key as CKey, XChaCha20Poly1305, XNonce,
+        aead::{Aead, KeyInit, Payload},
     };
-    let forged = DerivationAuthority::from_signed(
-        grant,
-        Base64UrlBytes::from_bytes(
-            &Ed25519SigningKey::from_bytes(&[6; 32])
-                .sign(b"forged")
+    use k256::ecdsa::SigningKey as K256SigningKey;
+
+    let instance = Token::new("bip32-seed-test").unwrap();
+    let root_id = Token::new("root-1").unwrap();
+    let aad = [
+        b"bloom-local-root-wrap/v1".as_slice(),
+        instance.as_str().as_bytes(),
+        root_id.as_str().as_bytes(),
+        &1_u32.to_be_bytes(),
+    ]
+    .concat();
+    let nonce = [0_u8; 24];
+    let ciphertext = XChaCha20Poly1305::new(CKey::from_slice(kek))
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: seed,
+                aad: &aad,
+            },
+        )
+        .unwrap();
+
+    // Master key at "m" and its SPKI fingerprint, mirroring describe_path.
+    let master: K256SigningKey =
+        XPrv::derive_from_path(seed, &DerivationPath::from_str("m").unwrap())
+            .unwrap()
+            .into();
+    let (spki, fingerprint) = spki_fingerprint(master.verifying_key());
+
+    let root = KeyRef {
+        backend: Token::new("local").unwrap(),
+        backend_instance: instance.clone(),
+        locator: format!("root:{}", root_id.as_str()),
+        key_spec: KeySpec::Secp256k1,
+        public_key_fingerprint: fingerprint.clone(),
+        derivation: None,
+    };
+    let backup = EncryptedLocalBackup {
+        root_key_id: root_id.clone(),
+        root_material_kind: bloom_signer_backend_local::LocalRootMaterialKind::Bip32Seed,
+        pinned_root: Some(root.clone()),
+        wrap_format_version: 1,
+        nonce: Base64UrlBytes::from_bytes(&nonce),
+        encrypted_seed: Base64UrlBytes::from_bytes(&ciphertext),
+        authority_verifying_key: Base64UrlBytes::from_bytes(
+            &Ed25519SigningKey::from_bytes(&[5; 32])
+                .verifying_key()
                 .to_bytes(),
         ),
+        public_descriptions: vec![bloom_signer_backend_api::KeyDescription {
+            key_ref: root.clone(),
+            canonical_spki_der: Base64UrlBytes::from_bytes(&spki),
+            public_key_fingerprint: fingerprint,
+            supported_crypto_suites: vec![
+                CryptoSuite::Secp256k1Keccak256Recoverable,
+                CryptoSuite::Secp256k1Sha256Recoverable,
+            ],
+        }],
+        derivation_registry: vec![],
+        derivation_namespaces: vec![],
+        derivation_tombstones: vec![],
+        pending_derivations: Default::default(),
+    };
+    LocalSignerBackend::restore(instance, backup).unwrap()
+}
+
+#[test]
+fn bip32_seed_backup_deserializes_to_the_bip32_seed_kind() {
+    let backend = bip32_seed_backend(&[9_u8; 32], &[7_u8; 32]);
+    let backup = backend.encrypted_backup().unwrap();
+    assert!(matches!(
+        backup.root_material_kind,
+        bloom_signer_backend_local::LocalRootMaterialKind::Bip32Seed
+    ));
+    // The on-disk tag is literally the original "bip32_seed".
+    let encoded = serde_json::to_string(&backup).unwrap();
+    assert!(encoded.contains("\"root_material_kind\":\"bip32_seed\""));
+    let reparsed: EncryptedLocalBackup = serde_json::from_str(&encoded).unwrap();
+    assert!(matches!(
+        reparsed.root_material_kind,
+        bloom_signer_backend_local::LocalRootMaterialKind::Bip32Seed
+    ));
+}
+
+#[test]
+fn bip32_seed_wallet_unlocks_derives_signs_and_round_trips() {
+    use bip32::{DerivationPath, XPrv};
+    use sha2::Digest as _;
+
+    let seed = [0xAB_u8; 32];
+    let kek = [7_u8; 32];
+    let backend = bip32_seed_backend(&seed, &kek);
+    let root = backend.root_key_ref().unwrap();
+
+    // Unlock (activate) with the KEK.
+    futures::executor::block_on(backend.activate(&root, SecretBytes::new(kek.to_vec()))).unwrap();
+
+    // The root and a derived child both sign.
+    let root_sig = futures::executor::block_on(backend.sign(BackendSignRequest {
+        provider_attempt_id: Digest32::new("aa".repeat(32)).unwrap(),
+        key_ref: root.clone(),
+        crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+        input: BackendInput::Digest32 {
+            digest: Digest32::new("bb".repeat(32)).unwrap(),
+        },
+        deadline_ms: DecimalU64::new(1_000_000),
+    }))
+    .unwrap();
+    assert_eq!(root_sig.bytes.decode().len(), 65);
+
+    // Derive two children and confirm they differ and are both signable.
+    let child_path = "m/0";
+    let child_sk: k256::ecdsa::SigningKey = XPrv::derive_from_path(
+        seed.as_slice(),
+        &DerivationPath::from_str(child_path).unwrap(),
+    )
+    .unwrap()
+    .into();
+    let (_child_spki, child_fingerprint) = spki_fingerprint(child_sk.verifying_key());
+    let child = KeyRef {
+        backend: Token::new("local").unwrap(),
+        backend_instance: Token::new("bip32-seed-test").unwrap(),
+        locator: hex::encode(sha2::Sha256::digest(b"root-1m/0")),
+        key_spec: KeySpec::Secp256k1,
+        public_key_fingerprint: child_fingerprint,
+        derivation: Some(DerivationRef::Bip32Secp256k1 {
+            root_key_id: Token::new("root-1").unwrap(),
+            path: child_path.into(),
+        }),
+    };
+    // Register the child in the backend's durable registry and sign with it.
+    backend.register_bip39_child(child.clone(), None).unwrap();
+    let child_sig = futures::executor::block_on(backend.sign(BackendSignRequest {
+        provider_attempt_id: Digest32::new("cc".repeat(32)).unwrap(),
+        key_ref: child.clone(),
+        crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+        input: BackendInput::Digest32 {
+            digest: Digest32::new("dd".repeat(32)).unwrap(),
+        },
+        deadline_ms: DecimalU64::new(1_000_000),
+    }))
+    .unwrap();
+    assert_eq!(child_sig.bytes.decode().len(), 65);
+    assert_ne!(root.public_key_fingerprint, child.public_key_fingerprint);
+
+    // Backup round-trip preserves the root and its derived child.
+    let exported = backend.encrypted_backup().unwrap();
+    let restored =
+        LocalSignerBackend::restore(Token::new("bip32-seed-test").unwrap(), exported).unwrap();
+    assert_eq!(restored.root_key_ref().unwrap(), root);
+    // Re-lock check: before unlocking, derived-child description is refused.
+    assert_eq!(
+        futures::executor::block_on(restored.describe_key(&child)).unwrap_err(),
+        BackendError::DefinitiveRejected
     );
-    assert!(backend.configure_namespace(&forged).is_err());
+    futures::executor::block_on(restored.activate(&root, SecretBytes::new(kek.to_vec()))).unwrap();
+    let description = futures::executor::block_on(restored.describe_key(&child)).unwrap();
+    assert_eq!(
+        description.public_key_fingerprint,
+        child.public_key_fingerprint
+    );
 }
