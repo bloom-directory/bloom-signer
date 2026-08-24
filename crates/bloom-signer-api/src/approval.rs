@@ -59,6 +59,7 @@ pub enum ApprovalSelector {
 pub struct PetalRouteGrant {
     pub route: String,
     pub allowed_operation_classes: Vec<Token>,
+    pub provenance_digest: Digest32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -349,10 +350,12 @@ mod tests {
                 PetalRouteGrant {
                     route: "r000002".into(),
                     allowed_operation_classes: vec![Token::new("order.place").unwrap()],
+                    provenance_digest: Digest32::new("77".repeat(32)).unwrap(),
                 },
                 PetalRouteGrant {
                     route: "r000003".into(),
                     allowed_operation_classes: vec![Token::new("order.cancel").unwrap()],
+                    provenance_digest: Digest32::new("88".repeat(32)).unwrap(),
                 },
             ],
             required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
