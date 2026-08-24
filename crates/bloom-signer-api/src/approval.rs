@@ -46,8 +46,10 @@ pub enum ApprovalSelector {
         package_hash: Digest32,
         route: String,
         allowed_operation_classes: Vec<Token>,
-        /// Additional route-specific grants in the same immutable package.
-        /// Empty preserves the v1 singleton `route` semantics.
+        /// Complete route-specific grant set for the immutable package.
+        /// Empty preserves the v1 singleton `route` semantics. When nonempty,
+        /// it must include a grant identical to the legacy route, classes, and
+        /// top-level provenance digest.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         route_grants: Vec<PetalRouteGrant>,
         required_claim_assurance: ClaimAssuranceLevel,
@@ -164,9 +166,13 @@ impl SealedApprovalTerms {
                 },
             ) if package_hash == selector_hash
                 && route == selector_route
-                && !allowed_operation_classes.is_empty()
-                && unique(allowed_operation_classes)
-                && valid_route_grants(route_grants) => {}
+                && classes_are_canonical(allowed_operation_classes)
+                && valid_route_grants(
+                    route_grants,
+                    selector_route,
+                    allowed_operation_classes,
+                    &self.provenance_digest,
+                ) => {}
             (
                 _,
                 ApprovalSelector::Exact {
@@ -210,15 +216,30 @@ impl SealedApprovalTerms {
     }
 }
 
-fn valid_route_grants(grants: &[PetalRouteGrant]) -> bool {
+fn valid_route_grants(
+    grants: &[PetalRouteGrant],
+    primary_route: &str,
+    primary_classes: &[Token],
+    primary_provenance: &Digest32,
+) -> bool {
     grants.is_empty()
         || grants.iter().all(|grant| {
-            !grant.route.is_empty()
-                && !grant.allowed_operation_classes.is_empty()
-                && unique(&grant.allowed_operation_classes)
+            !grant.route.is_empty() && classes_are_canonical(&grant.allowed_operation_classes)
         }) && grants
             .windows(2)
             .all(|pair| pair[0].route.as_bytes() < pair[1].route.as_bytes())
+            && grants.iter().any(|grant| {
+                grant.route == primary_route
+                    && grant.allowed_operation_classes == primary_classes
+                    && &grant.provenance_digest == primary_provenance
+            })
+}
+
+fn classes_are_canonical(classes: &[Token]) -> bool {
+    !classes.is_empty()
+        && classes
+            .windows(2)
+            .all(|pair| pair[0].as_str().as_bytes() < pair[1].as_str().as_bytes())
 }
 
 fn validate_suites(suites: &[CryptoSuite], key_spec: crate::KeySpec) -> Result<(), ProtocolError> {
@@ -348,6 +369,11 @@ mod tests {
             allowed_operation_classes: vec![Token::new("session.create").unwrap()],
             route_grants: vec![
                 PetalRouteGrant {
+                    route: "r000001".into(),
+                    allowed_operation_classes: vec![Token::new("session.create").unwrap()],
+                    provenance_digest: terms.provenance_digest.clone(),
+                },
+                PetalRouteGrant {
                     route: "r000002".into(),
                     allowed_operation_classes: vec![Token::new("order.place").unwrap()],
                     provenance_digest: Digest32::new("77".repeat(32)).unwrap(),
@@ -369,6 +395,27 @@ mod tests {
         }
         assert_eq!(
             reversed.validate().unwrap_err().code,
+            ProtocolErrorCode::SelectorMismatch
+        );
+
+        let mut missing_primary = terms.clone();
+        if let ApprovalSelector::Petal { route_grants, .. } = &mut missing_primary.selector {
+            route_grants.remove(0);
+        }
+        assert_eq!(
+            missing_primary.validate().unwrap_err().code,
+            ProtocolErrorCode::SelectorMismatch
+        );
+
+        let mut unsorted_classes = terms.clone();
+        if let ApprovalSelector::Petal { route_grants, .. } = &mut unsorted_classes.selector {
+            route_grants[1].allowed_operation_classes = vec![
+                Token::new("order.place").unwrap(),
+                Token::new("order.cancel").unwrap(),
+            ];
+        }
+        assert_eq!(
+            unsorted_classes.validate().unwrap_err().code,
             ProtocolErrorCode::SelectorMismatch
         );
 
