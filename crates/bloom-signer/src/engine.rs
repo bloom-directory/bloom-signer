@@ -4785,6 +4785,7 @@ fn validate_petal_key_approval(
         package_hash: selector_package,
         route: selector_route,
         allowed_operation_classes,
+        route_grants,
         ..
     } = &terms.selector
     {
@@ -4802,6 +4803,21 @@ fn validate_petal_key_approval(
             return Err(error(
                 ProtocolErrorCode::SelectorMismatch,
                 "Petal selector operation classes exceed the derived-key purpose",
+            ));
+        }
+        if route_grants.iter().any(|grant| {
+            !scope.allowed_routes.contains(&grant.route)
+                || grant.allowed_operation_classes.is_empty()
+                || grant
+                    .allowed_operation_classes
+                    .iter()
+                    .any(|operation_class| {
+                        !scope.allowed_operation_classes.contains(operation_class)
+                    })
+        }) {
+            return Err(error(
+                ProtocolErrorCode::SelectorMismatch,
+                "Petal route grant exceeds the derived-key route or purpose scope",
             ));
         }
     }

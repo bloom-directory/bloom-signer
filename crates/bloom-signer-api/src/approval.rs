@@ -46,8 +46,19 @@ pub enum ApprovalSelector {
         package_hash: Digest32,
         route: String,
         allowed_operation_classes: Vec<Token>,
+        /// Additional route-specific grants in the same immutable package.
+        /// Empty preserves the v1 singleton `route` semantics.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        route_grants: Vec<PetalRouteGrant>,
         required_claim_assurance: ClaimAssuranceLevel,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PetalRouteGrant {
+    pub route: String,
+    pub allowed_operation_classes: Vec<Token>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -147,12 +158,14 @@ impl SealedApprovalTerms {
                     package_hash: selector_hash,
                     route: selector_route,
                     allowed_operation_classes,
+                    route_grants,
                     ..
                 },
             ) if package_hash == selector_hash
                 && route == selector_route
                 && !allowed_operation_classes.is_empty()
-                && unique(allowed_operation_classes) => {}
+                && unique(allowed_operation_classes)
+                && valid_route_grants(route_grants) => {}
             (
                 _,
                 ApprovalSelector::Exact {
@@ -194,6 +207,17 @@ impl SealedApprovalTerms {
     pub fn approval_id(&self) -> Result<Digest32, ProtocolError> {
         self.approval_digest()
     }
+}
+
+fn valid_route_grants(grants: &[PetalRouteGrant]) -> bool {
+    grants.is_empty()
+        || grants.iter().all(|grant| {
+            !grant.route.is_empty()
+                && !grant.allowed_operation_classes.is_empty()
+                && unique(&grant.allowed_operation_classes)
+        }) && grants
+            .windows(2)
+            .all(|pair| pair[0].route.as_bytes() < pair[1].route.as_bytes())
 }
 
 fn validate_suites(suites: &[CryptoSuite], key_spec: crate::KeySpec) -> Result<(), ProtocolError> {

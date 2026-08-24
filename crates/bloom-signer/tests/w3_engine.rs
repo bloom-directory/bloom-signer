@@ -119,6 +119,7 @@ fn petal_terms() -> SealedApprovalTerms {
         package_hash: digest("77"),
         route: "/sign".into(),
         allowed_operation_classes: vec![Token::new("transfer").unwrap()],
+        route_grants: Vec::new(),
         required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
     };
     terms
