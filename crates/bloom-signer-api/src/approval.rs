@@ -331,4 +331,52 @@ mod tests {
             ProtocolErrorCode::SelectorMismatch
         );
     }
+
+    #[test]
+    fn petal_route_grants_are_canonical_and_legacy_singletons_decode() {
+        let mut terms = exact_terms("02".repeat(16).as_str());
+        let package_hash = Digest32::new("66".repeat(32)).unwrap();
+        terms.subject = ApprovalSubject::Petal {
+            package_hash: package_hash.clone(),
+            route: "r000001".into(),
+            agent_id: None,
+        };
+        terms.selector = ApprovalSelector::Petal {
+            package_hash,
+            route: "r000001".into(),
+            allowed_operation_classes: vec![Token::new("session.create").unwrap()],
+            route_grants: vec![
+                PetalRouteGrant {
+                    route: "r000002".into(),
+                    allowed_operation_classes: vec![Token::new("order.place").unwrap()],
+                },
+                PetalRouteGrant {
+                    route: "r000003".into(),
+                    allowed_operation_classes: vec![Token::new("order.cancel").unwrap()],
+                },
+            ],
+            required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+        };
+        terms.limits.max_operations = DecimalU64::new(10);
+        terms.validate().unwrap();
+
+        let mut reversed = terms.clone();
+        if let ApprovalSelector::Petal { route_grants, .. } = &mut reversed.selector {
+            route_grants.reverse();
+        }
+        assert_eq!(
+            reversed.validate().unwrap_err().code,
+            ProtocolErrorCode::SelectorMismatch
+        );
+
+        if let ApprovalSelector::Petal { route_grants, .. } = &mut terms.selector {
+            route_grants.clear();
+        }
+        let encoded = serde_json::to_value(&terms).unwrap();
+        assert!(encoded["selector"].get("route_grants").is_none());
+        serde_json::from_value::<SealedApprovalTerms>(encoded)
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
 }
