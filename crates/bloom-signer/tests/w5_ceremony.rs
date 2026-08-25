@@ -1017,6 +1017,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         package_hash: base_scope.package_hash.clone(),
         route: base_scope.route.clone(),
         allowed_operation_classes: vec![Token::new("payment-key").unwrap()],
+        route_grants: Vec::new(),
         required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
     };
     wrong_purpose.request_nonce = RequestNonce::new("ca".repeat(16)).unwrap();
@@ -1049,6 +1050,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         package_hash: base_scope.package_hash.clone(),
         route: base_scope.route.clone(),
         allowed_operation_classes: base_scope.allowed_operation_classes.clone(),
+        route_grants: Vec::new(),
         required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
     };
     reusable.request_nonce = RequestNonce::new("cb".repeat(16)).unwrap();
