@@ -253,6 +253,7 @@ fn sign_request() -> SignRequest {
             selector_kind: SelectorKind::Exact,
             ordered_payload_digests: vec![digest(40)],
             ordered_hashes: vec![digest(41)],
+            ordered_messages: Vec::new(),
             signature_count: DecimalU64::new(1),
             petal_use_claim_digest: None,
             claim_assurance_digest: None,

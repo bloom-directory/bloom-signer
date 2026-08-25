@@ -2122,6 +2122,50 @@ impl SignerEngine {
         Ok(())
     }
 
+    /// Permanently abandon a BIP-39 allocation whose enclosing custody
+    /// ceremony did not commit. The registry counter is monotonic, so rollback
+    /// tombstones the path instead of making a potentially exposed child
+    /// address reusable.
+    pub fn tombstone_failed_bip39_account(
+        &self,
+        key_ref: &KeyRef,
+        now_ms: u64,
+    ) -> Result<(), ProtocolError> {
+        let Some(DerivationRef::Bip39Multicurve {
+            wallet_seed_ref, ..
+        }) = &key_ref.derivation
+        else {
+            return Ok(());
+        };
+        let mut connection = self.connection.lock();
+        let operation_id = connection
+            .query_row(
+                "SELECT operation_id FROM derivation_allocations
+                 WHERE wallet_id = ?1 AND public_key_fingerprint = ?2
+                   AND state != 'TOMBSTONED'",
+                params![
+                    wallet_seed_ref.as_str(),
+                    key_ref.public_key_fingerprint.as_str()
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        let Some(operation_id) = operation_id else {
+            return Ok(());
+        };
+        let audit = |tx: &Transaction, event: &str, payload: serde_json::Value| {
+            self.append_audit(tx, event, &payload)
+        };
+        crate::derivation_registry::tombstone(
+            &mut connection,
+            wallet_seed_ref,
+            &operation_id,
+            now_ms,
+            &audit,
+        )
+    }
+
     /// Drive the full allocation lifecycle for one BIP-39 derived child, in
     /// separate IMMEDIATE transactions keyed by the ceremony operation id,
     /// and enroll the resulting `KeyRef`. Returns the child `KeyRef` and its
@@ -2238,12 +2282,50 @@ impl SignerEngine {
                 path: public.path.clone(),
             }),
         };
-        self.backend_registry.register_bip39_child(
+        let supported_crypto_suites = match profile {
+            DerivationProfile::Bip44EvmSecp256k1V1 => vec![
+                bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+                bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable,
+            ],
+            DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+                vec![bloom_signer_api::CryptoSuite::Ed25519Message]
+            }
+        };
+        let canonical_public_key = Base64UrlBytes::from_bytes(&spki_der);
+        let description = bloom_signer_backend_api::KeyDescription {
+            key_ref: key_ref.clone(),
+            canonical_spki_der: canonical_public_key.clone(),
+            public_key_fingerprint: fingerprint.clone(),
+            supported_crypto_suites: supported_crypto_suites.clone(),
+        };
+        if let Err(cause) = self.backend_registry.register_bip39_child(
             wallet_id,
-            &key_ref,
+            description,
             Some(operation_id.clone()),
-        )?;
-        self.enroll_bip39_child(wallet_id, &key_ref)?;
+        ) {
+            if let Err(rollback) = self.tombstone_failed_bip39_account(&key_ref, now_ms) {
+                return Err(error(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!(
+                        "BIP-39 allocation failed ({cause}); fail-closed rollback also failed ({rollback})"
+                    ),
+                ));
+            }
+            return Err(cause);
+        }
+        if let Err(cause) = self.enroll_bip39_child(wallet_id, &key_ref) {
+            let registry_rollback = self.tombstone_failed_bip39_account(&key_ref, now_ms);
+            let backend_rollback = self.backend_registry.rollback_local_derived_key(&key_ref);
+            if let Err(rollback) = registry_rollback.and(backend_rollback) {
+                return Err(error(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!(
+                        "BIP-39 enrollment failed ({cause}); fail-closed rollback also failed ({rollback})"
+                    ),
+                ));
+            }
+            return Err(cause);
+        }
 
         let descriptor = DerivedAccountDescriptor {
             key_ref: key_ref.clone(),
@@ -2254,18 +2336,10 @@ impl SignerEngine {
             },
             derivation_profile: profile,
             path: public.path,
-            canonical_public_key: Base64UrlBytes::from_bytes(&spki_der),
+            canonical_public_key,
             public_key_encoding: encoding,
             public_key_fingerprint: fingerprint,
-            supported_crypto_suites: match profile {
-                DerivationProfile::Bip44EvmSecp256k1V1 => vec![
-                    bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable,
-                    bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable,
-                ],
-                DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
-                    vec![bloom_signer_api::CryptoSuite::Ed25519Message]
-                }
-            },
+            supported_crypto_suites,
             lifecycle: AccountLifecycleState::Active,
         };
         Ok((key_ref, descriptor))
@@ -7407,14 +7481,15 @@ mod require_key_tests {
             )
             .unwrap(),
         );
-        // A synthetic derived child: derivation points at the wallet seed, and
-        // the fingerprint is arbitrary (the state check only looks it up).
+        let mnemonic = bloom_signer_derive::mnemonic_from_entropy(&[7_u8; 16]).unwrap();
+        let seed = bloom_signer_derive::seed_from_mnemonic(&mnemonic, "").unwrap();
+        let derived = bloom_signer_derive::derive_evm_account(&seed, 0, 0).unwrap();
         let child = KeyRef {
             backend: Token::new("local").unwrap(),
             backend_instance: wallet.clone(),
             locator: "child-evm-0".into(),
             key_spec: KeySpec::Secp256k1,
-            public_key_fingerprint: Digest32::from_bytes([0x11; 32]),
+            public_key_fingerprint: Digest32::from_bytes(derived.fingerprint),
             derivation: Some(DerivationRef::Bip39Multicurve {
                 wallet_seed_ref: wallet.clone(),
                 profile: DerivationProfile::Bip44EvmSecp256k1V1,
@@ -7476,5 +7551,34 @@ mod require_key_tests {
         assert!(error.message.contains("not an active derived account"));
         drop(transaction);
         drop(connection);
+    }
+
+    #[test]
+    fn failed_bip39_allocation_tombstones_registry_and_backend() {
+        let (engine, child, registry) = retired_bip39_child_engine();
+        engine
+            .connection
+            .lock()
+            .execute(
+                "UPDATE derivation_allocations SET state = 'ACTIVATED' WHERE operation_id = 'op-retired'",
+                [],
+            )
+            .unwrap();
+
+        engine.tombstone_failed_bip39_account(&child, 99).unwrap();
+        assert_eq!(
+            engine
+                .connection
+                .lock()
+                .query_row(
+                    "SELECT state FROM derivation_allocations WHERE operation_id = 'op-retired'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "TOMBSTONED"
+        );
+        registry.rollback_local_derived_key(&child).unwrap();
+        assert!(!registry.key_is_registered(&child).unwrap());
     }
 }

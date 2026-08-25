@@ -384,6 +384,7 @@ impl BackendRegistry {
         &self,
         backend_instance: &Token,
         encrypted_record: &Base64UrlBytes,
+        public_descriptions: Vec<bloom_signer_backend_api::KeyDescription>,
     ) -> Result<(), ProtocolError> {
         let backend_id = Token::new("local").expect("static token");
         if self
@@ -393,7 +394,7 @@ impl BackendRegistry {
         {
             return Ok(());
         }
-        let backup: bloom_signer_backend_local::EncryptedLocalBackup =
+        let mut backup: bloom_signer_backend_local::EncryptedLocalBackup =
             serde_json::from_slice(&encrypted_record.decode()).map_err(|error| {
                 ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
             })?;
@@ -404,6 +405,33 @@ impl BackendRegistry {
                 ProtocolErrorCode::KeyrefMismatch,
                 "backend enrollment is not a bip39 entropy root",
             ));
+        }
+        // Early BIP-39 enrollments persisted child KeyRefs and SPKI in the
+        // Signer registry but omitted the backend's public-description cache.
+        // Rehydrate that public-only cache from the independently persisted
+        // registry so upgrades do not require decrypting the mnemonic merely
+        // to project an existing address after restart.
+        for description in public_descriptions {
+            if !backup.derivation_registry.contains(&description.key_ref) {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::KeyrefMismatch,
+                    "persisted bip39 public description is not in the backend registry",
+                ));
+            }
+            if let Some(existing) = backup
+                .public_descriptions
+                .iter()
+                .find(|existing| existing.key_ref == description.key_ref)
+            {
+                if existing != &description {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::KeyrefMismatch,
+                        "persisted bip39 public descriptions disagree",
+                    ));
+                }
+            } else {
+                backup.public_descriptions.push(description);
+            }
         }
         let backend = Arc::new(
             bloom_signer_backend_local::LocalSignerBackend::restore(
@@ -428,9 +456,10 @@ impl BackendRegistry {
     pub fn register_bip39_child(
         &self,
         wallet_id: &Token,
-        key_ref: &bloom_signer_api::KeyRef,
+        description: bloom_signer_backend_api::KeyDescription,
         operation_id: Option<bloom_signer_api::OperationId>,
     ) -> Result<(), ProtocolError> {
+        let key_ref = &description.key_ref;
         let backends = self.backends.read();
         let backend = backends
             .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
@@ -444,7 +473,7 @@ impl BackendRegistry {
         match backend {
             #[cfg(feature = "local")]
             CompiledBackend::Local(local) => local
-                .register_bip39_child(key_ref.clone(), operation_id)
+                .register_bip39_child_description(description, operation_id)
                 .map_err(|error| {
                     ProtocolError::new(
                         ProtocolErrorCode::BackendInvalidRequest,

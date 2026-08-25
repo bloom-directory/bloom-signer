@@ -266,6 +266,7 @@ impl LocalSignerBackend {
         let mut locators = std::collections::BTreeSet::new();
         let mut paths = std::collections::BTreeSet::new();
         let mut namespace_ids = std::collections::BTreeSet::new();
+        let mut described_keys = std::collections::BTreeSet::new();
         let tombstones: std::collections::BTreeSet<_> =
             backup.derivation_tombstones.iter().cloned().collect();
         if backup.wrap_format_version != WRAP_FORMAT_VERSION
@@ -301,6 +302,16 @@ impl LocalSignerBackend {
                         }
                         _ => true,
                     }
+            })
+            || backup.public_descriptions.iter().any(|description| {
+                let key = &description.key_ref;
+                (!backup.derivation_registry.contains(key)
+                    && backup.pinned_root.as_ref() != Some(key))
+                    || !described_keys.insert(key.locator.clone())
+                    || description.public_key_fingerprint != key.public_key_fingerprint
+                    || Digest32::from_bytes(
+                        Sha256::digest(description.canonical_spki_der.decode()).into(),
+                    ) != key.public_key_fingerprint
             })
             || tombstones.len() != backup.derivation_tombstones.len()
             || backup.derivation_namespaces.iter().any(|namespace| {
@@ -380,15 +391,67 @@ impl LocalSignerBackend {
         if key_ref.derivation.is_none() {
             return Err(BackendError::InvalidRequest);
         }
+        // Pin the canonical public description while custody is active. The
+        // encrypted root remains locked after restart, but address/public-key
+        // projection must remain available without decrypting seed material.
+        let description = matches!(
+            key_ref.derivation,
+            Some(DerivationRef::Bip39Multicurve { .. })
+        )
+        .then(|| self.describe_bip39_child(&key_ref))
+        .transpose()?;
+        self.register_child(key_ref, description, operation_id)
+    }
+
+    /// Register a BIP-39 child together with the public description derived by
+    /// Signer's already-unlocked custody path. This never needs to activate or
+    /// decrypt the backend a second time.
+    pub fn register_bip39_child_description(
+        &self,
+        description: KeyDescription,
+        operation_id: Option<OperationId>,
+    ) -> Result<(), BackendError> {
+        let key_ref = description.key_ref.clone();
+        if !matches!(
+            key_ref.derivation,
+            Some(DerivationRef::Bip39Multicurve { .. })
+        ) || description.public_key_fingerprint != key_ref.public_key_fingerprint
+            || Digest32::from_bytes(Sha256::digest(description.canonical_spki_der.decode()).into())
+                != key_ref.public_key_fingerprint
+        {
+            return Err(BackendError::InvalidRequest);
+        }
+        self.register_child(key_ref, Some(description), operation_id)
+    }
+
+    fn register_child(
+        &self,
+        key_ref: KeyRef,
+        description: Option<KeyDescription>,
+        operation_id: Option<OperationId>,
+    ) -> Result<(), BackendError> {
         let mut state = self.state.write();
         let mut next = state
             .backup
             .clone()
             .ok_or(BackendError::DefinitiveRejected)?;
         if next.derivation_registry.iter().any(|key| key == &key_ref) {
+            if let Some(description) = description {
+                if !next
+                    .public_descriptions
+                    .iter()
+                    .any(|pinned| pinned.key_ref == key_ref)
+                {
+                    next.public_descriptions.push(description);
+                    commit_backup(&mut state, next)?;
+                }
+            }
             return Ok(());
         }
         next.derivation_registry.push(key_ref.clone());
+        if let Some(description) = description {
+            next.public_descriptions.push(description);
+        }
         if let Some(operation_id) = operation_id {
             next.pending_derivations
                 .insert(operation_id.as_str().to_owned(), key_ref.clone());
@@ -641,6 +704,7 @@ impl LocalSignerBackend {
     pub fn tombstone_derived_key(&self, key_ref: &KeyRef) -> Result<(), BackendError> {
         let path = match &key_ref.derivation {
             Some(DerivationRef::Bip32Secp256k1 { path, .. }) => path.clone(),
+            Some(DerivationRef::Bip39Multicurve { path, .. }) => path.clone(),
             _ => return Err(BackendError::InvalidRequest),
         };
         let mut state = self.state.write();
@@ -1068,9 +1132,6 @@ impl SignerBackend for LocalSignerBackend {
         key: &'a KeyRef,
     ) -> BackendFuture<'a, Result<KeyDescription, BackendError>> {
         Box::pin(async move {
-            if matches!(key.derivation, Some(DerivationRef::Bip39Multicurve { .. })) {
-                return self.describe_bip39_child(key);
-            }
             if let Some(description) = self.state.read().backup.as_ref().and_then(|backup| {
                 backup
                     .public_descriptions
@@ -1086,6 +1147,21 @@ impl SignerBackend for LocalSignerBackend {
                     return Err(BackendError::DefinitiveRejected);
                 }
                 return Ok(description);
+            }
+            if let Some(DerivationRef::Bip39Multicurve { path, .. }) = &key.derivation {
+                let state = self.state.read();
+                if state
+                    .backup
+                    .as_ref()
+                    .is_some_and(|backup| backup.derivation_tombstones.contains(path))
+                {
+                    return Err(BackendError::DefinitiveRejected);
+                }
+                if state.registry.get(&key.locator) != Some(key) {
+                    return Err(BackendError::InvalidRequest);
+                }
+                drop(state);
+                return self.describe_bip39_child(key);
             }
             if self.root_key_ref()? == *key {
                 let mut description = self.describe_path("m")?;

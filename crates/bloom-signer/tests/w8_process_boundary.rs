@@ -578,9 +578,26 @@ fn bip39_derived_account_list_is_lock_free_and_stable_across_restart() {
     // identical and still requires no unlock. The re-registered backend still
     // carries every allocated child so retirement works across the restart.
     let (first_child, solana_child) = {
-        let (_service, engine, _registry) = bip39_service(&db_path);
+        let (_service, engine, registry) = bip39_service(&db_path);
         let listed = engine.derived_account_descriptors(&wallet_id).unwrap();
         assert_eq!(listed.len(), 2);
+        for descriptor in &listed {
+            let public = futures::executor::block_on(
+                registry
+                    .get(
+                        &descriptor.key_ref.backend,
+                        &descriptor.key_ref.backend_instance,
+                    )
+                    .unwrap()
+                    .describe_key(&descriptor.key_ref),
+            )
+            .unwrap();
+            assert_eq!(public.canonical_spki_der, descriptor.canonical_public_key);
+            assert_eq!(
+                public.public_key_fingerprint,
+                descriptor.public_key_fingerprint
+            );
+        }
 
         // Retiring after restart removes the child from the lock-free list and
         // from the re-registered backend registry.

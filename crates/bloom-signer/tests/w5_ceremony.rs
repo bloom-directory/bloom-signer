@@ -57,6 +57,7 @@ fn signed_petal_request(
         selector_kind: SelectorKind::Petal,
         ordered_payload_digests: vec![digest("b5")],
         ordered_hashes: vec![digest("b6")],
+        ordered_messages: Vec::new(),
         signature_count: DecimalU64::new(1),
         petal_use_claim_digest: Some(digest("bd")),
         claim_assurance_digest: Some(digest("be")),

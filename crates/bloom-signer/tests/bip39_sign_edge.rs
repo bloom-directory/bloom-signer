@@ -192,19 +192,7 @@ fn wrong_pinned_fingerprint_is_refused() {
         "00".repeat(32).as_str(),
         "evm-0",
     );
-    backend
-        .register_bip39_child(tampered.clone(), None)
-        .unwrap();
-    let result = futures::executor::block_on(backend.sign(BackendSignRequest {
-        provider_attempt_id: Digest32::from_bytes([0x11u8; 32]),
-        key_ref: tampered,
-        crypto_suite: bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable,
-        input: BackendInput::Digest32 {
-            digest: bloom_signer_api::Digest32::from_bytes([0x5Au8; 32]),
-        },
-        deadline_ms: bloom_signer_api::DecimalU64::new(1_000_000),
-    }));
-    assert!(result.is_err());
+    assert!(backend.register_bip39_child(tampered, None).is_err());
 }
 
 #[test]

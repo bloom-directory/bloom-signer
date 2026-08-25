@@ -195,10 +195,31 @@ impl SignerCeremonyService {
                 // BIP-39 backend: no signable root; pinned keys are derived
                 // children (or none yet) and the root is entropy-only.
                 None => {
+                    let descriptors =
+                        engine.derived_account_descriptors(&enrollment.backend_instance)?;
+                    let public_descriptions = descriptors
+                        .iter()
+                        .map(|descriptor| bloom_signer_backend_api::KeyDescription {
+                            key_ref: descriptor.key_ref.clone(),
+                            canonical_spki_der: descriptor.canonical_public_key.clone(),
+                            public_key_fingerprint: descriptor.public_key_fingerprint.clone(),
+                            supported_crypto_suites: descriptor.supported_crypto_suites.clone(),
+                        })
+                        .collect();
                     engine.backend_registry().restore_bip39_wallet_backend(
                         &enrollment.backend_instance,
                         &enrollment.encrypted_record,
+                        public_descriptions,
                     )?;
+                    if let Some(descriptor) = descriptors.first() {
+                        // Persist the public-description migration immediately
+                        // so every later restart follows the ordinary backend
+                        // enrollment path without needing another repair.
+                        engine.refresh_backend_enrollment(
+                            &enrollment.backend_instance,
+                            &descriptor.key_ref,
+                        )?;
+                    }
                 }
             }
         }
@@ -1027,7 +1048,7 @@ impl SignerCeremonyService {
         let encrypted_browser_result = match encrypted_browser_result {
             Ok(result) => result,
             Err(error) => {
-                self.rollback_derived_key(apply_outcome.rollback_derived_key.as_ref())?;
+                self.rollback_derived_key(apply_outcome.rollback_derived_key.as_ref(), now_ms)?;
                 self.rollback_provisioned_backend(
                     apply_outcome.rollback_provisioned_backend.as_ref(),
                 );
@@ -1090,7 +1111,7 @@ impl SignerCeremonyService {
             &durable_status,
             apply_outcome.database_effect,
         ) {
-            self.rollback_derived_key(apply_outcome.rollback_derived_key.as_ref())?;
+            self.rollback_derived_key(apply_outcome.rollback_derived_key.as_ref(), now_ms)?;
             self.rollback_provisioned_backend(apply_outcome.rollback_provisioned_backend.as_ref());
             self.restore_custody_snapshot(before)?;
             return Err(error);
@@ -1949,7 +1970,7 @@ impl SignerCeremonyService {
                 Ok(GenericCustodyOutcome {
                     sensitive_output: None,
                     database_effect: CeremonyDatabaseEffect::None,
-                    rollback_derived_key: None,
+                    rollback_derived_key: Some(key_ref.clone()),
                     public_key_refs: vec![key_ref],
                 })
             }
@@ -2016,12 +2037,15 @@ impl SignerCeremonyService {
     fn rollback_derived_key(
         &self,
         key_ref: Option<&bloom_signer_api::KeyRef>,
+        now_ms: u64,
     ) -> Result<(), ProtocolError> {
         let Some(key_ref) = key_ref else {
             return Ok(());
         };
         #[cfg(feature = "local")]
         {
+            self.engine
+                .tombstone_failed_bip39_account(key_ref, now_ms)?;
             self.engine
                 .backend_registry()
                 .rollback_local_derived_key(key_ref)

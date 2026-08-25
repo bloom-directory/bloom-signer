@@ -166,6 +166,7 @@ fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> Unsign
         selector_kind,
         ordered_payload_digests: payloads,
         ordered_hashes: hashes.clone(),
+        ordered_messages: Vec::new(),
         signature_count: DecimalU64::new(hashes.len() as u64),
         petal_use_claim_digest: claim_digest,
         claim_assurance_digest: assurance_digest,

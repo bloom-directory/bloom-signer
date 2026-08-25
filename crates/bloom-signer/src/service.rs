@@ -533,7 +533,7 @@ impl SignerRpcService {
                     digest: hash.clone(),
                 },
                 CryptoInputKind::Message => BackendInput::Message {
-                    message: Base64UrlBytes::from_bytes(&hash.to_bytes()),
+                    message: request.unsigned.ordered_messages[index].clone(),
                 },
             };
             let result = backend
@@ -1066,6 +1066,7 @@ mod tests {
             selector_kind: SelectorKind::Exact,
             ordered_payload_digests: payloads,
             ordered_hashes: hashes,
+            ordered_messages: Vec::new(),
             signature_count: DecimalU64::new(1),
             petal_use_claim_digest: None,
             claim_assurance_digest: None,
@@ -1097,6 +1098,11 @@ mod tests {
         request.unsigned.operation_id = OperationId::from_bytes([attempt_byte; 32]);
         request.unsigned.key_ref = key_ref.clone();
         request.unsigned.crypto_suite = CryptoSuite::Ed25519Message;
+        let message = vec![attempt_byte; 48];
+        let digest = Digest32::from_bytes(Sha256::digest(&message).into());
+        request.unsigned.ordered_payload_digests = vec![digest.clone()];
+        request.unsigned.ordered_hashes = vec![digest];
+        request.unsigned.ordered_messages = vec![Base64UrlBytes::from_bytes(&message)];
         request.unsigned.operation_digest = SignOperationIdentity {
             operation_id: request.unsigned.operation_id.clone(),
             approval_id: request.unsigned.approval_id.clone(),

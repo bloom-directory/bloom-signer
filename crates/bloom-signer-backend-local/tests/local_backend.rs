@@ -1,5 +1,6 @@
 use bloom_signer_api::{
-    Base64UrlBytes, CryptoSuite, DecimalU64, DerivationRef, Digest32, KeyRef, KeySpec, Token,
+    Base64UrlBytes, CryptoSuite, DecimalU64, DerivationProfile, DerivationRef, Digest32, KeyRef,
+    KeySpec, Token,
 };
 use bloom_signer_backend_api::{
     ActivationStatus, BackendError, BackendInput, BackendSignRequest, SecretBytes, SignerBackend,
@@ -28,6 +29,132 @@ fn backend(private_key: [u8; 32]) -> LocalSignerBackend {
         Ed25519SigningKey::from_bytes(&[5; 32]).verifying_key(),
     )
     .unwrap()
+}
+
+fn bip39_backend() -> (LocalSignerBackend, Vec<u8>) {
+    let entropy = vec![0_u8; 32];
+    let backend = LocalSignerBackend::provision_bip39(
+        Token::new("bip39-restart-test").unwrap(),
+        Token::new("bip39-restart-test").unwrap(),
+        SecretBytes::new(entropy.clone()),
+        SecretBytes::new(vec![7; 32]),
+        Ed25519SigningKey::from_bytes(&[5; 32]).verifying_key(),
+    )
+    .unwrap();
+    (backend, entropy)
+}
+
+fn bip39_child(entropy: &[u8], profile: DerivationProfile) -> (KeyRef, Vec<u8>, Vec<CryptoSuite>) {
+    let mnemonic = bloom_signer_derive::mnemonic_from_entropy(entropy).unwrap();
+    let seed = bloom_signer_derive::seed_from_mnemonic(&mnemonic, "").unwrap();
+    let (path, key_spec, spki, fingerprint, suites) = match profile {
+        DerivationProfile::Bip44EvmSecp256k1V1 => {
+            let derived = bloom_signer_derive::derive_evm_account(&seed, 0, 0).unwrap();
+            (
+                "m/44'/60'/0'/0/0",
+                KeySpec::Secp256k1,
+                derived.spki_der,
+                derived.fingerprint,
+                vec![
+                    CryptoSuite::Secp256k1Keccak256Recoverable,
+                    CryptoSuite::Secp256k1Sha256Recoverable,
+                ],
+            )
+        }
+        DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+            let derived = bloom_signer_derive::derive_solana_account(&seed, 0).unwrap();
+            (
+                "m/44'/501'/0'/0'",
+                KeySpec::Ed25519,
+                derived.spki_der,
+                derived.fingerprint,
+                vec![CryptoSuite::Ed25519Message],
+            )
+        }
+    };
+    let key_ref = KeyRef {
+        backend: Token::new("local").unwrap(),
+        backend_instance: Token::new("bip39-restart-test").unwrap(),
+        locator: hex::encode(sha2::Sha256::digest(
+            [b"bip39-restart-test".as_slice(), path.as_bytes()].concat(),
+        )),
+        key_spec,
+        public_key_fingerprint: Digest32::from_bytes(fingerprint),
+        derivation: Some(DerivationRef::Bip39Multicurve {
+            wallet_seed_ref: Token::new("bip39-restart-test").unwrap(),
+            profile,
+            path: path.into(),
+        }),
+    };
+    (key_ref, spki, suites)
+}
+
+#[test]
+fn bip39_public_descriptions_survive_a_locked_restart() {
+    let (backend, entropy) = bip39_backend();
+    let evm = bip39_child(&entropy, DerivationProfile::Bip44EvmSecp256k1V1);
+    let solana = bip39_child(&entropy, DerivationProfile::Bip44SolanaSlip10Ed25519V1);
+    backend.register_bip39_child(evm.0.clone(), None).unwrap();
+    backend
+        .register_bip39_child(solana.0.clone(), None)
+        .unwrap();
+
+    let backup = backend.encrypted_backup().unwrap();
+    assert_eq!(backup.public_descriptions.len(), 2);
+    let restarted =
+        LocalSignerBackend::restore(Token::new("bip39-restart-test").unwrap(), backup).unwrap();
+
+    for (key_ref, spki, suites) in [evm, solana] {
+        let description = futures::executor::block_on(restarted.describe_key(&key_ref)).unwrap();
+        assert_eq!(description.canonical_spki_der.decode(), spki);
+        assert_eq!(description.supported_crypto_suites, suites);
+    }
+    assert!(
+        futures::executor::block_on(restarted.sign(BackendSignRequest {
+            provider_attempt_id: Digest32::new("11".repeat(32)).unwrap(),
+            key_ref: bip39_child(&entropy, DerivationProfile::Bip44EvmSecp256k1V1).0,
+            crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+            input: BackendInput::Digest32 {
+                digest: Digest32::new("22".repeat(32)).unwrap(),
+            },
+            deadline_ms: DecimalU64::new(100),
+        }))
+        .is_err(),
+        "public projection must not unlock signing"
+    );
+}
+
+#[test]
+fn failed_bip39_child_can_be_tombstoned_without_reusing_its_path() {
+    let (backend, entropy) = bip39_backend();
+    let child = bip39_child(&entropy, DerivationProfile::Bip44SolanaSlip10Ed25519V1).0;
+    backend
+        .register_bip39_child(
+            child.clone(),
+            Some(bloom_signer_api::OperationId::from_bytes([9; 32])),
+        )
+        .unwrap();
+
+    backend.tombstone_derived_key(&child).unwrap();
+    let backup = backend.encrypted_backup().unwrap();
+    assert!(!backup.derivation_registry.contains(&child));
+    assert!(
+        backup
+            .public_descriptions
+            .iter()
+            .all(|item| item.key_ref != child)
+    );
+    assert!(
+        backup
+            .derivation_tombstones
+            .contains(&"m/44'/501'/0'/0'".into())
+    );
+    assert!(backup.pending_derivations.is_empty());
+    assert!(futures::executor::block_on(backend.describe_key(&child)).is_err());
+
+    let restarted =
+        LocalSignerBackend::restore(Token::new("bip39-restart-test").unwrap(), backup).unwrap();
+    assert!(futures::executor::block_on(restarted.describe_key(&child)).is_err());
 }
 
 #[test]
@@ -64,12 +191,12 @@ fn imported_scalar_roots_sign_deactivate_and_restart() {
 #[test]
 fn restarted_public_projection_rejects_an_spki_fingerprint_mismatch() {
     let backend = backend([2_u8; 32]);
-    let root = backend.root_key_ref().unwrap();
     let mut backup = backend.encrypted_backup().unwrap();
     backup.public_descriptions[0].canonical_spki_der = Base64UrlBytes::from_bytes(&[9; 33]);
-    let restored =
-        LocalSignerBackend::restore(Token::new("local-default").unwrap(), backup).unwrap();
-    assert!(futures::executor::block_on(restored.describe_key(&root)).is_err());
+    assert!(matches!(
+        LocalSignerBackend::restore(Token::new("local-default").unwrap(), backup),
+        Err(BackendError::InvalidRequest)
+    ));
 }
 
 #[test]
