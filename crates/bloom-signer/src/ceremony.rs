@@ -113,6 +113,10 @@ pub enum SignerCeremonyStatus {
     Pending,
     CompletedApproval(Box<SignerActivationReceipt>),
     CompletedCustody(Box<CustodyResult>),
+    /// A ceremony that ran and reached a durable non-successful terminal:
+    /// failed closed, expired, or cancelled. Distinct from `Missing`, which
+    /// means Signer holds no record of the operation at all.
+    Terminal(CeremonyState),
     Missing,
 }
 
@@ -766,11 +770,30 @@ impl SignerCeremonyService {
             }
             return Ok(receipt);
         }
+        let operation_id = request.activation_operation_id.clone();
         let mut pending = self
             .pending
             .lock()
-            .remove(&request.activation_operation_id)
+            .remove(&operation_id)
             .ok_or_else(replay)?;
+        match self
+            .apply_approval_completion(request, now_ms, &mut pending)
+            .await
+        {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => {
+                self.terminalize_consumed_ceremony(&operation_id, &pending.contribution, now_ms);
+                Err(error)
+            }
+        }
+    }
+
+    async fn apply_approval_completion(
+        &self,
+        request: CeremonyCompleteRequest,
+        now_ms: u64,
+        pending: &mut PendingCeremony,
+    ) -> Result<SignerActivationReceipt, ProtocolError> {
         let (prepare, contribution) = match (&pending.request, &pending.contribution) {
             (PendingRequest::Approval(prepare), PendingContribution::Approval(contribution)) => {
                 (prepare, contribution)
@@ -910,11 +933,34 @@ impl SignerCeremonyService {
             }
             return Ok(result);
         }
+        let operation_id = request.custody_operation_id.clone();
         let mut pending = self
             .pending
             .lock()
-            .remove(&request.custody_operation_id)
+            .remove(&operation_id)
             .ok_or_else(replay)?;
+        match self.apply_custody_completion(request, now_ms, policy_update, &mut pending) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.terminalize_consumed_ceremony(&operation_id, &pending.contribution, now_ms);
+                Err(error)
+            }
+        }
+    }
+
+    /// Complete a custody ceremony whose single-use pending record has already
+    /// been consumed by the caller.
+    ///
+    /// Every exit from here is terminal for that record: the caller either
+    /// commits a receipt or durably terminalizes the ceremony, so a rejected
+    /// proof never leaves the operation merely absent.
+    fn apply_custody_completion(
+        &self,
+        request: CustodyCompleteRequest,
+        now_ms: u64,
+        policy_update: bool,
+        pending: &mut PendingCeremony,
+    ) -> Result<CustodyResult, ProtocolError> {
         let (prepare, policy_prepare, contribution) =
             match (&pending.request, &pending.contribution) {
                 (PendingRequest::Custody(prepare), PendingContribution::Custody(contribution)) => {
@@ -1089,37 +1135,96 @@ impl SignerCeremonyService {
 
     pub fn cancel(&self, operation_id: &OperationId) -> Result<(), ProtocolError> {
         if self.completed.lock().contains_key(operation_id) {
-            return Err(protocol(
-                ProtocolErrorCode::OperationIdConflict,
-                "committed ceremony cannot be cancelled",
-            ));
+            return Err(committed_conflict());
         }
-        let pending =
-            self.pending.lock().remove(operation_id).ok_or_else(|| {
-                protocol(ProtocolErrorCode::ApprovalNotFound, "ceremony not found")
-            })?;
-        let status = match pending.contribution {
-            PendingContribution::Approval(contribution) => CeremonyPublicStatus {
-                ceremony_id: contribution.ceremony_id,
-                ceremony_kind: CeremonyKind::SealedApproval,
-                operation_id: operation_id.clone(),
-                state: CeremonyState::Cancelled,
-                expires_at_ms: contribution.expires_at_ms,
-                ceremony_url: None,
-                receipt_digest: None,
-            },
-            PendingContribution::Custody(contribution) => CeremonyPublicStatus {
-                ceremony_id: contribution.ceremony_id,
-                ceremony_kind: contribution.ceremony_kind,
-                operation_id: operation_id.clone(),
-                state: CeremonyState::Cancelled,
-                expires_at_ms: contribution.expires_at_ms,
-                ceremony_url: None,
-                receipt_digest: None,
-            },
+        let Some(pending) = self.pending.lock().remove(operation_id) else {
+            return self.cancel_consumed_ceremony(operation_id);
         };
+        let status = pending_public_status(
+            operation_id,
+            &pending.contribution,
+            CeremonyState::Cancelled,
+        );
         self.engine.persist_ceremony_public_status(&status)?;
         Ok(())
+    }
+
+    /// Answer cancellation for a ceremony whose pending record is gone.
+    ///
+    /// Completion consumes that record before it can validate the user's proof,
+    /// so the ordinary cleanup a peer performs after a rejected proof arrives
+    /// here. Reporting `ApprovalNotFound` left the peer unable to distinguish
+    /// "already failed closed" from "unknown", and a peer that treats the error
+    /// as fatal abandons its own session mid-flight, so a ceremony that already
+    /// reached a durable non-successful terminal answers idempotently. A
+    /// committed ceremony still refuses.
+    fn cancel_consumed_ceremony(&self, operation_id: &OperationId) -> Result<(), ProtocolError> {
+        if self.engine.activation_receipt(operation_id)?.is_some()
+            || self.engine.custody_receipt(operation_id)?.is_some()
+        {
+            return Err(committed_conflict());
+        }
+        match self.engine.ceremony_public_status(operation_id)? {
+            Some(status) => match status.state {
+                CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed => Ok(()),
+                _ => Err(committed_conflict()),
+            },
+            None => Err(protocol(
+                ProtocolErrorCode::ApprovalNotFound,
+                "ceremony not found",
+            )),
+        }
+    }
+
+    /// Record the durable terminal state of a consumed ceremony that produced
+    /// no receipt.
+    ///
+    /// Signer removes the pending record before it can verify the WebAuthn
+    /// proof, which is what keeps completion single-use. Without this the
+    /// rejected ceremony became invisible instead of terminal: status,
+    /// cancellation and reconciliation all reported it absent, and the peer
+    /// holding the live session had nothing to converge on.
+    ///
+    /// Best effort by design. The caller's answer is the proof rejection, so a
+    /// storage failure here is reported on the operator's channel rather than
+    /// replacing the structured authentication error.
+    fn terminalize_consumed_ceremony(
+        &self,
+        operation_id: &OperationId,
+        contribution: &PendingContribution,
+        now_ms: u64,
+    ) {
+        // `apply_custody_completion` has a small amount of cleanup after its
+        // durable commit; never let that later error overwrite a committed
+        // receipt's successful public status.
+        if self
+            .engine
+            .activation_receipt(operation_id)
+            .ok()
+            .flatten()
+            .is_some()
+            || self
+                .engine
+                .custody_receipt(operation_id)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            return;
+        }
+        let mut status = pending_public_status(operation_id, contribution, CeremonyState::Failed);
+        if status.expires_at_ms.get() <= now_ms {
+            status.state = CeremonyState::Expired;
+        }
+        if let Err(error) = self.engine.persist_ceremony_public_status(&status) {
+            eprintln!(
+                "Bloom Signer could not terminalize a rejected ceremony: \
+                 operation_id={}, state={:?}, cleanup_error={:?}",
+                operation_id.as_str(),
+                status.state,
+                error.code
+            );
+        }
     }
 
     pub fn status(
@@ -1142,10 +1247,15 @@ impl SignerCeremonyService {
         if let Some(result) = self.engine.custody_receipt(operation_id)? {
             return Ok(SignerCeremonyStatus::CompletedCustody(Box::new(result)));
         }
-        Ok(if self.pending.lock().contains_key(operation_id) {
-            SignerCeremonyStatus::Pending
-        } else {
-            SignerCeremonyStatus::Missing
+        if self.pending.lock().contains_key(operation_id) {
+            return Ok(SignerCeremonyStatus::Pending);
+        }
+        // A ceremony that failed closed, expired or was cancelled keeps only a
+        // durable public status, so reporting `Missing` here would tell a peer
+        // reconciling its own live session that Signer never saw the operation.
+        Ok(match self.engine.ceremony_public_status(operation_id)? {
+            Some(status) => SignerCeremonyStatus::Terminal(status.state),
+            None => SignerCeremonyStatus::Missing,
         })
     }
 
@@ -2383,6 +2493,41 @@ fn random_32() -> [u8; 32] {
     let mut bytes = [0_u8; 32];
     OsRng.fill_bytes(&mut bytes);
     bytes
+}
+
+fn pending_public_status(
+    operation_id: &OperationId,
+    contribution: &PendingContribution,
+    state: CeremonyState,
+) -> CeremonyPublicStatus {
+    let (ceremony_id, ceremony_kind, expires_at_ms) = match contribution {
+        PendingContribution::Approval(contribution) => (
+            contribution.ceremony_id.clone(),
+            CeremonyKind::SealedApproval,
+            contribution.expires_at_ms.clone(),
+        ),
+        PendingContribution::Custody(contribution) => (
+            contribution.ceremony_id.clone(),
+            contribution.ceremony_kind,
+            contribution.expires_at_ms.clone(),
+        ),
+    };
+    CeremonyPublicStatus {
+        ceremony_id,
+        ceremony_kind,
+        operation_id: operation_id.clone(),
+        state,
+        expires_at_ms,
+        ceremony_url: None,
+        receipt_digest: None,
+    }
+}
+
+fn committed_conflict() -> ProtocolError {
+    protocol(
+        ProtocolErrorCode::OperationIdConflict,
+        "committed ceremony cannot be cancelled",
+    )
 }
 
 fn replay() -> ProtocolError {

@@ -217,6 +217,25 @@ fn complete_local_approval(
     sign_count: u32,
     now_ms: u64,
 ) -> SignerActivationReceipt {
+    try_complete_local_approval(
+        service,
+        authenticator,
+        terms,
+        activation_operation_id,
+        sign_count,
+        now_ms,
+    )
+    .unwrap()
+}
+
+fn try_complete_local_approval(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    terms: SealedApprovalTerms,
+    activation_operation_id: OperationId,
+    sign_count: u32,
+    now_ms: u64,
+) -> Result<SignerActivationReceipt, ProtocolError> {
     let review_manifest_digest = digest("76");
     let (exact_ordered_payload_digests, exact_ordered_hashes) = match &terms.selector {
         ApprovalSelector::Exact {
@@ -225,19 +244,17 @@ fn complete_local_approval(
         } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
         ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
     };
-    let prepared = service
-        .prepare_approval(
-            CeremonyPrepareRequest {
-                activation_operation_id: activation_operation_id.clone(),
-                terms: terms.clone(),
-                review_manifest_digest: review_manifest_digest.clone(),
-                exact_ordered_payload_digests,
-                exact_ordered_hashes,
-                replacement_approval_id: None,
-            },
-            now_ms,
-        )
-        .unwrap();
+    let prepared = service.prepare_approval(
+        CeremonyPrepareRequest {
+            activation_operation_id: activation_operation_id.clone(),
+            terms: terms.clone(),
+            review_manifest_digest: review_manifest_digest.clone(),
+            exact_ordered_payload_digests,
+            exact_ordered_hashes,
+            replacement_approval_id: None,
+        },
+        now_ms,
+    )?;
     let assertion = authenticator.assertion(
         &prepared.challenges[0].canonical_bytes().unwrap(),
         sign_count,
@@ -276,7 +293,6 @@ fn complete_local_approval(
         },
         now_ms + 1,
     ))
-    .unwrap()
 }
 
 fn register_wallet(
