@@ -3,6 +3,7 @@ mod support;
 use bloom_signer::webauthn::{verify_webauthn_assertion, verify_webauthn_attestation};
 use bloom_signer::{
     ceremony::{PreparedCustodyCeremony, SignerCeremonyService},
+    clock::{ClockCondition, ClockDecision},
     engine::{BackendEnrollmentBackup, SignerAuditKeys, SignerEngine},
     hpke::{CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO},
     legacy_passkey::{LEGACY_PASSKEY_INPUT_CLASS, LegacyMigrationStore, stage_legacy_wallet},
@@ -21,6 +22,59 @@ use k256::{SecretKey as Secp256k1Secret, elliptic_curve::sec1::ToEncodedPoint as
 use sha2::Digest as _;
 use std::{collections::BTreeMap, os::unix::fs::MetadataExt as _, sync::Arc};
 use support::{VirtualAuthenticator, seal_hpke};
+
+fn signed_petal_request(
+    terms: &SealedApprovalTerms,
+    broker: &SigningKey,
+    operation_id: OperationId,
+) -> SignRequest {
+    let identity = SignOperationIdentity {
+        operation_id: operation_id.clone(),
+        approval_id: terms.approval_id().unwrap(),
+        key_ref: terms.key_ref.clone(),
+        crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+        ordered_payload_digests: vec![digest("b5")],
+        ordered_hashes: vec![digest("b6")],
+        petal_use_claim_digest: Some(digest("bd")),
+        claim_assurance_digest: Some(digest("be")),
+        policy_version: terms.policy_version.clone(),
+        policy_digest: terms.policy_digest.clone(),
+    };
+    let mut unsigned = UnsignedSignRequest {
+        schema: Token::new("bloom.sign-request/1").unwrap(),
+        attempt_id: digest("bf"),
+        operation_id,
+        operation_digest: identity.digest().unwrap(),
+        attempt_digest: digest("00"),
+        audience: Token::new("bloom-signer").unwrap(),
+        issuer_service_id: Token::new("bloom-broker").unwrap(),
+        issuer_boot_epoch: BootEpoch::new("c0".repeat(16)).unwrap(),
+        broker_signing_key_id: Token::new("broker-app-1").unwrap(),
+        approval_id: terms.approval_id().unwrap(),
+        wallet_id: terms.wallet_id.clone(),
+        key_ref: terms.key_ref.clone(),
+        crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+        selector_kind: SelectorKind::Petal,
+        ordered_payload_digests: vec![digest("b5")],
+        ordered_hashes: vec![digest("b6")],
+        signature_count: DecimalU64::new(1),
+        petal_use_claim_digest: Some(digest("bd")),
+        claim_assurance_digest: Some(digest("be")),
+        policy_version: terms.policy_version.clone(),
+        policy_digest: terms.policy_digest.clone(),
+        validation_receipt_digest: digest("c1"),
+        issued_at_ms: DecimalU64::new(10_500),
+        not_before_ms: DecimalU64::new(10_500),
+        expires_at_ms: DecimalU64::new(11_000),
+    };
+    unsigned.attempt_digest = unsigned.computed_attempt_digest().unwrap();
+    SignRequest {
+        broker_signature: Base64UrlBytes::from_bytes(
+            &broker.sign(&unsigned.attempt_digest.to_bytes()).to_bytes(),
+        ),
+        unsigned,
+    }
+}
 
 fn audit_keys() -> SignerAuditKeys {
     SignerAuditKeys {
@@ -699,6 +753,504 @@ fn complete_policy_update(
         now_ms + 100,
     )?;
     Ok((result, request))
+}
+
+#[test]
+fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let authenticator = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
+    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+    let engine = Arc::new(
+        SignerEngine::open(
+            &database,
+            Token::new("broker-app-1").unwrap(),
+            broker.verifying_key(),
+            ceremony_key.verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
+            registry,
+        )
+        .unwrap(),
+    );
+    let service = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        ceremony_key.clone(),
+    )
+    .unwrap();
+    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("b1"), 10_000);
+    // A BIP-39 wallet's root is a non-signable seed, so registration enrols no
+    // signable key. A Petal subkey derives from an allocated account instead.
+    let (account, _) = complete_account_allocate(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("b0"),
+        DerivedAccountRequest {
+            derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
+            requested_role: Token::new("evm-account").unwrap(),
+            account: Some(0),
+        },
+        10_050,
+    );
+    let parent = account.public_key_refs[0].clone();
+    let base_scope = PetalKeyScope {
+        wallet_id: wallet_id.clone(),
+        parent_key_ref: parent.clone(),
+        package_hash: digest("b2"),
+        route: "/petals/exchange/sign".into(),
+        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        key_slot: Token::new("account-a").unwrap(),
+        allowed_routes: vec!["/petals/exchange/sign".into()],
+        allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+        maximum_lifetime_ms: DecimalU64::new(20_000),
+        custody_operation_id: operation("b3"),
+    };
+
+    let mut cross_wallet = base_scope.clone();
+    cross_wallet.wallet_id = Token::new("another-wallet").unwrap();
+    assert_eq!(
+        service
+            .prepare_custody(
+                CustodyPrepareRequest {
+                    ceremony_kind: CeremonyKind::KeyDerive,
+                    custody_operation_id: cross_wallet.custody_operation_id.clone(),
+                    wallet_id: Some(cross_wallet.wallet_id.clone()),
+                    key_ref: Some(parent.clone()),
+                    exact_terms_digest: cross_wallet.request_digest().unwrap(),
+                    expected_input_class: Token::new("petal-subkey-v1").unwrap(),
+                    browser_output_recipient_key: None,
+                    petal_key_scope: Some(cross_wallet),
+                    legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_request: None,
+                },
+                10_150,
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::KeyrefMismatch
+    );
+
+    let mut browser_controlled = base_scope.clone();
+    browser_controlled.custody_operation_id = operation("bc");
+    assert_eq!(
+        complete_petal_key_derivation(
+            &service,
+            &authenticator,
+            browser_controlled,
+            Some(serde_json::json!({
+                "kind": "key_derive",
+                "namespace_id": "browser-chosen",
+                "grant": {
+                    "authority_kind": "ceremony",
+                    "namespace_id": "browser-chosen",
+                    "canonical_prefix": "m/0",
+                    "starting_index": "0",
+                    "maximum_children": "1"
+                },
+                "authority_signature": Base64UrlBytes::from_bytes(&[0; 64]),
+            })),
+            10_175,
+        )
+        .unwrap_err()
+        .code,
+        ProtocolErrorCode::BackendInvalidRequest
+    );
+
+    let (first, first_complete) =
+        complete_petal_key_derivation(&service, &authenticator, base_scope.clone(), None, 10_200)
+            .unwrap();
+    assert!(first.encrypted_browser_result.is_none());
+    assert_eq!(first.public_key_refs.len(), 1);
+    // Completion replay returns the same public receipt and never allocates a
+    // second child for the same custody identity.
+    assert_eq!(
+        service.complete_custody(first_complete, 10_400).unwrap(),
+        first
+    );
+
+    let mut second_scope = base_scope.clone();
+    second_scope.custody_operation_id = operation("b4");
+    let (second, _) =
+        complete_petal_key_derivation(&service, &authenticator, second_scope, None, 10_500)
+            .unwrap();
+    assert_ne!(first.public_key_refs[0], second.public_key_refs[0]);
+    let child = first.public_key_refs[0].clone();
+
+    drop(service);
+    drop(engine);
+    // A fresh engine and empty registry restore both custody and the derived
+    // key from Signer's durable records. The scope remains an independent
+    // authorization boundary after restart.
+    let restarted_registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+    let restarted_engine = Arc::new(
+        SignerEngine::open(
+            &database,
+            Token::new("broker-app-1").unwrap(),
+            broker.verifying_key(),
+            ceremony_key.verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
+            restarted_registry.clone(),
+        )
+        .unwrap(),
+    );
+    let restarted_service = SignerCeremonyService::new(
+        restarted_engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        ceremony_key,
+    )
+    .unwrap();
+    let policy = restarted_engine.policy_snapshot(&wallet_id).unwrap();
+    let epoch = restarted_engine
+        .revocation_state(&wallet_id, 10_400)
+        .unwrap()
+        .wallet_revocation_epoch;
+    let scoped_terms = SealedApprovalTerms {
+        subject: ApprovalSubject::Petal {
+            package_hash: base_scope.package_hash.clone(),
+            route: base_scope.route.clone(),
+            agent_id: Some(base_scope.key_slot.as_str().into()),
+        },
+        wallet_id: wallet_id.clone(),
+        key_ref: child,
+        allowed_crypto_suites: base_scope.allowed_crypto_suites.clone(),
+        selector: ApprovalSelector::Exact {
+            ordered_payload_digests: vec![digest("b5")],
+            ordered_hashes: vec![digest("b6")],
+        },
+        limits: ApprovalLimits {
+            max_operations: DecimalU64::new(1),
+            max_signatures: DecimalU64::new(1),
+            operation_rate_limits: vec![],
+            signature_rate_limits: vec![],
+            value_limits: vec![],
+        },
+        activation_mode: ActivationMode::BootBound,
+        wallet_revocation_epoch: epoch,
+        policy_version: policy.version,
+        policy_digest: policy.policy_digest,
+        provenance_digest: digest("b7"),
+        request_nonce: RequestNonce::new("b8".repeat(16)).unwrap(),
+        issued_at_ms: DecimalU64::new(10_400),
+        not_before_ms: DecimalU64::new(10_400),
+        expires_at_ms: DecimalU64::new(20_000),
+        renewal_of: None,
+    };
+
+    let mut cli = scoped_terms.clone();
+    cli.subject = ApprovalSubject::Cli {
+        client_id: Token::new("bloom-cli").unwrap(),
+        command_class: Token::new("wallet-sign").unwrap(),
+    };
+    assert_eq!(
+        restarted_service
+            .prepare_approval(
+                CeremonyPrepareRequest {
+                    activation_operation_id: operation("ba"),
+                    terms: cli.clone(),
+                    review_manifest_digest: digest("bb"),
+                    exact_ordered_payload_digests: vec![digest("b5")],
+                    exact_ordered_hashes: vec![digest("b6")],
+                    replacement_approval_id: None,
+                },
+                10_400,
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&cli)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+    let mut another_petal = scoped_terms.clone();
+    another_petal.subject = ApprovalSubject::Petal {
+        package_hash: digest("b9"),
+        route: base_scope.route.clone(),
+        agent_id: Some(base_scope.key_slot.as_str().into()),
+    };
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&another_petal)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+    let mut another_agent = scoped_terms.clone();
+    another_agent.subject = ApprovalSubject::Petal {
+        package_hash: base_scope.package_hash.clone(),
+        route: base_scope.route.clone(),
+        agent_id: Some("account-b".into()),
+    };
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&another_agent)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+    let mut another_wallet = scoped_terms.clone();
+    another_wallet.wallet_id = Token::new("another-wallet").unwrap();
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&another_wallet)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::KeyrefMismatch
+    );
+    let mut excessive_suite = scoped_terms.clone();
+    excessive_suite.allowed_crypto_suites = vec![CryptoSuite::Secp256k1Keccak256Recoverable];
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&excessive_suite)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SuiteNotAllowed
+    );
+    let mut excessive_lifetime = scoped_terms.clone();
+    excessive_lifetime.expires_at_ms = DecimalU64::new(31_000);
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&excessive_lifetime)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ApprovalExpired
+    );
+    let mut wrong_purpose = scoped_terms.clone();
+    wrong_purpose.selector = ApprovalSelector::Petal {
+        package_hash: base_scope.package_hash.clone(),
+        route: base_scope.route.clone(),
+        allowed_operation_classes: vec![Token::new("payment-key").unwrap()],
+        route_grants: Vec::new(),
+        required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+    };
+    wrong_purpose.request_nonce = RequestNonce::new("ca".repeat(16)).unwrap();
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&wrong_purpose)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+    let mut empty_purpose = wrong_purpose.clone();
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut empty_purpose.selector
+    {
+        allowed_operation_classes.clear();
+    }
+    empty_purpose.request_nonce = RequestNonce::new("cf".repeat(16)).unwrap();
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&empty_purpose)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+
+    let mut reusable = scoped_terms.clone();
+    reusable.selector = ApprovalSelector::Petal {
+        package_hash: base_scope.package_hash.clone(),
+        route: base_scope.route.clone(),
+        allowed_operation_classes: base_scope.allowed_operation_classes.clone(),
+        route_grants: Vec::new(),
+        required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+    };
+    reusable.request_nonce = RequestNonce::new("cb".repeat(16)).unwrap();
+    complete_local_approval(
+        &restarted_service,
+        &authenticator,
+        reusable.clone(),
+        operation("cc"),
+        10_501,
+        10_400,
+    );
+
+    // Fault injection: losing the immutable child-scope row must make the
+    // public KeyRef unusable, even though the backend still has the private
+    // child active. Restore the exact row afterward so the remaining tamper
+    // cases exercise independent checks.
+    let scope_fingerprint = reusable.key_ref.public_key_fingerprint.as_str();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let retained_scope = connection
+        .query_row(
+            "SELECT wallet_id, custody_operation_id, scope_digest, scope_jcs,
+                    created_at_ms, expires_at_ms
+             FROM petal_key_scopes WHERE key_fingerprint = ?1",
+            [scope_fingerprint],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM petal_key_scopes WHERE key_fingerprint = ?1",
+            [scope_fingerprint],
+        )
+        .unwrap();
+    drop(connection);
+    let missing_scope = signed_petal_request(&reusable, &broker, operation("c9"));
+    assert_eq!(
+        restarted_engine
+            .authorize_sign(
+                &missing_scope,
+                &ClockDecision {
+                    effective_now_ms: 10_500,
+                    condition: ClockCondition::Healthy,
+                    observed_utc_ms: Some(10_500),
+                    monotonic_anchor_ns: 999_999,
+                    boot_epoch: BootEpoch::new("ce".repeat(16)).unwrap(),
+                },
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ServiceUnavailable
+    );
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "INSERT INTO petal_key_scopes(
+                key_fingerprint, wallet_id, custody_operation_id, scope_digest,
+                scope_jcs, created_at_ms, expires_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                scope_fingerprint,
+                retained_scope.0,
+                retained_scope.1,
+                retained_scope.2,
+                retained_scope.3,
+                retained_scope.4,
+                retained_scope.5,
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    // Simulate a corrupt/replayed durable approval that bypassed activation.
+    // authorize_sign must independently apply the scope-purpose check rather
+    // than trusting the earlier activation decision.
+    let mut corrupted = reusable.clone();
+    if let ApprovalSelector::Petal {
+        allowed_operation_classes,
+        ..
+    } = &mut corrupted.selector
+    {
+        *allowed_operation_classes = vec![Token::new("payment-key").unwrap()];
+    }
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE approvals SET terms_jcs = ?2 WHERE approval_id = ?1",
+            rusqlite::params![
+                reusable.approval_id().unwrap().as_str(),
+                serde_jcs::to_string(&corrupted).unwrap()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    let signed = signed_petal_request(&reusable, &broker, operation("cc"));
+    assert_eq!(
+        restarted_engine
+            .authorize_sign(
+                &signed,
+                &ClockDecision {
+                    effective_now_ms: 10_500,
+                    condition: ClockCondition::Healthy,
+                    observed_utc_ms: Some(10_500),
+                    monotonic_anchor_ns: 1_000_000,
+                    boot_epoch: BootEpoch::new("cd".repeat(16)).unwrap(),
+                },
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+    restarted_engine
+        .install_approval_for_test(&scoped_terms)
+        .unwrap();
+
+    // Exercise expiry and revocation against the actual persisted Petal child,
+    // rather than relying on the generic approval tests.  The approval is
+    // necessarily bounded by the child scope, so once the scope window has
+    // elapsed no request using that child can remain valid.
+    let mut expired_scoped_request = signed_petal_request(&scoped_terms, &broker, operation("d0"));
+    // Keep the attempt itself live just beyond the child boundary so the
+    // failure is Signer's independent persisted-scope check, not the generic
+    // attempt-expiry guard.
+    expired_scoped_request.unsigned.expires_at_ms = DecimalU64::new(30_400);
+    expired_scoped_request.unsigned.attempt_digest = expired_scoped_request
+        .unsigned
+        .computed_attempt_digest()
+        .unwrap();
+    expired_scoped_request.broker_signature = Base64UrlBytes::from_bytes(
+        &broker
+            .sign(&expired_scoped_request.unsigned.attempt_digest.to_bytes())
+            .to_bytes(),
+    );
+    let scope_expired = restarted_engine
+        .authorize_sign(
+            &expired_scoped_request,
+            &ClockDecision {
+                effective_now_ms: 30_301,
+                condition: ClockCondition::Healthy,
+                observed_utc_ms: Some(30_301),
+                monotonic_anchor_ns: 1_000_000,
+                boot_epoch: BootEpoch::new("d1".repeat(16)).unwrap(),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(scope_expired.code, ProtocolErrorCode::ApprovalExpired);
+    assert_eq!(
+        scope_expired.message,
+        "approval validity exceeds the Petal derived-key scope"
+    );
+
+    let scoped_approval_id = scoped_terms.approval_id().unwrap();
+    restarted_engine
+        .revoke_approval(
+            &scoped_approval_id,
+            "fixture Petal child approval revoked".into(),
+            operation("d2"),
+            10_600,
+        )
+        .unwrap();
+    let revoked_scoped_request = signed_petal_request(&scoped_terms, &broker, operation("d3"));
+    assert_eq!(
+        restarted_engine
+            .authorize_sign(
+                &revoked_scoped_request,
+                &ClockDecision {
+                    effective_now_ms: 10_700,
+                    condition: ClockCondition::Healthy,
+                    observed_utc_ms: Some(10_700),
+                    monotonic_anchor_ns: 1_000_001,
+                    boot_epoch: BootEpoch::new("d4".repeat(16)).unwrap(),
+                },
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ApprovalRevoked
+    );
 }
 
 #[test]

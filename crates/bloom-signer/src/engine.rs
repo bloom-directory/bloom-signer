@@ -397,12 +397,27 @@ impl SignerBackupSet {
 pub struct SignerEngine {
     connection: Mutex<Connection>,
     audit_degraded: AtomicBool,
+    audit_tail: Mutex<AuditTailState>,
     broker_key_id: Token,
     broker_public_key: VerifyingKey,
     revocation_key_id: Token,
     revocation_signing_key: Arc<SigningKey>,
     audit_keys: RwLock<AuditKeyState>,
     backend_registry: Arc<BackendRegistry>,
+}
+
+#[derive(Clone)]
+struct VerifiedAuditTail {
+    sequence: u64,
+    head_hash: Digest32,
+    data_version: i64,
+    total_changes: u64,
+}
+
+#[derive(Default)]
+struct AuditTailState {
+    verified: Option<VerifiedAuditTail>,
+    pending: Option<VerifiedAuditTail>,
 }
 
 struct AuditKeyState {
@@ -424,37 +439,12 @@ impl SignerEngine {
         &self.backend_registry
     }
 
-    /// Fully verify and return the current audit head as `(entry_count, hash)`.
+    /// Return the startup-verified, incrementally maintained audit head.
     /// An empty journal is `(0, 00..00)`; DB head sequence N maps to count N+1.
     pub fn verified_audit_head(&self) -> Result<(u64, Digest32), ProtocolError> {
         let connection = self.connection.lock();
         let audit_keys = self.audit_keys.read();
-        let result = (|| {
-            verify_audit_chain(
-                &connection,
-                &audit_keys.current_key_id,
-                &audit_keys.trusted_keys,
-            )?;
-            connection
-                .query_row(
-                    "SELECT sequence, entry_hash FROM audit_chain ORDER BY sequence DESC LIMIT 1",
-                    [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()
-                .map_err(storage)?
-                .map(|(sequence, head)| {
-                    Ok((
-                        u64::try_from(sequence)
-                            .map_err(malformed)?
-                            .checked_add(1)
-                            .ok_or_else(|| malformed("audit entry count overflow"))?,
-                        Digest32::new(head).map_err(malformed)?,
-                    ))
-                })
-                .transpose()
-                .map(|head| head.unwrap_or((0, Digest32::from_bytes([0; 32]))))
-        })();
+        let result = self.cached_audit_head(&connection, &audit_keys);
         if result.is_err() {
             self.latch_audit_degraded();
         }
@@ -883,9 +873,18 @@ impl SignerEngine {
             &audit_keys.historical_verifying_keys,
         )
         .is_err();
+        let verified_tail = if audit_degraded {
+            None
+        } else {
+            Some(read_verified_audit_tail(&connection)?)
+        };
         Ok(Self {
             connection: Mutex::new(connection),
             audit_degraded: AtomicBool::new(audit_degraded),
+            audit_tail: Mutex::new(AuditTailState {
+                verified: verified_tail,
+                pending: None,
+            }),
             broker_key_id,
             broker_public_key,
             revocation_key_id,
@@ -906,19 +905,12 @@ impl SignerEngine {
         if self.audit_degraded.load(Ordering::SeqCst) {
             return Err(audit_degraded_error());
         }
-        let transaction = connection.transaction().map_err(storage)?;
         let audit_keys = self.audit_keys.read();
-        if verify_audit_chain(
-            &transaction,
-            &audit_keys.current_key_id,
-            &audit_keys.trusted_keys,
-        )
-        .is_err()
-        {
+        if self.cached_audit_head(connection, &audit_keys).is_err() {
             self.audit_degraded.store(true, Ordering::SeqCst);
             return Err(audit_degraded_error());
         }
-        Ok(transaction)
+        connection.transaction().map_err(storage)
     }
 
     fn append_audit(
@@ -943,7 +935,58 @@ impl SignerEngine {
                 format!("Signer audit append failed; mutations are latched closed: {cause}"),
             ));
         }
+        let mut pending = read_verified_audit_tail(transaction)?;
+        pending.data_version = self
+            .audit_tail
+            .lock()
+            .verified
+            .as_ref()
+            .map_or(pending.data_version, |tail| tail.data_version);
+        self.audit_tail.lock().pending = Some(pending);
         Ok(())
+    }
+
+    fn cached_audit_head(
+        &self,
+        connection: &Connection,
+        audit_keys: &AuditKeyState,
+    ) -> Result<(u64, Digest32), ProtocolError> {
+        let observed = read_verified_audit_tail(connection)?;
+        let mut state = self.audit_tail.lock();
+        if let Some(verified) = state.verified.as_ref().filter(|tail| {
+            tail.data_version == observed.data_version
+                && tail.total_changes == observed.total_changes
+                && tail.sequence == observed.sequence
+                && tail.head_hash == observed.head_hash
+        }) {
+            return Ok((verified.sequence, verified.head_hash.clone()));
+        }
+        if let Some(pending) = state.pending.as_ref().filter(|tail| {
+            tail.data_version == observed.data_version
+                && tail.total_changes == observed.total_changes
+                && tail.sequence == observed.sequence
+                && tail.head_hash == observed.head_hash
+                && state
+                    .verified
+                    .as_ref()
+                    .is_some_and(|verified| verified.data_version == observed.data_version)
+        }) {
+            let promoted = pending.clone();
+            let head = (promoted.sequence, promoted.head_hash.clone());
+            state.verified = Some(promoted);
+            state.pending = None;
+            return Ok(head);
+        }
+        verify_audit_chain(
+            connection,
+            &audit_keys.current_key_id,
+            &audit_keys.trusted_keys,
+        )?;
+        let verified = read_verified_audit_tail(connection)?;
+        let head = (verified.sequence, verified.head_hash.clone());
+        state.verified = Some(verified);
+        state.pending = None;
+        Ok(head)
     }
 
     pub(crate) fn observe_time(
@@ -5547,6 +5590,7 @@ fn validate_petal_key_approval(
         package_hash: selector_package,
         route: selector_route,
         allowed_operation_classes,
+        route_grants,
         ..
     } = &terms.selector
     {
@@ -5564,6 +5608,21 @@ fn validate_petal_key_approval(
             return Err(error(
                 ProtocolErrorCode::SelectorMismatch,
                 "Petal selector operation classes exceed the derived-key purpose",
+            ));
+        }
+        if route_grants.iter().any(|grant| {
+            !scope.allowed_routes.contains(&grant.route)
+                || grant.allowed_operation_classes.is_empty()
+                || grant
+                    .allowed_operation_classes
+                    .iter()
+                    .any(|operation_class| {
+                        !scope.allowed_operation_classes.contains(operation_class)
+                    })
+        }) {
+            return Err(error(
+                ProtocolErrorCode::SelectorMismatch,
+                "Petal route grant exceeds the derived-key route or purpose scope",
             ));
         }
     }
@@ -6022,6 +6081,39 @@ fn append_audit_entry(
         )
         .map_err(storage)?;
     Ok(())
+}
+
+fn read_verified_audit_tail(connection: &Connection) -> Result<VerifiedAuditTail, ProtocolError> {
+    let (sequence, head_hash) = connection
+        .query_row(
+            "SELECT sequence, entry_hash FROM audit_chain ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(storage)?
+        .map(
+            |(sequence, head)| -> Result<(u64, Digest32), ProtocolError> {
+                Ok((
+                    u64::try_from(sequence)
+                        .map_err(malformed)?
+                        .checked_add(1)
+                        .ok_or_else(|| malformed("audit entry count overflow"))?,
+                    Digest32::new(head).map_err(malformed)?,
+                ))
+            },
+        )
+        .transpose()?
+        .unwrap_or((0, Digest32::from_bytes([0; 32])));
+    let data_version = connection
+        .query_row("PRAGMA data_version", [], |row| row.get(0))
+        .map_err(storage)?;
+    Ok(VerifiedAuditTail {
+        sequence,
+        head_hash,
+        data_version,
+        total_changes: connection.total_changes(),
+    })
 }
 
 fn verify_audit_chain(
