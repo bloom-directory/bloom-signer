@@ -775,7 +775,7 @@ mod tests {
 
     fn test_time_source() -> &'static str {
         #[cfg(target_os = "linux")]
-        return "linux-chrony-nts";
+        return "linux-system-clock";
         #[cfg(target_os = "macos")]
         return "macos-managed-timed";
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]

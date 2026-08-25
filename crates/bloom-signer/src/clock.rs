@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use bloom_signer_api::{BootEpoch, ProtocolError, ProtocolErrorCode, ReadinessState, Token};
-use bloom_trusted_time::{
-    MAX_FORWARD_STEP_MS, PlatformTimeReading, PlatformTimeSampler, TrustedTimeSource,
-};
+use bloom_trusted_time::{MAX_FORWARD_STEP_MS, PlatformTimeReading, PlatformTimeSampler};
 use parking_lot::Mutex;
 
 use crate::engine::SignerEngine;
@@ -43,10 +41,7 @@ impl SignerClock {
         let sampler = PlatformTimeSampler::new(trusted_time_source).map_err(|error| {
             ProtocolError::new(ProtocolErrorCode::ClockUntrusted, error.to_string())
         })?;
-        let durable_clock_guard = match sampler.source() {
-            TrustedTimeSource::LinuxChronyNts => true,
-            TrustedTimeSource::MacosManagedTimed => false,
-        };
+        let durable_clock_guard = sampler.source().requires_durable_clock_guard();
         let clock = Self {
             engine,
             sampler,
@@ -220,7 +215,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         let source = "macos-managed-timed";
         #[cfg(target_os = "linux")]
-        let source = "linux-chrony-nts";
+        let source = "linux-system-clock";
         let clock =
             SignerClock::new(engine, source, BootEpoch::new("01".repeat(16)).unwrap()).unwrap();
         assert_eq!(

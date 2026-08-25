@@ -6031,11 +6031,11 @@ mod clock_tests {
     }
 
     #[test]
-    fn signer_clock_rejects_downtime_credited_across_a_boot_change() {
-        // A reboot restarts the kernel's suspend-aware clock, so a current
-        // anchor can exceed a persisted one while belonging to a different
-        // boot. Crediting that delta would advance effective time by downtime
-        // that never elapsed and let a large UTC step pass the forward guard.
+    fn signer_clock_accepts_non_decreasing_wall_time_across_a_boot_change() {
+        // A reboot restarts the kernel's suspend-aware clock. Bloom cannot
+        // measure powered-off time from that new monotonic domain, so it uses
+        // the durable floor to reject rollback and otherwise accepts the host
+        // wall clock without requiring an external synchronization daemon.
         let engine = engine();
         engine
             .observe_time(
@@ -6067,8 +6067,8 @@ mod clock_tests {
             )
             .unwrap();
 
-        assert_eq!(rebooted.condition, ClockCondition::ForwardJumpRejected);
-        assert_eq!(rebooted.effective_now_ms, 10_000);
+        assert_eq!(rebooted.condition, ClockCondition::Healthy);
+        assert_eq!(rebooted.effective_now_ms, 10_000 + two_hours_ms);
     }
 
     #[test]
@@ -6148,7 +6148,7 @@ mod clock_tests {
     }
 
     #[test]
-    fn signer_clock_monotonic_anchor_rollback_stays_fail_closed() {
+    fn signer_clock_new_boot_with_smaller_anchor_accepts_wall_time() {
         let engine = engine();
         engine
             .observe_time(
@@ -6163,13 +6163,9 @@ mod clock_tests {
             )
             .unwrap();
 
-        // A kernel reboot (or other monotonic-domain reset) makes the
-        // absolute anchor go backwards relative to what was persisted. Even
-        // though UTC advanced by more than MAX_FORWARD_STEP_MS, the anchor
-        // can no longer be trusted to attribute that gap to real downtime in
-        // the same monotonic domain, so this must stay fail-closed via the
-        // existing process-relative guard and require an explicit operator
-        // repair.
+        // A kernel reboot normally makes the absolute anchor smaller. The new
+        // boot epoch proves the old anchor is incomparable, so a nondecreasing
+        // host wall clock recovers without operator repair.
         let two_hours_ms = 2 * 60 * 60 * 1_000;
         let rebooted = engine
             .observe_time(
@@ -6183,12 +6179,8 @@ mod clock_tests {
                 false,
             )
             .unwrap();
-        assert_eq!(rebooted.condition, ClockCondition::ForwardJumpRejected);
-        assert_eq!(rebooted.effective_now_ms, 10_000);
-
-        let repaired = engine.repair_clock(10_000 + two_hours_ms).unwrap();
-        assert_eq!(repaired.condition, ClockCondition::Repaired);
-        assert_eq!(repaired.effective_now_ms, 10_000 + two_hours_ms);
+        assert_eq!(rebooted.condition, ClockCondition::Healthy);
+        assert_eq!(rebooted.effective_now_ms, 10_000 + two_hours_ms);
     }
 
     #[test]
