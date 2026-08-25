@@ -517,6 +517,7 @@ fn signer_responses() -> Vec<BrokerSignerResponse> {
         BrokerSignerResponse::CeremonyCancel(ceremony_status()),
         BrokerSignerResponse::OperationStatus(operation_status),
         BrokerSignerResponse::CeremonyStatus(SignerCeremonyStatus::Pending),
+        BrokerSignerResponse::CeremonyStatus(SignerCeremonyStatus::Terminal(CeremonyState::Failed)),
         BrokerSignerResponse::SealedApprovalStatus(approval_status()),
         BrokerSignerResponse::SealedApprovalRevoke(approval_status()),
         BrokerSignerResponse::SealedApprovalRevokeAll(revocation_state()),
@@ -595,7 +596,7 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "5cce5c7bcbd6930d62d968a7ac407f8e33d5c8900fd288573c02bc75496c50e9",
+        "6060acc449d32bbc2932406d0be9be2deaa05e4cf03942b274e95bbfcb7ca3cf",
     );
     assert_wire_digest(
         "control requests",

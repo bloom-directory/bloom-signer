@@ -317,6 +317,7 @@ impl SignerCeremonyService {
             }
             return Err(kind_mismatch());
         }
+        self.require_unopened_operation_id(&request.activation_operation_id)?;
         self.require_no_live_wallet_session(&request.terms.wallet_id)?;
 
         let ceremony_id = random_digest();
@@ -413,6 +414,7 @@ impl SignerCeremonyService {
             }
             return Err(kind_mismatch());
         }
+        self.require_unopened_operation_id(&request.custody_operation_id)?;
         if let Some(wallet_id) = &request.wallet_id {
             self.require_no_live_wallet_session(wallet_id)?;
         }
@@ -1174,6 +1176,30 @@ impl SignerCeremonyService {
                 "ceremony not found",
             )),
         }
+    }
+
+    /// Refuse to prepare an operation ID that already reached a durable
+    /// outcome.
+    ///
+    /// Preparation is the only way back into `pending`, and `pending` is what
+    /// `status` reports first. Without this a terminal ceremony is reopenable:
+    /// the operation ID whose rejected proof left a `FAILED` row could be
+    /// prepared again, reverting the reported state to `Pending`, granting the
+    /// fail-closed ceremony a second attempt, and letting its completion
+    /// overwrite the durable terminal row. A committed receipt is equally
+    /// closed — replaying it belongs to `complete`, which returns the existing
+    /// receipt rather than arming a fresh ceremony.
+    fn require_unopened_operation_id(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<(), ProtocolError> {
+        if self.engine.activation_receipt(operation_id)?.is_some()
+            || self.engine.custody_receipt(operation_id)?.is_some()
+            || self.engine.ceremony_public_status(operation_id)?.is_some()
+        {
+            return Err(terminal_conflict());
+        }
+        Ok(())
     }
 
     /// Record the durable terminal state of a consumed ceremony that produced
@@ -2534,6 +2560,13 @@ fn replay() -> ProtocolError {
     protocol(
         ProtocolErrorCode::CeremonyReplay,
         "ceremony is absent, expired, or already consumed",
+    )
+}
+
+fn terminal_conflict() -> ProtocolError {
+    protocol(
+        ProtocolErrorCode::OperationIdConflict,
+        "ceremony operation ID already reached a durable terminal state or receipt",
     )
 }
 
