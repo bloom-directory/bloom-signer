@@ -38,11 +38,13 @@ pub use bloom_rpc_wire::{
     WireError, WireErrorCode, decode_frame, encode_frame,
 };
 
-/// Broker-to-Signer authority contract. Version 1.3 adds the bounded legacy
-/// passkey-migration metadata carried by `wallet.import_prepare`.
+/// Broker-to-Signer authority contract. Version 1.4 adds the durable terminal
+/// ceremony-status response. It is intentionally a strict minor bump: a 1.3
+/// peer cannot deserialize the new `Terminal` response variant, so it must not
+/// negotiate this contract.
 pub const SIGNER_API_MAJOR: u16 = 1;
-pub const SIGNER_API_MINOR_MIN: u16 = 3;
-pub const SIGNER_API_MINOR_MAX: u16 = 3;
+pub const SIGNER_API_MINOR_MIN: u16 = 4;
+pub const SIGNER_API_MINOR_MAX: u16 = 4;
 pub const SIGNER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(SIGNER_API_MAJOR, SIGNER_API_MINOR_MAX);
 pub const SIGNER_API_RANGE: ProtocolVersionRange =
