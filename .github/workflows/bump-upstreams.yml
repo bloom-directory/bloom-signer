@@ -144,8 +144,9 @@ jobs:
           git diff --check
 
       - name: Open or update bump PR
+        if: steps.resolve.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${ secrets.RELEASE_PR_TOKEN }
+          GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
