@@ -2181,7 +2181,6 @@ impl SignerEngine {
         let profile = request.derivation_profile;
         let profile_str = profile_id(profile);
         let role = request.requested_role.as_str().to_owned();
-        let account = request.account.unwrap_or(0);
         let seed = unlocked.bip39_seed()?;
 
         let mut connection = self.connection.lock();
@@ -2193,7 +2192,7 @@ impl SignerEngine {
             wallet_id,
             profile_str,
             &role,
-            account,
+            request.account,
             operation_id.as_str(),
             |candidate_account: u32, candidate_index: u32| match profile {
                 DerivationProfile::Bip44EvmSecp256k1V1 => matches!(
@@ -2213,11 +2212,14 @@ impl SignerEngine {
 
         let (spki_der, key_spec, encoding) = match profile {
             DerivationProfile::Bip44EvmSecp256k1V1 => {
-                let derived =
-                    bloom_signer_derive::derive_evm_account(&seed, account, reservation.index)
-                        .map_err(|cause| {
-                            error(ProtocolErrorCode::BackendInvalidRequest, cause.to_string())
-                        })?;
+                let derived = bloom_signer_derive::derive_evm_account(
+                    &seed,
+                    reservation.account,
+                    reservation.index,
+                )
+                .map_err(|cause| {
+                    error(ProtocolErrorCode::BackendInvalidRequest, cause.to_string())
+                })?;
                 (
                     derived.spki_der,
                     KeySpec::Secp256k1,
@@ -2225,9 +2227,11 @@ impl SignerEngine {
                 )
             }
             DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
-                let derived = bloom_signer_derive::derive_solana_account(&seed, account).map_err(
-                    |cause| error(ProtocolErrorCode::BackendInvalidRequest, cause.to_string()),
-                )?;
+                let derived =
+                    bloom_signer_derive::derive_solana_account(&seed, reservation.account)
+                        .map_err(|cause| {
+                            error(ProtocolErrorCode::BackendInvalidRequest, cause.to_string())
+                        })?;
                 (
                     derived.spki_der,
                     KeySpec::Ed25519,

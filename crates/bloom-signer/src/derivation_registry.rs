@@ -362,23 +362,24 @@ pub fn prepare_allocation(
     wallet_id: &Token,
     profile: &str,
     role: &str,
-    account: u32,
+    account: impl Into<Option<u32>>,
     operation_id: &str,
     invalid_child: impl Fn(u32, u32) -> bool,
     now_ms: u64,
     audit: AuditRecorder<'_>,
 ) -> Result<Reservation, ProtocolError> {
+    let requested_account = account.into();
     if let Some(existing) = load_allocation(connection, wallet_id, operation_id)? {
         // Idempotent retry: identical request returns the same reservation.
         if existing.profile == profile
             && existing.role == role
-            && existing.account == i64::from(account)
+            && requested_account.is_none_or(|account| existing.account == i64::from(account))
         {
             return Ok(Reservation {
                 operation_id: operation_id.to_owned(),
                 profile: existing.profile,
                 role: existing.role,
-                account,
+                account: existing.account as u32,
                 index: existing.index as u32,
                 path: existing.path,
                 state: existing.state,
@@ -390,6 +391,35 @@ pub fn prepare_allocation(
     }
 
     let transaction = immediate_transaction(connection)?;
+    let account = match requested_account {
+        Some(account) => account,
+        // A Solana profile path contains the BIP-44 account but no address
+        // index. Automatic allocation therefore advances the account across
+        // every prior lifecycle, including retired and tombstoned rows. This
+        // decision belongs in the authoritative registry transaction; an
+        // active-only public projection cannot safely choose it.
+        None if profile == PROFILE_SOLANA => {
+            let highest: Option<i64> = transaction
+                .query_row(
+                    "SELECT MAX(account) FROM derivation_allocations
+                      WHERE wallet_id = ?1 AND profile = ?2",
+                    rusqlite::params![wallet_id.as_str(), profile],
+                    |row| row.get(0),
+                )
+                .map_err(storage)?;
+            match highest {
+                None => 0,
+                Some(highest) if highest < i64::from((1_u32 << 31) - 1) => (highest as u32) + 1,
+                Some(_) => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::LimitExceededOperations,
+                        "Solana derivation account namespace is exhausted",
+                    ));
+                }
+            }
+        }
+        None => 0,
+    };
     ensure_namespace(&transaction, wallet_id, profile, role, account)?;
     let capacity: (i64, i64) = transaction
         .query_row(
@@ -443,6 +473,20 @@ pub fn prepare_allocation(
     });
 
     let path = resolve_canonical_path(profile, account, start)?;
+    let path_owner = transaction
+        .query_row(
+            "SELECT operation_id FROM derivation_allocations
+              WHERE wallet_id = ?1 AND profile = ?2 AND path = ?3",
+            rusqlite::params![wallet_id.as_str(), profile, path],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    if let Some(path_owner) = path_owner {
+        return Err(conflict(format!(
+            "canonical derivation path '{path}' is already allocated by operation '{path_owner}'"
+        )));
+    }
     for skipped_index in &skipped {
         transaction
             .execute(

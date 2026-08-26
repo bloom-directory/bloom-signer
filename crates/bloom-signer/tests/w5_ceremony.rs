@@ -784,21 +784,12 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     )
     .unwrap();
     let (wallet_id, _) = register_wallet(&service, &authenticator, operation("b1"), 10_000);
-    // A BIP-39 wallet's root is a non-signable seed, so registration enrols no
-    // signable key. A Petal subkey derives from an allocated account instead.
-    let (account, _) = complete_account_allocate(
-        &service,
-        &authenticator,
-        &wallet_id,
-        &operation("b0"),
-        DerivedAccountRequest {
-            derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
-            requested_role: Token::new("evm-account").unwrap(),
-            account: Some(0),
-        },
-        10_050,
-    );
-    let parent = account.public_key_refs[0].clone();
+    // A BIP-39 wallet's root is a non-signable seed. Registration allocates
+    // its canonical primary EVM child, which is the valid Petal parent; do not
+    // manufacture a second role at the same derivation path.
+    let accounts = engine.derived_account_descriptors(&wallet_id).unwrap();
+    assert_eq!(accounts.len(), 1);
+    let parent = accounts[0].key_ref.clone();
     let base_scope = PetalKeyScope {
         wallet_id: wallet_id.clone(),
         parent_key_ref: parent.clone(),
@@ -2810,7 +2801,7 @@ fn bip39_solana_allocation_is_deterministic_and_advances_accounts() {
         DerivedAccountRequest {
             derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
             requested_role: Token::new("solana-account").unwrap(),
-            account: Some(0),
+            account: None,
         },
         10_100,
     );
@@ -2831,7 +2822,7 @@ fn bip39_solana_allocation_is_deterministic_and_advances_accounts() {
         DerivedAccountRequest {
             derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
             requested_role: Token::new("solana-account").unwrap(),
-            account: Some(1),
+            account: None,
         },
         10_200,
     );

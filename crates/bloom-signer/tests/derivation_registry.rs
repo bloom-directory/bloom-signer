@@ -2,7 +2,7 @@
 //! crash-at-every-transition reload semantics.
 
 use bloom_signer::derivation_registry as registry;
-use bloom_signer_api::{Digest32, Token};
+use bloom_signer_api::{Digest32, DurableEffect, ProtocolErrorCode, RetryClass, Token};
 use rusqlite::Connection;
 
 fn connection() -> Connection {
@@ -630,4 +630,116 @@ fn address_index_counter_is_per_account() {
     .unwrap();
     assert_eq!(reservation.index, 0);
     assert_eq!(reservation.path, "m/44'/60'/1'/0/0");
+}
+
+#[test]
+fn solana_path_collision_is_permanent_and_does_not_consume_the_next_account() {
+    let mut connection = connection();
+    let wallet = primary();
+    let first = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_SOLANA,
+        registry::ROLE_SOLANA_ACCOUNT,
+        0,
+        "op-solana-0",
+        |_, _| false,
+        1_000,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(first.index, 0);
+    assert_eq!(first.path, "m/44'/501'/0'/0'");
+
+    // Solana's canonical profile has no address-index component. A second
+    // reservation in account 0 therefore resolves to the already-owned path,
+    // even though the namespace's internal counter advanced to index 1.
+    let collision = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_SOLANA,
+        registry::ROLE_SOLANA_ACCOUNT,
+        0,
+        "op-solana-collision",
+        |_, _| false,
+        1_100,
+        &noop,
+    )
+    .unwrap_err();
+    assert_eq!(collision.code, ProtocolErrorCode::OperationIdConflict);
+    assert_eq!(collision.retry, RetryClass::Never);
+    assert_eq!(
+        collision.durable_effect,
+        DurableEffect::PriorOperationStands
+    );
+    assert!(collision.message.contains("m/44'/501'/0'/0'"));
+    assert!(collision.message.contains("op-solana-0"));
+
+    // The rejected transaction must not consume the first slot of account 1.
+    let next_account = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_SOLANA,
+        registry::ROLE_SOLANA_ACCOUNT,
+        1,
+        "op-solana-1",
+        |_, _| false,
+        1_200,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(next_account.index, 0);
+    assert_eq!(next_account.path, "m/44'/501'/1'/0'");
+}
+
+#[test]
+fn automatic_solana_accounts_advance_across_tombstones_and_roles() {
+    let mut connection = connection();
+    let wallet = primary();
+    let first = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_SOLANA,
+        registry::ROLE_SOLANA_ACCOUNT,
+        None,
+        "op-solana-0",
+        |_, _| false,
+        1_000,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(first.account, 0);
+    registry::tombstone(&mut connection, &wallet, "op-solana-0", 1_100, &noop).unwrap();
+
+    let second = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_SOLANA,
+        "alternate-solana-role",
+        None,
+        "op-solana-1",
+        |_, _| false,
+        1_200,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(second.account, 1);
+    assert_eq!(second.index, 0);
+    assert_eq!(second.path, "m/44'/501'/1'/0'");
+
+    // Retrying an automatic request must recover its original reservation,
+    // not observe itself as the highest account and allocate account 2.
+    let retry = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_SOLANA,
+        "alternate-solana-role",
+        None,
+        "op-solana-1",
+        |_, _| false,
+        1_300,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(retry, second);
 }
