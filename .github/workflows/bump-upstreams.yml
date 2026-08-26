@@ -6,10 +6,12 @@ name: Bump Upstreams
 # Registry (crates.io) updates are handled separately by Dependabot; cargo
 # ignores git dependencies, so pinned revs need this job.
 #
+# The PAT used to open the PR exists only in the token-check and publish
+# steps; build and test steps run unreviewed upstream code with no
+# repository credentials present.
+#
 # RELEASE_PR_TOKEN must be a repository secret containing a fine-grained PAT
-# with Contents: read/write and Pull requests: read/write, mirroring the
-# convention used by the bloom repository's Propose Release workflow. A
-# separate token lets the generated PR receive normal pull_request CI.
+# with Contents: read/write and Pull requests: read/write.
 
 on:
   schedule:
@@ -30,14 +32,14 @@ jobs:
     name: Open reviewed upstream bump PR
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
     env:
-      GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
       BASE: ${{ github.event.repository.default_branch }}
       BRANCH: chore/bump-upstreams
     steps:
       - name: Require release PR token
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
         run: |
           set -euo pipefail
           if [[ -z "${GH_TOKEN:-}" ]]; then
@@ -49,60 +51,73 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_PR_TOKEN }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup show
 
-      - name: Resolve and rewrite pinned upstream revision
+      - name: Resolve and rewrite pinned upstream revisions
         id: resolve
         run: |
           set -euo pipefail
 
-          repo="bloom-service-runtime"
-          url="https://github.com/bloom-directory/${repo}.git"
-          new="$(git ls-remote "$url" HEAD | cut -f1)"
-          if [[ ! "$new" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::could not resolve HEAD of $url"
-            exit 1
-          fi
+          # Upstream repositories and every workspace package resolved
+          # from each. Keep in sync with the git pins in Cargo.toml files
+          # (pin URLs may or may not carry a .git suffix).
+          declare -A UPSTREAM_PKGS=(
+            [bloom-service-runtime]="bloom-rpc-wire bloom-triad-local-transport bloom-audit-checkpoint bloom-service-activation bloom-trusted-time bloom-platform-containment"
+          )
 
-          pins="$(
-            grep -rhoE "git = \"https://github\.com/bloom-directory/${repo}\.git\", rev = \"[0-9a-f]{40}\"" \
-              --include=Cargo.toml . |
-              sed -E 's/.*rev = "([0-9a-f]{40})".*/\1/' | sort -u
-          )"
-          if [[ -z "$pins" ]]; then
-            echo "::error::no git pin found for $repo"
-            exit 1
-          fi
-          if [[ "$(wc -l <<<"$pins")" -ne 1 ]]; then
-            echo "::error::$repo is pinned at multiple divergent revisions; reconcile manually:"
-            printf '%s\n' "$pins"
-            exit 1
-          fi
-          old="$pins"
+          SUMMARY="$(mktemp)"
+          CHANGED=0
 
-          if [[ "$old" == "$new" ]]; then
-            echo "$repo: up to date at $new"
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          for repo in bloom-service-runtime; do
+            url="https://github.com/bloom-directory/${repo}.git"
+            new="$(git ls-remote "$url" HEAD | cut -f1)"
+            if [[ ! "$new" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::could not resolve HEAD of $url"
+              exit 1
+            fi
 
-          for file in $(git grep -l "$old" -- '*.toml'); do
-            sed -i "s/$old/$new/g" "$file"
+            pins="$(
+              grep -rhoE "git = \"https://github\.com/bloom-directory/${repo}(\.git)?\", rev = \"[0-9a-f]{40}\"" \
+                --include=Cargo.toml . |
+                sed -E 's/.*rev = "([0-9a-f]{40})".*/\1/' | sort -u
+            )"
+            if [[ -z "$pins" ]]; then
+              echo "::error::no git pin found for $repo"
+              exit 1
+            fi
+            if [[ "$(wc -l <<<"$pins")" -ne 1 ]]; then
+              echo "::error::$repo is pinned at multiple divergent revisions; reconcile manually:"
+              printf '%s\n' "$pins"
+              exit 1
+            fi
+            old="$pins"
+
+            if [[ "$old" == "$new" ]]; then
+              echo "$repo: up to date at $new" >> "$SUMMARY"
+              continue
+            fi
+
+            for file in $(git grep -l "$old" -- '*.toml'); do
+              sed -i "s/$old/$new/g" "$file"
+            done
+
+            # shellcheck disable=SC2086
+            cargo update -p $(printf -- '-p %s ' ${UPSTREAM_PKGS[$repo]})
+
+            echo "- $repo: \`$old\` -> \`$new\`" >> "$SUMMARY"
+            CHANGED=1
           done
 
-          cargo update \
-            -p bloom-rpc-wire \
-            -p bloom-triad-local-transport \
-            -p bloom-audit-checkpoint \
-            -p bloom-service-activation \
-            -p bloom-trusted-time \
-            -p bloom-platform-containment
-
-          echo "- $repo: \`$old\` -> \`$new\`" > "$RUNNER_TEMP/summary.md"
-          echo "changed=true" >> "$GITHUB_OUTPUT"
+          cat "$SUMMARY"
+          if [[ "$CHANGED" -eq 0 ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            cp "$SUMMARY" "$RUNNER_TEMP/summary.md"
+          fi
 
       - name: Check formatting
         if: steps.resolve.outputs.changed == 'true'
@@ -129,22 +144,25 @@ jobs:
           git diff --check
 
       - name: Open or update bump PR
-        if: steps.resolve.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${ secrets.RELEASE_PR_TOKEN }
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "chore: bump upstream triad pins"
+          git config --local http.https://github.com/.extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
           git push --force origin "HEAD:refs/heads/$BRANCH"
+          git config --local --unset http.https://github.com/.extraheader
 
           NOTES="$(mktemp)"
           {
             echo "## Upstream pin bumps"
             echo
             cat "$RUNNER_TEMP/summary.md"
-            echo
-            echo "Resolved from the default-branch head of bloom-service-runtime."
+            echo "Resolved from the default-branch heads of the upstream repositories."
             echo "Please review the upstream commits between the old and new revisions"
             echo "before merging; normal CI checks apply."
           } > "$NOTES"
