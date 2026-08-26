@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActivationMode, Base64UrlBytes, CryptoSuite, DecimalU64, Digest32, HpkeEnvelope, KeyRef,
-    OperationId, PetalKeyScope, ProtocolError, ProtocolErrorCode, SealedApprovalTerms, Token,
+    ActivationMode, Base64UrlBytes, CeremonyState, CryptoSuite, DecimalU64, Digest32, HpkeEnvelope,
+    KeyRef, OperationId, PetalKeyScope, ProtocolError, ProtocolErrorCode, SealedApprovalTerms,
+    Token,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -487,6 +488,9 @@ pub enum SignerCeremonyStatus {
     Pending,
     CompletedApproval(Box<SignerActivationReceipt>),
     CompletedCustody(Box<CustodyResult>),
+    /// A durable non-successful terminal ceremony state, distinct from an
+    /// operation unknown to Signer.
+    Terminal(CeremonyState),
     Missing,
 }
 

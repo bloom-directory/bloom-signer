@@ -496,10 +496,10 @@ fn clock_repair_request() -> Result<Option<u64>, Box<dyn std::error::Error>> {
         .transpose()
 }
 
-/// Whether a Broker request body relies on a protocol-minor-4-only field:
+/// Whether a Broker request body relies on a protocol-minor-5-only field:
 /// the BIP-39 seed profile, the derived-account allocation request, or the
 /// account allocate/retire ceremony kinds.
-fn request_uses_minor_4_features(request: &BrokerSignerRequest) -> bool {
+fn request_uses_minor_5_features(request: &BrokerSignerRequest) -> bool {
     let custody = match request {
         BrokerSignerRequest::KeyDerivePrepare(r)
         | BrokerSignerRequest::KeyEnrollPrepare(r)
@@ -527,8 +527,15 @@ fn request_uses_minor_4_features(request: &BrokerSignerRequest) -> bool {
 
 /// Authority-edge dispatch with per-request protocol enforcement. The
 /// transport negotiates and verifies the request's signed protocol against
-/// the supported range; this seam additionally refuses a pre-1.4 peer that
-/// carries a minor-4-only field.
+/// the supported range; this seam additionally refuses a pre-1.5 peer that
+/// carries a minor-5-only field.
+///
+/// The floor tracks the bip39 surface, not the supported minimum. Those were
+/// both 4 while the bip39 fields were minor-4, but the terminal
+/// ceremony-status contract took 1.4 and moved the bip39 surface to 1.5. A
+/// gate left at `< 4` would be unreachable, because the transport already
+/// refuses anything below the 1.4 floor, and a 1.4 peer would reach dispatch
+/// carrying fields it cannot have understood.
 async fn dispatch_authority_connection<Dispatch, DispatchFuture>(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
@@ -553,8 +560,8 @@ where
     )
     .await?;
     if request.unsigned.protocol.major == 1
-        && request.unsigned.protocol.minor < 4
-        && request_uses_minor_4_features(&request.unsigned.body)
+        && request.unsigned.protocol.minor < 5
+        && request_uses_minor_5_features(&request.unsigned.body)
     {
         let (sequence, head_hash) = journals.local_journal_head(&request.unsigned.method)?;
         let head = bloom_triad_local_transport::sign_journal_head(identity, sequence, head_hash);
@@ -568,7 +575,7 @@ where
             &request,
             Err(ProtocolError::new(
                 ProtocolErrorCode::UnsupportedVersion,
-                "request body uses protocol-minor-4 fields for a pre-1.4 peer",
+                "request body uses protocol-minor-5 fields for a pre-1.5 peer",
             )),
             head,
         )
@@ -1374,7 +1381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signer_rejects_minor_4_fields_from_a_1_3_peer() {
+    async fn signer_rejects_bip39_fields_from_a_pre_1_5_peer() {
         let signer = signer_identity();
         let broker = LocalIdentity {
             service_id: Token::new("bloom-broker").unwrap(),
@@ -1392,6 +1399,11 @@ mod tests {
         };
         let dispatched = std::sync::atomic::AtomicBool::new(false);
         let (mut server_stream, mut client_stream) = UnixStream::pair().unwrap();
+        // The peer negotiates over the full supported range, so it accepts the
+        // service's announced 1.5, but signs its request at the 1.4 floor
+        // while carrying a minor-5 bip39 field. That mismatch is what the
+        // dispatch seam exists to refuse; a peer below the floor never gets
+        // that far, because the transport rejects it during negotiation.
         let legacy_version = ProtocolVersion::new(
             bloom_signer_api::SIGNER_API_MAJOR,
             bloom_signer_api::SIGNER_API_MINOR_MIN,

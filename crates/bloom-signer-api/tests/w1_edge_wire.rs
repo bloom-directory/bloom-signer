@@ -556,6 +556,7 @@ fn signer_responses() -> Vec<BrokerSignerResponse> {
         BrokerSignerResponse::CeremonyCancel(ceremony_status()),
         BrokerSignerResponse::OperationStatus(operation_status),
         BrokerSignerResponse::CeremonyStatus(SignerCeremonyStatus::Pending),
+        BrokerSignerResponse::CeremonyStatus(SignerCeremonyStatus::Terminal(CeremonyState::Failed)),
         BrokerSignerResponse::SealedApprovalStatus(approval_status()),
         BrokerSignerResponse::SealedApprovalRevoke(approval_status()),
         BrokerSignerResponse::SealedApprovalRevokeAll(revocation_state()),
@@ -626,6 +627,12 @@ where
 
 #[test]
 fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
+    // The signer-responses frame set covers both unreleased additions that met
+    // here: `DerivedAccountList` from the bip39 surface and
+    // `SignerCeremonyStatus::Terminal` from the durable terminal
+    // ceremony-status contract. Its digest is therefore neither side's frozen
+    // value. The signer-requests set gained no variant and its digest tracks
+    // only the advertised `protocol_minor_max`, which is 5 again.
     assert_wire_digest(
         "signer requests",
         signer_requests(),
@@ -634,7 +641,7 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "8b1afb04b55f11fecec5f151a1ed0d80c9bf8bbb566cd8dbd34fb98791f79f26",
+        "c4fb818d589cdb160e2602b9c4f9f639316848c90f970fb0db77cac3317152e7",
     );
     assert_wire_digest(
         "control requests",

@@ -200,6 +200,25 @@ fn complete_local_approval(
     sign_count: u32,
     now_ms: u64,
 ) -> SignerActivationReceipt {
+    try_complete_local_approval(
+        service,
+        authenticator,
+        terms,
+        activation_operation_id,
+        sign_count,
+        now_ms,
+    )
+    .unwrap()
+}
+
+fn try_complete_local_approval(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    terms: SealedApprovalTerms,
+    activation_operation_id: OperationId,
+    sign_count: u32,
+    now_ms: u64,
+) -> Result<SignerActivationReceipt, ProtocolError> {
     let review_manifest_digest = digest("76");
     let (exact_ordered_payload_digests, exact_ordered_hashes) = match &terms.selector {
         ApprovalSelector::Exact {
@@ -208,19 +227,17 @@ fn complete_local_approval(
         } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
         ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
     };
-    let prepared = service
-        .prepare_approval(
-            CeremonyPrepareRequest {
-                activation_operation_id: activation_operation_id.clone(),
-                terms: terms.clone(),
-                review_manifest_digest: review_manifest_digest.clone(),
-                exact_ordered_payload_digests,
-                exact_ordered_hashes,
-                replacement_approval_id: None,
-            },
-            now_ms,
-        )
-        .unwrap();
+    let prepared = service.prepare_approval(
+        CeremonyPrepareRequest {
+            activation_operation_id: activation_operation_id.clone(),
+            terms: terms.clone(),
+            review_manifest_digest: review_manifest_digest.clone(),
+            exact_ordered_payload_digests,
+            exact_ordered_hashes,
+            replacement_approval_id: None,
+        },
+        now_ms,
+    )?;
     let assertion = authenticator.assertion(
         &prepared.challenges[0].canonical_bytes().unwrap(),
         sign_count,
@@ -259,7 +276,6 @@ fn complete_local_approval(
         },
         now_ms + 1,
     ))
-    .unwrap()
 }
 
 fn register_wallet(
@@ -1413,6 +1429,405 @@ fn approval_completion_verifies_raw_proof_decrypts_prf_and_is_idempotent() {
     let recovered =
         futures::executor::block_on(restarted.complete_approval(complete, 2_700)).unwrap();
     assert_eq!(receipt, recovered);
+}
+
+#[test]
+fn stale_webauthn_counter_fails_closed_into_a_durable_terminal_ceremony() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, engine, registry) = service(&authenticator);
+    let (registration, _) = complete_new_wallet(
+        &service,
+        &authenticator,
+        CeremonyKind::WalletRegistration,
+        operation("40"),
+        None,
+        None,
+        1_000,
+    );
+    let key_ref = registration.public_key_refs[0].clone();
+    let mut terms = terms(key_ref.clone());
+    terms.wallet_id = registration.wallet_id.unwrap();
+
+    // Registration left the credential counter at 1, so replaying that exact
+    // counter is the cloned-authenticator signal WebAuthn requires Signer to
+    // reject.
+    let rejected = try_complete_local_approval(
+        &service,
+        &authenticator,
+        terms.clone(),
+        operation("41"),
+        1,
+        2_000,
+    )
+    .unwrap_err();
+    assert_eq!(rejected.code, ProtocolErrorCode::UnauthenticatedPeer);
+
+    // No authority was granted: no activation receipt, no installed approval,
+    // and the key the ceremony would have armed stays inactive.
+    assert!(matches!(
+        service.status(&operation("41")).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Failed)
+    ));
+    assert_eq!(
+        engine
+            .approval_public_status(&terms.approval_id().unwrap(), 2_000)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ApprovalNotFound
+    );
+    // The rejected ceremony produced no installed approval or authority receipt.
+    // `key_ref` is the existing wallet root from registration, so its prior
+    // availability is intentionally not used as a failure signal here.
+
+    // The failed-closed operation ID is terminal, not merely absent: preparing
+    // it again would revert its reported state to `Pending`.
+    assert_eq!(
+        try_complete_local_approval(
+            &service,
+            &authenticator,
+            terms.clone(),
+            operation("41"),
+            2,
+            2_100,
+        )
+        .unwrap_err()
+        .code,
+        ProtocolErrorCode::OperationIdConflict
+    );
+
+    // A fresh operation ID over the same terms still activates, so the failure
+    // is bounded to the rejected ceremony rather than the wallet.
+    complete_local_approval(
+        &service,
+        &authenticator,
+        terms.clone(),
+        operation("42"),
+        2,
+        2_200,
+    );
+    assert!(registry.key_is_available(&key_ref).unwrap());
+
+    // Restart destroys the in-process ceremony state; the terminal remains.
+    drop(service);
+    let restarted = SignerCeremonyService::new(
+        engine,
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    assert!(matches!(
+        restarted.status(&operation("41")).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Failed)
+    ));
+
+    // Cancellation of an already failed-closed ceremony is idempotent and
+    // preserves the terminal a reconciling peer converges on.
+    restarted.cancel(&operation("41")).unwrap();
+    restarted.cancel(&operation("41")).unwrap();
+    assert_eq!(
+        restarted.public_status(&operation("41")).unwrap().state,
+        CeremonyState::Failed
+    );
+    assert!(matches!(
+        restarted.status(&operation("41")).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Failed)
+    ));
+    // A committed ceremony still refuses cancellation.
+    assert_eq!(
+        restarted.cancel(&operation("42")).unwrap_err().code,
+        ProtocolErrorCode::OperationIdConflict
+    );
+}
+
+#[test]
+fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, engine, registry) = service(&authenticator);
+    let prepare = CustodyPrepareRequest {
+        ceremony_kind: CeremonyKind::WalletRegistration,
+        custody_operation_id: operation("20"),
+        wallet_id: Some(Token::new("quiet-lilac").unwrap()),
+        key_ref: None,
+        exact_terms_digest: digest("88"),
+        expected_input_class: Token::new("passkey-prf").unwrap(),
+        browser_output_recipient_key: None,
+        petal_key_scope: None,
+        legacy_passkey_migration: None,
+        derivation_request: None,
+        wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
+    };
+    let prepared = service.prepare_custody(prepare, 3_000).unwrap();
+    let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
+    let prf_assertion =
+        authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::WalletRegistration,
+        custody_operation_id: operation("20"),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest().unwrap(),
+        wallet_id: prepared.contribution.wallet_id.clone(),
+        key_ref: None,
+        credential_id: Some(attestation.credential_id.clone()),
+        expected_input_class: Token::new("passkey-prf").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let envelope = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &authenticator.deterministic_prf(),
+    )
+    .unwrap();
+    let mut complete = CustodyCompleteRequest {
+        ceremony_kind: CeremonyKind::CredentialAdd,
+        custody_operation_id: operation("20"),
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        proof: WebAuthnCeremonyProof::Registration {
+            attestation: attestation.clone(),
+            prf_assertion: Some(prf_assertion.clone()),
+        },
+        encrypted_input: Some(envelope.clone()),
+        public_binding_digest: digest("88"),
+    };
+    assert_eq!(
+        service
+            .complete_custody(complete.clone(), 3_500)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyKindMismatch
+    );
+
+    // Kind mismatch is terminal for that single-use ceremony. A fresh
+    // operation is required and no partially registered wallet is visible.
+    complete.custody_operation_id = operation("21");
+    assert_eq!(
+        service.complete_custody(complete, 3_500).unwrap_err().code,
+        ProtocolErrorCode::CeremonyReplay
+    );
+
+    let retry = CustodyPrepareRequest {
+        ceremony_kind: CeremonyKind::WalletRegistration,
+        custody_operation_id: operation("21"),
+        wallet_id: Some(Token::new("quiet-lilac").unwrap()),
+        key_ref: None,
+        exact_terms_digest: digest("89"),
+        expected_input_class: Token::new("passkey-prf").unwrap(),
+        browser_output_recipient_key: None,
+        petal_key_scope: None,
+        legacy_passkey_migration: None,
+        derivation_request: None,
+        wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
+    };
+    let prepared = service.prepare_custody(retry, 3_600).unwrap();
+    let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
+    let prf_assertion =
+        authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::WalletRegistration,
+        custody_operation_id: operation("21"),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest().unwrap(),
+        wallet_id: prepared.contribution.wallet_id.clone(),
+        key_ref: None,
+        credential_id: Some(attestation.credential_id.clone()),
+        expected_input_class: Token::new("passkey-prf").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let envelope = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &authenticator.deterministic_prf(),
+    )
+    .unwrap();
+    let registered_wallet_id = prepared.contribution.wallet_id.clone().unwrap();
+    let successful_completion = CustodyCompleteRequest {
+        ceremony_kind: CeremonyKind::WalletRegistration,
+        custody_operation_id: operation("21"),
+        ceremony_id: prepared.contribution.ceremony_id,
+        proof: WebAuthnCeremonyProof::Registration {
+            attestation,
+            prf_assertion: Some(prf_assertion),
+        },
+        encrypted_input: Some(envelope),
+        public_binding_digest: digest("89"),
+    };
+    let result = service
+        .complete_custody(successful_completion.clone(), 3_700)
+        .unwrap();
+    assert_eq!(result.public_status, CeremonyState::Completed);
+    assert_eq!(result.public_key_refs.len(), 1);
+    assert_eq!(result.public_key_refs[0].backend.as_str(), "local");
+    assert_eq!(
+        result.public_key_refs[0].backend_instance,
+        registered_wallet_id
+    );
+    result.public_key_refs[0].validate().unwrap();
+    let backend = registry
+        .get(
+            &result.public_key_refs[0].backend,
+            &result.public_key_refs[0].backend_instance,
+        )
+        .unwrap();
+    let description =
+        futures::executor::block_on(backend.describe_key(&result.public_key_refs[0])).unwrap();
+    assert_eq!(
+        description.public_key_fingerprint,
+        result.public_key_refs[0].public_key_fingerprint
+    );
+    let signature = futures::executor::block_on(backend.sign(BackendSignRequest {
+        provider_attempt_id: digest("d4"),
+        key_ref: result.public_key_refs[0].clone(),
+        crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+        input: BackendInput::Digest32 {
+            digest: digest("d5"),
+        },
+        deadline_ms: DecimalU64::new(10_000),
+    }))
+    .unwrap();
+    assert_eq!(signature.bytes.decode().len(), 65);
+
+    let registered_root = result.public_key_refs[0].clone();
+    drop(service);
+    registry.remove_local_wallet_backend(&registered_root);
+    assert!(
+        registry
+            .get(&registered_root.backend, &registered_root.backend_instance)
+            .is_err()
+    );
+    let restarted = SignerCeremonyService::new(
+        engine,
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    assert!(!registry.key_is_available(&registered_root).unwrap());
+    let mut activation_terms = terms(registered_root.clone());
+    activation_terms.wallet_id = registered_wallet_id.clone();
+    complete_local_approval(
+        &restarted,
+        &authenticator,
+        activation_terms,
+        operation("2f"),
+        2,
+        3_900,
+    );
+    assert!(registry.key_is_available(&registered_root).unwrap());
+    assert_eq!(
+        restarted
+            .complete_custody(successful_completion, 3_800)
+            .unwrap(),
+        result
+    );
+    let unlock_prepare = restarted
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletDelete,
+                custody_operation_id: operation("22"),
+                wallet_id: Some(registered_wallet_id.clone()),
+                key_ref: None,
+                exact_terms_digest: digest("90"),
+                expected_input_class: Token::new("policy-document").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                derivation_request: None,
+                wallet_seed_profile: None,
+            },
+            3_900,
+        )
+        .unwrap();
+    assert_eq!(unlock_prepare.webauthn_options.allowed_credentials.len(), 1);
+    restarted.cancel(&operation("22")).unwrap();
+
+    let second = VirtualAuthenticator::generate();
+    let add = restarted
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::CredentialAdd,
+                custody_operation_id: operation("23"),
+                wallet_id: Some(registered_wallet_id.clone()),
+                key_ref: None,
+                exact_terms_digest: digest("91"),
+                expected_input_class: Token::new("credential-change-prfs").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                derivation_request: None,
+                wallet_seed_profile: None,
+            },
+            4_000,
+        )
+        .unwrap();
+    let authority_assertion =
+        authenticator.assertion(&add.challenges[0].canonical_bytes().unwrap(), 3);
+    let new_attestation = second.attestation(&add.challenges[1].canonical_bytes().unwrap());
+    let new_prf_assertion = second.assertion(&add.challenges[2].canonical_bytes().unwrap(), 1);
+    let add_aad = CustodyHpkeAad {
+        ceremony_id: add.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::CredentialAdd,
+        custody_operation_id: operation("23"),
+        signer_nonce: add.contribution.signer_nonce.clone(),
+        signer_contribution_digest: add.contribution.digest().unwrap(),
+        wallet_id: Some(registered_wallet_id.clone()),
+        key_ref: None,
+        credential_id: Some(new_attestation.credential_id.clone()),
+        expected_input_class: Token::new("credential-change-prfs").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let add_plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "authority_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "new_credential_prf": Base64UrlBytes::from_bytes(&second.deterministic_prf())
+    }))
+    .unwrap();
+    let add_envelope = seal_hpke(
+        &add.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &add_aad,
+        &add_plaintext,
+    )
+    .unwrap();
+    restarted
+        .complete_custody(
+            CustodyCompleteRequest {
+                ceremony_kind: CeremonyKind::CredentialAdd,
+                custody_operation_id: operation("23"),
+                ceremony_id: add.contribution.ceremony_id,
+                proof: WebAuthnCeremonyProof::AuthorityCredentialChange {
+                    authority_assertion,
+                    new_credential_attestation: new_attestation,
+                    new_credential_prf_assertion: Some(new_prf_assertion),
+                },
+                encrypted_input: Some(add_envelope),
+                public_binding_digest: digest("91"),
+            },
+            4_100,
+        )
+        .unwrap();
+    let after_add = restarted
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::WalletDelete,
+                custody_operation_id: operation("24"),
+                wallet_id: Some(registered_wallet_id),
+                key_ref: None,
+                exact_terms_digest: digest("92"),
+                expected_input_class: Token::new("policy-document").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                derivation_request: None,
+                wallet_seed_profile: None,
+            },
+            4_200,
+        )
+        .unwrap();
+    assert_eq!(after_add.webauthn_options.allowed_credentials.len(), 2);
 }
 
 #[test]
