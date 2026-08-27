@@ -217,6 +217,25 @@ fn complete_local_approval(
     sign_count: u32,
     now_ms: u64,
 ) -> SignerActivationReceipt {
+    try_complete_local_approval(
+        service,
+        authenticator,
+        terms,
+        activation_operation_id,
+        sign_count,
+        now_ms,
+    )
+    .unwrap()
+}
+
+fn try_complete_local_approval(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    terms: SealedApprovalTerms,
+    activation_operation_id: OperationId,
+    sign_count: u32,
+    now_ms: u64,
+) -> Result<SignerActivationReceipt, ProtocolError> {
     let review_manifest_digest = digest("76");
     let (exact_ordered_payload_digests, exact_ordered_hashes) = match &terms.selector {
         ApprovalSelector::Exact {
@@ -225,19 +244,17 @@ fn complete_local_approval(
         } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
         ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
     };
-    let prepared = service
-        .prepare_approval(
-            CeremonyPrepareRequest {
-                activation_operation_id: activation_operation_id.clone(),
-                terms: terms.clone(),
-                review_manifest_digest: review_manifest_digest.clone(),
-                exact_ordered_payload_digests,
-                exact_ordered_hashes,
-                replacement_approval_id: None,
-            },
-            now_ms,
-        )
-        .unwrap();
+    let prepared = service.prepare_approval(
+        CeremonyPrepareRequest {
+            activation_operation_id: activation_operation_id.clone(),
+            terms: terms.clone(),
+            review_manifest_digest: review_manifest_digest.clone(),
+            exact_ordered_payload_digests,
+            exact_ordered_hashes,
+            replacement_approval_id: None,
+        },
+        now_ms,
+    )?;
     let assertion = authenticator.assertion(
         &prepared.challenges[0].canonical_bytes().unwrap(),
         sign_count,
@@ -276,7 +293,6 @@ fn complete_local_approval(
         },
         now_ms + 1,
     ))
-    .unwrap()
 }
 
 fn register_wallet(
@@ -1406,6 +1422,114 @@ fn approval_completion_verifies_raw_proof_decrypts_prf_and_is_idempotent() {
     let recovered =
         futures::executor::block_on(restarted.complete_approval(complete, 2_700)).unwrap();
     assert_eq!(receipt, recovered);
+}
+
+#[test]
+fn stale_webauthn_counter_fails_closed_into_a_durable_terminal_ceremony() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, engine, registry) = service(&authenticator);
+    let (registration, _) = complete_new_wallet(
+        &service,
+        &authenticator,
+        CeremonyKind::WalletRegistration,
+        operation("40"),
+        None,
+        None,
+        1_000,
+    );
+    let key_ref = registration.public_key_refs[0].clone();
+    let mut terms = terms(key_ref.clone());
+    terms.wallet_id = registration.wallet_id.unwrap();
+
+    // Registration left the credential counter at 1, so replaying that exact
+    // counter is the cloned-authenticator signal WebAuthn requires Signer to
+    // reject.
+    let rejected = try_complete_local_approval(
+        &service,
+        &authenticator,
+        terms.clone(),
+        operation("41"),
+        1,
+        2_000,
+    )
+    .unwrap_err();
+    assert_eq!(rejected.code, ProtocolErrorCode::UnauthenticatedPeer);
+
+    // No authority was granted: no activation receipt, no installed approval,
+    // and the key the ceremony would have armed stays inactive.
+    assert!(matches!(
+        service.status(&operation("41")).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Failed)
+    ));
+    assert_eq!(
+        engine
+            .approval_public_status(&terms.approval_id().unwrap(), 2_000)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ApprovalNotFound
+    );
+    // The rejected ceremony produced no installed approval or authority receipt.
+    // `key_ref` is the existing wallet root from registration, so its prior
+    // availability is intentionally not used as a failure signal here.
+
+    // The failed-closed operation ID is terminal, not merely absent: preparing
+    // it again would revert its reported state to `Pending`.
+    assert_eq!(
+        try_complete_local_approval(
+            &service,
+            &authenticator,
+            terms.clone(),
+            operation("41"),
+            2,
+            2_100,
+        )
+        .unwrap_err()
+        .code,
+        ProtocolErrorCode::OperationIdConflict
+    );
+
+    // A fresh operation ID over the same terms still activates, so the failure
+    // is bounded to the rejected ceremony rather than the wallet.
+    complete_local_approval(
+        &service,
+        &authenticator,
+        terms.clone(),
+        operation("42"),
+        2,
+        2_200,
+    );
+    assert!(registry.key_is_available(&key_ref).unwrap());
+
+    // Restart destroys the in-process ceremony state; the terminal remains.
+    drop(service);
+    let restarted = SignerCeremonyService::new(
+        engine,
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    assert!(matches!(
+        restarted.status(&operation("41")).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Failed)
+    ));
+
+    // Cancellation of an already failed-closed ceremony is idempotent and
+    // preserves the terminal a reconciling peer converges on.
+    restarted.cancel(&operation("41")).unwrap();
+    restarted.cancel(&operation("41")).unwrap();
+    assert_eq!(
+        restarted.public_status(&operation("41")).unwrap().state,
+        CeremonyState::Failed
+    );
+    assert!(matches!(
+        restarted.status(&operation("41")).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Failed)
+    ));
+    // A committed ceremony still refuses cancellation.
+    assert_eq!(
+        restarted.cancel(&operation("42")).unwrap_err().code,
+        ProtocolErrorCode::OperationIdConflict
+    );
 }
 
 #[test]

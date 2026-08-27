@@ -211,10 +211,14 @@ impl SignerRpcService {
             }
             Request::CeremonyCancel(request) => {
                 let operation_id = OperationId::new(request.id.as_str().to_owned())?;
-                let mut status = self.ceremony.public_status(&operation_id)?;
                 self.ceremony.cancel(&operation_id)?;
-                status.state = bloom_signer_api::CeremonyState::Cancelled;
-                Ok(Response::CeremonyCancel(status))
+                // Report the durable status rather than asserting `CANCELLED`:
+                // a ceremony that already failed closed answers cancellation
+                // idempotently, and callers reconciling it must see the state
+                // `ceremony.status` will keep reporting.
+                Ok(Response::CeremonyCancel(
+                    self.ceremony.public_status(&operation_id)?,
+                ))
             }
             Request::SealedApprovalStatus(request) => Ok(Response::SealedApprovalStatus(
                 self.engine.approval_public_status(&request.id, now_ms)?,
@@ -721,6 +725,9 @@ fn signer_ceremony_status(
         }
         crate::ceremony::SignerCeremonyStatus::CompletedCustody(result) => {
             bloom_signer_api::SignerCeremonyStatus::CompletedCustody(result)
+        }
+        crate::ceremony::SignerCeremonyStatus::Terminal(state) => {
+            bloom_signer_api::SignerCeremonyStatus::Terminal(state)
         }
         crate::ceremony::SignerCeremonyStatus::Missing => {
             bloom_signer_api::SignerCeremonyStatus::Missing
