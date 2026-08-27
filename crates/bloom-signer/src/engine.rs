@@ -6222,6 +6222,39 @@ mod clock_tests {
     }
 
     #[test]
+    fn signer_clock_unknown_legacy_boot_epoch_does_not_impersonate_a_reboot() {
+        let engine = engine();
+        {
+            let connection = engine.connection.lock();
+            connection
+                .execute(
+                    "INSERT INTO clock_state(
+                         singleton, last_effective_ms, condition, observed_utc_ms,
+                         monotonic_anchor_ns, boot_epoch
+                     ) VALUES (1, '10000', 'HEALTHY', '10000', '1000000000', ?1)",
+                    [zero_boot_epoch().as_str()],
+                )
+                .unwrap();
+        }
+
+        let two_hours_ms = 2 * 60 * 60 * 1_000;
+        let decision = engine
+            .observe_time(
+                PlatformTimeReading {
+                    utc_ms: Some(10_000 + two_hours_ms),
+                    monotonic_elapsed_ms: 0,
+                    monotonic_anchor_ns: 1_000_000_000 + two_hours_ms * 1_000_000,
+                },
+                bloom_signer_api::BootEpoch::from_bytes([1; 16]),
+                3_600_000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(decision.condition, ClockCondition::ForwardJumpRejected);
+        assert_eq!(decision.effective_now_ms, 10_000);
+    }
+
+    #[test]
     fn signer_clock_same_process_incremental_elapsed_still_advances_healthily() {
         let engine = engine();
         engine
