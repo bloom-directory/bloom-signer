@@ -16,12 +16,12 @@ license = "MIT"
 
 [workspace.dependencies]
 bloom-signer-api = { path = "crates/bloom-signer-api" }
-bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "06104c74d63275473dea1a554b2afebb32338a9c" }
-bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "06104c74d63275473dea1a554b2afebb32338a9c" }
-bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "06104c74d63275473dea1a554b2afebb32338a9c" }
-bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "06104c74d63275473dea1a554b2afebb32338a9c" }
-bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "06104c74d63275473dea1a554b2afebb32338a9c" }
-bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "06104c74d63275473dea1a554b2afebb32338a9c" }
+bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d8229e51d80971505af69c387818334a3c44aef0" }
+bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d8229e51d80971505af69c387818334a3c44aef0" }
+bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d8229e51d80971505af69c387818334a3c44aef0" }
+bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d8229e51d80971505af69c387818334a3c44aef0" }
+bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d8229e51d80971505af69c387818334a3c44aef0" }
+bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d8229e51d80971505af69c387818334a3c44aef0" }
 aws-config = { version = "=1.8.1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-credential-types = "1"
 # Exact AWS service pins preserve the workspace's declared Rust 1.85 floor.

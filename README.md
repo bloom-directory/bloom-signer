@@ -25,24 +25,31 @@ envelope and commit it through current WKEK custody. Machine and Broker never
 read the legacy private-key envelope, and the original source directory is not
 modified.
 
-## Recovering a fail-closed clock after a restart
+## Durable-clock recovery and repair
 
-Signer will not sign while its durable clock is untrusted. The clock is trusted
-only when the wall clock agrees with elapsed time that Signer can account for,
-so any gap it cannot explain is rejected rather than assumed benign.
+Signer will not sign while its durable clock is untrusted. Linux always rejects
+a wall-clock rollback below the persisted effective-time floor. Within one
+confirmed boot it also compares the wall clock with a persisted,
+suspend-aware monotonic anchor and rejects an unexplained forward step larger
+than the compiled limit.
 
-A **process** restart is credited automatically. The absolute monotonic anchor is
-persisted, and elapsed time is taken from it, so downtime is recovered without
-operator involvement.
+A **process stop, crash, or restart** does not interrupt service recovery. The
+absolute monotonic anchor survives in Signer's state, so elapsed downtime in
+the same boot is credited automatically even when the process-relative sampler
+restarts at zero. Suspend time is credited by the same kernel clock.
 
-A **reboot** is not. The kernel's suspend-aware clock restarts at zero, so the
-persisted anchor belongs to a domain that no longer exists and cannot vouch for
-the gap. If the wall clock has moved on by more than the maximum forward step,
-the next observation is `FORWARD_JUMP_REJECTED` and requests fail with
-`CLOCK_UNTRUSTED` until an operator repairs the clock. This is deliberate: the
-alternative is accepting an unexplained forward jump, which is
-indistinguishable from an attacker moving the clock to expire approvals or
-extend a grant.
+After a **confirmed host reboot**, the old and new monotonic anchors are in
+different domains and cannot measure powered-off time. Signer therefore accepts
+a nondecreasing host wall clock and establishes a new anchor without operator
+repair. This is an explicit availability tradeoff: a privileged actor who can
+change the host clock across a reboot can expire time-bounded state early, but
+cannot move effective time backwards to extend existing lifetimes. Correct host
+time at boot is part of the deployment boundary now that Linux has no Chrony
+dependency.
+
+Missing legacy boot-epoch state is not treated as proof of reboot. An
+unexplained large forward step on that one-time upgrade path remains
+`FORWARD_JUMP_REJECTED` until an operator vouches for the clock.
 
 Repair is an explicit, audited operator action taken at startup.
 
@@ -52,9 +59,8 @@ BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS=<unix-ms> bloom-signer …
 
 `<unix-ms>` is the UTC time the operator vouches for. It may not be earlier than
 the current effective time; moving effective time backwards is refused with
-`CLOCK_ROLLBACK`. Repair also requires initialised clock state, and is
-unavailable when the host wall clock is authoritative rather than the trusted
-time source.
+`CLOCK_ROLLBACK`. Repair also requires initialised clock state and is
+unavailable on profiles that do not use the durable guard, currently macOS.
 
 If repairing would expire live approvals, Signer refuses on the first attempt
 and prints the accepted time, the approvals that would expire, and a
