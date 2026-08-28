@@ -6511,6 +6511,7 @@ fn ceremony_mutation_kind(kind: bloom_signer_api::CeremonyKind) -> &'static str 
         Kind::CredentialAdd | Kind::CredentialReplace | Kind::CredentialRemove => "credential",
         Kind::PolicyUpdate => "policy",
         Kind::BackendEnrollment | Kind::KeyDerive => "key",
+        Kind::AccountAllocate | Kind::AccountRetire => "wallet",
         Kind::SealedApproval => "approval",
     }
 }
@@ -6740,6 +6741,18 @@ fn profile_id(profile: DerivationProfile) -> &'static str {
 mod clock_tests {
     use super::*;
     use bloom_trusted_time::PlatformTimeReading;
+
+    #[test]
+    fn account_ceremonies_are_classified_as_wallet_mutations() {
+        assert_eq!(
+            ceremony_mutation_kind(bloom_signer_api::CeremonyKind::AccountAllocate),
+            "wallet"
+        );
+        assert_eq!(
+            ceremony_mutation_kind(bloom_signer_api::CeremonyKind::AccountRetire),
+            "wallet"
+        );
+    }
 
     fn engine() -> SignerEngine {
         SignerEngine::open_in_memory(

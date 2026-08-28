@@ -62,6 +62,8 @@ fn ceremony_kind_name(kind: CeremonyKind) -> &'static str {
         CeremonyKind::CredentialRemove => "credential_remove",
         CeremonyKind::BackendEnrollment => "backend_enrollment",
         CeremonyKind::KeyDerive => "key_derive",
+        CeremonyKind::AccountAllocate => "account_allocate",
+        CeremonyKind::AccountRetire => "account_retire",
         CeremonyKind::PolicyUpdate => "policy_update",
     }
 }
@@ -3112,5 +3114,17 @@ mod tests {
         mnemonic_only.wallet_seed_profile =
             Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1);
         assert!(reject_seed_profile_with_migration(&mnemonic_only).is_ok());
+    }
+
+    #[test]
+    fn account_ceremonies_have_stable_safe_log_names() {
+        assert_eq!(
+            ceremony_kind_name(CeremonyKind::AccountAllocate),
+            "account_allocate"
+        );
+        assert_eq!(
+            ceremony_kind_name(CeremonyKind::AccountRetire),
+            "account_retire"
+        );
     }
 }

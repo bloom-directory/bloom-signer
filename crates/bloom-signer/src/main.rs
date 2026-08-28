@@ -723,82 +723,114 @@ where
         sent_at_ms: request.unsigned.sent_at_ms.get(),
         deadline_ms: request.unsigned.deadline_ms.get(),
     };
-    if request.unsigned.protocol.major == 1
-        && request.unsigned.protocol.minor < 5
-        && request_uses_minor_5_features(&request.unsigned.body)
-    {
-        let (sequence, head_hash) = journals.local_journal_head_with_context(&context)?;
-        let head = bloom_triad_local_transport::sign_journal_head(identity, sequence, head_hash);
-        return bloom_triad_local_transport::send_response_with_journal_head::<
-            BrokerSignerRequest,
-            BrokerSignerResponse,
-            ProtocolError,
-        >(
-            stream,
-            identity,
-            &request,
-            Err(ProtocolError::new(
+    let request_span = tracing::info_span!(
+        "authenticated_request",
+        rpc_method = %context.method,
+        operation_id = %context.operation_id,
+        peer_service_id = %context.caller_service_id,
+        peer_key_id = %context.caller_application_key_id,
+        protocol_major = request.unsigned.protocol.major,
+        protocol_minor = request.unsigned.protocol.minor,
+    );
+    async move {
+        if request.unsigned.protocol.major == 1
+            && request.unsigned.protocol.minor < 5
+            && request_uses_minor_5_features(&request.unsigned.body)
+        {
+            let error = ProtocolError::new(
                 ProtocolErrorCode::UnsupportedVersion,
                 "request body uses protocol-minor-5 fields for a pre-1.5 peer",
-            )),
-            head,
-        )
-        .await
-        .map_err(bloom_signer_api::ProtocolError::from);
-    }
-    let peer_head = request
-        .unsigned
-        .sender_journal_head
-        .as_ref()
-        .ok_or_else(|| {
+            );
+            let (sequence, head_hash) = journals.local_journal_head_with_context(&context)?;
+            let head =
+                bloom_triad_local_transport::sign_journal_head(identity, sequence, head_hash);
+            bloom_triad_local_transport::send_response_with_journal_head::<
+                BrokerSignerRequest,
+                BrokerSignerResponse,
+                ProtocolError,
+            >(stream, identity, &request, Err(error), head)
+            .await
+            .map_err(bloom_signer_api::ProtocolError::from)?;
+            log_rpc_terminal_rejection("protocol_features", "UNSUPPORTED_VERSION");
+            return Ok(());
+        }
+        let peer_head = request
+            .unsigned
+            .sender_journal_head
+            .as_ref()
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "authority-edge request omitted its authenticated journal head",
+                )
+            })?;
+        if let Err(error) = journals.checkpoint_request_head_with_context(&context, peer_head) {
+            let (sequence, head_hash) = journals.local_journal_head_with_context(&context)?;
+            let head =
+                bloom_triad_local_transport::sign_journal_head(identity, sequence, head_hash);
+            bloom_triad_local_transport::send_response_with_journal_head::<
+                BrokerSignerRequest,
+                BrokerSignerResponse,
+                ProtocolError,
+            >(stream, identity, &request, Err(error), head)
+            .await
+            .map_err(bloom_signer_api::ProtocolError::from)?;
+            log_rpc_terminal_rejection("checkpoint", "checkpoint_rejected");
+            return Ok(());
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| {
+                ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "system clock before epoch",
+                )
+            })?
+            .as_millis();
+        let now_ms = u64::try_from(now_ms).map_err(|_| {
             ProtocolError::new(
-                ProtocolErrorCode::UnauthenticatedPeer,
-                "authority-edge request omitted its authenticated journal head",
+                ProtocolErrorCode::ServiceUnavailable,
+                "system clock overflow",
             )
         })?;
-    if let Err(error) = journals.checkpoint_request_head_with_context(&context, peer_head) {
+        let (result, quota_error_code) =
+            match quota.admit(request.unsigned.body.is_read_only(), now_ms) {
+                Ok(admission) => {
+                    let result = dispatch(request.unsigned.body.clone(), context.clone()).await;
+                    drop(admission);
+                    (result, None)
+                }
+                Err(error) => {
+                    let error_code = format!("{:?}", error.code);
+                    (Err(error.into()), Some(error_code))
+                }
+            };
         let (sequence, head_hash) = journals.local_journal_head_with_context(&context)?;
         let head = bloom_triad_local_transport::sign_journal_head(identity, sequence, head_hash);
-        return bloom_triad_local_transport::send_response_with_journal_head::<
+        bloom_triad_local_transport::send_response_with_journal_head::<
             BrokerSignerRequest,
             BrokerSignerResponse,
             ProtocolError,
-        >(stream, identity, &request, Err(error), head)
+        >(stream, identity, &request, result, head)
         .await
-        .map_err(bloom_signer_api::ProtocolError::from);
-    }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| {
-            ProtocolError::new(
-                ProtocolErrorCode::ServiceUnavailable,
-                "system clock before epoch",
-            )
-        })?
-        .as_millis();
-    let now_ms = u64::try_from(now_ms).map_err(|_| {
-        ProtocolError::new(
-            ProtocolErrorCode::ServiceUnavailable,
-            "system clock overflow",
-        )
-    })?;
-    let result = match quota.admit(request.unsigned.body.is_read_only(), now_ms) {
-        Ok(admission) => {
-            let result = dispatch(request.unsigned.body.clone(), context.clone()).await;
-            drop(admission);
-            result
+        .map_err(bloom_signer_api::ProtocolError::from)?;
+        if let Some(error_code) = quota_error_code {
+            log_rpc_terminal_rejection("quota", &error_code);
         }
-        Err(error) => Err(error.into()),
-    };
-    let (sequence, head_hash) = journals.local_journal_head_with_context(&context)?;
-    let head = bloom_triad_local_transport::sign_journal_head(identity, sequence, head_hash);
-    bloom_triad_local_transport::send_response_with_journal_head::<
-        BrokerSignerRequest,
-        BrokerSignerResponse,
-        ProtocolError,
-    >(stream, identity, &request, result, head)
+        Ok(())
+    }
+    .instrument(request_span)
     .await
-    .map_err(bloom_signer_api::ProtocolError::from)
+}
+
+fn log_rpc_terminal_rejection(stage: &'static str, error_code: &str) {
+    tracing::warn!(
+        event = "rpc.completed",
+        outcome = "rejected",
+        stage,
+        error_code,
+        "Authenticated RPC rejected before domain dispatch"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1617,6 +1649,7 @@ mod tests {
     };
     use ed25519_dalek::Signer as _;
     use std::os::unix::fs::PermissionsExt as _;
+    use tracing::instrument::WithSubscriber as _;
 
     struct FailingCheckpointSink;
 
@@ -1767,7 +1800,6 @@ mod tests {
             0,
             Digest32::from_bytes([0; 32]),
         );
-
         let server = async {
             let result = bloom_triad_local_transport::dispatch_connection_with_journal_heads::<
                 BrokerSignerRequest,
@@ -1783,7 +1815,7 @@ mod tests {
                 bloom_signer_api::SIGNER_API_RANGE,
                 &quota,
                 &journals,
-                |_request, _context| async {
+                |_request| async {
                     dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
                     Err(ProtocolError::new(
                         ProtocolErrorCode::ServiceUnavailable,
@@ -1873,6 +1905,13 @@ mod tests {
             0,
             Digest32::from_bytes([0; 32]),
         );
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_writer(capture.clone())
+            .finish();
 
         let server = async {
             let result = dispatch_authority_connection(
@@ -1881,7 +1920,7 @@ mod tests {
                 &broker_acl,
                 &quota,
                 &journals,
-                |_request| async {
+                |_request, _context| async {
                     dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
                     Err(ProtocolError::new(
                         ProtocolErrorCode::ServiceUnavailable,
@@ -1892,7 +1931,8 @@ mod tests {
             .await;
             drop(server_stream);
             result
-        };
+        }
+        .with_subscriber(subscriber);
         let client = async {
             let body = BrokerSignerRequest::WalletRegistrationPrepare(
                 bloom_signer_api::CustodyPrepareRequest {
@@ -1938,6 +1978,32 @@ mod tests {
             ProtocolErrorCode::UnsupportedVersion
         );
         assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
+        let events = capture
+            .text()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["fields"]["event"] == "rpc.completed")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["fields"]["stage"], "protocol_features");
+        let request_span = events[0]["spans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|span| span["name"] == "authenticated_request")
+            .unwrap();
+        assert_eq!(request_span["rpc_method"], "wallet.registration_prepare");
+        assert_eq!(
+            request_span["operation_id"],
+            bloom_signer_api::OperationId::from_bytes([3; 32]).as_str()
+        );
+        assert_eq!(request_span["peer_service_id"], "bloom-broker");
+        assert_eq!(request_span["peer_key_id"], "broker-app");
+        assert_eq!(request_span["protocol_major"], 1);
+        assert_eq!(
+            request_span["protocol_minor"],
+            bloom_signer_api::SIGNER_API_MINOR_MIN
+        );
     }
 
     #[tokio::test]
