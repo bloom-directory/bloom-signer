@@ -6104,7 +6104,12 @@ fn restore_audit_entries(
 ) -> Result<(), ProtocolError> {
     let current = load_audit_entries(transaction)?;
     if backup.len() < current.len() {
-        log_journal_verification_failure(backup.len() as u64, "durable_state_correlation", None);
+        log_journal_verification_failure_with_state(
+            backup.len() as u64,
+            "durable_state_correlation",
+            None,
+            false,
+        );
         return Err(error(
             ProtocolErrorCode::RevocationEpochUnreconciled,
             "backup cannot lower the Signer audit sequence",
@@ -6116,7 +6121,12 @@ fn restore_audit_entries(
             .zip(backup)
             .position(|(durable, candidate)| durable != candidate)
             .unwrap_or(current.len()) as u64;
-        log_journal_verification_failure(sequence, "durable_state_correlation", None);
+        log_journal_verification_failure_with_state(
+            sequence,
+            "durable_state_correlation",
+            None,
+            false,
+        );
         return Err(error(
             ProtocolErrorCode::OperationIdConflict,
             "backup audit chain does not extend the durable chain",
@@ -6148,7 +6158,12 @@ fn restore_audit_entries(
         .any(|(sequence, rotation)| backup_rotation_map.get(sequence) != Some(rotation))
     {
         let sequence = current_rotations.keys().copied().next().unwrap_or(0);
-        log_journal_verification_failure(sequence, "durable_state_correlation", None);
+        log_journal_verification_failure_with_state(
+            sequence,
+            "durable_state_correlation",
+            None,
+            false,
+        );
         return Err(error(
             ProtocolErrorCode::OperationIdConflict,
             "backup audit rotations do not extend the durable rotation chain",
@@ -6196,12 +6211,14 @@ fn restore_audit_entries(
             )
             .map_err(storage)?;
     }
-    verify_audit_chain(transaction, expected_key_id, verifying_keys).map_err(|cause| {
-        error(
-            ProtocolErrorCode::MalformedFrame,
-            format!("backup audit chain or rotation proof is invalid: {cause}"),
-        )
-    })
+    verify_audit_chain_with_state(transaction, expected_key_id, verifying_keys, false).map_err(
+        |cause| {
+            error(
+                ProtocolErrorCode::MalformedFrame,
+                format!("backup audit chain or rotation proof is invalid: {cause}"),
+            )
+        },
+    )
 }
 
 fn append_audit_entry(
@@ -6294,6 +6311,25 @@ fn verify_audit_chain(
     expected_final_key_id: &Token,
     verifying_keys: &BTreeMap<Token, VerifyingKey>,
 ) -> Result<(), ProtocolError> {
+    verify_audit_chain_with_state(connection, expected_final_key_id, verifying_keys, true)
+}
+
+fn verify_audit_chain_with_state(
+    connection: &Connection,
+    expected_final_key_id: &Token,
+    verifying_keys: &BTreeMap<Token, VerifyingKey>,
+    mutations_disabled: bool,
+) -> Result<(), ProtocolError> {
+    macro_rules! verification_failure {
+        ($sequence:expr, $invariant:expr, $signing_key_id:expr $(,)?) => {
+            log_journal_verification_failure_with_state(
+                $sequence,
+                $invariant,
+                $signing_key_id,
+                mutations_disabled,
+            )
+        };
+    }
     let mut statement = connection
         .prepare(
             "SELECT sequence, event_type, payload_jcs, previous_hash, entry_hash,
@@ -6330,22 +6366,22 @@ fn verify_audit_chain(
             signature,
         ) = row.map_err(storage)?;
         let sequence = u64::try_from(sequence).map_err(|cause| {
-            log_journal_verification_failure(expected_sequence, "row_sequence", None);
+            verification_failure!(expected_sequence, "row_sequence", None);
             malformed(cause)
         })?;
         let signing_key_id = Token::new(signing_key_id).map_err(|cause| {
-            log_journal_verification_failure(sequence, "signing_key", None);
+            verification_failure!(sequence, "signing_key", None);
             malformed(cause)
         })?;
         if sequence != expected_sequence {
-            log_journal_verification_failure(sequence, "sequence", Some(&signing_key_id));
+            verification_failure!(sequence, "sequence", Some(&signing_key_id));
             return Err(error(
                 ProtocolErrorCode::ServiceUnavailable,
                 "Signer audit chain sequence is invalid",
             ));
         }
         if previous_hash != expected_previous_hash.as_str() {
-            log_journal_verification_failure(sequence, "predecessor_link", Some(&signing_key_id));
+            verification_failure!(sequence, "predecessor_link", Some(&signing_key_id));
             return Err(error(
                 ProtocolErrorCode::ServiceUnavailable,
                 "Signer audit chain predecessor is invalid",
@@ -6359,7 +6395,7 @@ fn verify_audit_chain(
         hasher.update(payload_jcs.as_bytes());
         let computed = Digest32::from_bytes(hasher.finalize().into());
         if computed.as_str() != entry_hash {
-            log_journal_verification_failure(sequence, "content_hash", Some(&signing_key_id));
+            verification_failure!(sequence, "content_hash", Some(&signing_key_id));
             return Err(error(
                 ProtocolErrorCode::ServiceUnavailable,
                 "Signer audit entry hash is invalid",
@@ -6368,11 +6404,7 @@ fn verify_audit_chain(
         if let Some(old_key_id) = &active_key_id {
             if old_key_id != &signing_key_id {
                 let rotation = rotations.get(&sequence).ok_or_else(|| {
-                    log_journal_verification_failure(
-                        sequence,
-                        "key_rotation",
-                        Some(&signing_key_id),
-                    );
+                    verification_failure!(sequence, "key_rotation", Some(&signing_key_id),);
                     audit_degraded_error()
                 })?;
                 verify_audit_rotation(
@@ -6385,37 +6417,25 @@ fn verify_audit_chain(
                     verifying_keys,
                 )
                 .inspect_err(|_| {
-                    log_journal_verification_failure(
-                        sequence,
-                        "key_rotation",
-                        Some(&signing_key_id),
-                    );
+                    verification_failure!(sequence, "key_rotation", Some(&signing_key_id),);
                 })?;
                 observed_rotations += 1;
             } else if rotations.contains_key(&sequence) {
-                log_journal_verification_failure(sequence, "key_rotation", Some(&signing_key_id));
+                verification_failure!(sequence, "key_rotation", Some(&signing_key_id));
                 return Err(audit_degraded_error());
             }
         } else if rotations.contains_key(&sequence) {
-            log_journal_verification_failure(sequence, "key_rotation", Some(&signing_key_id));
+            verification_failure!(sequence, "key_rotation", Some(&signing_key_id));
             return Err(audit_degraded_error());
         }
         let signature_bytes: [u8; 64] = Base64UrlBytes::parse(signature)
             .inspect_err(|_| {
-                log_journal_verification_failure(
-                    sequence,
-                    "signature_encoding",
-                    Some(&signing_key_id),
-                );
+                verification_failure!(sequence, "signature_encoding", Some(&signing_key_id),);
             })?
             .decode()
             .try_into()
             .map_err(|_| {
-                log_journal_verification_failure(
-                    sequence,
-                    "signature_length",
-                    Some(&signing_key_id),
-                );
+                verification_failure!(sequence, "signature_length", Some(&signing_key_id),);
                 error(
                     ProtocolErrorCode::ServiceUnavailable,
                     "Signer audit signature length is invalid",
@@ -6425,7 +6445,7 @@ fn verify_audit_chain(
         verifying_keys
             .get(&signing_key_id)
             .ok_or_else(|| {
-                log_journal_verification_failure(sequence, "signing_key", Some(&signing_key_id));
+                verification_failure!(sequence, "signing_key", Some(&signing_key_id));
                 audit_degraded_error()
             })?
             .verify(
@@ -6433,7 +6453,7 @@ fn verify_audit_chain(
                 &signature,
             )
             .map_err(|_| {
-                log_journal_verification_failure(sequence, "signature", Some(&signing_key_id));
+                verification_failure!(sequence, "signature", Some(&signing_key_id));
                 error(
                     ProtocolErrorCode::ServiceUnavailable,
                     "Signer audit signature is invalid",
@@ -6453,7 +6473,7 @@ fn verify_audit_chain(
             .as_ref()
             .is_some_and(|key_id| key_id != expected_final_key_id)
     {
-        log_journal_verification_failure(
+        verification_failure!(
             expected_sequence.saturating_sub(1),
             "key_rotation",
             active_key_id.as_ref(),
@@ -6463,17 +6483,18 @@ fn verify_audit_chain(
     Ok(())
 }
 
-fn log_journal_verification_failure(
+fn log_journal_verification_failure_with_state(
     sequence: u64,
     invariant: &'static str,
     signing_key_id: Option<&Token>,
+    mutations_disabled: bool,
 ) {
     tracing::error!(
         event = "signer.journal_verification_failed",
         sequence,
         invariant,
         signing_key_id = signing_key_id.map(Token::as_str),
-        mutations_disabled = true,
+        mutations_disabled,
         "Signer journal verification failed"
     );
 }
@@ -6869,10 +6890,11 @@ mod clock_tests {
             .with_writer(capture.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            log_journal_verification_failure(
+            log_journal_verification_failure_with_state(
                 17,
                 "durable_state_correlation",
                 Some(&Token::new("audit-key-17").unwrap()),
+                true,
             );
         });
         let output = capture.text();
@@ -6883,6 +6905,25 @@ mod clock_tests {
         );
         assert_eq!(event["fields"]["sequence"], 17);
         assert_eq!(event["fields"]["invariant"], "durable_state_correlation");
+    }
+
+    #[test]
+    fn rejected_backup_diagnostic_does_not_claim_mutations_are_disabled() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_journal_verification_failure_with_state(
+                4,
+                "durable_state_correlation",
+                None,
+                false,
+            );
+        });
+        let event: serde_json::Value = serde_json::from_str(capture.text().trim()).unwrap();
+        assert_eq!(event["fields"]["mutations_disabled"], false);
     }
 
     #[test]

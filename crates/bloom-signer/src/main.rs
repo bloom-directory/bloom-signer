@@ -603,6 +603,10 @@ fn require_clock_repair_confirmation(
     hasher.update(accepted_utc_ms.to_be_bytes());
     hasher.update(serde_jcs::to_vec(expiring)?);
     let expected = Digest32::from_bytes(hasher.finalize().into());
+    // Approval IDs are public operational digests: showing each exact ID is
+    // what makes this destructive confirmation informed without exposing the
+    // approval terms or any credential material.
+    log_clock_repair_expiring_approvals(accepted_utc_ms, expiring, &expected);
     let supplied = std::env::var("BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST").ok();
     if supplied.as_deref() != Some(expected.as_str()) {
         tracing::warn!(
@@ -618,6 +622,22 @@ fn require_clock_repair_confirmation(
         );
     }
     Ok(())
+}
+
+fn log_clock_repair_expiring_approvals(
+    accepted_utc_ms: u64,
+    expiring: &[Digest32],
+    confirmation_digest: &Digest32,
+) {
+    for approval_id in expiring {
+        tracing::warn!(
+            event = "signer.clock_repair_expiring_approval",
+            accepted_utc_ms,
+            approval_id = approval_id.as_str(),
+            confirmation_digest = confirmation_digest.as_str(),
+            "Signer clock repair would expire a live approval"
+        );
+    }
 }
 
 fn clock_repair_request() -> Result<Option<u64>, Box<dyn std::error::Error>> {
@@ -950,7 +970,7 @@ fn select_initial_self_head(
     let head = bloom_triad_local_transport::sign_journal_head(identity, sequence, head_hash);
     match checkpoints.append_peer_head_diagnosed(&head) {
         Ok(decision) => {
-            log_checkpoint_decision("self", None, &decision, false);
+            log_checkpoint_decision("self", None, &decision, engine.audit_is_degraded());
             Ok(Some(head))
         }
         Err(error) => {
@@ -1098,7 +1118,12 @@ impl SignerJournalExchange {
                         }
                     }
                     Ok(decision) => {
-                        log_checkpoint_decision("self", context, &decision, false);
+                        log_checkpoint_decision(
+                            "self",
+                            context,
+                            &decision,
+                            self.engine.audit_is_degraded(),
+                        );
                     }
                 }
                 Ok((sequence, head_hash))
@@ -1154,7 +1179,9 @@ impl JournalExchange<ProtocolError> for SignerJournalExchange {
                     ));
                 }
             }
-            Ok(decision) => log_checkpoint_decision("peer", None, &decision, false),
+            Ok(decision) => {
+                log_checkpoint_decision("peer", None, &decision, self.engine.audit_is_degraded())
+            }
         }
         Ok(())
     }
@@ -1183,7 +1210,12 @@ impl JournalExchange<ProtocolError> for SignerJournalExchange {
                     ));
                 }
             }
-            Ok(decision) => log_checkpoint_decision("peer", Some(context), &decision, false),
+            Ok(decision) => log_checkpoint_decision(
+                "peer",
+                Some(context),
+                &decision,
+                self.engine.audit_is_degraded(),
+            ),
         }
         Ok(())
     }
@@ -2295,6 +2327,62 @@ mod tests {
         assert_eq!(event["fields"]["retained_sequence"], 8);
         assert_eq!(event["fields"]["outcome"], "sequence_rollback");
         assert!(!output.contains(marker_secret));
+    }
+
+    #[test]
+    fn successful_checkpoint_event_reports_existing_mutation_latch() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        let decision = CheckpointDecision {
+            recipient_service_id: Some(Token::new("bloom-signer").unwrap()),
+            attempted: bloom_audit_checkpoint::CheckpointHeadMetadata {
+                service_id: Token::new("bloom-broker").unwrap(),
+                key_id: Token::new("broker-audit-1").unwrap(),
+                sequence: 7,
+                head_digest: "11".repeat(32),
+            },
+            retained: None,
+            outcome: CheckpointDecisionOutcome::Appended,
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            log_checkpoint_decision("peer", None, &decision, true);
+        });
+        let event: serde_json::Value = serde_json::from_str(capture.text().trim()).unwrap();
+        assert_eq!(event["fields"]["outcome"], "appended");
+        assert_eq!(event["fields"]["mutations_disabled"], true);
+    }
+
+    #[test]
+    fn clock_repair_logs_each_exact_expiring_approval_id() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        let approval_id = Digest32::from_bytes([0x11; 32]);
+        let confirmation_digest = Digest32::from_bytes([0x22; 32]);
+        tracing::subscriber::with_default(subscriber, || {
+            log_clock_repair_expiring_approvals(
+                1_234,
+                std::slice::from_ref(&approval_id),
+                &confirmation_digest,
+            );
+        });
+        let output = capture.text();
+        let event: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(
+            event["fields"]["event"],
+            "signer.clock_repair_expiring_approval"
+        );
+        assert_eq!(event["fields"]["approval_id"], approval_id.as_str());
+        assert_eq!(
+            event["fields"]["confirmation_digest"],
+            confirmation_digest.as_str()
+        );
+        assert!(!output.contains("MARKER_APPROVAL_TERMS_SECRET_DO_NOT_LOG"));
     }
 
     #[test]
