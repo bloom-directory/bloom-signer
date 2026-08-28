@@ -4,6 +4,9 @@ members = [
   "crates/bloom-signer-backend-api",
   "crates/bloom-signer-backend-local",
   "crates/bloom-signer-backend-aws-kms",
+  "crates/bloom-signer-derive",
+  "crates/bloom-signer-process-hardening",
+  "crates/bloom-signer-vectors",
   "crates/bloom-signer",
 ]
 resolver = "3"
@@ -16,6 +19,8 @@ license = "MIT"
 
 [workspace.dependencies]
 bloom-signer-api = { path = "crates/bloom-signer-api" }
+bloom-signer-derive = { path = "crates/bloom-signer-derive" }
+bloom-signer-process-hardening = { path = "crates/bloom-signer-process-hardening" }
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d8229e51d80971505af69c387818334a3c44aef0" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d8229e51d80971505af69c387818334a3c44aef0" }
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "d8229e51d80971505af69c387818334a3c44aef0" }
@@ -32,6 +37,8 @@ aws-smithy-types = "1"
 aws-types = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+tracing = "0.1"
+unicode-normalization = "0.1"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 futures = "0.3"
 bip32 = { version = "0.5", features = ["secp256k1"] }
@@ -48,7 +55,7 @@ k256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 parking_lot = "0.12"
 p256 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.8"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled", "backup"] }
 serde_jcs = "0.2"
 serde_json = "1"
 sha2 = "0.10"

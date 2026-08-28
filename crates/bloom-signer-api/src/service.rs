@@ -38,6 +38,30 @@ pub struct BackendPublicCapability {
     pub crypto_suites: Vec<crate::CryptoSuite>,
     pub derivation_schemes: Vec<Token>,
     pub networked: bool,
+    /// Seed profiles this backend can provision (e.g. `bip39-multicurve-v1`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wallet_seed_profiles: Vec<crate::WalletSeedProfile>,
+    /// Derivation profiles this backend can allocate children for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derivation_profiles: Vec<crate::DerivationProfile>,
+    /// Whether this backend supports BIP-39 mnemonic export.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mnemonic_export: bool,
+    /// Per-namespace child-count limits, if the backend enforces any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derivation_namespace_limits: Vec<DerivationNamespaceLimit>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// A backend-advertised allocation cap for one derivation profile.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivationNamespaceLimit {
+    pub profile: crate::DerivationProfile,
+    pub maximum_children: DecimalU64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -209,6 +233,11 @@ pub struct KeyPublic {
     pub canonical_public_key: Base64UrlBytes,
     pub addresses: Vec<String>,
     pub supported_crypto_suites: Vec<crate::CryptoSuite>,
+    /// Present for a BIP-39 derived child; carries the full registry
+    /// descriptor (profile, path, fingerprint, lifecycle). Absent for legacy
+    /// roots/children so 1.3 peers see an unchanged shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_account: Option<crate::DerivedAccountDescriptor>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -292,6 +321,8 @@ pub enum BrokerSignerRequest {
     KeyDerivePrepare(CustodyPrepareRequest),
     #[serde(rename = "key.list_derived")]
     KeyListDerived(KeyRequest),
+    #[serde(rename = "wallet.derived_accounts")]
+    DerivedAccountList(WalletRequest),
     #[serde(rename = "key.enroll_prepare")]
     KeyEnrollPrepare(CustodyPrepareRequest),
     #[serde(rename = "key.enroll_status")]
@@ -371,6 +402,8 @@ pub enum BrokerSignerResponse {
     KeyDerivationCapabilities(Vec<Token>),
     #[serde(rename = "key.list_derived")]
     KeyListDerived(Vec<KeyPublic>),
+    #[serde(rename = "wallet.derived_accounts")]
+    DerivedAccountList(Vec<crate::DerivedAccountDescriptor>),
     #[serde(rename = "key.derive_prepare")]
     KeyDerivePrepare(crate::SignerPreparedCustody),
     #[serde(rename = "key.enroll_prepare")]

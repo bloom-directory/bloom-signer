@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Test-only driver for Signer ceremony surfaces.
 //!
 //! This module is not linked by production Signer artifacts. It
