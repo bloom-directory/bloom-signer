@@ -31,6 +31,43 @@ use crate::{
     webauthn::{verify_webauthn_assertion, verify_webauthn_attestation},
 };
 
+fn ceremony_state_name(state: CeremonyState) -> &'static str {
+    match state {
+        CeremonyState::Prepared => "prepared",
+        CeremonyState::AwaitingUser => "awaiting_user",
+        CeremonyState::Verifying => "verifying",
+        CeremonyState::WalletCommitted => "wallet_committed",
+        CeremonyState::AwaitingRecoveryAck => "awaiting_recovery_ack",
+        CeremonyState::Completed => "completed",
+        CeremonyState::ApprovingRootChange => "approving_root_change",
+        CeremonyState::CreatingCredential => "creating_credential",
+        CeremonyState::Committing => "committing",
+        CeremonyState::Succeeded => "succeeded",
+        CeremonyState::Cancelled => "cancelled",
+        CeremonyState::Expired => "expired",
+        CeremonyState::Failed => "failed",
+    }
+}
+
+fn ceremony_kind_name(kind: CeremonyKind) -> &'static str {
+    match kind {
+        CeremonyKind::SealedApproval => "sealed_approval",
+        CeremonyKind::WalletRegistration => "wallet_registration",
+        CeremonyKind::WalletImport => "wallet_import",
+        CeremonyKind::WalletExport => "wallet_export",
+        CeremonyKind::WalletDelete => "wallet_delete",
+        CeremonyKind::WalletRecovery => "wallet_recovery",
+        CeremonyKind::CredentialAdd => "credential_add",
+        CeremonyKind::CredentialReplace => "credential_replace",
+        CeremonyKind::CredentialRemove => "credential_remove",
+        CeremonyKind::BackendEnrollment => "backend_enrollment",
+        CeremonyKind::KeyDerive => "key_derive",
+        CeremonyKind::AccountAllocate => "account_allocate",
+        CeremonyKind::AccountRetire => "account_retire",
+        CeremonyKind::PolicyUpdate => "policy_update",
+    }
+}
+
 const CEREMONY_TTL_MS: u64 = 5 * 60 * 1_000;
 const CONTRIBUTION_DOMAIN: &[u8] = b"bloom-signer-ceremony-contribution/v1";
 const RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1";
@@ -350,9 +387,22 @@ impl SignerCeremonyService {
         let request_digest = canonical_digest(&request)?;
         if let Some(existing) = self.pending.lock().get(&request.activation_operation_id) {
             if existing.request_digest != request_digest {
+                tracing::warn!(
+                    event = "signer.ceremony_retry_conflict",
+                    operation_id = request.activation_operation_id.as_str(),
+                    ceremony_kind = "sealed_approval",
+                    "Signer rejected a conflicting ceremony retry"
+                );
                 return Err(operation_conflict());
             }
             if let PendingContribution::Approval(contribution) = &existing.contribution {
+                tracing::info!(
+                    event = "signer.ceremony_recovered",
+                    operation_id = request.activation_operation_id.as_str(),
+                    ceremony_kind = "sealed_approval",
+                    outcome = "pending_retry",
+                    "Signer recovered a pending ceremony"
+                );
                 return Ok(PreparedApprovalCeremony {
                     contribution: contribution.clone(),
                     challenges: existing.challenges.clone(),
@@ -419,6 +469,12 @@ impl SignerCeremonyService {
                 legacy_migration: None,
             },
         );
+        tracing::info!(
+            event = "signer.ceremony_prepared",
+            operation_id = prepared.challenges[0].operation_id.as_str(),
+            ceremony_kind = "sealed_approval",
+            "Signer prepared a ceremony"
+        );
         Ok(prepared)
     }
 
@@ -453,9 +509,22 @@ impl SignerCeremonyService {
         let request_digest = canonical_digest(&request)?;
         if let Some(existing) = self.pending.lock().get(&request.custody_operation_id) {
             if existing.request_digest != request_digest {
+                tracing::warn!(
+                    event = "signer.ceremony_retry_conflict",
+                    operation_id = request.custody_operation_id.as_str(),
+                    ceremony_kind = ceremony_kind_name(request.ceremony_kind),
+                    "Signer rejected a conflicting ceremony retry"
+                );
                 return Err(operation_conflict());
             }
             if let PendingContribution::Custody(contribution) = &existing.contribution {
+                tracing::info!(
+                    event = "signer.ceremony_recovered",
+                    operation_id = request.custody_operation_id.as_str(),
+                    ceremony_kind = ceremony_kind_name(request.ceremony_kind),
+                    outcome = "pending_retry",
+                    "Signer recovered a pending ceremony"
+                );
                 return Ok(PreparedCustodyCeremony {
                     contribution: contribution.clone(),
                     challenges: existing.challenges.clone(),
@@ -663,6 +732,12 @@ impl SignerCeremonyService {
                 legacy_migration,
             },
         );
+        tracing::info!(
+            event = "signer.ceremony_prepared",
+            operation_id = prepared.contribution.custody_operation_id.as_str(),
+            ceremony_kind = ceremony_kind_name(prepared.contribution.ceremony_kind),
+            "Signer prepared a ceremony"
+        );
         Ok(prepared)
     }
 
@@ -810,6 +885,13 @@ impl SignerCeremonyService {
         if let Some(CompletedCeremony::Approval(receipt)) =
             self.completed.lock().get(&request.activation_operation_id)
         {
+            tracing::info!(
+                event = "signer.ceremony_recovered",
+                operation_id = request.activation_operation_id.as_str(),
+                ceremony_kind = "sealed_approval",
+                outcome = "completed_retry",
+                "Signer recovered a completed ceremony"
+            );
             return Ok(receipt.as_ref().clone());
         }
         if let Some(receipt) = self
@@ -819,8 +901,21 @@ impl SignerCeremonyService {
             if receipt.ceremony_id != request.contribution.ceremony_id
                 || receipt.approval_digest != request.contribution.approval_digest
             {
+                tracing::warn!(
+                    event = "signer.ceremony_retry_conflict",
+                    operation_id = request.activation_operation_id.as_str(),
+                    ceremony_kind = "sealed_approval",
+                    "Signer rejected a conflicting completed ceremony retry"
+                );
                 return Err(operation_conflict());
             }
+            tracing::info!(
+                event = "signer.ceremony_recovered",
+                operation_id = request.activation_operation_id.as_str(),
+                ceremony_kind = "sealed_approval",
+                outcome = "durable_receipt",
+                "Signer recovered a durable ceremony receipt"
+            );
             return Ok(receipt);
         }
         let operation_id = request.activation_operation_id.clone();
@@ -946,6 +1041,13 @@ impl SignerCeremonyService {
             request.activation_operation_id,
             CompletedCeremony::Approval(Box::new(receipt.clone())),
         );
+        tracing::info!(
+            event = "signer.ceremony_terminal",
+            operation_id = receipt.activation_operation_id.as_str(),
+            ceremony_kind = "sealed_approval",
+            state = "completed",
+            "Signer committed a terminal ceremony outcome"
+        );
         Ok(receipt)
     }
 
@@ -978,12 +1080,32 @@ impl SignerCeremonyService {
         if let Some(CompletedCeremony::Custody { result, .. }) =
             self.completed.lock().get(&request.custody_operation_id)
         {
+            tracing::info!(
+                event = "signer.ceremony_recovered",
+                operation_id = request.custody_operation_id.as_str(),
+                ceremony_kind = ceremony_kind_name(request.ceremony_kind),
+                outcome = "completed_retry",
+                "Signer recovered a completed ceremony"
+            );
             return Ok((**result).clone());
         }
         if let Some(result) = self.engine.custody_receipt(&request.custody_operation_id)? {
             if result.ceremony_kind != request.ceremony_kind {
+                tracing::warn!(
+                    event = "signer.ceremony_retry_conflict",
+                    operation_id = request.custody_operation_id.as_str(),
+                    ceremony_kind = ceremony_kind_name(request.ceremony_kind),
+                    "Signer rejected a conflicting completed ceremony retry"
+                );
                 return Err(operation_conflict());
             }
+            tracing::info!(
+                event = "signer.ceremony_recovered",
+                operation_id = request.custody_operation_id.as_str(),
+                ceremony_kind = ceremony_kind_name(request.ceremony_kind),
+                outcome = "durable_receipt",
+                "Signer recovered a durable ceremony receipt"
+            );
             return Ok(result);
         }
         let operation_id = request.custody_operation_id.clone();
@@ -1184,6 +1306,13 @@ impl SignerCeremonyService {
                 expires_at_ms: contribution.expires_at_ms.clone(),
             },
         );
+        tracing::info!(
+            event = "signer.ceremony_terminal",
+            operation_id = result.custody_operation_id.as_str(),
+            ceremony_kind = ceremony_kind_name(result.ceremony_kind),
+            state = ceremony_state_name(result.public_status),
+            "Signer committed a terminal ceremony outcome"
+        );
         Ok(result)
     }
 
@@ -1295,12 +1424,25 @@ impl SignerCeremonyService {
             status.state = CeremonyState::Expired;
         }
         if let Err(error) = self.engine.persist_ceremony_public_status(&status) {
-            eprintln!(
-                "Bloom Signer could not terminalize a rejected ceremony: \
-                 operation_id={}, state={:?}, cleanup_error={:?}",
-                operation_id.as_str(),
-                status.state,
-                error.code
+            tracing::warn!(
+                event = "signer.ceremony_terminalization_failed",
+                operation_id = operation_id.as_str(),
+                ceremony_state = ceremony_state_name(status.state),
+                error_code = error.code.as_str(),
+                "Signer could not persist a rejected ceremony's terminal state"
+            );
+        } else {
+            tracing::warn!(
+                event = "signer.ceremony_terminal",
+                operation_id = operation_id.as_str(),
+                ceremony_kind = match contribution {
+                    PendingContribution::Approval(_) => "sealed_approval",
+                    PendingContribution::Custody(contribution) => {
+                        ceremony_kind_name(contribution.ceremony_kind)
+                    }
+                },
+                state = ceremony_state_name(status.state),
+                "Signer committed a rejected ceremony's terminal outcome"
             );
         }
     }
@@ -2972,5 +3114,17 @@ mod tests {
         mnemonic_only.wallet_seed_profile =
             Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1);
         assert!(reject_seed_profile_with_migration(&mnemonic_only).is_ok());
+    }
+
+    #[test]
+    fn account_ceremonies_have_stable_safe_log_names() {
+        assert_eq!(
+            ceremony_kind_name(CeremonyKind::AccountAllocate),
+            "account_allocate"
+        );
+        assert_eq!(
+            ceremony_kind_name(CeremonyKind::AccountRetire),
+            "account_retire"
+        );
     }
 }
