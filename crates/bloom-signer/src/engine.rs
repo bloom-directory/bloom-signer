@@ -376,6 +376,7 @@ impl SignerBackupSet {
 pub struct SignerEngine {
     connection: Mutex<Connection>,
     audit_degraded: AtomicBool,
+    audit_degradation: Mutex<Option<AuditDegradation>>,
     audit_tail: Mutex<AuditTailState>,
     broker_key_id: Token,
     broker_public_key: VerifyingKey,
@@ -383,6 +384,35 @@ pub struct SignerEngine {
     revocation_signing_key: Arc<SigningKey>,
     audit_keys: RwLock<AuditKeyState>,
     backend_registry: Arc<BackendRegistry>,
+}
+
+/// Safe, first-write-wins diagnostics for the failure that disabled mutations.
+///
+/// Values here are deliberately limited to operational identifiers. Request
+/// payloads, signatures, and arbitrary error text do not belong in this type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditDegradation {
+    pub cause_code: &'static str,
+    pub peer_service_id: Option<String>,
+    pub peer_key_id: Option<String>,
+    pub attempted_sequence: Option<u64>,
+    pub attempted_head_digest: Option<String>,
+    pub retained_sequence: Option<u64>,
+    pub retained_head_digest: Option<String>,
+}
+
+impl AuditDegradation {
+    pub const fn new(cause_code: &'static str) -> Self {
+        Self {
+            cause_code,
+            peer_service_id: None,
+            peer_key_id: None,
+            attempted_sequence: None,
+            attempted_head_digest: None,
+            retained_sequence: None,
+            retained_head_digest: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -433,11 +463,36 @@ impl SignerEngine {
     /// Permanently fail closed for mutations after an independently detected
     /// peer/OS checkpoint violation. Read and status methods remain available.
     pub fn latch_audit_degraded(&self) {
+        self.latch_audit_degraded_with(AuditDegradation::new("audit_verification_failed"));
+    }
+
+    /// Latch the first safe degradation cause and emit it exactly once.
+    pub fn latch_audit_degraded_with(&self, cause: AuditDegradation) {
+        let mut retained = self.audit_degradation.lock();
+        if retained.is_some() {
+            return;
+        }
+        tracing::error!(
+            event = "signer.mutations_disabled",
+            cause_code = cause.cause_code,
+            peer_service_id = cause.peer_service_id.as_deref(),
+            peer_key_id = cause.peer_key_id.as_deref(),
+            attempted_sequence = cause.attempted_sequence,
+            attempted_head_digest = cause.attempted_head_digest.as_deref(),
+            retained_sequence = cause.retained_sequence,
+            retained_head_digest = cause.retained_head_digest.as_deref(),
+            "Signer mutations disabled"
+        );
+        *retained = Some(cause);
         self.audit_degraded.store(true, Ordering::SeqCst);
     }
 
     pub fn audit_is_degraded(&self) -> bool {
         self.audit_degraded.load(Ordering::SeqCst)
+    }
+
+    pub fn audit_degradation(&self) -> Option<AuditDegradation> {
+        self.audit_degradation.lock().clone()
     }
 
     /// Atomically cross-sign the exact final old-key and first new-key heads,
@@ -855,9 +910,10 @@ impl SignerEngine {
         } else {
             Some(read_verified_audit_tail(&connection)?)
         };
-        Ok(Self {
+        let engine = Self {
             connection: Mutex::new(connection),
-            audit_degraded: AtomicBool::new(audit_degraded),
+            audit_degraded: AtomicBool::new(false),
+            audit_degradation: Mutex::new(None),
             audit_tail: Mutex::new(AuditTailState {
                 verified: verified_tail,
                 pending: None,
@@ -872,7 +928,11 @@ impl SignerEngine {
                 trusted_keys: audit_keys.historical_verifying_keys,
             }),
             backend_registry,
-        })
+        };
+        if audit_degraded {
+            engine.latch_audit_degraded_with(AuditDegradation::new("journal_verification_failed"));
+        }
+        Ok(engine)
     }
 
     fn mutation_transaction<'a>(
@@ -884,7 +944,7 @@ impl SignerEngine {
         }
         let audit_keys = self.audit_keys.read();
         if self.cached_audit_head(connection, &audit_keys).is_err() {
-            self.audit_degraded.store(true, Ordering::SeqCst);
+            self.latch_audit_degraded_with(AuditDegradation::new("journal_verification_failed"));
             return Err(audit_degraded_error());
         }
         connection.transaction().map_err(storage)
@@ -906,7 +966,7 @@ impl SignerEngine {
             &audit_keys.current_key_id,
             &audit_keys.trusted_keys,
         ) {
-            self.audit_degraded.store(true, Ordering::SeqCst);
+            self.latch_audit_degraded_with(AuditDegradation::new("audit_append_failed"));
             return Err(error(
                 ProtocolErrorCode::ServiceUnavailable,
                 format!("Signer audit append failed; mutations are latched closed: {cause}"),
@@ -1036,6 +1096,7 @@ impl SignerEngine {
                 }),
             )?;
             transaction.commit().map_err(storage)?;
+            log_clock_transition(condition, effective_now_ms, !rate_limited_mutation);
             if rate_limited_mutation {
                 return Err(error(
                     ProtocolErrorCode::ClockUntrusted,
@@ -1082,6 +1143,7 @@ impl SignerEngine {
                 };
                 self.append_audit(&transaction, event_type, &payload)?;
                 transaction.commit().map_err(storage)?;
+                log_clock_transition(condition, effective_now_ms, true);
                 Ok(decision(effective_now_ms, condition))
             }
             DurableClockCondition::RollbackFrozen => {
@@ -1103,6 +1165,7 @@ impl SignerEngine {
                     }),
                 )?;
                 transaction.commit().map_err(storage)?;
+                log_clock_transition(condition, effective_now_ms, !rate_limited_mutation);
                 if rate_limited_mutation {
                     return Err(error(
                         ProtocolErrorCode::ClockRollback,
@@ -1130,6 +1193,7 @@ impl SignerEngine {
                     }),
                 )?;
                 transaction.commit().map_err(storage)?;
+                log_clock_transition(condition, effective_now_ms, false);
                 Ok(decision(effective_now_ms, condition))
             }
             DurableClockCondition::Untrusted => unreachable!("handled above"),
@@ -1203,6 +1267,14 @@ impl SignerEngine {
         })?;
         let prior = prior.parse::<u64>().map_err(malformed)?;
         if accepted_utc_ms < prior {
+            tracing::warn!(
+                event = "signer.clock_transition",
+                condition = "repair",
+                effective_now_ms = prior,
+                outcome = "rejected",
+                error_code = ProtocolErrorCode::ClockRollback.as_str(),
+                "Signer rejected a durable clock transition"
+            );
             return Err(error(
                 ProtocolErrorCode::ClockRollback,
                 "clock repair cannot move effective time backwards",
@@ -1233,6 +1305,7 @@ impl SignerEngine {
             }),
         )?;
         transaction.commit().map_err(storage)?;
+        log_clock_transition(ClockCondition::Repaired, accepted_utc_ms, true);
         Ok(ClockDecision {
             effective_now_ms: accepted_utc_ms,
             condition: ClockCondition::Repaired,
@@ -1834,7 +1907,14 @@ impl SignerEngine {
                 "database_effect": database_effect,
             }),
         )?;
-        transaction.commit().map_err(storage)
+        transaction.commit().map_err(storage)?;
+        tracing::info!(
+            event = "signer.mutation_committed",
+            operation_id = result.custody_operation_id.as_str(),
+            mutation_kind = ceremony_mutation_kind(result.ceremony_kind),
+            "Signer committed a ceremony mutation"
+        );
+        Ok(())
     }
 
     pub(crate) fn ceremony_public_status(
@@ -1877,6 +1957,12 @@ impl SignerEngine {
             &serde_json::json!({ "status": status }),
         )?;
         transaction.commit().map_err(storage)?;
+        tracing::info!(
+            event = "signer.ceremony_status_committed",
+            operation_id = status.operation_id.as_str(),
+            state = ceremony_state_code(status.state),
+            "Signer committed a ceremony status"
+        );
         Ok(())
     }
 
@@ -5151,12 +5237,29 @@ fn restore_audit_entries(
 ) -> Result<(), ProtocolError> {
     let current = load_audit_entries(transaction)?;
     if backup.len() < current.len() {
+        log_journal_verification_failure_with_state(
+            backup.len() as u64,
+            "durable_state_correlation",
+            None,
+            false,
+        );
         return Err(error(
             ProtocolErrorCode::RevocationEpochUnreconciled,
             "backup cannot lower the Signer audit sequence",
         ));
     }
     if current != backup[..current.len()] {
+        let sequence = current
+            .iter()
+            .zip(backup)
+            .position(|(durable, candidate)| durable != candidate)
+            .unwrap_or(current.len()) as u64;
+        log_journal_verification_failure_with_state(
+            sequence,
+            "durable_state_correlation",
+            None,
+            false,
+        );
         return Err(error(
             ProtocolErrorCode::OperationIdConflict,
             "backup audit chain does not extend the durable chain",
@@ -5183,10 +5286,7 @@ fn restore_audit_entries(
             ));
         }
     }
-    if current_rotations
-        .iter()
-        .any(|(sequence, rotation)| backup_rotation_map.get(sequence) != Some(rotation))
-    {
+    if log_first_backup_rotation_mismatch(&current_rotations, &backup_rotation_map).is_some() {
         return Err(error(
             ProtocolErrorCode::OperationIdConflict,
             "backup audit rotations do not extend the durable rotation chain",
@@ -5234,12 +5334,25 @@ fn restore_audit_entries(
             )
             .map_err(storage)?;
     }
-    verify_audit_chain(transaction, expected_key_id, verifying_keys).map_err(|cause| {
-        error(
-            ProtocolErrorCode::MalformedFrame,
-            format!("backup audit chain or rotation proof is invalid: {cause}"),
-        )
-    })
+    verify_audit_chain_with_state(transaction, expected_key_id, verifying_keys, false).map_err(
+        |cause| {
+            error(
+                ProtocolErrorCode::MalformedFrame,
+                format!("backup audit chain or rotation proof is invalid: {cause}"),
+            )
+        },
+    )
+}
+
+fn log_first_backup_rotation_mismatch(
+    durable: &BTreeMap<u64, AuditRotationBackup>,
+    candidate: &BTreeMap<u64, AuditRotationBackup>,
+) -> Option<u64> {
+    let sequence = durable.iter().find_map(|(sequence, rotation)| {
+        (candidate.get(sequence) != Some(rotation)).then_some(*sequence)
+    })?;
+    log_journal_verification_failure_with_state(sequence, "durable_state_correlation", None, false);
+    Some(sequence)
 }
 
 fn append_audit_entry(
@@ -5332,6 +5445,25 @@ fn verify_audit_chain(
     expected_final_key_id: &Token,
     verifying_keys: &BTreeMap<Token, VerifyingKey>,
 ) -> Result<(), ProtocolError> {
+    verify_audit_chain_with_state(connection, expected_final_key_id, verifying_keys, true)
+}
+
+fn verify_audit_chain_with_state(
+    connection: &Connection,
+    expected_final_key_id: &Token,
+    verifying_keys: &BTreeMap<Token, VerifyingKey>,
+    mutations_disabled: bool,
+) -> Result<(), ProtocolError> {
+    macro_rules! verification_failure {
+        ($sequence:expr, $invariant:expr, $signing_key_id:expr $(,)?) => {
+            log_journal_verification_failure_with_state(
+                $sequence,
+                $invariant,
+                $signing_key_id,
+                mutations_disabled,
+            )
+        };
+    }
     let mut statement = connection
         .prepare(
             "SELECT sequence, event_type, payload_jcs, previous_hash, entry_hash,
@@ -5367,12 +5499,26 @@ fn verify_audit_chain(
             signing_key_id,
             signature,
         ) = row.map_err(storage)?;
-        let sequence = u64::try_from(sequence).map_err(malformed)?;
-        let signing_key_id = Token::new(signing_key_id).map_err(malformed)?;
-        if sequence != expected_sequence || previous_hash != expected_previous_hash.as_str() {
+        let sequence = u64::try_from(sequence).map_err(|cause| {
+            verification_failure!(expected_sequence, "row_sequence", None);
+            malformed(cause)
+        })?;
+        let signing_key_id = Token::new(signing_key_id).map_err(|cause| {
+            verification_failure!(sequence, "signing_key", None);
+            malformed(cause)
+        })?;
+        if sequence != expected_sequence {
+            verification_failure!(sequence, "sequence", Some(&signing_key_id));
             return Err(error(
                 ProtocolErrorCode::ServiceUnavailable,
-                "Signer audit chain sequence or predecessor is invalid",
+                "Signer audit chain sequence is invalid",
+            ));
+        }
+        if previous_hash != expected_previous_hash.as_str() {
+            verification_failure!(sequence, "predecessor_link", Some(&signing_key_id));
+            return Err(error(
+                ProtocolErrorCode::ServiceUnavailable,
+                "Signer audit chain predecessor is invalid",
             ));
         }
         let mut hasher = Sha256::new();
@@ -5383,6 +5529,7 @@ fn verify_audit_chain(
         hasher.update(payload_jcs.as_bytes());
         let computed = Digest32::from_bytes(hasher.finalize().into());
         if computed.as_str() != entry_hash {
+            verification_failure!(sequence, "content_hash", Some(&signing_key_id));
             return Err(error(
                 ProtocolErrorCode::ServiceUnavailable,
                 "Signer audit entry hash is invalid",
@@ -5390,7 +5537,10 @@ fn verify_audit_chain(
         }
         if let Some(old_key_id) = &active_key_id {
             if old_key_id != &signing_key_id {
-                let rotation = rotations.get(&sequence).ok_or_else(audit_degraded_error)?;
+                let rotation = rotations.get(&sequence).ok_or_else(|| {
+                    verification_failure!(sequence, "key_rotation", Some(&signing_key_id),);
+                    audit_degraded_error()
+                })?;
                 verify_audit_rotation(
                     rotation,
                     old_key_id,
@@ -5399,18 +5549,27 @@ fn verify_audit_chain(
                     &expected_previous_hash,
                     &computed,
                     verifying_keys,
-                )?;
+                )
+                .inspect_err(|_| {
+                    verification_failure!(sequence, "key_rotation", Some(&signing_key_id),);
+                })?;
                 observed_rotations += 1;
             } else if rotations.contains_key(&sequence) {
+                verification_failure!(sequence, "key_rotation", Some(&signing_key_id));
                 return Err(audit_degraded_error());
             }
         } else if rotations.contains_key(&sequence) {
+            verification_failure!(sequence, "key_rotation", Some(&signing_key_id));
             return Err(audit_degraded_error());
         }
-        let signature_bytes: [u8; 64] = Base64UrlBytes::parse(signature)?
+        let signature_bytes: [u8; 64] = Base64UrlBytes::parse(signature)
+            .inspect_err(|_| {
+                verification_failure!(sequence, "signature_encoding", Some(&signing_key_id),);
+            })?
             .decode()
             .try_into()
             .map_err(|_| {
+                verification_failure!(sequence, "signature_length", Some(&signing_key_id),);
                 error(
                     ProtocolErrorCode::ServiceUnavailable,
                     "Signer audit signature length is invalid",
@@ -5419,12 +5578,16 @@ fn verify_audit_chain(
         let signature = Signature::from_bytes(&signature_bytes);
         verifying_keys
             .get(&signing_key_id)
-            .ok_or_else(audit_degraded_error)?
+            .ok_or_else(|| {
+                verification_failure!(sequence, "signing_key", Some(&signing_key_id));
+                audit_degraded_error()
+            })?
             .verify(
                 &[AUDIT_SIGNATURE_DOMAIN, computed.as_str().as_bytes()].concat(),
                 &signature,
             )
             .map_err(|_| {
+                verification_failure!(sequence, "signature", Some(&signing_key_id));
                 error(
                     ProtocolErrorCode::ServiceUnavailable,
                     "Signer audit signature is invalid",
@@ -5444,9 +5607,84 @@ fn verify_audit_chain(
             .as_ref()
             .is_some_and(|key_id| key_id != expected_final_key_id)
     {
+        verification_failure!(
+            expected_sequence.saturating_sub(1),
+            "key_rotation",
+            active_key_id.as_ref(),
+        );
         return Err(audit_degraded_error());
     }
     Ok(())
+}
+
+fn log_journal_verification_failure_with_state(
+    sequence: u64,
+    invariant: &'static str,
+    signing_key_id: Option<&Token>,
+    mutations_disabled: bool,
+) {
+    tracing::error!(
+        event = "signer.journal_verification_failed",
+        sequence,
+        invariant,
+        signing_key_id = signing_key_id.map(Token::as_str),
+        mutations_disabled,
+        "Signer journal verification failed"
+    );
+}
+
+fn ceremony_mutation_kind(kind: bloom_signer_api::CeremonyKind) -> &'static str {
+    use bloom_signer_api::CeremonyKind as Kind;
+    match kind {
+        Kind::WalletRegistration
+        | Kind::WalletImport
+        | Kind::WalletExport
+        | Kind::WalletDelete
+        | Kind::WalletRecovery => "wallet",
+        Kind::CredentialAdd | Kind::CredentialReplace | Kind::CredentialRemove => "credential",
+        Kind::PolicyUpdate => "policy",
+        Kind::BackendEnrollment | Kind::KeyDerive => "key",
+        Kind::SealedApproval => "approval",
+    }
+}
+
+fn ceremony_state_code(state: bloom_signer_api::CeremonyState) -> &'static str {
+    use bloom_signer_api::CeremonyState;
+    match state {
+        CeremonyState::Prepared => "prepared",
+        CeremonyState::AwaitingUser => "awaiting_user",
+        CeremonyState::Verifying => "verifying",
+        CeremonyState::WalletCommitted => "wallet_committed",
+        CeremonyState::AwaitingRecoveryAck => "awaiting_recovery_ack",
+        CeremonyState::Completed => "completed",
+        CeremonyState::ApprovingRootChange => "approving_root_change",
+        CeremonyState::CreatingCredential => "creating_credential",
+        CeremonyState::Committing => "committing",
+        CeremonyState::Succeeded => "succeeded",
+        CeremonyState::Cancelled => "cancelled",
+        CeremonyState::Expired => "expired",
+        CeremonyState::Failed => "failed",
+    }
+}
+
+fn log_clock_transition(condition: ClockCondition, effective_now_ms: u64, accepted: bool) {
+    if accepted {
+        tracing::info!(
+            event = "signer.clock_transition",
+            condition = condition.as_str(),
+            effective_now_ms,
+            outcome = "accepted",
+            "Signer accepted a durable clock transition"
+        );
+    } else {
+        tracing::warn!(
+            event = "signer.clock_transition",
+            condition = condition.as_str(),
+            effective_now_ms,
+            outcome = "rejected",
+            "Signer rejected a durable clock transition"
+        );
+    }
 }
 
 fn insert_trusted_audit_key(
@@ -5746,15 +5984,110 @@ mod clock_tests {
         );
 
         let clean = file_engine(&directory.path().join("clean.sqlite3"));
-        clean.latch_audit_degraded();
+        clean.latch_audit_degraded_with(AuditDegradation {
+            cause_code: "checkpoint_sequence_rollback",
+            peer_service_id: Some("bloom-broker".into()),
+            peer_key_id: Some("broker-audit-1".into()),
+            attempted_sequence: Some(7),
+            attempted_head_digest: Some("11".repeat(32)),
+            retained_sequence: Some(8),
+            retained_head_digest: Some("22".repeat(32)),
+        });
+        clean.latch_audit_degraded_with(AuditDegradation::new("later_failure"));
         assert_eq!(
             clean.repair_clock(1).unwrap_err().code,
             ProtocolErrorCode::ServiceUnavailable
         );
+        let cause = clean.audit_degradation().unwrap();
+        assert_eq!(cause.cause_code, "checkpoint_sequence_rollback");
+        assert_eq!(cause.attempted_sequence, Some(7));
+        assert_eq!(cause.retained_sequence, Some(8));
         assert_eq!(
             clean.verified_audit_head().unwrap(),
             (0, Digest32::from_bytes([0; 32]))
         );
+    }
+
+    #[test]
+    fn journal_diagnostic_names_exact_row_and_invariant() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_journal_verification_failure_with_state(
+                17,
+                "durable_state_correlation",
+                Some(&Token::new("audit-key-17").unwrap()),
+                true,
+            );
+        });
+        let output = capture.text();
+        let event: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(
+            event["fields"]["event"],
+            "signer.journal_verification_failed"
+        );
+        assert_eq!(event["fields"]["sequence"], 17);
+        assert_eq!(event["fields"]["invariant"], "durable_state_correlation");
+    }
+
+    #[test]
+    fn rejected_backup_diagnostic_does_not_claim_mutations_are_disabled() {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_journal_verification_failure_with_state(
+                4,
+                "durable_state_correlation",
+                None,
+                false,
+            );
+        });
+        let event: serde_json::Value = serde_json::from_str(capture.text().trim()).unwrap();
+        assert_eq!(event["fields"]["mutations_disabled"], false);
+    }
+
+    #[test]
+    fn backup_rotation_diagnostic_reports_first_actual_later_mismatch() {
+        fn rotation(sequence: u64, label: u8) -> AuditRotationBackup {
+            AuditRotationBackup {
+                old_key_id: Token::new(format!("audit-old-{label}")).unwrap(),
+                new_key_id: Token::new(format!("audit-new-{label}")).unwrap(),
+                final_old_sequence: DecimalU64::new(sequence - 1),
+                final_old_head: Digest32::from_bytes([label; 32]),
+                first_new_sequence: DecimalU64::new(sequence),
+                first_new_head: Digest32::from_bytes([label + 1; 32]),
+                old_key_signature: Base64UrlBytes::from_bytes(&[label; 64]),
+                new_key_signature: Base64UrlBytes::from_bytes(&[label + 1; 64]),
+            }
+        }
+
+        let durable = BTreeMap::from([(4, rotation(4, 1)), (9, rotation(9, 2))]);
+        let mut candidate = durable.clone();
+        let marker_secret = "MARKER_BACKUP_ROTATION_SIGNATURE_DO_NOT_LOG";
+        candidate.get_mut(&9).unwrap().old_key_signature =
+            Base64UrlBytes::from_bytes(marker_secret.as_bytes());
+        let encoded_signature = candidate.get(&9).unwrap().old_key_signature.encoded();
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        let mismatch = tracing::subscriber::with_default(subscriber, || {
+            log_first_backup_rotation_mismatch(&durable, &candidate)
+        });
+        assert_eq!(mismatch, Some(9));
+        let output = capture.text();
+        let event: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(event["fields"]["sequence"], 9);
+        assert_eq!(event["fields"]["mutations_disabled"], false);
+        assert!(!output.contains(marker_secret));
+        assert!(!output.contains(encoded_signature));
     }
 
     #[test]
