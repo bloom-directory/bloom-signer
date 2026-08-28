@@ -2094,7 +2094,7 @@ mod tests {
     }
 
     #[test]
-    fn request_checkpoint_failure_blocks_mutations_but_keeps_read_heads_available() {
+    fn checkpoint_failure_keeps_derived_account_list_available_but_blocks_mutations() {
         let engine = test_engine();
         let exchange = SignerJournalExchange {
             engine: engine.clone(),
@@ -2102,18 +2102,13 @@ mod tests {
             identity: signer_identity(),
             last_verified_head: Mutex::new(None),
         };
+        let derived_accounts = Token::new("wallet.derived_accounts").unwrap();
         assert!(
             exchange
-                .checkpoint_request_head(&Token::new("signer.readiness").unwrap(), &broker_head(),)
+                .checkpoint_request_head(&derived_accounts, &broker_head())
                 .is_ok()
         );
-        assert_eq!(
-            exchange
-                .local_journal_head(&Token::new("signer.readiness").unwrap())
-                .unwrap()
-                .0,
-            0
-        );
+        assert_eq!(exchange.local_journal_head(&derived_accounts).unwrap().0, 0);
         assert_eq!(
             exchange
                 .checkpoint_request_head(&Token::new("signer.sign").unwrap(), &broker_head())

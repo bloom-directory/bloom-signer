@@ -515,6 +515,7 @@ pub fn is_read_only_method(method: &Token) -> bool {
         || method == "revocation.state"
         || method == "key.derivation_capabilities"
         || method == "key.list_derived"
+        || method == "wallet.derived_accounts"
         || method == "credential.list_public"
         || method == "custody.result"
 }
@@ -588,8 +589,23 @@ impl crate::TypedRequestMethod for ControlRequest {
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        BrokerSignerRequest, Token, TypedRequestMethod as _, WalletRequest, is_read_only_method,
+    };
+
     #[test]
     fn typed_request_inventories_cover_every_normative_method() {
         assert_eq!(crate::BrokerSignerMethod::ALL.len(), 38);
+    }
+
+    #[test]
+    fn derived_account_list_is_classified_read_only_by_method_and_request() {
+        let request = BrokerSignerRequest::DerivedAccountList(WalletRequest {
+            wallet_id: Token::new("wallet").unwrap(),
+        });
+        let method = request.method().unwrap();
+        assert_eq!(method.as_str(), "wallet.derived_accounts");
+        assert!(is_read_only_method(&method));
+        assert!(request.is_read_only());
     }
 }
