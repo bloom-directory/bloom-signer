@@ -13,9 +13,9 @@ fn key(value: u8) -> SecretBytes {
 }
 
 fn registered() -> WalletCustody {
-    WalletCustody::register_bip39(
+    WalletCustody::register(
         Token::new("wallet-1").unwrap(),
-        SecretBytes::new((0_u8..32).collect()),
+        SecretBytes::new((0_u8..64).collect()),
         key(9),
         key(8),
         credential(1),
@@ -172,9 +172,9 @@ fn loss_of_every_passkey_without_recovery_is_unrecoverable() {
 #[test]
 fn credential_wrap_is_bound_to_exact_root_ciphertext_fingerprint() {
     let first = registered().backup();
-    let second = WalletCustody::register_bip39(
+    let second = WalletCustody::register(
         Token::new("wallet-1").unwrap(),
-        SecretBytes::new(vec![42; 32]),
+        SecretBytes::new(vec![42; 64]),
         key(6),
         key(8),
         credential(1),
@@ -209,7 +209,7 @@ fn custody_mutations_survive_atomic_file_restart() {
     let custody = WalletCustody::register_at(
         &path,
         Token::new("wallet-1").unwrap(),
-        SecretBytes::new((0_u8..32).collect()),
+        SecretBytes::new((0_u8..64).collect()),
         key(9),
         key(8),
         credential(1),

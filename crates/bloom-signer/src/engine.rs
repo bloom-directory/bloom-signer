@@ -1,13 +1,12 @@
 use bloom_signer_api::{
-    AccountLifecycleState, ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector,
-    ApprovalSubject, ApprovalTombstone, Base64UrlBytes, CeremonyPublicStatus, CredentialPublic,
-    CredentialState, CustodyResult, DecimalU64, DerivationProfile, DerivationRef,
-    DerivedAccountDescriptor, DerivedAccountRequest, Digest32, KeyRef, KeySpec, OperationId,
-    OperationPublicStatus, OperationState, PetalKeyScope, PolicyCommitReceipt,
-    PolicyCompareAndSwapRequest, PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest,
-    PolicyValidationReceipt, ProtocolError, ProtocolErrorCode, PublicKeyEncoding, RevocationState,
-    SealedApprovalTerms, SelectorKind, SignRequest, SignedPolicySnapshot, SignerActivationReceipt,
-    SigningResult, Token, WalletSeedProfile, WalletSeedRef, WalletTombstone, WebAuthnCredential,
+    ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
+    ApprovalTombstone, Base64UrlBytes, CeremonyPublicStatus, CredentialPublic, CredentialState,
+    CustodyResult, DecimalU64, Digest32, KeyRef, OperationId, OperationPublicStatus,
+    OperationState, PetalKeyScope, PolicyCommitReceipt, PolicyCompareAndSwapRequest,
+    PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest, PolicyValidationReceipt,
+    ProtocolError, ProtocolErrorCode, RevocationState, SealedApprovalTerms, SelectorKind,
+    SignRequest, SignedPolicySnapshot, SignerActivationReceipt, SigningResult, Token,
+    WalletTombstone, WebAuthnCredential,
 };
 use bloom_trusted_time::{DurableClockCondition, PersistedClockState, evaluate_durable_clock};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
@@ -244,24 +243,6 @@ pub struct DerivationRegistryBackup {
     pub namespaces: Vec<DerivationNamespaceBackup>,
 }
 
-/// One durable `derivation_allocations` row for a BIP-39 derived child, plus
-/// the enrolled `KeyRef` it resolves to. Carried so `restore_backup` can
-/// reconstruct the descriptor projection (SPKI / fingerprint / lifecycle) and
-/// re-enroll the child without re-deriving from a locked backend.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DerivationAllocationBackup {
-    pub key_ref: KeyRef,
-    pub operation_id: OperationId,
-    pub role: Token,
-    pub account: u32,
-    pub index: u32,
-    pub public_key_spki_der: Base64UrlBytes,
-    pub lifecycle: AccountLifecycleState,
-    pub created_at_ms: DecimalU64,
-    pub updated_at_ms: DecimalU64,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendEnrollmentBackup {
@@ -326,8 +307,6 @@ pub struct SignerBackupSet {
     pub wallet_revocation_epoch: DecimalU64,
     pub custody: Option<WalletCustodyBackup>,
     pub derivation_registry: Option<DerivationRegistryBackup>,
-    #[serde(default)]
-    pub derivation_allocations: Vec<DerivationAllocationBackup>,
     pub backend_enrollments: Vec<BackendEnrollmentBackup>,
     pub policy: Option<PolicyBackup>,
     #[serde(default)]
@@ -664,8 +643,6 @@ impl SignerEngine {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(storage)?;
-        crate::bip39_store::configure_durability(&connection)?;
-        crate::derivation_registry::migrate(&connection)?;
         connection
             .execute_batch(
                 "
@@ -1676,39 +1653,28 @@ impl SignerEngine {
                     )
                     .map_err(storage)?;
                 if let Some(enrollment) = backend_enrollment {
-                    // A legacy/imported-scalar backend pins exactly one root
-                    // KeyRef (derivation None) and enrolls it as wallet_root
-                    // here. A BIP-39 backend pins only derived children
-                    // (derivation Some), enrolled separately via
-                    // enroll_bip39_child; it has no root to enroll.
-                    let roots: Vec<&bloom_signer_api::KeyRef> = enrollment
-                        .pinned_keys
-                        .iter()
-                        .filter(|key| key.derivation.is_none())
-                        .collect();
-                    if let Some(root) = roots.first() {
-                        if roots.len() != 1
-                            || root.backend != enrollment.backend
-                            || root.backend_instance != enrollment.backend_instance
-                        {
-                            return Err(error(
-                                ProtocolErrorCode::KeyrefMismatch,
-                                "registration backend enrollment is not bound to one root KeyRef",
-                            ));
-                        }
-                        transaction
-                            .execute(
-                                "INSERT INTO enrolled_keys(
-                                    key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
-                                 ) VALUES (?1, ?2, 1, 'wallet_root', ?3)",
-                                params![
-                                    root.public_key_fingerprint.as_str(),
-                                    serde_jcs::to_string(root).map_err(malformed)?,
-                                    snapshot.wallet_id.as_str(),
-                                ],
-                            )
-                            .map_err(storage)?;
+                    if enrollment.pinned_keys.len() != 1
+                        || enrollment.pinned_keys[0].backend != enrollment.backend
+                        || enrollment.pinned_keys[0].backend_instance != enrollment.backend_instance
+                    {
+                        return Err(error(
+                            ProtocolErrorCode::KeyrefMismatch,
+                            "registration backend enrollment is not bound to one root KeyRef",
+                        ));
                     }
+                    let key_ref = &enrollment.pinned_keys[0];
+                    transaction
+                        .execute(
+                            "INSERT INTO enrolled_keys(
+                                key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
+                             ) VALUES (?1, ?2, 1, 'wallet_root', ?3)",
+                            params![
+                                key_ref.public_key_fingerprint.as_str(),
+                                serde_jcs::to_string(key_ref).map_err(malformed)?,
+                                snapshot.wallet_id.as_str(),
+                            ],
+                        )
+                        .map_err(storage)?;
                     transaction
                         .execute(
                             "INSERT INTO ceremony_backend_enrollments(
@@ -2010,555 +1976,6 @@ impl SignerEngine {
             &serde_json::json!({ "wallet_id": wallet_id, "key_ref": key_ref }),
         )?;
         transaction.commit().map_err(storage)
-    }
-
-    /// Enroll a BIP-39 derived child as a wallet-scoped derived key. The root
-    /// of a BIP-39 wallet is never enrolled and never signable; only
-    /// `ACTIVATED` children reach this point.
-    pub fn enroll_bip39_child(
-        &self,
-        wallet_id: &Token,
-        key_ref: &KeyRef,
-    ) -> Result<(), ProtocolError> {
-        key_ref.validate()?;
-        let mut connection = self.connection.lock();
-        let transaction = self.mutation_transaction(&mut connection)?;
-        transaction
-            .execute(
-                "INSERT INTO enrolled_keys(
-                    key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
-                 ) VALUES (?1, ?2, 1, 'derived', ?3)
-                 ON CONFLICT(key_fingerprint) DO UPDATE SET
-                    key_ref_jcs = excluded.key_ref_jcs,
-                    available = 1,
-                    authority_class = 'derived',
-                    wallet_id = excluded.wallet_id",
-                params![
-                    key_ref.public_key_fingerprint.as_str(),
-                    serde_jcs::to_string(key_ref).map_err(malformed)?,
-                    wallet_id.as_str(),
-                ],
-            )
-            .map_err(storage)?;
-        self.append_audit(
-            &transaction,
-            "key.derived_enrolled",
-            &serde_json::json!({ "wallet_id": wallet_id, "key_ref": key_ref }),
-        )?;
-        transaction.commit().map_err(storage)
-    }
-
-    /// Mark a BIP-39 derived child unavailable (retirement).
-    pub fn deactivate_enrolled_bip39_child(
-        &self,
-        wallet_id: &Token,
-        key_ref: &KeyRef,
-    ) -> Result<(), ProtocolError> {
-        let mut connection = self.connection.lock();
-        let transaction = self.mutation_transaction(&mut connection)?;
-        let updated = transaction
-            .execute(
-                "UPDATE enrolled_keys SET available = 0
-                  WHERE key_fingerprint = ?1 AND wallet_id = ?2",
-                params![key_ref.public_key_fingerprint.as_str(), wallet_id.as_str()],
-            )
-            .map_err(storage)?;
-        if updated != 1 {
-            return Err(error(
-                ProtocolErrorCode::KeyrefMismatch,
-                "derived child is not enrolled for this wallet",
-            ));
-        }
-        transaction.commit().map_err(storage)
-    }
-
-    /// Persist the backend's current encrypted record so a restart re-registers
-    /// the derived children allocated or retired since provisioning. The
-    /// `ceremony_backend_enrollments` row is the durable enrollment source.
-    /// Called by the AccountAllocate/AccountRetire ceremonies after mutating
-    /// the backend; registration writes its own post-allocation record.
-    pub fn refresh_backend_enrollment(
-        &self,
-        wallet_id: &Token,
-        key_ref: &KeyRef,
-    ) -> Result<(), ProtocolError> {
-        #[cfg(feature = "local")]
-        {
-            let encrypted_record = self.backend_registry.local_encrypted_backup(key_ref)?;
-            // The enrollment's pinned_keys must equal the backend's actual
-            // derivation registry (its derived-key subset, no root) so the
-            // export/restore cross-check in `derivation_registry_from_enrollments`
-            // matches. Record the real accumulated set, not a blank slate.
-            let backup: bloom_signer_backend_local::EncryptedLocalBackup =
-                serde_json::from_slice(&encrypted_record.decode()).map_err(malformed)?;
-            let enrollment = BackendEnrollmentBackup {
-                backend: key_ref.backend.clone(),
-                backend_instance: key_ref.backend_instance.clone(),
-                encrypted_record,
-                pinned_keys: backup.derivation_registry.clone(),
-            };
-            let connection = self.connection.lock();
-            let updated = connection
-                .execute(
-                    "UPDATE ceremony_backend_enrollments
-                     SET enrollment_jcs = ?2 WHERE backend_instance = ?1",
-                    params![
-                        wallet_id.as_str(),
-                        serde_jcs::to_string(&enrollment).map_err(malformed)?,
-                    ],
-                )
-                .map_err(storage)?;
-            if updated != 1 {
-                return Err(error(
-                    ProtocolErrorCode::KeyrefMismatch,
-                    "bip39 backend lacks durable enrollment",
-                ));
-            }
-        }
-        #[cfg(not(feature = "local"))]
-        {
-            let _ = (wallet_id, key_ref);
-        }
-        Ok(())
-    }
-
-    /// Permanently abandon a BIP-39 allocation whose enclosing custody
-    /// ceremony did not commit. The registry counter is monotonic, so rollback
-    /// tombstones the path instead of making a potentially exposed child
-    /// address reusable.
-    pub fn tombstone_failed_bip39_account(
-        &self,
-        key_ref: &KeyRef,
-        now_ms: u64,
-    ) -> Result<(), ProtocolError> {
-        let Some(DerivationRef::Bip39Multicurve {
-            wallet_seed_ref, ..
-        }) = &key_ref.derivation
-        else {
-            return Ok(());
-        };
-        let mut connection = self.connection.lock();
-        let operation_id = connection
-            .query_row(
-                "SELECT operation_id FROM derivation_allocations
-                 WHERE wallet_id = ?1 AND public_key_fingerprint = ?2
-                   AND state != 'TOMBSTONED'",
-                params![
-                    wallet_seed_ref.as_str(),
-                    key_ref.public_key_fingerprint.as_str()
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(storage)?;
-        let Some(operation_id) = operation_id else {
-            return Ok(());
-        };
-        let audit = |tx: &Transaction, event: &str, payload: serde_json::Value| {
-            self.append_audit(tx, event, &payload)
-        };
-        crate::derivation_registry::tombstone(
-            &mut connection,
-            wallet_seed_ref,
-            &operation_id,
-            now_ms,
-            &audit,
-        )
-    }
-
-    /// Drive the full allocation lifecycle for one BIP-39 derived child, in
-    /// separate IMMEDIATE transactions keyed by the ceremony operation id,
-    /// and enroll the resulting `KeyRef`. Returns the child `KeyRef` and its
-    /// `DerivedAccountDescriptor`.
-    pub fn allocate_bip39_account(
-        &self,
-        wallet_id: &Token,
-        operation_id: &OperationId,
-        request: &DerivedAccountRequest,
-        unlocked: &UnlockedWallet,
-        now_ms: u64,
-    ) -> Result<(KeyRef, DerivedAccountDescriptor), ProtocolError> {
-        let profile = request.derivation_profile;
-        let profile_str = profile_id(profile);
-        let role = request.requested_role.as_str().to_owned();
-        let seed = unlocked.bip39_seed()?;
-
-        let mut connection = self.connection.lock();
-        let audit = |tx: &Transaction, event: &str, payload: serde_json::Value| {
-            self.append_audit(tx, event, &payload)
-        };
-        let reservation = crate::derivation_registry::prepare_allocation(
-            &mut connection,
-            wallet_id,
-            profile_str,
-            &role,
-            request.account,
-            operation_id.as_str(),
-            |candidate_account: u32, candidate_index: u32| match profile {
-                DerivationProfile::Bip44EvmSecp256k1V1 => matches!(
-                    bloom_signer_derive::derive_evm_account(
-                        &seed,
-                        candidate_account,
-                        candidate_index
-                    ),
-                    Err(bloom_signer_derive::Secp256k1DeriveError::InvalidChild)
-                ),
-                // SLIP-10 Ed25519 clamps its scalar and has no invalid-child case.
-                DerivationProfile::Bip44SolanaSlip10Ed25519V1 => false,
-            },
-            now_ms,
-            &audit,
-        )?;
-
-        let (spki_der, key_spec, encoding) = match profile {
-            DerivationProfile::Bip44EvmSecp256k1V1 => {
-                let derived = bloom_signer_derive::derive_evm_account(
-                    &seed,
-                    reservation.account,
-                    reservation.index,
-                )
-                .map_err(|cause| {
-                    error(ProtocolErrorCode::BackendInvalidRequest, cause.to_string())
-                })?;
-                (
-                    derived.spki_der,
-                    KeySpec::Secp256k1,
-                    PublicKeyEncoding::Secp256k1SpkiDer,
-                )
-            }
-            DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
-                let derived =
-                    bloom_signer_derive::derive_solana_account(&seed, reservation.account)
-                        .map_err(|cause| {
-                            error(ProtocolErrorCode::BackendInvalidRequest, cause.to_string())
-                        })?;
-                (
-                    derived.spki_der,
-                    KeySpec::Ed25519,
-                    PublicKeyEncoding::Ed25519SpkiDer,
-                )
-            }
-        };
-        let fingerprint = Digest32::from_bytes(Sha256::digest(&spki_der).into());
-
-        crate::derivation_registry::commit_index(
-            &mut connection,
-            wallet_id,
-            operation_id.as_str(),
-            now_ms,
-            &audit,
-        )?;
-        crate::derivation_registry::commit_account(
-            &mut connection,
-            wallet_id,
-            operation_id.as_str(),
-            &hex::encode(&spki_der),
-            &fingerprint,
-            now_ms,
-            &audit,
-        )?;
-        let public = crate::derivation_registry::activate(
-            &mut connection,
-            wallet_id,
-            operation_id.as_str(),
-            now_ms,
-            &audit,
-        )?;
-        drop(connection);
-
-        let locator = hex::encode(Sha256::digest(
-            [
-                wallet_id.as_str().as_bytes(),
-                profile_str.as_bytes(),
-                public.path.as_bytes(),
-            ]
-            .concat(),
-        ));
-        let key_ref = KeyRef {
-            backend: Token::new("local").expect("static token"),
-            backend_instance: wallet_id.clone(),
-            locator,
-            key_spec,
-            public_key_fingerprint: fingerprint.clone(),
-            derivation: Some(DerivationRef::Bip39Multicurve {
-                wallet_seed_ref: wallet_id.clone(),
-                profile,
-                path: public.path.clone(),
-            }),
-        };
-        let supported_crypto_suites = match profile {
-            DerivationProfile::Bip44EvmSecp256k1V1 => vec![
-                bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable,
-                bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable,
-            ],
-            DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
-                vec![bloom_signer_api::CryptoSuite::Ed25519Message]
-            }
-        };
-        let canonical_public_key = Base64UrlBytes::from_bytes(&spki_der);
-        let description = bloom_signer_backend_api::KeyDescription {
-            key_ref: key_ref.clone(),
-            canonical_spki_der: canonical_public_key.clone(),
-            public_key_fingerprint: fingerprint.clone(),
-            supported_crypto_suites: supported_crypto_suites.clone(),
-        };
-        if let Err(cause) = self.backend_registry.register_bip39_child(
-            wallet_id,
-            description,
-            Some(operation_id.clone()),
-        ) {
-            if let Err(rollback) = self.tombstone_failed_bip39_account(&key_ref, now_ms) {
-                return Err(error(
-                    ProtocolErrorCode::ServiceUnavailable,
-                    format!(
-                        "BIP-39 allocation failed ({cause}); fail-closed rollback also failed ({rollback})"
-                    ),
-                ));
-            }
-            return Err(cause);
-        }
-        if let Err(cause) = self.enroll_bip39_child(wallet_id, &key_ref) {
-            let registry_rollback = self.tombstone_failed_bip39_account(&key_ref, now_ms);
-            let backend_rollback = self.backend_registry.rollback_local_derived_key(&key_ref);
-            if let Err(rollback) = registry_rollback.and(backend_rollback) {
-                return Err(error(
-                    ProtocolErrorCode::ServiceUnavailable,
-                    format!(
-                        "BIP-39 enrollment failed ({cause}); fail-closed rollback also failed ({rollback})"
-                    ),
-                ));
-            }
-            return Err(cause);
-        }
-
-        let descriptor = DerivedAccountDescriptor {
-            key_ref: key_ref.clone(),
-            wallet_seed_ref: WalletSeedRef {
-                wallet_id: wallet_id.clone(),
-                profile: WalletSeedProfile::Bip39MulticurveV1,
-                entropy_bits: unlocked.entropy_bits(),
-            },
-            derivation_profile: profile,
-            path: public.path,
-            canonical_public_key,
-            public_key_encoding: encoding,
-            public_key_fingerprint: fingerprint,
-            supported_crypto_suites,
-            lifecycle: AccountLifecycleState::Active,
-        };
-        Ok((key_ref, descriptor))
-    }
-
-    /// Look up the `DerivedAccountDescriptor` for a BIP-39 derived child, or
-    /// `None` for legacy keys. Resolves the registry entry by public-key
-    /// fingerprint and reconstructs the descriptor with its lifecycle state.
-    pub fn derived_account_descriptor(
-        &self,
-        key_ref: &KeyRef,
-    ) -> Result<Option<DerivedAccountDescriptor>, ProtocolError> {
-        let Some(DerivationRef::Bip39Multicurve {
-            wallet_seed_ref,
-            profile,
-            path,
-        }) = &key_ref.derivation
-        else {
-            return Ok(None);
-        };
-        let connection = self.connection.lock();
-        let row = connection
-            .query_row(
-                "SELECT key_spec, public_key_spki_der, public_key_fingerprint, state
-              FROM derivation_allocations
-              WHERE wallet_id = ?1 AND public_key_fingerprint = ?2
-                AND state IN ('ACTIVATED', 'RETIRED')",
-                params![
-                    wallet_seed_ref.as_str(),
-                    key_ref.public_key_fingerprint.as_str()
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(storage)?
-            .ok_or_else(|| {
-                error(
-                    ProtocolErrorCode::KeyrefMismatch,
-                    "no registry entry for this derived child",
-                )
-            })?;
-        let (key_spec, spki_hex, fingerprint, state) = row;
-        let key_spec = if key_spec == "secp256k1" {
-            KeySpec::Secp256k1
-        } else {
-            KeySpec::Ed25519
-        };
-        // A stored key spec that contradicts the derivation profile is a
-        // registry integrity failure, never a valid projection.
-        if profile.key_spec() != key_spec {
-            return Err(error(
-                ProtocolErrorCode::KeyrefMismatch,
-                "derivation profile and stored key spec disagree",
-            ));
-        }
-        let encoding = if key_spec == KeySpec::Secp256k1 {
-            PublicKeyEncoding::Secp256k1SpkiDer
-        } else {
-            PublicKeyEncoding::Ed25519SpkiDer
-        };
-        let fingerprint = Digest32::new(&fingerprint).map_err(malformed)?;
-        let entropy_bits = connection
-            .query_row(
-                "SELECT custody_jcs FROM ceremony_wallets WHERE wallet_id = ?1",
-                params![wallet_seed_ref.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(storage)?
-            .map(|encoded| {
-                let backup: WalletCustodyBackup =
-                    serde_json::from_str(&encoded).map_err(malformed)?;
-                backup.entropy_bits.ok_or_else(|| {
-                    error(
-                        ProtocolErrorCode::MalformedFrame,
-                        "BIP-39 wallet custody is missing entropy-bit metadata",
-                    )
-                })
-            })
-            .transpose()?
-            .ok_or_else(|| {
-                error(
-                    ProtocolErrorCode::KeyrefMismatch,
-                    "no custody record for this BIP-39 wallet",
-                )
-            })?;
-        let lifecycle = if state == "ACTIVATED" {
-            AccountLifecycleState::Active
-        } else {
-            AccountLifecycleState::Retired
-        };
-        Ok(Some(DerivedAccountDescriptor {
-            key_ref: key_ref.clone(),
-            wallet_seed_ref: WalletSeedRef {
-                wallet_id: wallet_seed_ref.clone(),
-                profile: WalletSeedProfile::Bip39MulticurveV1,
-                entropy_bits,
-            },
-            derivation_profile: *profile,
-            path: path.clone(),
-            canonical_public_key: Base64UrlBytes::from_bytes(&hex::decode(&spki_hex).map_err(
-                |_| {
-                    error(
-                        ProtocolErrorCode::MalformedFrame,
-                        "stored SPKI is not valid hex",
-                    )
-                },
-            )?),
-            public_key_encoding: encoding,
-            public_key_fingerprint: fingerprint,
-            supported_crypto_suites: if key_spec == KeySpec::Secp256k1 {
-                vec![
-                    bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable,
-                    bloom_signer_api::CryptoSuite::Secp256k1Sha256Recoverable,
-                ]
-            } else {
-                vec![bloom_signer_api::CryptoSuite::Ed25519Message]
-            },
-            lifecycle,
-        }))
-    }
-
-    /// Lock-free enumeration of a wallet's active BIP-39 derived accounts.
-    ///
-    /// This reads only the persisted `enrolled_keys` + `derivation_allocations`
-    /// registry — no backend activation, no entropy decryption, no
-    /// re-derivation from seed. It answers the public projection question
-    /// ("what accounts does this wallet have") without unlocking anything.
-    /// Only `Active` accounts are returned; retired children leave the list.
-    pub fn derived_account_descriptors(
-        &self,
-        wallet_id: &Token,
-    ) -> Result<Vec<bloom_signer_api::DerivedAccountDescriptor>, ProtocolError> {
-        let connection = self.connection.lock();
-        let mut statement = connection
-            .prepare(
-                "SELECT key_ref_jcs FROM enrolled_keys
-                 WHERE available = 1 AND authority_class = 'derived' AND wallet_id = ?1
-                 ORDER BY key_fingerprint",
-            )
-            .map_err(storage)?;
-        let rows = statement
-            .query_map([wallet_id.as_str()], |row| row.get::<_, String>(0))
-            .map_err(storage)?;
-        let mut key_refs = Vec::new();
-        for row in rows {
-            let key: KeyRef = serde_json::from_str(&row.map_err(storage)?).map_err(malformed)?;
-            key_refs.push(key);
-        }
-        drop(statement);
-        drop(connection);
-        let mut descriptors = Vec::with_capacity(key_refs.len());
-        for key_ref in key_refs {
-            let descriptor = self.derived_account_descriptor(&key_ref)?.ok_or_else(|| {
-                error(
-                    ProtocolErrorCode::KeyrefMismatch,
-                    "enrolled derived key has no bip39 registry entry",
-                )
-            })?;
-            if descriptor.lifecycle == bloom_signer_api::AccountLifecycleState::Retired {
-                // The account retired between the enrolled_keys read and this
-                // descriptor read; omit it rather than failing the whole
-                // listing (the documented contract is "active accounts").
-                continue;
-            }
-            descriptors.push(descriptor);
-        }
-        Ok(descriptors)
-    }
-
-    /// Retire a BIP-39 derived child: ACTIVATED → RETIRED in the registry,
-    /// then mark the enrolled key and backend child unavailable.
-    pub fn retire_bip39_account(
-        &self,
-        wallet_id: &Token,
-        key_ref: &KeyRef,
-        now_ms: u64,
-    ) -> Result<(), ProtocolError> {
-        let mut connection = self.connection.lock();
-        let operation_id: String = connection
-            .query_row(
-                "SELECT operation_id FROM derivation_allocations
-                  WHERE wallet_id = ?1 AND public_key_fingerprint = ?2
-                    AND state IN ('ACTIVATED', 'RETIRED')",
-                params![wallet_id.as_str(), key_ref.public_key_fingerprint.as_str()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(storage)?
-            .ok_or_else(|| {
-                error(
-                    ProtocolErrorCode::KeyrefMismatch,
-                    "no active allocation for this derived child",
-                )
-            })?;
-        let audit = |tx: &Transaction, event: &str, payload: serde_json::Value| {
-            self.append_audit(tx, event, &payload)
-        };
-        crate::derivation_registry::retire(
-            &mut connection,
-            wallet_id,
-            &operation_id,
-            now_ms,
-            &audit,
-        )?;
-        drop(connection);
-        self.backend_registry.retire_bip39_child(key_ref)?;
-        self.deactivate_enrolled_bip39_child(wallet_id, key_ref)
     }
 
     pub fn authorize_sign(
@@ -3104,9 +2521,7 @@ impl SignerEngine {
             .map_err(storage)?;
         match class.as_deref() {
             Some("wallet_root") => Ok(bloom_signer_api::KeyRole::WalletRoot),
-            Some("derived") | Some("petal") if key_ref.derivation.is_some() => {
-                Ok(bloom_signer_api::KeyRole::Derived)
-            }
+            Some("petal") if key_ref.derivation.is_some() => Ok(bloom_signer_api::KeyRole::Derived),
             _ => Err(error(
                 ProtocolErrorCode::KeyrefMismatch,
                 "key is not an enrolled wallet root or Signer-derived key",
@@ -3118,11 +2533,10 @@ impl SignerEngine {
     ///
     /// This asserts only facts that survive a restart: the parent is enrolled,
     /// its KeyRef is byte-identical to the enrolled one, it is not withdrawn,
-    /// it is a wallet root or Signer-derived account, and it belongs to this
-    /// wallet. It deliberately does not assert that the backend is currently
-    /// activated, because staging a ceremony is what later produces that
-    /// activation. Callers that are about to use the parent must use
-    /// `require_activated_parent_key` instead.
+    /// it is a wallet root, and it belongs to this wallet. It deliberately does
+    /// not assert that the backend is currently activated, because staging a
+    /// ceremony is what later produces that activation. Callers that are about
+    /// to use the parent must use `require_activated_parent_key` instead.
     pub(crate) fn require_enrolled_parent_key(
         &self,
         wallet_id: &Token,
@@ -3149,16 +2563,11 @@ impl SignerEngine {
                     enrolled_wallet.as_deref(),
                 )
             })
-            .is_none_or(|(stored, available, class, enrolled_wallet)| {
-                stored != &expected
-                    || !available
-                    || !matches!(class, "wallet_root" | "derived")
-                    || enrolled_wallet != Some(wallet_id.as_str())
-            })
+            != Some((&expected, true, "wallet_root", Some(wallet_id.as_str())))
         {
             return Err(error(
                 ProtocolErrorCode::KeyrefMismatch,
-                "Petal sub-key parent is absent, unavailable, or not owned by the named wallet",
+                "Petal sub-key parent is absent or unavailable for the named wallet",
             ));
         }
         Ok(())
@@ -4365,107 +3774,6 @@ impl SignerEngine {
                     )
                     .map_err(storage)?;
             }
-            transaction
-                .execute(
-                    "INSERT INTO ceremony_backend_enrollments(
-                        backend_instance, enrollment_jcs
-                     ) VALUES (?1, ?2)
-                     ON CONFLICT(backend_instance) DO UPDATE SET
-                        enrollment_jcs = excluded.enrollment_jcs",
-                    params![
-                        enrollment.backend_instance.as_str(),
-                        serde_jcs::to_string(&restored_enrollment(enrollment)?)
-                            .map_err(malformed)?,
-                    ],
-                )
-                .map_err(storage)?;
-        }
-        if let Some(custody) = &backup.custody {
-            transaction
-                .execute(
-                    "INSERT INTO ceremony_wallets(wallet_id, custody_jcs)
-                     VALUES (?1, ?2)
-                     ON CONFLICT(wallet_id) DO UPDATE SET
-                        custody_jcs = excluded.custody_jcs",
-                    params![
-                        backup.wallet_id.as_str(),
-                        serde_jcs::to_string(custody).map_err(malformed)?,
-                    ],
-                )
-                .map_err(storage)?;
-        }
-        for allocation in &backup.derivation_allocations {
-            let Some(DerivationRef::Bip39Multicurve { profile, path, .. }) =
-                &allocation.key_ref.derivation
-            else {
-                return Err(error(
-                    ProtocolErrorCode::MalformedFrame,
-                    "backup derivation allocation has no bip39 derivation",
-                ));
-            };
-            let key_spec = match allocation.key_ref.key_spec {
-                KeySpec::Secp256k1 => "secp256k1",
-                KeySpec::Ed25519 => "ed25519",
-            };
-            let state = match allocation.lifecycle {
-                AccountLifecycleState::Active => "ACTIVATED",
-                AccountLifecycleState::Retired => "RETIRED",
-            };
-            let fingerprint = allocation.key_ref.public_key_fingerprint.as_str();
-            transaction
-                .execute(
-                    "INSERT INTO derivation_allocations(
-                        wallet_id, operation_id, profile, role, account, \"index\", path,
-                        state, key_spec, public_key_spki_der, public_key_fingerprint,
-                        created_at_ms, updated_at_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                     ON CONFLICT(wallet_id, operation_id) DO UPDATE SET
-                        profile = excluded.profile,
-                        role = excluded.role,
-                        account = excluded.account,
-                        \"index\" = excluded.\"index\",
-                        path = excluded.path,
-                        state = excluded.state,
-                        key_spec = excluded.key_spec,
-                        public_key_spki_der = excluded.public_key_spki_der,
-                        public_key_fingerprint = excluded.public_key_fingerprint,
-                        created_at_ms = excluded.created_at_ms,
-                        updated_at_ms = excluded.updated_at_ms",
-                    params![
-                        backup.wallet_id.as_str(),
-                        allocation.operation_id.as_str(),
-                        profile_id(*profile),
-                        allocation.role.as_str(),
-                        i64::from(allocation.account),
-                        i64::from(allocation.index),
-                        path,
-                        state,
-                        key_spec,
-                        hex::encode(allocation.public_key_spki_der.decode()),
-                        fingerprint,
-                        allocation.created_at_ms.get() as i64,
-                        allocation.updated_at_ms.get() as i64,
-                    ],
-                )
-                .map_err(storage)?;
-            transaction
-                .execute(
-                    "INSERT INTO enrolled_keys(
-                        key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
-                     ) VALUES (?1, ?2, ?3, 'derived', ?4)
-                     ON CONFLICT(key_fingerprint) DO UPDATE SET
-                        key_ref_jcs = excluded.key_ref_jcs,
-                        available = excluded.available,
-                        authority_class = 'derived',
-                        wallet_id = excluded.wallet_id",
-                    params![
-                        fingerprint,
-                        serde_jcs::to_string(&allocation.key_ref).map_err(malformed)?,
-                        matches!(allocation.lifecycle, AccountLifecycleState::Active),
-                        backup.wallet_id.as_str(),
-                    ],
-                )
-                .map_err(storage)?;
         }
         for operation in &backup.operations {
             if !backup
@@ -4939,7 +4247,6 @@ impl SignerEngine {
             });
         }
         drop(scope_statement);
-        let derivation_allocations = export_derivation_allocations(&connection, wallet_id)?;
         let audit_entries = load_audit_entries(&connection)?;
         let audit_rotations = load_audit_rotations(&connection)?
             .into_values()
@@ -4959,7 +4266,6 @@ impl SignerEngine {
             wallet_revocation_epoch,
             custody,
             derivation_registry,
-            derivation_allocations,
             backend_enrollments,
             policy,
             petal_key_scopes,
@@ -4989,25 +4295,6 @@ impl SignerEngine {
         backup.audit_rotations = load_audit_rotations(&connection)?.into_values().collect();
         connection.commit().map_err(storage)?;
         Ok(backup)
-    }
-
-    /// Export one wallet's complete backup set from its persisted custody and
-    /// backend enrollment. This is the read side of the
-    /// [`Self::restore_backup`] round-trip.
-    pub fn export_wallet_backup(
-        &self,
-        wallet_id: &Token,
-    ) -> Result<SignerBackupSet, ProtocolError> {
-        let (wallets, _) = self.load_ceremony_custody()?;
-        let custody = wallets
-            .into_iter()
-            .find(|record| &record.wallet_id == wallet_id);
-        let enrollments = self
-            .load_ceremony_backend_enrollments()?
-            .into_iter()
-            .filter(|enrollment| &enrollment.backend_instance == wallet_id)
-            .collect();
-        self.export_backup(wallet_id, custody, enrollments)
     }
 
     pub fn derivation_status(
@@ -5404,133 +4691,6 @@ fn derivation_registry_from_enrollments(
     Ok(None)
 }
 
-/// Normalize a restored backend enrollment: the enrolled encrypted record may
-/// still carry `pending_derivations` entries whose custody receipt was already
-/// committed but not yet reconciled at the next startup. A restore is a fully
-/// finalized snapshot — every derived child is already in `derivation_registry`
-/// — so the transient pending map is cleared rather than leaving stale
-/// operations for startup to roll back (which would tombstone live children).
-#[cfg(feature = "local")]
-fn restored_enrollment(
-    enrollment: &BackendEnrollmentBackup,
-) -> Result<BackendEnrollmentBackup, ProtocolError> {
-    let mut record: bloom_signer_backend_local::EncryptedLocalBackup =
-        serde_json::from_slice(&enrollment.encrypted_record.decode()).map_err(malformed)?;
-    record.pending_derivations.clear();
-    let mut normalized = enrollment.clone();
-    normalized.encrypted_record =
-        Base64UrlBytes::from_bytes(&serde_jcs::to_vec(&record).map_err(malformed)?);
-    Ok(normalized)
-}
-
-#[cfg(not(feature = "local"))]
-fn restored_enrollment(
-    enrollment: &BackendEnrollmentBackup,
-) -> Result<BackendEnrollmentBackup, ProtocolError> {
-    Ok(enrollment.clone())
-}
-
-/// Read every ACTIVATED/RETIRED `derivation_allocations` row for a wallet and
-/// join it with its enrolled `KeyRef`, producing the descriptor projection
-/// that `restore_backup` re-inserts so a restored wallet can still describe
-/// and sign from its own derived accounts.
-fn export_derivation_allocations(
-    connection: &Connection,
-    wallet_id: &Token,
-) -> Result<Vec<DerivationAllocationBackup>, ProtocolError> {
-    let mut statement = connection
-        .prepare(
-            "SELECT e.key_ref_jcs, a.operation_id, a.role, a.account, a.\"index\",
-                    a.path, a.state, a.key_spec, a.public_key_spki_der,
-                    a.created_at_ms, a.updated_at_ms
-             FROM derivation_allocations a
-             JOIN enrolled_keys e ON e.key_fingerprint = a.public_key_fingerprint
-                AND e.authority_class = 'derived'
-             WHERE a.wallet_id = ?1 AND a.state IN ('ACTIVATED', 'RETIRED')
-             ORDER BY a.public_key_fingerprint",
-        )
-        .map_err(storage)?;
-    let rows = statement
-        .query_map([wallet_id.as_str()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
-                row.get::<_, i64>(9)?,
-                row.get::<_, i64>(10)?,
-            ))
-        })
-        .map_err(storage)?;
-    let mut allocations = Vec::new();
-    for row in rows {
-        let (
-            key_ref_jcs,
-            operation_id,
-            role,
-            account,
-            index,
-            path,
-            state,
-            key_spec,
-            spki_hex,
-            created_at_ms,
-            updated_at_ms,
-        ) = row.map_err(storage)?;
-        let key_ref: KeyRef = serde_json::from_str(&key_ref_jcs).map_err(malformed)?;
-        // The enrolled KeyRef's derivation path and key spec must agree with
-        // the durable allocation row; a mismatch is a registry integrity
-        // failure, never something to round-trip silently.
-        let Some(DerivationRef::Bip39Multicurve {
-            path: derived_path, ..
-        }) = &key_ref.derivation
-        else {
-            return Err(malformed("derived allocation has no bip39 derivation"));
-        };
-        if derived_path != &path {
-            return Err(malformed(
-                "enrolled child path differs from allocation path",
-            ));
-        }
-        let expected_spec = if key_spec == "secp256k1" {
-            KeySpec::Secp256k1
-        } else {
-            KeySpec::Ed25519
-        };
-        if key_ref.key_spec != expected_spec {
-            return Err(malformed("enrolled child key spec differs from allocation"));
-        }
-        let lifecycle = match state.as_str() {
-            "ACTIVATED" => AccountLifecycleState::Active,
-            "RETIRED" => AccountLifecycleState::Retired,
-            _ => return Err(malformed("allocation has a non-durable state")),
-        };
-        allocations.push(DerivationAllocationBackup {
-            key_ref,
-            operation_id: OperationId::new(operation_id).map_err(malformed)?,
-            role: Token::new(role).map_err(malformed)?,
-            account: u32::try_from(account).map_err(|_| malformed("account index out of range"))?,
-            index: u32::try_from(index).map_err(|_| malformed("address index out of range"))?,
-            public_key_spki_der: Base64UrlBytes::from_bytes(
-                &hex::decode(&spki_hex).map_err(|_| malformed("stored SPKI is not valid hex"))?,
-            ),
-            lifecycle,
-            created_at_ms: DecimalU64::new(
-                u64::try_from(created_at_ms).map_err(|_| malformed("timestamp out of range"))?,
-            ),
-            updated_at_ms: DecimalU64::new(
-                u64::try_from(updated_at_ms).map_err(|_| malformed("timestamp out of range"))?,
-            ),
-        });
-    }
-    Ok(allocations)
-}
-
 fn validate_against_approval(
     request: &SignRequest,
     terms: &SealedApprovalTerms,
@@ -5754,33 +4914,6 @@ fn require_key_available(
             ProtocolErrorCode::KeyrefMismatch,
             "approval key is absent, inactive, or differs from compiled backend enrollment",
         ));
-    }
-    // A BIP-39 derived child must still be ACTIVATED in the durable registry.
-    // Retirement commits that transition before it deactivates enrolled_keys,
-    // so a sign request that slips into that gap must fail closed here rather
-    // than authorize a retired account.
-    if let Some(DerivationRef::Bip39Multicurve {
-        wallet_seed_ref, ..
-    }) = &key_ref.derivation
-    {
-        let state: Option<String> = transaction
-            .query_row(
-                "SELECT state FROM derivation_allocations
-                  WHERE wallet_id = ?1 AND public_key_fingerprint = ?2",
-                params![
-                    wallet_seed_ref.as_str(),
-                    key_ref.public_key_fingerprint.as_str()
-                ],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(storage)?;
-        if state.as_deref() != Some("ACTIVATED") {
-            return Err(error(
-                ProtocolErrorCode::KeyrefMismatch,
-                "approval key is not an active derived account",
-            ));
-        }
     }
     Ok(())
 }
@@ -6476,7 +5609,7 @@ fn error(code: ProtocolErrorCode, message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(code, message)
 }
 
-pub(crate) fn storage(cause: impl std::fmt::Display) -> ProtocolError {
+fn storage(cause: impl std::fmt::Display) -> ProtocolError {
     error(
         ProtocolErrorCode::ServiceUnavailable,
         format!("Signer durable state failure: {cause}"),
@@ -6488,14 +5621,6 @@ fn malformed(cause: impl std::fmt::Display) -> ProtocolError {
         ProtocolErrorCode::MalformedFrame,
         format!("canonical value failure: {cause}"),
     )
-}
-
-/// Canonical registry profile identifier for a derivation profile.
-fn profile_id(profile: DerivationProfile) -> &'static str {
-    match profile {
-        DerivationProfile::Bip44EvmSecp256k1V1 => "bip44-evm-secp256k1-v1",
-        DerivationProfile::Bip44SolanaSlip10Ed25519V1 => "bip44-solana-slip10-ed25519-v1",
-    }
 }
 
 #[cfg(test)]
@@ -7490,124 +6615,5 @@ mod clock_tests {
             ProtocolErrorCode::ServiceUnavailable
         );
         assert!(engine.audit_degraded.load(Ordering::SeqCst));
-    }
-}
-
-#[cfg(test)]
-mod require_key_tests {
-    use super::*;
-    use bloom_signer_backend_api::SecretBytes;
-
-    fn retired_bip39_child_engine() -> (SignerEngine, KeyRef, Arc<BackendRegistry>) {
-        let wallet = Token::new("bip39-wallet").unwrap();
-        let backend = Arc::new(
-            bloom_signer_backend_local::LocalSignerBackend::provision_bip39(
-                wallet.clone(),
-                wallet.clone(),
-                SecretBytes::new(vec![7_u8; 16]),
-                SecretBytes::new(vec![8_u8; 32]),
-                SigningKey::from_bytes(&[5; 32]).verifying_key(),
-            )
-            .unwrap(),
-        );
-        let mnemonic = bloom_signer_derive::mnemonic_from_entropy(&[7_u8; 16]).unwrap();
-        let seed = bloom_signer_derive::seed_from_mnemonic(&mnemonic, "").unwrap();
-        let derived = bloom_signer_derive::derive_evm_account(&seed, 0, 0).unwrap();
-        let child = KeyRef {
-            backend: Token::new("local").unwrap(),
-            backend_instance: wallet.clone(),
-            locator: "child-evm-0".into(),
-            key_spec: KeySpec::Secp256k1,
-            public_key_fingerprint: Digest32::from_bytes(derived.fingerprint),
-            derivation: Some(DerivationRef::Bip39Multicurve {
-                wallet_seed_ref: wallet.clone(),
-                profile: DerivationProfile::Bip44EvmSecp256k1V1,
-                path: "m/44'/60'/0'/0/0".into(),
-            }),
-        };
-        backend.register_bip39_child(child.clone(), None).unwrap();
-        let registry = Arc::new(
-            BackendRegistry::from_compiled(vec![crate::registry::CompiledBackend::Local(backend)])
-                .unwrap(),
-        );
-        let engine = SignerEngine::open_in_memory(
-            Token::new("broker-key").unwrap(),
-            SigningKey::from_bytes(&[1; 32]).verifying_key(),
-            SigningKey::from_bytes(&[2; 32]).verifying_key(),
-            Token::new("revocation-key").unwrap(),
-            SigningKey::from_bytes(&[3; 32]),
-            SignerAuditKeys {
-                current_key_id: Token::new("audit-key").unwrap(),
-                current_signing_key: SigningKey::from_bytes(&[30; 32]),
-                historical_verifying_keys: BTreeMap::new(),
-            },
-            registry.clone(),
-        )
-        .unwrap();
-        engine.enroll_bip39_child(&wallet, &child).unwrap();
-        // Simulate the narrow retire/sign window: the durable allocation is
-        // already RETIRED, but enrolled_keys.available is still 1 and the
-        // backend still has the child.
-        let connection = engine.connection.lock();
-        connection
-            .execute(
-                "INSERT INTO derivation_allocations(
-                    wallet_id, operation_id, profile, role, account, \"index\", path,
-                    state, key_spec, public_key_spki_der, public_key_fingerprint,
-                    created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, 'RETIRED', 'secp256k1', NULL, ?6, 0, 0)",
-                rusqlite::params![
-                    wallet.as_str(),
-                    "op-retired",
-                    "bip44-evm-secp256k1-v1",
-                    "primary-evm",
-                    "m/44'/60'/0'/0/0",
-                    child.public_key_fingerprint.as_str(),
-                ],
-            )
-            .unwrap();
-        drop(connection);
-        (engine, child, registry)
-    }
-
-    #[test]
-    fn require_key_available_rejects_a_durably_retired_child() {
-        let (engine, child, registry) = retired_bip39_child_engine();
-        let mut connection = engine.connection.lock();
-        let transaction = engine.mutation_transaction(&mut connection).unwrap();
-        let error = require_key_available(&transaction, &registry, &child).unwrap_err();
-        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
-        assert!(error.message.contains("not an active derived account"));
-        drop(transaction);
-        drop(connection);
-    }
-
-    #[test]
-    fn failed_bip39_allocation_tombstones_registry_and_backend() {
-        let (engine, child, registry) = retired_bip39_child_engine();
-        engine
-            .connection
-            .lock()
-            .execute(
-                "UPDATE derivation_allocations SET state = 'ACTIVATED' WHERE operation_id = 'op-retired'",
-                [],
-            )
-            .unwrap();
-
-        engine.tombstone_failed_bip39_account(&child, 99).unwrap();
-        assert_eq!(
-            engine
-                .connection
-                .lock()
-                .query_row(
-                    "SELECT state FROM derivation_allocations WHERE operation_id = 'op-retired'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            "TOMBSTONED"
-        );
-        registry.rollback_local_derived_key(&child).unwrap();
-        assert!(!registry.key_is_registered(&child).unwrap());
     }
 }

@@ -221,54 +221,34 @@ impl BackendRegistry {
         }
     }
 
-    pub async fn deactivate_key(
-        &self,
-        key_ref: &bloom_signer_api::KeyRef,
-    ) -> Result<(), ProtocolError> {
-        let backend = self
-            .backends
-            .read()
-            .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
-            .cloned()
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorCode::BackendUnsupported,
-                    "activation backend is not compiled into this Signer",
-                )
-            })?;
-        match backend {
-            #[cfg(feature = "local")]
-            CompiledBackend::Local(local) => local.deactivate(key_ref).await.map_err(|cause| {
-                ProtocolError::new(
-                    ProtocolErrorCode::BackendInvalidRequest,
-                    format!("local backend deactivation failed: {cause:?}"),
-                )
-            }),
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "AWS KMS keys do not use Signer activation",
-            )),
-        }
-    }
-
     #[cfg(feature = "local")]
-    pub fn provision_imported_secp256k1_wallet_backend(
+    pub fn provision_local_wallet_backend(
         &self,
         wallet_id: &Token,
-        private_key: SecretBytes,
+        root_material: SecretBytes,
+        imported_private_key: bool,
         activation_secret: SecretBytes,
         authority_verifying_key: ed25519_dalek::VerifyingKey,
     ) -> Result<(KeyRef, Base64UrlBytes), ProtocolError> {
         let backend_instance = wallet_id.clone();
         let backend = Arc::new(
-            bloom_signer_backend_local::LocalSignerBackend::provision_imported_secp256k1(
-                backend_instance.clone(),
-                Token::new("wallet-root").expect("static token"),
-                private_key,
-                activation_secret,
-                authority_verifying_key,
-            )
+            if imported_private_key {
+                bloom_signer_backend_local::LocalSignerBackend::provision_imported_secp256k1(
+                    backend_instance.clone(),
+                    Token::new("wallet-root").expect("static token"),
+                    root_material,
+                    activation_secret,
+                    authority_verifying_key,
+                )
+            } else {
+                bloom_signer_backend_local::LocalSignerBackend::provision(
+                    backend_instance.clone(),
+                    Token::new("wallet-root").expect("static token"),
+                    root_material,
+                    activation_secret,
+                    authority_verifying_key,
+                )
+            }
             .map_err(|error| {
                 ProtocolError::new(
                     ProtocolErrorCode::BackendInvalidRequest,
@@ -306,216 +286,6 @@ impl BackendRegistry {
             CompiledBackend::Local(backend),
         );
         Ok((key_ref, encrypted_record))
-    }
-
-    /// Provision a BIP-39 wallet backend: the root is entropy and is never a
-    /// signable key, so this returns no root `KeyRef` — only the encrypted
-    /// backend record for the backup set. Derived children are registered
-    /// later via [`BackendRegistry::register_bip39_child`].
-    #[cfg(feature = "local")]
-    pub fn provision_bip39_wallet_backend(
-        &self,
-        wallet_id: &Token,
-        entropy: SecretBytes,
-        activation_secret: SecretBytes,
-        authority_verifying_key: ed25519_dalek::VerifyingKey,
-    ) -> Result<Base64UrlBytes, ProtocolError> {
-        let backend_instance = wallet_id.clone();
-        let backend = Arc::new(
-            bloom_signer_backend_local::LocalSignerBackend::provision_bip39(
-                backend_instance.clone(),
-                wallet_id.clone(),
-                entropy,
-                activation_secret,
-                authority_verifying_key,
-            )
-            .map_err(|error| {
-                ProtocolError::new(
-                    ProtocolErrorCode::BackendInvalidRequest,
-                    format!("local bip39 wallet provisioning failed: {error:?}"),
-                )
-            })?,
-        );
-        let encrypted_record = Base64UrlBytes::from_bytes(
-            &serde_jcs::to_vec(&backend.encrypted_backup().map_err(|error| {
-                ProtocolError::new(
-                    ProtocolErrorCode::ServiceUnavailable,
-                    format!("local bip39 wallet backup failed: {error:?}"),
-                )
-            })?)
-            .map_err(|error| {
-                ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
-            })?,
-        );
-        let backend_id = Token::new("local").expect("static token");
-        let mut backends = self.backends.write();
-        if backends.contains_key(&(backend_id.clone(), backend_instance.clone())) {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::OperationIdConflict,
-                "wallet backend instance already exists",
-            ));
-        }
-        backends.insert(
-            (backend_id, backend_instance),
-            CompiledBackend::Local(backend),
-        );
-        Ok(encrypted_record)
-    }
-
-    /// BIP-39 derivation requires the local backend; without it, fail closed.
-    #[cfg(not(feature = "local"))]
-    pub fn provision_bip39_wallet_backend(
-        &self,
-        _wallet_id: &Token,
-        _entropy: SecretBytes,
-        _activation_secret: SecretBytes,
-        _authority_verifying_key: ed25519_dalek::VerifyingKey,
-    ) -> Result<Base64UrlBytes, ProtocolError> {
-        Err(ProtocolError::new(
-            ProtocolErrorCode::BackendUnsupported,
-            "bip39 wallets require the local derivation backend",
-        ))
-    }
-
-    /// Restore a BIP-39 wallet backend (entropy root, no signable root KeyRef)
-    /// from its persisted enrollment at startup.
-    #[cfg(feature = "local")]
-    pub fn restore_bip39_wallet_backend(
-        &self,
-        backend_instance: &Token,
-        encrypted_record: &Base64UrlBytes,
-        public_descriptions: Vec<bloom_signer_backend_api::KeyDescription>,
-    ) -> Result<(), ProtocolError> {
-        let backend_id = Token::new("local").expect("static token");
-        if self
-            .backends
-            .read()
-            .contains_key(&(backend_id.clone(), backend_instance.clone()))
-        {
-            return Ok(());
-        }
-        let mut backup: bloom_signer_backend_local::EncryptedLocalBackup =
-            serde_json::from_slice(&encrypted_record.decode()).map_err(|error| {
-                ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
-            })?;
-        if backup.root_material_kind
-            != bloom_signer_backend_local::LocalRootMaterialKind::Bip39Entropy
-        {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::KeyrefMismatch,
-                "backend enrollment is not a bip39 entropy root",
-            ));
-        }
-        // Early BIP-39 enrollments persisted child KeyRefs and SPKI in the
-        // Signer registry but omitted the backend's public-description cache.
-        // Rehydrate that public-only cache from the independently persisted
-        // registry so upgrades do not require decrypting the mnemonic merely
-        // to project an existing address after restart.
-        for description in public_descriptions {
-            if !backup.derivation_registry.contains(&description.key_ref) {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::KeyrefMismatch,
-                    "persisted bip39 public description is not in the backend registry",
-                ));
-            }
-            if let Some(existing) = backup
-                .public_descriptions
-                .iter()
-                .find(|existing| existing.key_ref == description.key_ref)
-            {
-                if existing != &description {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::KeyrefMismatch,
-                        "persisted bip39 public descriptions disagree",
-                    ));
-                }
-            } else {
-                backup.public_descriptions.push(description);
-            }
-        }
-        let backend = Arc::new(
-            bloom_signer_backend_local::LocalSignerBackend::restore(
-                backend_instance.clone(),
-                backup,
-            )
-            .map_err(|error| {
-                ProtocolError::new(
-                    ProtocolErrorCode::ServiceUnavailable,
-                    format!("local bip39 wallet restore failed: {error:?}"),
-                )
-            })?,
-        );
-        self.backends.write().insert(
-            (backend_id, backend_instance.clone()),
-            CompiledBackend::Local(backend),
-        );
-        Ok(())
-    }
-
-    /// Register a BIP-39 derived child in the local backend registry.
-    pub fn register_bip39_child(
-        &self,
-        wallet_id: &Token,
-        description: bloom_signer_backend_api::KeyDescription,
-        operation_id: Option<bloom_signer_api::OperationId>,
-    ) -> Result<(), ProtocolError> {
-        let key_ref = &description.key_ref;
-        let backends = self.backends.read();
-        let backend = backends
-            .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorCode::BackendUnsupported,
-                    "backend instance is not compiled into this Signer",
-                )
-            })?;
-        let _ = wallet_id;
-        match backend {
-            #[cfg(feature = "local")]
-            CompiledBackend::Local(local) => local
-                .register_bip39_child_description(description, operation_id)
-                .map_err(|error| {
-                    ProtocolError::new(
-                        ProtocolErrorCode::BackendInvalidRequest,
-                        format!("local bip39 child registration failed: {error:?}"),
-                    )
-                }),
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "AWS KMS does not support bip39 child registration",
-            )),
-        }
-    }
-
-    /// Retire a BIP-39 derived child in the local backend registry.
-    pub fn retire_bip39_child(
-        &self,
-        key_ref: &bloom_signer_api::KeyRef,
-    ) -> Result<(), ProtocolError> {
-        let backends = self.backends.read();
-        let backend = backends
-            .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorCode::BackendUnsupported,
-                    "backend instance is not compiled into this Signer",
-                )
-            })?;
-        match backend {
-            #[cfg(feature = "local")]
-            CompiledBackend::Local(local) => local.retire_bip39_child(key_ref).map_err(|error| {
-                ProtocolError::new(
-                    ProtocolErrorCode::BackendInvalidRequest,
-                    format!("local bip39 child retirement failed: {error:?}"),
-                )
-            }),
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "AWS KMS does not support bip39 child retirement",
-            )),
-        }
     }
 
     #[cfg(feature = "local")]
