@@ -468,6 +468,7 @@ impl SignerEngine {
 
     /// Latch the first safe degradation cause and emit it exactly once.
     pub fn latch_audit_degraded_with(&self, cause: AuditDegradation) {
+        self.audit_degraded.store(true, Ordering::SeqCst);
         let mut retained = self.audit_degradation.lock();
         if retained.is_some() {
             return;
@@ -484,7 +485,6 @@ impl SignerEngine {
             "Signer mutations disabled"
         );
         *retained = Some(cause);
-        self.audit_degraded.store(true, Ordering::SeqCst);
     }
 
     pub fn audit_is_degraded(&self) -> bool {
@@ -6005,6 +6005,44 @@ mod clock_tests {
         assert_eq!(
             clean.verified_audit_head().unwrap(),
             (0, Digest32::from_bytes([0; 32]))
+        );
+    }
+
+    #[test]
+    fn degradation_closes_mutations_before_first_cause_diagnostics_lock() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let engine = file_engine(&directory.path().join("signer.sqlite3"));
+        let diagnostics = engine.audit_degradation.lock();
+        let started = std::sync::Barrier::new(2);
+
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                started.wait();
+                engine.latch_audit_degraded_with(AuditDegradation::new(
+                    "checkpoint_sequence_rollback",
+                ));
+            });
+            started.wait();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !engine.audit_is_degraded() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(
+                engine.audit_is_degraded(),
+                "the mutation latch must close before waiting for diagnostics"
+            );
+            assert_eq!(
+                engine.repair_clock(1).unwrap_err().code,
+                ProtocolErrorCode::ServiceUnavailable
+            );
+
+            drop(diagnostics);
+            worker.join().unwrap();
+        });
+        assert_eq!(
+            engine.audit_degradation().unwrap().cause_code,
+            "checkpoint_sequence_rollback"
         );
     }
 
