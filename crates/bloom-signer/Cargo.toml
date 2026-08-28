@@ -20,7 +20,6 @@ bloom-triad-local-transport.workspace = true
 bloom-platform-containment.workspace = true
 bloom-audit-checkpoint.workspace = true
 bloom-service-activation.workspace = true
-bloom-service-observability.workspace = true
 bloom-trusted-time.workspace = true
 bloom-signer-backend-api = { path = "../bloom-signer-backend-api" }
 bloom-signer-backend-local = { path = "../bloom-signer-backend-local", optional = true }
@@ -53,4 +52,4 @@ bloom-signer-vectors = { path = "../bloom-signer-vectors" }
 tempfile = "3"
 k256.workspace = true
 rusqlite.workspace = true
-tracing-subscriber = { version = "0.3", features = ["json"] }
+tracing-subscriber = "0.3"
