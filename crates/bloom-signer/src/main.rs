@@ -1427,20 +1427,33 @@ fn open_operational_signer_engine(
             ));
         }
     }
-    let current = SignerEngine::open(
-        path,
-        broker_key_id.clone(),
-        broker_public_key,
-        ceremony_public_key,
-        revocation_key_id.clone(),
-        revocation_signing_key.clone(),
-        SignerAuditKeys {
-            current_key_id: current_audit_key_id.clone(),
-            current_signing_key: current_audit_signing_key.clone(),
-            historical_verifying_keys: trusted.clone(),
-        },
-        registry.clone(),
-    )?;
+    let open_current = || {
+        SignerEngine::open(
+            path,
+            broker_key_id.clone(),
+            broker_public_key,
+            ceremony_public_key,
+            revocation_key_id.clone(),
+            revocation_signing_key.clone(),
+            SignerAuditKeys {
+                current_key_id: current_audit_key_id.clone(),
+                current_signing_key: current_audit_signing_key.clone(),
+                historical_verifying_keys: trusted.clone(),
+            },
+            registry.clone(),
+        )
+    };
+    // With a planned rotation, opening under the new key is only a probe: an
+    // existing journal ending under the previous key is the expected signal
+    // to reopen and rotate, not an operational degradation worth emitting.
+    let current = if previous.is_some() {
+        tracing::subscriber::with_default(
+            tracing::subscriber::NoSubscriber::default(),
+            open_current,
+        )?
+    } else {
+        open_current()?
+    };
     if !current.audit_is_degraded() || previous.is_none() {
         return Ok(current);
     }
@@ -2082,21 +2095,31 @@ mod tests {
             key_id: first_id.as_str().to_owned(),
             public_key_hex: hex::encode(first.verifying_key().to_bytes()),
         }];
-        let rotated = open_operational_signer_engine(
-            &path,
-            Token::new("broker-app").unwrap(),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[6; 32]).verifying_key(),
-            Token::new("revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            current_id.clone(),
-            current.clone(),
-            &historical,
-            Some((previous_id.clone(), previous.clone())),
-            registry(),
-        )
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        let rotated = tracing::subscriber::with_default(subscriber, || {
+            open_operational_signer_engine(
+                &path,
+                Token::new("broker-app").unwrap(),
+                SigningKey::from_bytes(&[7; 32]).verifying_key(),
+                SigningKey::from_bytes(&[6; 32]).verifying_key(),
+                Token::new("revocation-key").unwrap(),
+                SigningKey::from_bytes(&[4; 32]),
+                current_id.clone(),
+                current.clone(),
+                &historical,
+                Some((previous_id.clone(), previous.clone())),
+                registry(),
+            )
+        })
         .unwrap();
         assert!(!rotated.audit_is_degraded());
+        let output = capture.text();
+        assert!(!output.contains("signer.journal_verification_failed"));
+        assert!(!output.contains("signer.mutations_disabled"));
         drop(rotated);
         let mut retained = historical;
         retained.push(AuditPublicKeyConfig {
