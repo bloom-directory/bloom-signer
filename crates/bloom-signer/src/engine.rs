@@ -6153,17 +6153,7 @@ fn restore_audit_entries(
             ));
         }
     }
-    if current_rotations
-        .iter()
-        .any(|(sequence, rotation)| backup_rotation_map.get(sequence) != Some(rotation))
-    {
-        let sequence = current_rotations.keys().copied().next().unwrap_or(0);
-        log_journal_verification_failure_with_state(
-            sequence,
-            "durable_state_correlation",
-            None,
-            false,
-        );
+    if log_first_backup_rotation_mismatch(&current_rotations, &backup_rotation_map).is_some() {
         return Err(error(
             ProtocolErrorCode::OperationIdConflict,
             "backup audit rotations do not extend the durable rotation chain",
@@ -6219,6 +6209,17 @@ fn restore_audit_entries(
             )
         },
     )
+}
+
+fn log_first_backup_rotation_mismatch(
+    durable: &BTreeMap<u64, AuditRotationBackup>,
+    candidate: &BTreeMap<u64, AuditRotationBackup>,
+) -> Option<u64> {
+    let sequence = durable.iter().find_map(|(sequence, rotation)| {
+        (candidate.get(sequence) != Some(rotation)).then_some(*sequence)
+    })?;
+    log_journal_verification_failure_with_state(sequence, "durable_state_correlation", None, false);
+    Some(sequence)
 }
 
 fn append_audit_entry(
@@ -6924,6 +6925,44 @@ mod clock_tests {
         });
         let event: serde_json::Value = serde_json::from_str(capture.text().trim()).unwrap();
         assert_eq!(event["fields"]["mutations_disabled"], false);
+    }
+
+    #[test]
+    fn backup_rotation_diagnostic_reports_first_actual_later_mismatch() {
+        fn rotation(sequence: u64, label: u8) -> AuditRotationBackup {
+            AuditRotationBackup {
+                old_key_id: Token::new(format!("audit-old-{label}")).unwrap(),
+                new_key_id: Token::new(format!("audit-new-{label}")).unwrap(),
+                final_old_sequence: DecimalU64::new(sequence - 1),
+                final_old_head: Digest32::from_bytes([label; 32]),
+                first_new_sequence: DecimalU64::new(sequence),
+                first_new_head: Digest32::from_bytes([label + 1; 32]),
+                old_key_signature: Base64UrlBytes::from_bytes(&[label; 64]),
+                new_key_signature: Base64UrlBytes::from_bytes(&[label + 1; 64]),
+            }
+        }
+
+        let durable = BTreeMap::from([(4, rotation(4, 1)), (9, rotation(9, 2))]);
+        let mut candidate = durable.clone();
+        let marker_secret = "MARKER_BACKUP_ROTATION_SIGNATURE_DO_NOT_LOG";
+        candidate.get_mut(&9).unwrap().old_key_signature =
+            Base64UrlBytes::from_bytes(marker_secret.as_bytes());
+        let encoded_signature = candidate.get(&9).unwrap().old_key_signature.encoded();
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        let mismatch = tracing::subscriber::with_default(subscriber, || {
+            log_first_backup_rotation_mismatch(&durable, &candidate)
+        });
+        assert_eq!(mismatch, Some(9));
+        let output = capture.text();
+        let event: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(event["fields"]["sequence"], 9);
+        assert_eq!(event["fields"]["mutations_disabled"], false);
+        assert!(!output.contains(marker_secret));
+        assert!(!output.contains(encoded_signature));
     }
 
     #[test]
