@@ -632,8 +632,9 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     // here: `DerivedAccountList` from the bip39 surface and
     // `SignerCeremonyStatus::Terminal` from the durable terminal
     // ceremony-status contract. Its digest is therefore neither side's frozen
-    // value. The signer-requests set gained no variant and its digest tracks
-    // only the advertised `protocol_minor_max`, which is 5 again.
+    // value. The response digest also records the authority-range floor of
+    // 1.5, the first complete BIP-39 contract. The signer-requests set gained
+    // no variant and its digest tracks only the advertised current minor.
     assert_wire_digest(
         "signer requests",
         signer_requests(),
@@ -642,7 +643,7 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "c4fb818d589cdb160e2602b9c4f9f639316848c90f970fb0db77cac3317152e7",
+        "880cb46fca9952d9a4916894ea4449ada66f00bd66ef45f21fa0518922a31017",
     );
     assert_wire_digest(
         "control requests",

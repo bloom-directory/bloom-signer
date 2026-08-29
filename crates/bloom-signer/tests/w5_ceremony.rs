@@ -2830,6 +2830,17 @@ fn complete_bip39_registration(
     operation_id: &OperationId,
     now_ms: u64,
 ) -> CustodyResult {
+    try_complete_bip39_registration(service, authenticator, wallet_id, operation_id, now_ms)
+        .unwrap()
+}
+
+fn try_complete_bip39_registration(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    wallet_id: &Token,
+    operation_id: &OperationId,
+    now_ms: u64,
+) -> Result<CustodyResult, ProtocolError> {
     let prepared = bip39_registration_prepare(service, wallet_id, operation_id, now_ms);
     let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
     let prf_assertion =
@@ -2854,22 +2865,20 @@ fn complete_bip39_registration(
         &authenticator.deterministic_prf(),
     )
     .unwrap();
-    service
-        .complete_custody(
-            CustodyCompleteRequest {
-                ceremony_kind: CeremonyKind::WalletRegistration,
-                custody_operation_id: operation_id.clone(),
-                ceremony_id: prepared.contribution.ceremony_id,
-                proof: WebAuthnCeremonyProof::Registration {
-                    attestation,
-                    prf_assertion: Some(prf_assertion),
-                },
-                encrypted_input: Some(encrypted_input),
-                public_binding_digest: digest("a1"),
+    service.complete_custody(
+        CustodyCompleteRequest {
+            ceremony_kind: CeremonyKind::WalletRegistration,
+            custody_operation_id: operation_id.clone(),
+            ceremony_id: prepared.contribution.ceremony_id,
+            proof: WebAuthnCeremonyProof::Registration {
+                attestation,
+                prf_assertion: Some(prf_assertion),
             },
-            now_ms + 100,
-        )
-        .unwrap()
+            encrypted_input: Some(encrypted_input),
+            public_binding_digest: digest("a1"),
+        },
+        now_ms + 100,
+    )
 }
 
 fn complete_bip39_mnemonic_import(
@@ -3193,6 +3202,71 @@ fn bip39_registration_allocates_the_initial_evm_child_without_a_root_keyref() {
             .get(&Token::new("local").unwrap(), &wallet_id)
             .is_ok()
     );
+}
+
+#[test]
+fn failed_bip39_registration_removes_the_provisioned_backend_before_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("signer.sqlite3");
+    let authenticator = VirtualAuthenticator::generate();
+    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+    let engine = Arc::new(
+        SignerEngine::open(
+            &database,
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            SigningKey::from_bytes(&[9; 32]).verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
+            registry.clone(),
+        )
+        .unwrap(),
+    );
+    let service = SignerCeremonyService::new(
+        engine,
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    let wallet_id = Token::new("bip39-registration-retry").unwrap();
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_initial_allocation
+             BEFORE INSERT ON derivation_allocations
+             BEGIN SELECT RAISE(FAIL, 'forced initial allocation failure'); END;",
+        )
+        .unwrap();
+    let error = try_complete_bip39_registration(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("a7"),
+        10_000,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+    assert!(
+        registry
+            .get(&Token::new("local").unwrap(), &wallet_id)
+            .is_err(),
+        "a failed registration must not retain the provisioned backend"
+    );
+
+    connection
+        .execute_batch("DROP TRIGGER fail_initial_allocation;")
+        .unwrap();
+    drop(connection);
+    let retried = complete_bip39_registration(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("a8"),
+        11_000,
+    );
+    assert_eq!(retried.public_key_refs.len(), 1);
 }
 
 #[test]

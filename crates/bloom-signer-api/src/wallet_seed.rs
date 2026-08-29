@@ -186,6 +186,19 @@ impl<'de> Deserialize<'de> for DerivedAccountDescriptor {
 impl DerivedAccountDescriptor {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.key_ref.validate()?;
+        if self.wallet_seed_ref.profile != WalletSeedProfile::Bip39MulticurveV1 {
+            return Err(invalid(
+                "derived accounts require the bip39-multicurve-v1 wallet seed profile",
+            ));
+        }
+        if !matches!(
+            self.wallet_seed_ref.entropy_bits,
+            128 | 160 | 192 | 224 | 256
+        ) {
+            return Err(invalid(
+                "wallet seed entropy must be one of 128/160/192/224/256 bits",
+            ));
+        }
         if self.key_ref.key_spec != self.derivation_profile.key_spec() {
             return Err(invalid(
                 "derivation profile curve does not match the child KeyRef",
@@ -387,6 +400,21 @@ mod tests {
             KeySpec::Secp256k1,
             "m/44'/501'/0'/0'",
         );
+        assert!(descriptor.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_non_bip39_seed_profile_and_invalid_entropy() {
+        let mut descriptor = descriptor(
+            DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            KeySpec::Ed25519,
+            "m/44'/501'/0'/0'",
+        );
+        descriptor.wallet_seed_ref.profile = WalletSeedProfile::ImportedSecp256k1Scalar;
+        assert!(descriptor.validate().is_err());
+
+        descriptor.wallet_seed_ref.profile = WalletSeedProfile::Bip39MulticurveV1;
+        descriptor.wallet_seed_ref.entropy_bits = 129;
         assert!(descriptor.validate().is_err());
     }
 

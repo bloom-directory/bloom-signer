@@ -40,7 +40,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
 unicode-normalization = "0.1"
-zeroize = { version = "1", features = ["zeroize_derive"] }
+zeroize = { version = "1", features = ["serde", "zeroize_derive"] }
 futures = "0.3"
 bip32 = { version = "0.5", features = ["secp256k1"] }
 blake3 = "1"

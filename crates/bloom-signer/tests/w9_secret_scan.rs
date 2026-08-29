@@ -234,8 +234,18 @@ fn bip39_secret_scan_is_empty_across_logs_audit_sqlite_and_responses() {
     // The frozen mnemonic and its frozen child scalars are the known secret
     // corpus; the PRF is deterministic for this authenticator.
     let mut secrets: Vec<Vec<u8>> = Vec::new();
-    secrets.push(bloom_signer_vectors::BIP39_MNEMONIC.as_bytes().to_vec());
-    secrets.push(bloom_signer_vectors::BIP39_ENTROPY_HEX.as_bytes().to_vec());
+    let mut add_secret_encodings = |secret: &[u8]| {
+        secrets.push(secret.to_vec());
+        secrets.push(
+            Base64UrlBytes::from_bytes(secret)
+                .encoded()
+                .as_bytes()
+                .to_vec(),
+        );
+    };
+    add_secret_encodings(bloom_signer_vectors::BIP39_MNEMONIC.as_bytes());
+    add_secret_encodings(bloom_signer_vectors::BIP39_ENTROPY_HEX.as_bytes());
+    add_secret_encodings(&hex::decode(bloom_signer_vectors::BIP39_ENTROPY_HEX).unwrap());
     for scalar in [
         bloom_signer_vectors::BIP32_EVM_MASTER_PRIVATE_KEY_HEX,
         bloom_signer_vectors::BIP32_EVM_M44H_PRIVATE_KEY_HEX,
@@ -249,9 +259,10 @@ fn bip39_secret_scan_is_empty_across_logs_audit_sqlite_and_responses() {
         bloom_signer_vectors::SLIP10_SOLANA_ACCOUNT0_PRIVATE_KEY_HEX,
         bloom_signer_vectors::SLIP10_SOLANA_TERMINAL_PRIVATE_KEY_HEX,
     ] {
-        secrets.push(scalar.as_bytes().to_vec());
+        add_secret_encodings(scalar.as_bytes());
+        add_secret_encodings(&hex::decode(scalar).unwrap());
     }
-    secrets.push(authenticator.deterministic_prf().to_vec());
+    add_secret_encodings(&authenticator.deterministic_prf());
 
     // (a) Capture tracing output.
     let log_buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -260,7 +271,7 @@ fn bip39_secret_scan_is_empty_across_logs_audit_sqlite_and_responses() {
     };
     let subscriber = tracing_subscriber::fmt()
         .with_writer(writer)
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::TRACE)
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
 
@@ -468,8 +479,12 @@ fn bip39_secret_scan_is_empty_across_logs_audit_sqlite_and_responses() {
             let mut rows = statement.query([]).unwrap();
             while let Some(row) = rows.next().unwrap() {
                 for index in 0..column_names.len() {
-                    if let Ok(value) = row.get::<_, String>(index) {
-                        dump.extend_from_slice(value.as_bytes());
+                    match row.get_ref(index).unwrap() {
+                        rusqlite::types::ValueRef::Text(value)
+                        | rusqlite::types::ValueRef::Blob(value) => dump.extend_from_slice(value),
+                        rusqlite::types::ValueRef::Null
+                        | rusqlite::types::ValueRef::Integer(_)
+                        | rusqlite::types::ValueRef::Real(_) => {}
                     }
                 }
             }

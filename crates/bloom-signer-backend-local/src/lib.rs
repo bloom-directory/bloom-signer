@@ -463,13 +463,28 @@ impl LocalSignerBackend {
 
     /// Mark a BIP-39 derived child unavailable (retirement).
     pub fn retire_bip39_child(&self, key_ref: &KeyRef) -> Result<(), BackendError> {
+        let path = match &key_ref.derivation {
+            Some(DerivationRef::Bip39Multicurve { path, .. }) => path.clone(),
+            _ => return Err(BackendError::InvalidRequest),
+        };
         let mut state = self.state.write();
-        if state.registry.remove(&key_ref.locator).is_none() {
+        if state.registry.get(&key_ref.locator) != Some(key_ref) {
             return Err(BackendError::InvalidRequest);
         }
-        if let Some(next) = state.backup.as_mut() {
-            next.derivation_registry.retain(|key| key != key_ref);
+        let mut next = state
+            .backup
+            .clone()
+            .ok_or(BackendError::DefinitiveRejected)?;
+        next.derivation_registry.retain(|key| key != key_ref);
+        next.public_descriptions
+            .retain(|description| &description.key_ref != key_ref);
+        next.pending_derivations
+            .retain(|_, pending| pending != key_ref);
+        if !next.derivation_tombstones.contains(&path) {
+            next.derivation_tombstones.push(path);
         }
+        commit_backup(&mut state, next)?;
+        state.registry.remove(&key_ref.locator);
         Ok(())
     }
 

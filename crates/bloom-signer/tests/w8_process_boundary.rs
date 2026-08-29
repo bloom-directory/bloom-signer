@@ -403,6 +403,79 @@ fn bip39_allocate(
     result.public_key_refs[0].clone()
 }
 
+fn bip39_retire(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    wallet_id: &Token,
+    child: &KeyRef,
+    operation_id: &OperationId,
+    now_ms: u64,
+) {
+    let effect = serde_json::json!({ "kind": "account_retire" });
+    let exact_terms_digest =
+        Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&effect).unwrap()).into());
+    let prepared = service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                ceremony_kind: CeremonyKind::AccountRetire,
+                custody_operation_id: operation_id.clone(),
+                wallet_id: Some(wallet_id.clone()),
+                key_ref: Some(child.clone()),
+                exact_terms_digest: exact_terms_digest.clone(),
+                expected_input_class: Token::new("generic-custody-v1").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                wallet_seed_profile: None,
+                derivation_request: None,
+            },
+            now_ms,
+        )
+        .unwrap();
+    let assertion = authenticator.assertion(
+        &prepared.challenges[0].canonical_bytes().unwrap(),
+        now_ms as u32,
+    );
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::AccountRetire,
+        custody_operation_id: operation_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest().unwrap(),
+        wallet_id: Some(wallet_id.clone()),
+        key_ref: Some(child.clone()),
+        credential_id: Some(assertion.credential_id.clone()),
+        expected_input_class: Token::new("generic-custody-v1").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "effect": effect,
+    }))
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    service
+        .complete_custody(
+            CustodyCompleteRequest {
+                ceremony_kind: CeremonyKind::AccountRetire,
+                custody_operation_id: operation_id.clone(),
+                ceremony_id: prepared.contribution.ceremony_id,
+                proof: WebAuthnCeremonyProof::Assertion { assertion },
+                encrypted_input: Some(encrypted_input),
+                public_binding_digest: exact_terms_digest,
+            },
+            now_ms + 100,
+        )
+        .unwrap();
+}
+
 #[test]
 fn bip39_process_boundary_end_to_end() {
     let directory = tempfile::tempdir().unwrap();
@@ -524,7 +597,7 @@ fn bip39_process_boundary_end_to_end() {
 }
 
 #[test]
-fn bip39_derived_account_list_is_lock_free_and_stable_across_restart() {
+fn bip39_derived_account_list_and_ceremony_retire_are_restart_safe() {
     let directory = tempfile::tempdir().unwrap();
     let db_path = directory.path().join("signer.db");
     let authenticator = VirtualAuthenticator::generate();
@@ -579,7 +652,7 @@ fn bip39_derived_account_list_is_lock_free_and_stable_across_restart() {
     // identical and still requires no unlock. The re-registered backend still
     // carries every allocated child so retirement works across the restart.
     let (first_child, solana_child) = {
-        let (_service, engine, registry) = bip39_service(&db_path);
+        let (service, engine, registry) = bip39_service(&db_path);
         let listed = engine.derived_account_descriptors(&wallet_id).unwrap();
         assert_eq!(listed.len(), 2);
         for descriptor in &listed {
@@ -602,9 +675,14 @@ fn bip39_derived_account_list_is_lock_free_and_stable_across_restart() {
 
         // Retiring after restart removes the child from the lock-free list and
         // from the re-registered backend registry.
-        engine
-            .retire_bip39_account(&wallet_id, &solana_child, 40_200)
-            .unwrap();
+        bip39_retire(
+            &service,
+            &authenticator,
+            &wallet_id,
+            &solana_child,
+            &OperationId::new("42".repeat(32)).unwrap(),
+            40_200,
+        );
         let after_retire = engine.derived_account_descriptors(&wallet_id).unwrap();
         assert_eq!(after_retire.len(), 1);
         assert_eq!(after_retire[0].key_ref, first_child);

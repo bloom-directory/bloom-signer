@@ -20,7 +20,10 @@ use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
 };
+use zeroize::Zeroizing;
 
+#[cfg(feature = "local")]
+use crate::registry::BackendRegistry;
 use crate::{
     custody::{UnlockedWallet, WalletCustody, WalletCustodyBackup},
     engine::{CeremonyDatabaseEffect, SignerEngine},
@@ -178,6 +181,38 @@ struct GenericCustodyOutcome {
     database_effect: CeremonyDatabaseEffect,
     rollback_derived_key: Option<bloom_signer_api::KeyRef>,
     public_key_refs: Vec<bloom_signer_api::KeyRef>,
+}
+
+#[cfg(feature = "local")]
+struct ProvisionedLocalBackendRollback<'a> {
+    registry: &'a BackendRegistry,
+    backend_instance: Token,
+    armed: bool,
+}
+
+#[cfg(feature = "local")]
+impl<'a> ProvisionedLocalBackendRollback<'a> {
+    fn new(registry: &'a BackendRegistry, backend_instance: Token) -> Self {
+        Self {
+            registry,
+            backend_instance,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "local")]
+impl Drop for ProvisionedLocalBackendRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry
+                .remove_local_wallet_backend_instance(&self.backend_instance);
+        }
+    }
 }
 
 /// Signer-owned, single-use ceremony state.
@@ -1754,7 +1789,8 @@ impl SignerCeremonyService {
                 #[cfg(feature = "local")]
                 {
                     if is_bip39 {
-                        self.engine
+                        let _initial_record = self
+                            .engine
                             .backend_registry()
                             .provision_bip39_wallet_backend(
                                 &registration.wallet_id,
@@ -1762,6 +1798,10 @@ impl SignerCeremonyService {
                                 SecretBytes::new(backend_activation_secret),
                                 self.signing_key.verifying_key(),
                             )?;
+                        let mut provisioned_backend = ProvisionedLocalBackendRollback::new(
+                            self.engine.backend_registry().as_ref(),
+                            registration.wallet_id.clone(),
+                        );
                         // D1: allocate the canonical initial EVM account
                         // m/44'/60'/0'/0/0 inside the same apply. The root is
                         // never a signable KeyRef, so public_key_refs holds the
@@ -1798,7 +1838,9 @@ impl SignerCeremonyService {
                             return Err(kind_mismatch());
                         };
                         *backend_enrollment = Some(enrollment);
+                        rollback_provisioned_backend = Some(child_key_ref.clone());
                         public_key_refs = vec![child_key_ref];
+                        provisioned_backend.disarm();
                     } else {
                         let (root_key_ref, encrypted_record) = self
                             .engine
@@ -1809,6 +1851,10 @@ impl SignerCeremonyService {
                                 SecretBytes::new(backend_activation_secret),
                                 self.signing_key.verifying_key(),
                             )?;
+                        let mut provisioned_backend = ProvisionedLocalBackendRollback::new(
+                            self.engine.backend_registry().as_ref(),
+                            registration.wallet_id.clone(),
+                        );
                         let enrollment = crate::engine::BackendEnrollmentBackup {
                             backend: root_key_ref.backend.clone(),
                             backend_instance: root_key_ref.backend_instance.clone(),
@@ -1824,6 +1870,7 @@ impl SignerCeremonyService {
                         *backend_enrollment = Some(enrollment);
                         public_key_refs = vec![root_key_ref.clone()];
                         rollback_provisioned_backend = Some(root_key_ref);
+                        provisioned_backend.disarm();
                     }
                 }
                 #[cfg(not(feature = "local"))]
@@ -2754,9 +2801,9 @@ struct RawWalletImportInput {
 #[serde(deny_unknown_fields)]
 struct Bip39MnemonicImportInput {
     credential_prf: Base64UrlBytes,
-    mnemonic: String,
+    mnemonic: Zeroizing<String>,
     #[serde(default)]
-    passphrase: String,
+    passphrase: Zeroizing<String>,
 }
 
 #[derive(Deserialize)]

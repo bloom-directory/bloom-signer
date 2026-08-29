@@ -651,46 +651,8 @@ fn clock_repair_request() -> Result<Option<u64>, Box<dyn std::error::Error>> {
         .transpose()
 }
 
-/// Whether a Broker request body relies on a protocol-minor-5-only field:
-/// the BIP-39 seed profile, the derived-account allocation request, or the
-/// account allocate/retire ceremony kinds.
-fn request_uses_minor_5_features(request: &BrokerSignerRequest) -> bool {
-    let custody = match request {
-        BrokerSignerRequest::KeyDerivePrepare(r)
-        | BrokerSignerRequest::KeyEnrollPrepare(r)
-        | BrokerSignerRequest::WalletRegistrationPrepare(r)
-        | BrokerSignerRequest::WalletUnlockPrepare(r)
-        | BrokerSignerRequest::WalletImportPrepare(r)
-        | BrokerSignerRequest::WalletExportPrepare(r)
-        | BrokerSignerRequest::WalletDeletePrepare(r)
-        | BrokerSignerRequest::CredentialAddPrepare(r)
-        | BrokerSignerRequest::CredentialRemovePrepare(r)
-        | BrokerSignerRequest::CredentialReplacePrepare(r)
-        | BrokerSignerRequest::RecoveryPrepare(r) => Some(r),
-        _ => None,
-    };
-    custody.is_some_and(|request| {
-        request.wallet_seed_profile.is_some()
-            || request.derivation_request.is_some()
-            || matches!(
-                request.ceremony_kind,
-                bloom_signer_api::CeremonyKind::AccountAllocate
-                    | bloom_signer_api::CeremonyKind::AccountRetire
-            )
-    })
-}
-
-/// Authority-edge dispatch with per-request protocol enforcement. The
-/// transport negotiates and verifies the request's signed protocol against
-/// the supported range; this seam additionally refuses a pre-1.5 peer that
-/// carries a minor-5-only field.
-///
-/// The floor tracks the bip39 surface, not the supported minimum. Those were
-/// both 4 while the bip39 fields were minor-4, but the terminal
-/// ceremony-status contract took 1.4 and moved the bip39 surface to 1.5. A
-/// gate left at `< 4` would be unreachable, because the transport already
-/// refuses anything below the 1.4 floor, and a 1.4 peer would reach dispatch
-/// carrying fields it cannot have understood.
+/// Authority-edge dispatch. The transport negotiates and verifies the
+/// request's signed protocol against the supported range before dispatch.
 async fn dispatch_authority_connection<Dispatch, DispatchFuture>(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
@@ -723,29 +685,6 @@ where
         sent_at_ms: request.unsigned.sent_at_ms.get(),
         deadline_ms: request.unsigned.deadline_ms.get(),
     };
-    if request.unsigned.protocol.major == 1
-        && request.unsigned.protocol.minor < 5
-        && request_uses_minor_5_features(&request.unsigned.body)
-    {
-        let (sequence, head_hash) = journals.local_journal_head_with_context(&context)?;
-        let head = bloom_triad_local_transport::sign_journal_head(identity, sequence, head_hash);
-        return bloom_triad_local_transport::send_response_with_journal_head::<
-            BrokerSignerRequest,
-            BrokerSignerResponse,
-            ProtocolError,
-        >(
-            stream,
-            identity,
-            &request,
-            Err(ProtocolError::new(
-                ProtocolErrorCode::UnsupportedVersion,
-                "request body uses protocol-minor-5 fields for a pre-1.5 peer",
-            )),
-            head,
-        )
-        .await
-        .map_err(bloom_signer_api::ProtocolError::from);
-    }
     let peer_head = request
         .unsigned
         .sender_journal_head
@@ -1833,111 +1772,6 @@ mod tests {
         client_result.unwrap();
         assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!journals.touched.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn signer_rejects_bip39_fields_from_a_pre_1_5_peer() {
-        let signer = signer_identity();
-        let broker = LocalIdentity {
-            service_id: Token::new("bloom-broker").unwrap(),
-            boot_epoch: bloom_signer_api::BootEpoch::new("02".repeat(16)).unwrap(),
-            application_key_id: Token::new("broker-app").unwrap(),
-            signing_key: Arc::new(SigningKey::from_bytes(&[7; 32])),
-        };
-        let temporary = tempfile::tempdir().unwrap();
-        let effective_uid = fs::metadata(temporary.path()).unwrap().uid();
-        let signer_acl = peer_acl(&signer, effective_uid);
-        let broker_acl = peer_acl(&broker, effective_uid);
-        let quota = EndpointQuota::new(1, 10, 1_000, 10, 1_000).unwrap();
-        let journals = TrackingJournalExchange {
-            touched: std::sync::atomic::AtomicBool::new(false),
-        };
-        let dispatched = std::sync::atomic::AtomicBool::new(false);
-        let (mut server_stream, mut client_stream) = UnixStream::pair().unwrap();
-        // The peer negotiates over the full supported range, so it accepts the
-        // service's announced 1.5, but signs its request at the 1.4 floor
-        // while carrying a minor-5 bip39 field. That mismatch is what the
-        // dispatch seam exists to refuse; a peer below the floor never gets
-        // that far, because the transport rejects it during negotiation.
-        let legacy_version = ProtocolVersion::new(
-            bloom_signer_api::SIGNER_API_MAJOR,
-            bloom_signer_api::SIGNER_API_MINOR_MIN,
-        );
-        let legacy_range = ProtocolVersionRange::new(
-            bloom_signer_api::SIGNER_API_MAJOR,
-            bloom_signer_api::SIGNER_API_MINOR_MIN,
-            bloom_signer_api::SIGNER_API_MINOR_MAX,
-        );
-        let broker_head = bloom_triad_local_transport::sign_journal_head(
-            &broker,
-            0,
-            Digest32::from_bytes([0; 32]),
-        );
-
-        let server = async {
-            let result = dispatch_authority_connection(
-                &mut server_stream,
-                &signer,
-                &broker_acl,
-                &quota,
-                &journals,
-                |_request, _context| async {
-                    dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
-                    Err(ProtocolError::new(
-                        ProtocolErrorCode::ServiceUnavailable,
-                        "dispatch must not run",
-                    ))
-                },
-            )
-            .await;
-            drop(server_stream);
-            result
-        };
-        let client = async {
-            let body = BrokerSignerRequest::WalletRegistrationPrepare(
-                bloom_signer_api::CustodyPrepareRequest {
-                    ceremony_kind: bloom_signer_api::CeremonyKind::WalletRegistration,
-                    custody_operation_id: bloom_signer_api::OperationId::from_bytes([3; 32]),
-                    wallet_id: Some(Token::new("wallet").unwrap()),
-                    key_ref: None,
-                    exact_terms_digest: Digest32::from_bytes([5; 32]),
-                    expected_input_class: Token::new("passkey-prf").unwrap(),
-                    browser_output_recipient_key: None,
-                    petal_key_scope: None,
-                    legacy_passkey_migration: None,
-                    wallet_seed_profile: Some(
-                        bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1,
-                    ),
-                    derivation_request: None,
-                },
-            );
-            let result = bloom_triad_local_transport::call_with_journal_head::<
-                BrokerSignerRequest,
-                BrokerSignerResponse,
-                ProtocolError,
-            >(
-                &mut client_stream,
-                &broker,
-                &signer_acl,
-                legacy_version,
-                legacy_range,
-                body,
-                1_000,
-                broker_head,
-                |_head| Ok(()),
-            )
-            .await;
-            drop(client_stream);
-            result
-        };
-        let (server_result, client_result) = tokio::join!(server, client);
-
-        assert!(server_result.is_ok());
-        assert_eq!(
-            client_result.unwrap_err().code,
-            ProtocolErrorCode::UnsupportedVersion
-        );
-        assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

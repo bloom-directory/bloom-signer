@@ -721,6 +721,7 @@ impl SignerEngine {
             .map_err(storage)?;
         crate::bip39_store::configure_durability(&connection)?;
         crate::derivation_registry::migrate(&connection)?;
+        crate::derivation_registry::verify_event_chain(&connection)?;
         connection
             .execute_batch(
                 "
@@ -6759,7 +6760,7 @@ mod clock_tests {
         .unwrap()
     }
 
-    fn file_engine(path: &Path) -> SignerEngine {
+    fn try_file_engine(path: &Path) -> Result<SignerEngine, ProtocolError> {
         SignerEngine::open(
             path,
             Token::new("broker-key").unwrap(),
@@ -6774,7 +6775,53 @@ mod clock_tests {
             },
             Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap()),
         )
-        .unwrap()
+    }
+
+    fn file_engine(path: &Path) -> SignerEngine {
+        try_file_engine(path).unwrap()
+    }
+
+    #[test]
+    fn open_rejects_a_tampered_derivation_event_chain() {
+        fn noop_audit(
+            _transaction: &rusqlite::Transaction<'_>,
+            _event_type: &str,
+            _payload: serde_json::Value,
+        ) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("signer.sqlite3");
+        let engine = file_engine(&path);
+        crate::derivation_registry::prepare_allocation(
+            &mut engine.connection.lock(),
+            &Token::new("primary").unwrap(),
+            crate::derivation_registry::PROFILE_EVM,
+            crate::derivation_registry::ROLE_EVM_ACCOUNT,
+            0,
+            "operation-1",
+            |_, _| false,
+            1_000,
+            &noop_audit,
+        )
+        .unwrap();
+        drop(engine);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE derivation_events SET to_state = 'TAMPERED' WHERE sequence = 1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = match try_file_engine(&path) {
+            Ok(_) => panic!("tampered derivation event chain was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ProtocolErrorCode::MalformedFrame);
     }
 
     fn dedicated_file_engine(

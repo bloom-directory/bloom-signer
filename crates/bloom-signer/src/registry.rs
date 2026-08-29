@@ -581,9 +581,15 @@ impl BackendRegistry {
 
     #[cfg(feature = "local")]
     pub fn remove_local_wallet_backend(&self, key_ref: &KeyRef) {
+        self.remove_local_wallet_backend_instance(&key_ref.backend_instance);
+    }
+
+    #[cfg(feature = "local")]
+    pub fn remove_local_wallet_backend_instance(&self, backend_instance: &Token) {
+        let backend_id = Token::new("local").expect("static token");
         self.backends
             .write()
-            .remove(&(key_ref.backend.clone(), key_ref.backend_instance.clone()));
+            .remove(&(backend_id, backend_instance.clone()));
     }
 
     #[cfg(feature = "local")]

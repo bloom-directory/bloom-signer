@@ -369,6 +369,11 @@ pub fn prepare_allocation(
     audit: AuditRecorder<'_>,
 ) -> Result<Reservation, ProtocolError> {
     let requested_account = account.into();
+    if requested_account.is_some_and(|account| account >= (1_u32 << 31)) {
+        return Err(invalid(
+            "derivation account must fit the non-hardened BIP-32 child-number range",
+        ));
+    }
     if let Some(existing) = load_allocation(connection, wallet_id, operation_id)? {
         // Idempotent retry: identical request returns the same reservation.
         if existing.profile == profile

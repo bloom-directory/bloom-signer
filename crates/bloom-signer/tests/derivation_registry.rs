@@ -141,6 +141,40 @@ fn operation_retry_returns_the_same_reservation() {
 }
 
 #[test]
+fn out_of_range_account_is_rejected_without_a_reservation() {
+    let mut connection = connection();
+    let wallet = primary();
+    let error = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_SOLANA,
+        registry::ROLE_SOLANA_ACCOUNT,
+        1_u32 << 31,
+        "op-out-of-range",
+        |_, _| false,
+        1_000,
+        &noop,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::MalformedFrame);
+
+    let reservation = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_SOLANA,
+        registry::ROLE_SOLANA_ACCOUNT,
+        0,
+        "op-out-of-range",
+        |_, _| false,
+        1_001,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(reservation.account, 0);
+    assert_eq!(reservation.path, "m/44'/501'/0'/0'");
+}
+
+#[test]
 fn invalid_children_are_tombstoned_and_never_reused() {
     let mut connection = connection();
     let wallet = primary();

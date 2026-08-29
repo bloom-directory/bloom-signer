@@ -50,7 +50,7 @@ pub enum SigningEdgeError {
 }
 
 /// Exact limits for the MVP signing inputs.
-pub const MAX_ED25519_MESSAGE_BYTES: usize = 1232;
+pub const MAX_ED25519_MESSAGE_BYTES: usize = bloom_signer_api::MAX_ED25519_MESSAGE_BYTES;
 pub const EVM_DIGEST_BYTES: usize = 32;
 
 /// The expected public descriptor of an activated registry entry.

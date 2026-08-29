@@ -8,6 +8,11 @@ use crate::{
 
 const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
 
+/// Solana's transaction wire-size ceiling. Ed25519 message signing is used
+/// for Solana transactions, so reject anything the chain could never accept
+/// before it crosses the backend boundary.
+pub const MAX_ED25519_MESSAGE_BYTES: usize = 1232;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectorKind {
@@ -114,8 +119,11 @@ impl SignRequest {
                         .zip(&self.unsigned.ordered_hashes)
                         .zip(&self.unsigned.ordered_payload_digests)
                         .all(|((message, ordered_hash), payload_digest)| {
-                            let digest =
-                                Digest32::from_bytes(Sha256::digest(message.decode()).into());
+                            let message = message.decode();
+                            if message.is_empty() || message.len() > MAX_ED25519_MESSAGE_BYTES {
+                                return false;
+                            }
+                            let digest = Digest32::from_bytes(Sha256::digest(message).into());
                             &digest == ordered_hash && &digest == payload_digest
                         })
             }

@@ -895,6 +895,8 @@ mod tests {
             CeremonyKind::BackendEnrollment,
             CeremonyKind::KeyDerive,
             CeremonyKind::PolicyUpdate,
+            CeremonyKind::AccountAllocate,
+            CeremonyKind::AccountRetire,
         ] {
             assert_eq!(
                 kind.successful_terminal_state(),

@@ -42,21 +42,13 @@ pub use bloom_rpc_wire::{
 
 /// Broker-to-Signer authority contract.
 ///
-/// Version 1.4 adds the durable terminal ceremony-status response. It is
-/// intentionally a strict minor bump: a 1.3 peer cannot deserialize the new
-/// `Terminal` response variant, so it must not negotiate this contract. That
-/// is why the accepted range starts at 1.4 and not at 1.3.
-///
-/// Version 1.5 adds the bip39-multicurve-v1 surface: the account-allocate and
-/// account-retire ceremony kinds, the wallet-seed/derivation request fields,
-/// the derived-account projection, and the `wallet.derived_accounts` edge.
-/// Master reached 1.4 first with the terminal status, so this surface — which
-/// was developed as 1.4 and 1.5 while unreleased — collapses into the single
-/// unreleased minor 1.5 above it. Its additions are optional, skip-serialized,
-/// or reached only by a request a 1.4 peer never sends, so 1.4 stays
-/// negotiable.
+/// Version 1.5 is the first complete authority contract for BIP-39 wallets.
+/// It includes the durable terminal ceremony status introduced during 1.4
+/// development plus the wallet-seed profile, account-allocation ceremonies,
+/// and derived-account projection. Registration and import semantics require
+/// those fields, so a 1.4 peer must not negotiate this contract.
 pub const SIGNER_API_MAJOR: u16 = 1;
-pub const SIGNER_API_MINOR_MIN: u16 = 4;
+pub const SIGNER_API_MINOR_MIN: u16 = 5;
 pub const SIGNER_API_MINOR_MAX: u16 = 5;
 pub const SIGNER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(SIGNER_API_MAJOR, SIGNER_API_MINOR_MAX);
