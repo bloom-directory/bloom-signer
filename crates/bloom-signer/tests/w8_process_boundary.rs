@@ -61,6 +61,7 @@ fn production_signer_dependency_graph_has_no_machine_broker_or_debug_driver() {
             "bloom-platform-containment",
             "bloom-rpc-wire",
             "bloom-service-activation",
+            "bloom-service-observability",
             "bloom-signer",
             "bloom-signer-api",
             "bloom-signer-backend-api",

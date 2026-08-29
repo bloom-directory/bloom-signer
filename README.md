@@ -63,12 +63,14 @@ the current effective time; moving effective time backwards is refused with
 unavailable on profiles that do not use the durable guard, currently macOS.
 
 If repairing would expire live approvals, Signer refuses on the first attempt
-and prints the accepted time, the approvals that would expire, and a
-confirmation digest over both:
+and logs the accepted time, one `signer.clock_repair_expiring_approval` event
+for each exact approval ID that would expire, and a confirmation digest over
+both. Approval IDs and the confirmation digest are operational identifiers;
+approval terms, policies, credentials, and signatures remain forbidden from
+logs.
 
 ```text
-Bloom Signer clock repair requires confirmation before mutation:
-accepted_utc_ms=…, expiring_live_approvals=[…], confirmation_digest=…
+event=signer.clock_repair_expiring_approval accepted_utc_ms=… approval_id=… confirmation_digest=…
 ```
 
 Re-run with that digest to commit, so an operator cannot expire approvals
