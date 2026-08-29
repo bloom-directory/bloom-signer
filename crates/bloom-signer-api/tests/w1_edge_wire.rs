@@ -387,6 +387,7 @@ fn custody_contribution() -> CustodySignerContribution {
         hpke_recipient_key: Base64UrlBytes::from_bytes(&[56; 32]),
         browser_output_recipient_key: None,
         petal_key_scope: None,
+        wallet_seed_profile: None,
         expires_at_ms: DecimalU64::new(20),
         signer_key_id: token("signer-key"),
         signer_signature: Base64UrlBytes::from_bytes(&[57; 64]),

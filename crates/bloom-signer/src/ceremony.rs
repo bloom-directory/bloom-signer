@@ -638,7 +638,7 @@ impl SignerCeremonyService {
             hpke_recipient_key: recipient.public_key().clone(),
             browser_output_recipient_key: request.browser_output_recipient_key.clone(),
             petal_key_scope: request.petal_key_scope.clone(),
-            wallet_seed_profile: request.wallet_seed_profile.clone(),
+            wallet_seed_profile: request.wallet_seed_profile,
             expires_at_ms: DecimalU64::new(now_ms.saturating_add(CEREMONY_TTL_MS)),
             signer_key_id: self.signer_key_id.clone(),
             signer_signature: Base64UrlBytes::from_bytes(&[]),

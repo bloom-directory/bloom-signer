@@ -578,6 +578,8 @@ impl CustodySignerContribution {
             hpke_recipient_key: &'a Base64UrlBytes,
             browser_output_recipient_key: &'a Option<Base64UrlBytes>,
             petal_key_scope: &'a Option<PetalKeyScope>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            wallet_seed_profile: &'a Option<crate::WalletSeedProfile>,
             expires_at_ms: &'a DecimalU64,
             signer_key_id: &'a Token,
         }
@@ -594,6 +596,7 @@ impl CustodySignerContribution {
             hpke_recipient_key: &self.hpke_recipient_key,
             browser_output_recipient_key: &self.browser_output_recipient_key,
             petal_key_scope: &self.petal_key_scope,
+            wallet_seed_profile: &self.wallet_seed_profile,
             expires_at_ms: &self.expires_at_ms,
             signer_key_id: &self.signer_key_id,
         })
@@ -934,10 +937,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn signed_custody_contribution_binds_full_petal_scope() {
+    fn custody_contribution_with_petal_scope() -> CustodySignerContribution {
         let scope = petal_scope();
-        let contribution = CustodySignerContribution {
+        CustodySignerContribution {
             ceremony_id: digest(4),
             ceremony_kind: CeremonyKind::KeyDerive,
             custody_operation_id: scope.custody_operation_id.clone(),
@@ -950,10 +952,16 @@ mod tests {
             hpke_recipient_key: Base64UrlBytes::from_bytes(&[7; 32]),
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope),
+            wallet_seed_profile: None,
             expires_at_ms: DecimalU64::new(1000),
             signer_key_id: Token::new("signer-identity").unwrap(),
             signer_signature: Base64UrlBytes::from_bytes(&[8; 64]),
-        };
+        }
+    }
+
+    #[test]
+    fn signed_custody_contribution_binds_full_petal_scope() {
+        let contribution = custody_contribution_with_petal_scope();
         assert!(
             contribution
                 .validate_petal_key_scope_binding(&scoped_prepare())
@@ -973,6 +981,20 @@ mod tests {
                 .unwrap_err()
                 .code,
             ProtocolErrorCode::OperationIdConflict
+        );
+    }
+
+    #[test]
+    fn signed_custody_contribution_binds_wallet_seed_profile() {
+        let without_profile = custody_contribution_with_petal_scope();
+        let original = without_profile.unsigned_canonical_bytes().unwrap();
+        let mut with_profile = without_profile;
+        with_profile.wallet_seed_profile = Some(crate::WalletSeedProfile::Bip39MulticurveV1);
+
+        assert_ne!(with_profile.unsigned_canonical_bytes().unwrap(), original);
+        assert_eq!(
+            serde_json::to_value(with_profile).unwrap()["wallet_seed_profile"],
+            "bip39-multicurve-v1"
         );
     }
 }
