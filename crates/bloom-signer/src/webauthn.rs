@@ -158,6 +158,7 @@ pub fn verify_webauthn_attestation(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClientData {
     #[serde(rename = "type")]
     ceremony_type: String,
@@ -315,42 +316,4 @@ fn integer_to_i128(integer: Integer) -> Option<i128> {
 
 fn proof_error(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::UnauthenticatedPeer, message)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn client_data(value: serde_json::Value) -> Base64UrlBytes {
-        Base64UrlBytes::from_bytes(&serde_json::to_vec(&value).unwrap())
-    }
-
-    #[test]
-    fn client_data_tolerates_future_unknown_members() {
-        let challenge = b"future-compatible-challenge";
-        let encoded = client_data(serde_json::json!({
-            "type": "webauthn.get",
-            "challenge": Base64UrlBytes::from_bytes(challenge),
-            "origin": CEREMONY_ORIGIN,
-            "crossOrigin": false,
-            "futureBrowserField": {"version": 1}
-        }));
-
-        verify_client_data(&encoded, "webauthn.get", challenge).unwrap();
-    }
-
-    #[test]
-    fn client_data_still_rejects_cross_origin_with_top_origin() {
-        let challenge = b"cross-origin-challenge";
-        let encoded = client_data(serde_json::json!({
-            "type": "webauthn.get",
-            "challenge": Base64UrlBytes::from_bytes(challenge),
-            "origin": CEREMONY_ORIGIN,
-            "crossOrigin": true,
-            "topOrigin": "https://example.invalid"
-        }));
-
-        let error = verify_client_data(&encoded, "webauthn.get", challenge).unwrap_err();
-        assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
-    }
 }

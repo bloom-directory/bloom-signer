@@ -7,7 +7,7 @@ use bloom_signer::engine::{
 use bloom_signer::registry::{BackendRegistry, CompiledBackend};
 use bloom_signer_api::*;
 use bloom_signer_backend_api::{SecretBytes, SignerBackendActivation};
-use bloom_signer_backend_local::LocalSignerBackend;
+use bloom_signer_backend_local::{DerivationAuthority, DerivationGrant, LocalSignerBackend};
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
@@ -35,20 +35,44 @@ fn clock(effective_now_ms: u64) -> ClockDecision {
 }
 
 fn key_ref() -> KeyRef {
-    local_backend().root_key_ref().unwrap()
+    local_backend()
+        .encrypted_backup()
+        .unwrap()
+        .derivation_registry[0]
+        .clone()
 }
 
 fn local_backend() -> Arc<LocalSignerBackend> {
-    Arc::new(
-        LocalSignerBackend::provision_imported_secp256k1(
+    let backend = Arc::new(
+        LocalSignerBackend::provision(
             Token::new("local-default").unwrap(),
             Token::new("root-1").unwrap(),
-            SecretBytes::new((0_u8..32).collect()),
+            SecretBytes::new((0_u8..16).collect()),
             SecretBytes::new(vec![7; 32]),
             SigningKey::from_bytes(&[5; 32]).verifying_key(),
         )
         .unwrap(),
-    )
+    );
+    let root = backend.root_key_ref().unwrap();
+    let namespace = Token::new("ethereum-account-0").unwrap();
+    let grant = DerivationGrant {
+        authority_kind: Token::new("ceremony").unwrap(),
+        namespace_id: namespace.clone(),
+        canonical_prefix: "m/44'/60'/0'/0".into(),
+        starting_index: DecimalU64::new(0),
+        maximum_children: DecimalU64::new(1),
+    };
+    let mut message = b"bloom-key-derive-authority/v1".to_vec();
+    message.extend_from_slice(&serde_jcs::to_vec(&grant).unwrap());
+    let authority = DerivationAuthority::from_signed(
+        grant,
+        Base64UrlBytes::from_bytes(&SigningKey::from_bytes(&[5; 32]).sign(&message).to_bytes()),
+    );
+    backend.configure_namespace(&authority).unwrap();
+    backend
+        .allocate_derived_key(&root, &namespace, &authority)
+        .unwrap();
+    backend
 }
 
 fn exact_terms() -> SealedApprovalTerms {
@@ -166,7 +190,6 @@ fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> Unsign
         selector_kind,
         ordered_payload_digests: payloads,
         ordered_hashes: hashes.clone(),
-        ordered_messages: Vec::new(),
         signature_count: DecimalU64::new(hashes.len() as u64),
         petal_use_claim_digest: claim_digest,
         claim_assurance_digest: assurance_digest,
@@ -524,7 +547,6 @@ fn ac32_backup_restore_refuses_missing_registry_for_derivation_and_lower_state()
         wallet_revocation_epoch: terms.wallet_revocation_epoch.clone(),
         custody: None,
         derivation_registry: None,
-        derivation_allocations: vec![],
         backend_enrollments: vec![],
         policy: None,
         petal_key_scopes: vec![],
@@ -624,7 +646,7 @@ fn ac32_rotated_audit_export_restore_carries_custody_policy_registry_and_counter
     let terms = exact_terms();
     let engine = new_engine(&broker);
     engine.install_approval_for_test(&terms).unwrap();
-    let custody = WalletCustody::register_imported_secp256k1(
+    let custody = WalletCustody::register(
         terms.wallet_id.clone(),
         SecretBytes::new(vec![1; 32]),
         SecretBytes::new(vec![8; 32]),
@@ -661,11 +683,7 @@ fn ac32_rotated_audit_export_restore_carries_custody_policy_registry_and_counter
         backend: Token::new("local").unwrap(),
         backend_instance: Token::new("local-default").unwrap(),
         encrypted_record: Base64UrlBytes::from_bytes(&serde_jcs::to_vec(&backend_record).unwrap()),
-        pinned_keys: backend_record
-            .pinned_root
-            .clone()
-            .into_iter()
-            .collect::<Vec<_>>(),
+        pinned_keys: backend_record.derivation_registry.clone(),
     };
     let rotated_audit_key_id = Token::new("signer-audit-key-2").unwrap();
     let rotated_audit_key = SigningKey::from_bytes(&[15; 32]);
@@ -688,9 +706,12 @@ fn ac32_rotated_audit_export_restore_carries_custody_policy_registry_and_counter
         "custody.export",
         "the returned continuity chain must include its own export event"
     );
-    // The imported-scalar fixture has no derivation namespace, so the export
-    // carries no derivation registry.
-    assert!(exported.derivation_registry.is_none());
+    assert_eq!(
+        exported.derivation_registry.as_ref().unwrap().namespaces[0]
+            .next_index
+            .get(),
+        1
+    );
     assert!(exported.custody.is_some());
     assert!(exported.policy.is_some());
     assert_eq!(
@@ -772,6 +793,17 @@ fn ac32_rotated_audit_export_restore_carries_custody_policy_registry_and_counter
         ),
     )
     .unwrap();
+    let mut inconsistent = exported.clone();
+    inconsistent
+        .derivation_registry
+        .as_mut()
+        .unwrap()
+        .namespaces[0]
+        .next_index = DecimalU64::new(5);
+    assert_eq!(
+        restored.restore_backup(&inconsistent).unwrap_err().code,
+        ProtocolErrorCode::MalformedFrame
+    );
     let mut corrupt_audit = exported.clone();
     corrupt_audit.audit_entries[0].payload_jcs = "{}".into();
     assert_eq!(
@@ -845,8 +877,9 @@ fn ac32_rotated_audit_export_restore_carries_custody_policy_registry_and_counter
     assert_eq!(round_trip.operations[0].monotonic_anchor_ns.get(), 0);
     assert_eq!(
         restored.derivation_status(&terms.wallet_id).unwrap(),
-        WalletDerivationStatus::DerivationRegistryMissing
+        WalletDerivationStatus::Ready
     );
+    restored.require_derivation_ready(&terms.wallet_id).unwrap();
     let mut retry = signed(&broker, unsigned_request(&terms, "09"));
     retry.unsigned.attempt_id = digest("8d");
     retry.unsigned.issuer_boot_epoch = BootEpoch::new("97".repeat(16)).unwrap();
@@ -866,20 +899,20 @@ fn ac32_rotated_audit_export_restore_carries_custody_policy_registry_and_counter
 #[test]
 fn backend_registry_accepts_only_compiled_variants() {
     let local = Arc::new(
-        LocalSignerBackend::provision_imported_secp256k1(
+        LocalSignerBackend::provision(
             Token::new("local-default").unwrap(),
             Token::new("root-1").unwrap(),
-            SecretBytes::new((0_u8..32).collect()),
+            SecretBytes::new((0_u8..16).collect()),
             SecretBytes::new(vec![7; 32]),
             SigningKey::from_bytes(&[5; 32]).verifying_key(),
         )
         .unwrap(),
     );
     let other = Arc::new(
-        LocalSignerBackend::provision_imported_secp256k1(
+        LocalSignerBackend::provision(
             Token::new("local-secondary").unwrap(),
             Token::new("root-2").unwrap(),
-            SecretBytes::new((16_u8..48).collect()),
+            SecretBytes::new((16_u8..32).collect()),
             SecretBytes::new(vec![8; 32]),
             SigningKey::from_bytes(&[5; 32]).verifying_key(),
         )

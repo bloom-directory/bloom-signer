@@ -143,10 +143,6 @@ impl SignerRpcService {
                 }
                 Ok(Response::KeyListPublic(keys))
             }
-            Request::DerivedAccountList(request) => Ok(Response::DerivedAccountList(
-                self.engine
-                    .derived_account_descriptors(&request.wallet_id)?,
-            )),
             Request::KeyDerivationCapabilities(request) => {
                 let capabilities = self
                     .engine
@@ -414,36 +410,16 @@ impl SignerRpcService {
             .backend_registry()
             .capabilities()
             .into_iter()
-            .map(|capability| {
-                let is_bip39 = capability
-                    .supported_crypto_suites
-                    .contains(&bloom_signer_api::CryptoSuite::Ed25519Message);
-                BackendPublicCapability {
-                    backend_id: capability.backend_id,
-                    backend_instance_id: capability.backend_instance_id,
-                    crypto_suites: capability.supported_crypto_suites,
-                    derivation_schemes: capability
-                        .supported_derivation
-                        .into_iter()
-                        .map(|derivation| derivation.scheme)
-                        .collect(),
-                    networked: capability.networked,
-                    wallet_seed_profiles: if is_bip39 {
-                        vec![bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1]
-                    } else {
-                        Vec::new()
-                    },
-                    derivation_profiles: if is_bip39 {
-                        vec![
-                            bloom_signer_api::DerivationProfile::Bip44EvmSecp256k1V1,
-                            bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-                        ]
-                    } else {
-                        Vec::new()
-                    },
-                    mnemonic_export: is_bip39,
-                    derivation_namespace_limits: vec![],
-                }
+            .map(|capability| BackendPublicCapability {
+                backend_id: capability.backend_id,
+                backend_instance_id: capability.backend_instance_id,
+                crypto_suites: capability.supported_crypto_suites,
+                derivation_schemes: capability
+                    .supported_derivation
+                    .into_iter()
+                    .map(|derivation| derivation.scheme)
+                    .collect(),
+                networked: capability.networked,
             })
             .collect();
         Ok(ServiceCapabilities {
@@ -487,14 +463,12 @@ impl SignerRpcService {
             ));
         }
         let addresses = ethereum_address(&description)?;
-        let derived_account = self.engine.derived_account_descriptor(key_ref)?;
         Ok(KeyPublic {
             key_ref: description.key_ref,
             role: self.engine.key_role(key_ref)?,
             canonical_public_key: description.canonical_spki_der,
             addresses,
             supported_crypto_suites: description.supported_crypto_suites,
-            derived_account,
         })
     }
 
@@ -510,12 +484,6 @@ impl SignerRpcService {
                 .engine
                 .stored_operation_result(&request.unsigned.operation_id)?
             {
-                tracing::info!(
-                    event = "signer.signing_recovered",
-                    operation_id = request.unsigned.operation_id.as_str(),
-                    outcome = "stored_result",
-                    "Signer recovered an existing signing result"
-                );
                 return serde_json::from_slice(&stored.decode()).map_err(|error| {
                     ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
                 });
@@ -532,12 +500,6 @@ impl SignerRpcService {
             &request.unsigned.key_ref,
             &provider_attempt_ids,
         )?;
-        tracing::info!(
-            event = "signer.signing_dispatched",
-            operation_id = request.unsigned.operation_id.as_str(),
-            provider_attempt_count = provider_attempt_ids.len(),
-            "Signer dispatched a signing operation"
-        );
         let backend = self.engine.backend_registry().get(
             &request.unsigned.key_ref.backend,
             &request.unsigned.key_ref.backend_instance,
@@ -549,7 +511,7 @@ impl SignerRpcService {
                     digest: hash.clone(),
                 },
                 CryptoInputKind::Message => BackendInput::Message {
-                    message: request.unsigned.ordered_messages[index].clone(),
+                    message: Base64UrlBytes::from_bytes(&hash.to_bytes()),
                 },
             };
             let result = backend
@@ -578,16 +540,6 @@ impl SignerRpcService {
                     };
                     self.engine
                         .finalize_operation(&request.unsigned.operation_id, effect)?;
-                    tracing::warn!(
-                        event = "signer.signing_finalized",
-                        operation_id = request.unsigned.operation_id.as_str(),
-                        outcome = match effect {
-                            SignerOperationEffect::Committed => "committed",
-                            SignerOperationEffect::Released => "released",
-                            SignerOperationEffect::Quarantined => "quarantined",
-                        },
-                        "Signer finalized a failed signing operation"
-                    );
                     return Err(map_backend_error(error));
                 }
             };
@@ -598,12 +550,6 @@ impl SignerRpcService {
                     &request.unsigned.operation_id,
                     SignerOperationEffect::Quarantined,
                 )?;
-                tracing::warn!(
-                    event = "signer.signing_finalized",
-                    operation_id = request.unsigned.operation_id.as_str(),
-                    outcome = "quarantined",
-                    "Signer quarantined a signing operation"
-                );
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::BackendInvalidRequest,
                     "backend returned a mismatched signature suite or encoding",
@@ -629,13 +575,6 @@ impl SignerRpcService {
                 ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
             })?),
         )?;
-        tracing::info!(
-            event = "signer.signing_finalized",
-            operation_id = request.unsigned.operation_id.as_str(),
-            outcome = "committed",
-            signature_count = result.signatures.len(),
-            "Signer committed a signing result"
-        );
         Ok(result)
     }
 }
@@ -677,7 +616,6 @@ fn broker_signer_request_is_read_only(request: &BrokerSignerRequest) -> bool {
             | Request::KeyListPublic(_)
             | Request::KeyDerivationCapabilities(_)
             | Request::KeyListDerived(_)
-            | Request::DerivedAccountList(_)
             | Request::KeyEnrollStatus(_)
             | Request::CeremonyStatus(_)
             | Request::SealedApprovalStatus(_)
@@ -833,10 +771,9 @@ mod tests {
     use super::*;
     use crate::{custody::WalletCustody, engine::SignerAuditKeys};
     use bloom_signer_api::{
-        ActivationMode, ApprovalLimits, ApprovalSelector, ApprovalSubject, CeremonyPrepareRequest,
-        CryptoSuite, KeyRef, KeySpec, ProtocolVersion, RequestNonce, RevokeRequest,
-        SealedApprovalTerms, SelectorKind, SignOperationIdentity, UnsignedSignRequest,
-        WalletRequest,
+        ActivationMode, ApprovalLimits, ApprovalSelector, ApprovalSubject, CryptoSuite, KeyRef,
+        KeySpec, ProtocolVersion, RequestNonce, RevokeRequest, SealedApprovalTerms, SelectorKind,
+        SignOperationIdentity, UnsignedSignRequest,
     };
     use bloom_signer_backend_api::{SecretBytes, SignerBackend, SignerBackendActivation};
     use bloom_signer_backend_local::LocalSignerBackend;
@@ -882,7 +819,7 @@ mod tests {
         let broker_key = SigningKey::from_bytes(&[7; 32]);
         let activation_secret = vec![9; 32];
         let backend = Arc::new(
-            LocalSignerBackend::provision_imported_secp256k1(
+            LocalSignerBackend::provision(
                 Token::new("wallet-service-test").unwrap(),
                 Token::new("root").unwrap(),
                 SecretBytes::new((0_u8..32).collect()),
@@ -1109,7 +1046,6 @@ mod tests {
             selector_kind: SelectorKind::Exact,
             ordered_payload_digests: payloads,
             ordered_hashes: hashes,
-            ordered_messages: Vec::new(),
             signature_count: DecimalU64::new(1),
             petal_use_claim_digest: None,
             claim_assurance_digest: None,
@@ -1141,11 +1077,6 @@ mod tests {
         request.unsigned.operation_id = OperationId::from_bytes([attempt_byte; 32]);
         request.unsigned.key_ref = key_ref.clone();
         request.unsigned.crypto_suite = CryptoSuite::Ed25519Message;
-        let message = vec![attempt_byte; 48];
-        let digest = Digest32::from_bytes(Sha256::digest(&message).into());
-        request.unsigned.ordered_payload_digests = vec![digest.clone()];
-        request.unsigned.ordered_hashes = vec![digest];
-        request.unsigned.ordered_messages = vec![Base64UrlBytes::from_bytes(&message)];
         request.unsigned.operation_digest = SignOperationIdentity {
             operation_id: request.unsigned.operation_id.clone(),
             approval_id: request.unsigned.approval_id.clone(),
@@ -1243,78 +1174,10 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn policy_ceremony_and_signing_paths_do_not_emit_marker_secrets() {
-        let capture = bloom_service_observability::CapturedWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_writer(capture.clone())
-            .finish();
-        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
-        let (service, broker_key, terms) = fixture().await;
-
-        let policy_marker = "marker-policy-secret-do-not-log";
-        let _ = BrokerSignerService::dispatch(
-            &service,
-            BrokerSignerRequest::PolicyRead(WalletRequest {
-                wallet_id: Token::new(policy_marker).unwrap(),
-            }),
-        )
-        .await;
-
-        let ceremony_marker = "marker-ceremony-secret-do-not-log";
-        let mut ceremony_terms = terms.clone();
-        ceremony_terms.subject = ApprovalSubject::Cli {
-            client_id: Token::new("bloom-machine").unwrap(),
-            command_class: Token::new(ceremony_marker).unwrap(),
-        };
-        let (payloads, hashes) = match &ceremony_terms.selector {
-            ApprovalSelector::Exact {
-                ordered_payload_digests,
-                ordered_hashes,
-            } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
-            ApprovalSelector::Petal { .. } => unreachable!("fixture is exact"),
-        };
-        service
-            .ceremony
-            .prepare_approval(
-                CeremonyPrepareRequest {
-                    activation_operation_id: OperationId::from_bytes([91; 32]),
-                    terms: ceremony_terms,
-                    review_manifest_digest: Digest32::from_bytes([92; 32]),
-                    exact_ordered_payload_digests: payloads,
-                    exact_ordered_hashes: hashes,
-                    replacement_approval_id: None,
-                },
-                now_ms().unwrap(),
-            )
-            .unwrap();
-
-        let signing_marker = "marker-signing-secret-do-not-log";
-        let mut signing = sign_request(&broker_key, &terms, 93);
-        signing.unsigned.issuer_service_id = Token::new(signing_marker).unwrap();
-        signing.unsigned.attempt_digest = signing.unsigned.computed_attempt_digest().unwrap();
-        signing.broker_signature = Base64UrlBytes::from_bytes(
-            &broker_key
-                .sign(&signing.unsigned.attempt_digest.to_bytes())
-                .to_bytes(),
-        );
-        let _ =
-            BrokerSignerService::dispatch(&service, BrokerSignerRequest::SignerSign(signing)).await;
-
-        let output = capture.text();
-        for marker in [policy_marker, ceremony_marker, signing_marker] {
-            assert!(
-                !output.contains(marker),
-                "marker leaked into tracing output"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn dedicated_policy_key_is_unreachable_through_single_and_batch_signing() {
         let (service, broker_key, terms) = fixture().await;
-        let custody = WalletCustody::register_imported_secp256k1(
+        let custody = WalletCustody::register(
             terms.wallet_id.clone(),
             SecretBytes::new(vec![1; 32]),
             SecretBytes::new(vec![2; 32]),

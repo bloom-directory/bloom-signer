@@ -71,18 +71,7 @@ pub enum SignatureEncoding {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "scheme", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DerivationRef {
-    Bip32Secp256k1 {
-        root_key_id: Token,
-        path: String,
-    },
-    /// A BIP-39 multi-curve derived child, identified at the backend
-    /// boundary by its wallet-seed root (a Token, never a signable KeyRef),
-    /// derivation profile, and canonical allocated path.
-    Bip39Multicurve {
-        wallet_seed_ref: Token,
-        profile: crate::DerivationProfile,
-        path: String,
-    },
+    Bip32Secp256k1 { root_key_id: Token, path: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -136,16 +125,6 @@ impl KeyRef {
         }
         match (&self.key_spec, &self.derivation) {
             (KeySpec::Secp256k1, Some(DerivationRef::Bip32Secp256k1 { path, .. })) => {
-                validate_bip32_path(path)
-            }
-            (KeySpec::Secp256k1, Some(DerivationRef::Bip39Multicurve { profile, path, .. }))
-                if *profile == crate::DerivationProfile::Bip44EvmSecp256k1V1 =>
-            {
-                validate_bip32_path(path)
-            }
-            (KeySpec::Ed25519, Some(DerivationRef::Bip39Multicurve { profile, path, .. }))
-                if *profile == crate::DerivationProfile::Bip44SolanaSlip10Ed25519V1 =>
-            {
                 validate_bip32_path(path)
             }
             (_, None) => Ok(()),

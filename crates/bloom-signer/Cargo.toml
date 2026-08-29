@@ -14,13 +14,10 @@ triad-dev-harness = ["bloom-triad-local-transport/triad-dev-harness"]
 [dependencies]
 blake3.workspace = true
 bloom-signer-api.workspace = true
-bloom-signer-derive.workspace = true
-bloom-signer-process-hardening.workspace = true
 bloom-triad-local-transport.workspace = true
 bloom-platform-containment.workspace = true
 bloom-audit-checkpoint.workspace = true
 bloom-service-activation.workspace = true
-bloom-service-observability.workspace = true
 bloom-trusted-time.workspace = true
 bloom-signer-backend-api = { path = "../bloom-signer-backend-api" }
 bloom-signer-backend-local = { path = "../bloom-signer-backend-local", optional = true }
@@ -44,13 +41,8 @@ serde_json.workspace = true
 sha2.workspace = true
 sha3.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
-tracing.workspace = true
 zeroize.workspace = true
-thiserror.workspace = true
 
 [dev-dependencies]
-bloom-signer-vectors = { path = "../bloom-signer-vectors" }
 tempfile = "3"
 k256.workspace = true
-rusqlite.workspace = true
-tracing-subscriber = { version = "0.3", features = ["json"] }

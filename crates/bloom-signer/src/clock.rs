@@ -15,18 +15,6 @@ pub enum ClockCondition {
     Repaired,
 }
 
-impl ClockCondition {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Healthy => "healthy",
-            Self::ForwardJumpRejected => "forward_jump_rejected",
-            Self::Untrusted => "untrusted",
-            Self::RollbackFrozen => "rollback_frozen",
-            Self::Repaired => "repaired",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClockDecision {
     pub effective_now_ms: u64,
