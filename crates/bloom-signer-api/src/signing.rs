@@ -78,6 +78,11 @@ pub struct UnsignedSignRequest {
     pub selector_kind: SelectorKind,
     pub ordered_payload_digests: Vec<Digest32>,
     pub ordered_hashes: Vec<Digest32>,
+    /// Raw preimages for message-signing suites. Digest-signing suites keep
+    /// this empty. The Broker signature authenticates these bytes and Signer
+    /// independently checks every SHA-256 commitment before dispatch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ordered_messages: Vec<Base64UrlBytes>,
     pub signature_count: DecimalU64,
     pub petal_use_claim_digest: Option<Digest32>,
     pub claim_assurance_digest: Option<Digest32>,
@@ -99,6 +104,24 @@ pub struct SignRequest {
 
 impl SignRequest {
     pub fn validate_shape(&self) -> Result<(), ProtocolError> {
+        let messages_are_bound = match self.unsigned.crypto_suite {
+            CryptoSuite::Ed25519Message => {
+                self.unsigned.ordered_messages.len() == self.unsigned.ordered_hashes.len()
+                    && self
+                        .unsigned
+                        .ordered_messages
+                        .iter()
+                        .zip(&self.unsigned.ordered_hashes)
+                        .zip(&self.unsigned.ordered_payload_digests)
+                        .all(|((message, ordered_hash), payload_digest)| {
+                            let digest =
+                                Digest32::from_bytes(Sha256::digest(message.decode()).into());
+                            &digest == ordered_hash && &digest == payload_digest
+                        })
+            }
+            CryptoSuite::Secp256k1Keccak256Recoverable
+            | CryptoSuite::Secp256k1Sha256Recoverable => self.unsigned.ordered_messages.is_empty(),
+        };
         if self.unsigned.schema.as_str() != "bloom.sign-request/1"
             || self.unsigned.audience.as_str() != "bloom-signer"
             || self.unsigned.expires_at_ms.get() <= self.unsigned.not_before_ms.get()
@@ -110,6 +133,7 @@ impl SignRequest {
                 .saturating_sub(self.unsigned.issued_at_ms.get())
                 > 30_000
             || self.unsigned.signature_count.get() != self.unsigned.ordered_hashes.len() as u64
+            || !messages_are_bound
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
