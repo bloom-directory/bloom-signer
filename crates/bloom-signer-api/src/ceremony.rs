@@ -464,6 +464,10 @@ pub struct CustodySignerContribution {
     pub browser_output_recipient_key: Option<Base64UrlBytes>,
     #[serde(default)]
     pub petal_key_scope: Option<PetalKeyScope>,
+    /// Selected root seed profile for wallet registration/import. Passed to browser
+    /// to control the import format: BIP-39 mnemonic or raw private key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet_seed_profile: Option<crate::WalletSeedProfile>,
     pub expires_at_ms: DecimalU64,
     pub signer_key_id: Token,
     pub signer_signature: Base64UrlBytes,
