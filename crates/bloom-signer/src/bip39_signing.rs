@@ -82,7 +82,16 @@ pub fn entropy_to_seed(
         nonce: bloom_signer_api::Base64UrlBytes::from_bytes(wrapped_entropy_nonce),
         ciphertext: bloom_signer_api::Base64UrlBytes::from_bytes(wrapped_entropy_ciphertext),
     };
-    let aad = crate::custody::root_aad(wallet_id, wrap_format_version);
+    // This helper only ever unwraps BIP-39 entropy, so the AAD is built for
+    // that profile and the caller's declared entropy size. From
+    // WRAP_FORMAT_V2 those values are authenticated, so a mismatch fails the
+    // AEAD here rather than after derivation.
+    let aad = crate::custody::root_aad(
+        wallet_id,
+        wrap_format_version,
+        crate::custody::RootMaterialProfile::Bip39MulticurveV1,
+        u32::try_from(entropy_bits).ok(),
+    );
     let secret = bloom_signer_backend_api::SecretBytes::new(wkek.to_vec());
     let entropy = Zeroizing::new(
         crate::custody::decrypt(&secret, &blob, &aad)

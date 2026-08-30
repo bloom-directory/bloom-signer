@@ -119,7 +119,14 @@ fn bip39_rekey_preserves_the_child_across_restart() {
     let mut keys = std::collections::BTreeMap::new();
     keys.insert(cred("cred-1").encoded().to_owned(), key(0x22));
     custody
-        .rekey_wrap_format(&unlocked, 2, &keys, None)
+        // Version-relative: new wallets are created at WRAP_FORMAT_CURRENT,
+        // so a rekey must target the next version, not a fixed number.
+        .rekey_wrap_format(
+            &unlocked,
+            bloom_signer::custody::WRAP_FORMAT_CURRENT + 1,
+            &keys,
+            None,
+        )
         .unwrap();
 
     let unlocked_again = custody

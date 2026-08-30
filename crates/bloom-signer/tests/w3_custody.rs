@@ -4,6 +4,10 @@ use bloom_signer_backend_api::SecretBytes;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// New wallets are created at `WRAP_FORMAT_CURRENT`, so a rekey must target
+/// the next version rather than a fixed literal.
+const NEXT_WRAP_FORMAT: u32 = bloom_signer::custody::WRAP_FORMAT_CURRENT + 1;
+
 fn credential(value: u8) -> Base64UrlBytes {
     Base64UrlBytes::from_bytes(&[value; 32])
 }
@@ -114,7 +118,7 @@ fn ac28_policy_versions_do_not_change_wrap_aad_and_format_rekey_is_atomic() {
     let before_failed_rekey = custody.backup();
     assert_eq!(
         custody
-            .rekey_wrap_format(&unlocked, 2, &incomplete, Some(&key(7)))
+            .rekey_wrap_format(&unlocked, NEXT_WRAP_FORMAT, &incomplete, Some(&key(7)))
             .unwrap_err()
             .code,
         ProtocolErrorCode::ApprovalRearmRequired
@@ -126,15 +130,15 @@ fn ac28_policy_versions_do_not_change_wrap_aad_and_format_rekey_is_atomic() {
         (credential(2).encoded().to_owned(), key(2)),
     ]);
     custody
-        .rekey_wrap_format(&unlocked, 2, &complete, Some(&key(7)))
+        .rekey_wrap_format(&unlocked, NEXT_WRAP_FORMAT, &complete, Some(&key(7)))
         .unwrap();
     let rekeyed = custody.backup();
-    assert_eq!(rekeyed.wrap_format_version, 2);
+    assert_eq!(rekeyed.wrap_format_version, NEXT_WRAP_FORMAT);
     assert!(
         rekeyed
             .credential_wraps
             .iter()
-            .all(|wrap| wrap.wrap_format_version == 2)
+            .all(|wrap| wrap.wrap_format_version == NEXT_WRAP_FORMAT)
     );
     assert!(
         custody
@@ -245,14 +249,145 @@ fn rekeyed_backup_with_revoked_older_wrap_restarts() {
     custody.revoke_credential(&credential(1)).unwrap();
     let keys = BTreeMap::from([(credential(2).encoded().to_owned(), key(2))]);
     custody
-        .rekey_wrap_format(&unlocked, 2, &keys, None)
+        .rekey_wrap_format(&unlocked, NEXT_WRAP_FORMAT, &keys, None)
         .unwrap();
     let backup = custody.backup();
-    assert_eq!(backup.credential_wraps[0].wrap_format_version, 1);
+    // The revoked wrap is left at the version it was created under.
+    assert_eq!(
+        backup.credential_wraps[0].wrap_format_version,
+        bloom_signer::custody::WRAP_FORMAT_CURRENT
+    );
     let restored = WalletCustody::restore(backup).unwrap();
     assert!(
         restored
             .unlock_with_credential(&credential(2), &key(2))
             .is_ok()
     );
+}
+
+/// From WRAP_FORMAT_V2 the fields that decide how the decrypted root is
+/// *interpreted* are authenticated, so editing them in the backup file
+/// fails the AEAD at decrypt time — before any derivation runs.
+///
+/// The specific attack this closes: `root_material_profile` carries
+/// `#[serde(default)]` and its default is `LegacySecp`, the one arm applying
+/// no length check. Stripping the field therefore both disabled the
+/// decrypt-time validation and reinterpreted BIP-39 entropy as a raw BIP-32
+/// seed — a different, silently valid key tree from the same secret.
+#[test]
+fn tampering_with_root_interpretation_metadata_fails_before_derivation() {
+    let custody = registered();
+    let baseline = custody.backup();
+    assert_eq!(
+        baseline.wrap_format_version,
+        bloom_signer::custody::WRAP_FORMAT_V2,
+        "new wallets must be created at the authenticated envelope version"
+    );
+    assert!(
+        WalletCustody::restore(baseline.clone())
+            .unwrap()
+            .unlock_with_credential(&credential(1), &key(1))
+            .is_ok(),
+        "baseline backup must unlock"
+    );
+
+    // Strip the profile, as an attacker editing the file would.
+    let mut stripped = baseline.clone();
+    stripped.root_material_profile = bloom_signer::custody::RootMaterialProfile::default();
+    assert_eq!(
+        stripped.root_material_profile,
+        bloom_signer::custody::RootMaterialProfile::LegacySecp,
+        "the serde default is the unchecked arm, which is what made this reachable"
+    );
+    assert!(
+        WalletCustody::restore(stripped)
+            .unwrap()
+            .unlock_with_credential(&credential(1), &key(1))
+            .is_err(),
+        "a relabelled root must not decrypt"
+    );
+
+    // Change the declared entropy size without touching the ciphertext.
+    let mut resized = baseline.clone();
+    resized.entropy_bits = Some(128);
+    assert!(
+        WalletCustody::restore(resized)
+            .unwrap()
+            .unlock_with_credential(&credential(1), &key(1))
+            .is_err(),
+        "a rewritten entropy size must not decrypt"
+    );
+
+    // Absent and present-but-zero must not collide in the AAD encoding.
+    let mut cleared = baseline;
+    cleared.entropy_bits = None;
+    assert!(
+        WalletCustody::restore(cleared)
+            .unwrap()
+            .unlock_with_credential(&credential(1), &key(1))
+            .is_err(),
+        "removing the entropy size must not decrypt"
+    );
+}
+
+/// V1 envelopes keep their original AAD byte-for-byte, so wallets written
+/// before the metadata was authenticated still unlock. The upgrade is
+/// `rekey_wrap_format`, which re-encrypts under the V2 AAD.
+#[test]
+fn legacy_v1_envelopes_still_unlock_and_upgrade_to_v2() {
+    let custody = registered();
+    let unlocked = custody
+        .unlock_with_credential(&credential(1), &key(1))
+        .unwrap();
+
+    let keys = BTreeMap::from([(credential(1).encoded().to_owned(), key(1))]);
+    custody
+        .rekey_wrap_format(&unlocked, NEXT_WRAP_FORMAT, &keys, None)
+        .unwrap();
+    let upgraded = custody.backup();
+    assert_eq!(upgraded.wrap_format_version, NEXT_WRAP_FORMAT);
+
+    // The upgrade re-encrypts rather than relabelling: the profile is
+    // carried across unchanged, and the wallet still unlocks.
+    assert_eq!(
+        upgraded.root_material_profile,
+        bloom_signer::custody::RootMaterialProfile::Bip39MulticurveV1,
+        "an upgrade must never restate what the material is"
+    );
+    assert!(
+        WalletCustody::restore(upgraded.clone())
+            .unwrap()
+            .unlock_with_credential(&credential(1), &key(1))
+            .is_ok()
+    );
+
+    // Metadata stays authenticated after the upgrade.
+    let mut tampered = upgraded;
+    tampered.root_material_profile = bloom_signer::custody::RootMaterialProfile::LegacySecp;
+    assert!(
+        WalletCustody::restore(tampered)
+            .unwrap()
+            .unlock_with_credential(&credential(1), &key(1))
+            .is_err()
+    );
+}
+
+/// The AAD binds a stable tag per profile rather than its serde name, so a
+/// future rename cannot silently change what a ciphertext authenticates.
+#[test]
+fn profile_aad_tags_are_stable_and_distinct() {
+    use bloom_signer::custody::RootMaterialProfile as P;
+    assert_eq!(P::Bip39MulticurveV1.aad_tag(), "bip39-multicurve-v1");
+    assert_eq!(
+        P::ImportedSecp256k1Scalar.aad_tag(),
+        "imported-secp256k1-scalar"
+    );
+    assert_eq!(P::LegacySecp.aad_tag(), "legacy-secp");
+    let tags = [
+        P::Bip39MulticurveV1.aad_tag(),
+        P::ImportedSecp256k1Scalar.aad_tag(),
+        P::LegacySecp.aad_tag(),
+    ];
+    let unique: std::collections::BTreeSet<_> = tags.iter().collect();
+    assert_eq!(unique.len(), tags.len(), "profile tags must be distinct");
 }

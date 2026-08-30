@@ -116,7 +116,12 @@ fn entropy_to_seed_validates_length_against_metadata() {
             aead::{Aead, Payload},
         };
         let nonce = [3u8; 24];
-        let aad = bloom_signer::custody::root_aad(&wallet, 1);
+        let aad = bloom_signer::custody::root_aad(
+            &wallet,
+            bloom_signer::custody::WRAP_FORMAT_V1,
+            bloom_signer::custody::RootMaterialProfile::Bip39MulticurveV1,
+            None,
+        );
         let ciphertext = XChaCha20Poly1305::new(Key::from_slice(&wkek))
             .encrypt(
                 XNonce::from_slice(&nonce),

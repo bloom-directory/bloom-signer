@@ -63,6 +63,18 @@ pub enum RootMaterialProfile {
     LegacySecp,
 }
 
+impl RootMaterialProfile {
+    /// Stable byte tag for AEAD binding. Fixed independently of serde naming
+    /// so a rename cannot silently change what a ciphertext authenticates.
+    pub const fn aad_tag(self) -> &'static str {
+        match self {
+            Self::Bip39MulticurveV1 => "bip39-multicurve-v1",
+            Self::ImportedSecp256k1Scalar => "imported-secp256k1-scalar",
+            Self::LegacySecp => "legacy-secp",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WalletCustodyBackup {
@@ -292,11 +304,16 @@ impl WalletCustody {
                 "registration root or policy signing key has invalid length",
             ));
         }
-        let wrap_format_version = 1;
+        let wrap_format_version = WRAP_FORMAT_CURRENT;
         let encrypted_root = encrypt(
             &wkek,
             root.expose_to_backend(),
-            &root_aad(&wallet_id, wrap_format_version),
+            &root_aad(
+                &wallet_id,
+                wrap_format_version,
+                root_material_profile,
+                entropy_bits,
+            ),
         )?;
         let encrypted_policy_signing_key = encrypt(
             &wkek,
@@ -630,7 +647,12 @@ impl WalletCustody {
         replacement.encrypted_root = encrypt(
             &wkek_key,
             unlocked.root.as_slice(),
-            &root_aad(&replacement.wallet_id, next_version),
+            &root_aad(
+                &replacement.wallet_id,
+                next_version,
+                replacement.root_material_profile,
+                replacement.entropy_bits,
+            ),
         )?;
         replacement.encrypted_policy_signing_key = encrypt(
             &wkek_key,
@@ -728,7 +750,12 @@ fn unlock_with_wkek(
     let root = decrypt(
         &key,
         &backup.encrypted_root,
-        &root_aad(&backup.wallet_id, backup.wrap_format_version),
+        &root_aad(
+            &backup.wallet_id,
+            backup.wrap_format_version,
+            backup.root_material_profile,
+            backup.entropy_bits,
+        ),
     )?;
     // Decrypt-time plaintext validation: authenticate (done above), then
     // require the decrypted root length to match its recorded profile.
@@ -864,13 +891,57 @@ fn validate_backup_shape(backup: &WalletCustodyBackup) -> Result<(), ProtocolErr
     Ok(())
 }
 
-pub fn root_aad(wallet_id: &Token, wrap_format_version: u32) -> Vec<u8> {
-    [
+/// Original envelope. Its AAD covers only the wallet and version, so the
+/// metadata describing how to *interpret* the decrypted root travels
+/// unauthenticated beside it. Still readable; never written for new wallets.
+pub const WRAP_FORMAT_V1: u32 = 1;
+
+/// Current envelope. Binds `root_material_profile` and `entropy_bits` into
+/// the root AAD, so the fields that decide how the decrypted bytes are
+/// interpreted cannot be edited without invalidating the ciphertext.
+pub const WRAP_FORMAT_V2: u32 = 2;
+
+/// The version new wallets are created at.
+pub const WRAP_FORMAT_CURRENT: u32 = WRAP_FORMAT_V2;
+
+/// Additional authenticated data for the wrapped root.
+///
+/// From [`WRAP_FORMAT_V2`] the profile and entropy size are part of the AAD.
+/// They decide whether the plaintext is read as BIP-39 entropy or as a raw
+/// BIP-32 seed — different key trees from the same secret — so an attacker
+/// able to edit the backup file could previously strip
+/// `root_material_profile`, fall back to its `LegacySecp` serde default (the
+/// one arm applying no length check), and change that interpretation without
+/// touching the ciphertext. Binding them here turns that edit into an AEAD
+/// failure at decrypt time, before any derivation runs.
+///
+/// V1 envelopes keep their original AAD byte-for-byte so existing wallets
+/// stay readable; `rekey_wrap_format` moves them to V2.
+pub fn root_aad(
+    wallet_id: &Token,
+    wrap_format_version: u32,
+    root_material_profile: RootMaterialProfile,
+    entropy_bits: Option<u32>,
+) -> Vec<u8> {
+    let mut aad = [
         ROOT_AAD,
         wallet_id.as_str().as_bytes(),
         &wrap_format_version.to_be_bytes(),
     ]
-    .concat()
+    .concat();
+    if wrap_format_version >= WRAP_FORMAT_V2 {
+        aad.extend_from_slice(root_material_profile.aad_tag().as_bytes());
+        // A distinguished encoding for "absent" so `None` and `Some(0)`
+        // cannot collide.
+        match entropy_bits {
+            Some(bits) => {
+                aad.push(1);
+                aad.extend_from_slice(&bits.to_be_bytes());
+            }
+            None => aad.push(0),
+        }
+    }
+    aad
 }
 
 fn policy_key_aad(wallet_id: &Token, wrap_format_version: u32) -> Vec<u8> {
