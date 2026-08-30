@@ -119,7 +119,10 @@ impl SignerRpcService {
         if signer_request_requires_containment(&request) {
             self.require_network_containment()?;
         }
-        let now_ms = if broker_signer_request_is_read_only(&request) {
+        // Read-only classification lives once, on `BrokerSignerMethod`.
+        // The duplicate variant list this replaced had drifted from it on
+        // four methods.
+        let now_ms = if bloom_signer_api::TypedRequestMethod::is_read_only(&request) {
             self.clock.now_ms_read_only()?
         } else {
             self.clock.now_ms(false)?
@@ -663,31 +666,6 @@ fn signer_request_requires_containment(request: &BrokerSignerRequest) -> bool {
             | Request::RecoveryPrepare(_)
             | Request::CustodyBindOutputRecipient(_)
             | Request::CustodyComplete(_)
-    )
-}
-
-fn broker_signer_request_is_read_only(request: &BrokerSignerRequest) -> bool {
-    use BrokerSignerRequest as Request;
-    matches!(
-        request,
-        Request::SystemHello(_)
-            | Request::SignerReadiness(_)
-            | Request::SignerCapabilities(_)
-            | Request::KeyGetPublic(_)
-            | Request::KeyListPublic(_)
-            | Request::KeyDerivationCapabilities(_)
-            | Request::KeyListDerived(_)
-            | Request::DerivedAccountList(_)
-            | Request::KeyEnrollStatus(_)
-            | Request::CeremonyStatus(_)
-            | Request::SealedApprovalStatus(_)
-            | Request::RevocationState(_)
-            | Request::OperationStatus(_)
-            | Request::PolicyRead(_)
-            | Request::WalletRegistrationStatus(_)
-            | Request::CredentialListPublic(_)
-            | Request::CustodyResult(_)
-            | Request::CustodyStatus(_)
     )
 }
 

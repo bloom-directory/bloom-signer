@@ -47,6 +47,7 @@ method_enum!(BrokerSignerMethod {
     KeyDerivationCapabilities => "key.derivation_capabilities",
     KeyDerivePrepare => "key.derive_prepare",
     KeyListDerived => "key.list_derived",
+    DerivedAccountList => "wallet.derived_accounts",
     KeyEnrollPrepare => "key.enroll_prepare",
     KeyEnrollStatus => "key.enroll_status",
     CeremonyPrepare => "ceremony.prepare",
@@ -78,6 +79,63 @@ method_enum!(BrokerSignerMethod {
     CustodyResult => "custody.result",
     CustodyStatus => "custody.status",
 });
+
+impl BrokerSignerMethod {
+    /// Whether this method may be served without consuming mutation quota
+    /// and while the audit chain is degraded.
+    ///
+    /// This is the single source of truth. It is an exhaustive match rather
+    /// than a name-shape rule for two reasons the previous suffix heuristic
+    /// demonstrated: `key.enroll_status` and `wallet.registration_status`
+    /// end in `_status`, not `.status`, so a suffix rule silently classified
+    /// two reads as mutations; and a new read method (`wallet.derived_accounts`)
+    /// was simply absent from the list. Being a match on the enum, adding a
+    /// variant now fails to compile until it is classified.
+    pub const fn is_read_only(self) -> bool {
+        match self {
+            Self::SystemHello
+            | Self::SignerReadiness
+            | Self::SignerCapabilities
+            | Self::KeyGetPublic
+            | Self::KeyListPublic
+            | Self::KeyDerivationCapabilities
+            | Self::KeyListDerived
+            | Self::DerivedAccountList
+            | Self::KeyEnrollStatus
+            | Self::CeremonyStatus
+            | Self::SealedApprovalStatus
+            | Self::RevocationState
+            | Self::OperationStatus
+            | Self::PolicyRead
+            | Self::WalletRegistrationStatus
+            | Self::CredentialListPublic
+            | Self::CustodyResult
+            | Self::CustodyStatus => true,
+
+            Self::KeyDerivePrepare
+            | Self::KeyEnrollPrepare
+            | Self::CeremonyPrepare
+            | Self::CeremonyComplete
+            | Self::CeremonyCancel
+            | Self::SealedApprovalRevoke
+            | Self::SealedApprovalRevokeAll
+            | Self::SignerSign
+            | Self::SignerSignBatch
+            | Self::PolicyCompareAndSwap
+            | Self::WalletRegistrationPrepare
+            | Self::WalletUnlockPrepare
+            | Self::WalletImportPrepare
+            | Self::WalletExportPrepare
+            | Self::WalletDeletePrepare
+            | Self::CredentialAddPrepare
+            | Self::CredentialRemovePrepare
+            | Self::CredentialReplacePrepare
+            | Self::RecoveryPrepare
+            | Self::CustodyBindOutputRecipient
+            | Self::CustodyComplete => false,
+        }
+    }
+}
 
 method_enum!(ControlMethod {
     Revoke => "control.revoke",
