@@ -31,8 +31,15 @@ bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-s
 aws-config = { version = "=1.8.1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-credential-types = "1"
 # Exact AWS service pins preserve the workspace's declared Rust 1.85 floor.
-aws-sdk-kms = "=1.77.0"
-aws-sdk-sts = "=1.76.0"
+#
+# `default-features = false` is deliberate. These SDKs default to their
+# `rustls` feature, which despite the name selects the *legacy* TLS stack
+# (aws-smithy-runtime/tls-rustls -> legacy-rustls-ring + hyper-0.14, i.e.
+# rustls 0.21 and h2 0.3). `default-https-client` selects the current one
+# (rustls 0.23 + aws-lc-rs). Both reach the same endpoints; only the second
+# is still maintained.
+aws-sdk-kms = { version = "=1.77.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sts = { version = "=1.76.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
 aws-types = "1"
