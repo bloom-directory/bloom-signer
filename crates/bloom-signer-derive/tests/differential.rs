@@ -308,4 +308,13 @@ fn zeroizing_wrappers_cover_every_secret_stage() {
     // pins the API shape so a refactor cannot silently drop Zeroizing.
     let _: &Zeroizing<[u8; 64]> = &seed;
     let _: &Zeroizing<[u8; 32]> = &entropy;
+
+    // The wrappers only cover the values this crate hands out. The parsed
+    // mnemonic itself holds the entropy as word indices inside the
+    // reference type, which wipes them on drop only when the `bip39`
+    // crate's `zeroize` feature is enabled. Assert the trait rather than
+    // trusting the dependency declaration.
+    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    assert_zeroize_on_drop::<bip39::Mnemonic>();
+    drop(parsed);
 }

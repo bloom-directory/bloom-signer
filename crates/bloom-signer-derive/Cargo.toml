@@ -10,7 +10,7 @@ description = "BIP-39 mnemonic, PBKDF2 seed, BIP-32 secp256k1, and hardened SLIP
 ed25519-dalek.workspace = true
 hex.workspace = true
 hmac.workspace = true
-bip39 = "2"
+bip39 = { version = "2", features = ["zeroize"] }
 k256.workspace = true
 rand.workspace = true
 sha2.workspace = true

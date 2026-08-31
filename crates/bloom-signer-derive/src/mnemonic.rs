@@ -33,9 +33,25 @@ pub enum MnemonicError {
 
 /// A parsed English mnemonic holding its entropy. Dropping zeroizes the
 /// entropy; the phrase itself lives in the caller's Zeroizing string.
+///
+/// The zeroize-on-drop guarantee comes from the [`bip39`] crate's optional
+/// `zeroize` feature, which this crate enables. Without it `bip39::Mnemonic`
+/// is a plain `[u16; 24]` of word indices — the entropy in another encoding
+/// — left in freed memory. The `const` assertion below makes that a
+/// compile-time requirement rather than a comment.
 pub struct ParsedMnemonic {
     mnemonic: bip39::Mnemonic,
 }
+
+/// Compile-time proof of the guarantee documented on [`ParsedMnemonic`]:
+/// dropping the reference mnemonic wipes the word indices. Removing
+/// `features = ["zeroize"]` from the `bip39` dependency fails the build
+/// here instead of silently downgrading every import to a memory leak of
+/// recovery material.
+const _: fn() = || {
+    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    assert_zeroize_on_drop::<bip39::Mnemonic>();
+};
 
 impl ParsedMnemonic {
     /// The entropy bytes.
