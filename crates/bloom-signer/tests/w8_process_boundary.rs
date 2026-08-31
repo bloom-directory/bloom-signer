@@ -158,7 +158,9 @@ fn bip39_terms(key_ref: KeyRef, wallet_id: &Token) -> SealedApprovalTerms {
         request_nonce: RequestNonce::new("66".repeat(16)).unwrap(),
         issued_at_ms: DecimalU64::new(1_000),
         not_before_ms: DecimalU64::new(1_000),
-        expires_at_ms: DecimalU64::new(30_303),
+        // Both restore/sign phases below run around 80 seconds in this
+        // synthetic clock. Keep the authority live through those ceremonies.
+        expires_at_ms: DecimalU64::new(300_303),
         renewal_of: None,
     }
 }
