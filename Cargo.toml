@@ -16,6 +16,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
+# Internal crates. None of these is published: they carry the Signer's key
+# handling, and an accidental `cargo publish` would put it on crates.io.
+publish = false
 
 [workspace.dependencies]
 bloom-signer-api = { path = "crates/bloom-signer-api" }
