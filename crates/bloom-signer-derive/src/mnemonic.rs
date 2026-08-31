@@ -19,8 +19,12 @@ use crate::policy;
 pub enum MnemonicError {
     #[error("mnemonic word count {found} is not one of 12/15/18/21/24")]
     WrongWordCount { found: usize },
-    #[error("word {index} is not in the BIP-39 English wordlist: {word:?}")]
-    UnknownWord { index: usize, word: String },
+    /// The offending token is deliberately not carried. It is a fragment of
+    /// what the operator typed while entering recovery material, and this
+    /// error is stringified onto the wire by the import ceremony. The
+    /// position is enough to correct a typo.
+    #[error("word {index} is not in the BIP-39 English wordlist")]
+    UnknownWord { index: usize },
     #[error("mnemonic checksum is invalid")]
     BadChecksum,
     #[error("mnemonic is not already NFKD-normalized")]
@@ -113,20 +117,11 @@ pub fn parse_mnemonic(mnemonic: &str) -> Result<ParsedMnemonic, MnemonicError> {
     }
     let parsed = match bip39::Mnemonic::parse(mnemonic) {
         Ok(parsed) => parsed,
-        Err(bip39::Error::UnknownWord(_)) => {
-            // Recover the offending index for the caller.
-            for (index, word) in mnemonic.split_whitespace().enumerate() {
-                if bip39::Language::English.find_word(word).is_none() {
-                    return Err(MnemonicError::UnknownWord {
-                        index,
-                        word: word.to_owned(),
-                    });
-                }
-            }
-            return Err(MnemonicError::UnknownWord {
-                index: 0,
-                word: String::new(),
-            });
+        // The reference reports the position within `split_whitespace()` —
+        // the same splitting used for the word-count check above — so it is
+        // taken directly rather than re-derived by a second scan.
+        Err(bip39::Error::UnknownWord(index)) => {
+            return Err(MnemonicError::UnknownWord { index });
         }
         Err(bip39::Error::InvalidChecksum) => return Err(MnemonicError::BadChecksum),
         Err(other) => return Err(MnemonicError::Reference(other.to_string())),
@@ -200,7 +195,7 @@ mod tests {
         );
         assert!(matches!(
             entropy_from_mnemonic(&unknown),
-            Err(MnemonicError::UnknownWord { index: 0, .. })
+            Err(MnemonicError::UnknownWord { index: 0 })
         ));
 
         let mut corrupted: Vec<&str> = mnemonic.split_whitespace().collect();
@@ -215,6 +210,43 @@ mod tests {
             mnemonic_from_entropy(&[0u8; 17]),
             Err(MnemonicError::InvalidEntropyLength { found: 17 })
         ));
+    }
+
+    #[test]
+    fn unknown_word_reports_its_position_without_echoing_the_token() {
+        let entropy = Zeroizing::new(vec![0u8; 32]);
+        let mnemonic = mnemonic_from_entropy(entropy.as_slice()).unwrap();
+        let mut words: Vec<&str> = mnemonic.split_whitespace().collect();
+        // A token outside the wordlist at a position other than the first.
+        // The position pins the reference index to the phrase position,
+        // which is what `parse_mnemonic` now relies on instead of a second
+        // scan of its own.
+        const CANARY: &str = "zzzcanaryzzz";
+        words[5] = CANARY;
+        let corrupted = words.join(" ");
+
+        // `ParsedMnemonic` deliberately implements no `Debug` (it holds the
+        // entropy), so the error is taken by match rather than `unwrap_err`.
+        let error = match parse_mnemonic(&corrupted) {
+            Err(error) => error,
+            Ok(_) => panic!("an out-of-wordlist token must not parse"),
+        };
+        assert!(
+            matches!(error, MnemonicError::UnknownWord { index: 5 }),
+            "expected the offending position, got {error:?}"
+        );
+        // The import ceremony stringifies this error onto the wire, so the
+        // operator's typed token must not survive into it.
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains(CANARY),
+            "Display rendered the typed token: {rendered}"
+        );
+        let debugged = format!("{error:?}");
+        assert!(
+            !debugged.contains(CANARY),
+            "Debug rendered the typed token: {debugged}"
+        );
     }
 
     #[test]
