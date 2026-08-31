@@ -1432,6 +1432,52 @@ fn approval_completion_verifies_raw_proof_decrypts_prf_and_is_idempotent() {
 }
 
 #[test]
+fn approval_browser_lifetime_is_capped_by_the_authority_expiry() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, _, _) = service(&authenticator);
+    let (registration, _) = complete_new_wallet(
+        &service,
+        &authenticator,
+        CeremonyKind::WalletRegistration,
+        operation("11"),
+        None,
+        None,
+        1_000,
+    );
+    let mut terms = terms(registration.public_key_refs[0].clone());
+    terms.wallet_id = registration.wallet_id.unwrap();
+    terms.expires_at_ms = DecimalU64::new(2_001);
+    let operation_id = operation("12");
+    let prepared = service
+        .prepare_approval(
+            CeremonyPrepareRequest {
+                activation_operation_id: operation_id.clone(),
+                terms,
+                review_manifest_digest: digest("78"),
+                exact_ordered_payload_digests: vec![digest("22")],
+                exact_ordered_hashes: vec![digest("33")],
+                replacement_approval_id: None,
+            },
+            2_000,
+        )
+        .unwrap();
+    assert_eq!(prepared.contribution.expires_at_ms.get(), 2_001);
+
+    let assertion = authenticator.assertion(&prepared.challenges[0].canonical_bytes().unwrap(), 2);
+    let error = futures::executor::block_on(service.complete_approval(
+        CeremonyCompleteRequest {
+            activation_operation_id: operation_id.clone(),
+            proof: WebAuthnCeremonyProof::Assertion { assertion },
+            contribution: prepared.contribution,
+            encrypted_local_prf: None,
+        },
+        2_001,
+    ))
+    .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::CeremonyReplay);
+}
+
+#[test]
 fn stale_webauthn_counter_fails_closed_into_a_durable_terminal_ceremony() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, _, engine, registry) = service(&authenticator);

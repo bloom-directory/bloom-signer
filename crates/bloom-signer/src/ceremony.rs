@@ -469,7 +469,15 @@ impl SignerCeremonyService {
             ephemeral_encryption_public_key: recipient
                 .as_ref()
                 .map(|recipient| recipient.public_key().clone()),
-            expires_at_ms: DecimalU64::new(now_ms.saturating_add(CEREMONY_TTL_MS)),
+            // A browser ceremony cannot outlive the authority it activates.
+            // In particular, Solana exact-message approvals are bounded by the
+            // recent blockhash lifetime, which is normally much shorter than
+            // the generic five-minute browser TTL.
+            expires_at_ms: DecimalU64::new(
+                now_ms
+                    .saturating_add(CEREMONY_TTL_MS)
+                    .min(request.terms.expires_at_ms.get()),
+            ),
             signer_key_id: self.signer_key_id.clone(),
             signer_signature: Base64UrlBytes::from_bytes(&[]),
         };
