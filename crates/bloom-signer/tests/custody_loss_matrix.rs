@@ -163,6 +163,28 @@ fn bip39_mnemonic_export_reconstructs_the_frozen_words() {
 }
 
 #[test]
+fn bip39_mnemonic_export_preserves_the_imported_word_count() {
+    let entropy = vec![0_u8; 16];
+    let expected = mnemonic_from_entropy(&entropy).unwrap();
+    let custody = WalletCustody::register_bip39(
+        Token::new("twelve-word-export").unwrap(),
+        SecretBytes::new(entropy),
+        key(0xAA),
+        key(0x11),
+        cred("cred-1"),
+        key(0x22),
+    )
+    .unwrap();
+    let unlocked = custody
+        .unlock_with_credential(&cred("cred-1"), &key(0x22))
+        .unwrap();
+    let exported = custody.export_mnemonic(&unlocked).unwrap();
+
+    assert_eq!(*exported, *expected);
+    assert_eq!(exported.split_whitespace().count(), 12);
+}
+
+#[test]
 fn imported_scalar_custody_rejects_mnemonic_export_and_keeps_its_path() {
     let custody = WalletCustody::register_imported_secp256k1(
         Token::new("imported").unwrap(),

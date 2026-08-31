@@ -3407,7 +3407,7 @@ fn bip39_mnemonic_export_seals_words_and_frozen_import_reproduces_vectors() {
 
     // (e) Export the mnemonic: words exist only in the sealed sensitive output.
     let recipient = HpkeRecipient::generate();
-    let effect = serde_json::json!({ "kind": "wallet_export", "format": "bip39_mnemonic24" });
+    let effect = serde_json::json!({ "kind": "wallet_export", "format": "bip39_mnemonic" });
     let exact_terms_digest =
         Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&effect).unwrap()).into());
     service

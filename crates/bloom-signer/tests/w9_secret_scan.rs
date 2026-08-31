@@ -327,7 +327,7 @@ fn bip39_secret_scan_is_empty_across_logs_audit_sqlite_and_responses() {
 
     // Export the mnemonic so the words pass through the sensitive-output path.
     let recipient = HpkeRecipient::generate();
-    let effect = serde_json::json!({ "kind": "wallet_export", "format": "bip39_mnemonic24" });
+    let effect = serde_json::json!({ "kind": "wallet_export", "format": "bip39_mnemonic" });
     let exact_terms_digest =
         Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&effect).unwrap()).into());
     service

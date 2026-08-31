@@ -2129,7 +2129,7 @@ impl SignerCeremonyService {
                             public_key_refs: Vec::new(),
                         })
                     }
-                    WalletExportFormat::Bip39Mnemonic24 => {
+                    WalletExportFormat::Bip39Mnemonic => {
                         // The words exist only in the sealed sensitive output,
                         // bound to the custody output recipient; they never
                         // enter public fields, audit, or logs.
@@ -2858,7 +2858,7 @@ enum GenericCustodyEffect {
 #[serde(rename_all = "snake_case")]
 enum WalletExportFormat {
     LegacyBackup,
-    Bip39Mnemonic24,
+    Bip39Mnemonic,
 }
 
 #[derive(Deserialize)]
