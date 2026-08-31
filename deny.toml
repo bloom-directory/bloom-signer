@@ -30,9 +30,10 @@ version = 2
 yanked = "deny"
 ignore = [
   # RUSTSEC-2026-0009 — `time` 0.3.45, stack exhaustion parsing untrusted
-  # date input (6.8 medium). Reached only through the AWS SDK's response
-  # parsing, so it requires a hostile or compromised KMS endpoint, and only
-  # when the optional `aws-kms` feature is built at all.
+  # date input (6.8 medium). It is present only when the optional AWS KMS
+  # graph is analyzed. The default `bloom-signer` release graph does not
+  # contain `time`; CI asserts that separately so this exception cannot
+  # silently spread into tonight's shipped local-backend artifact.
   #
   # This one is a genuine accepted risk, not a false positive. The fix is
   # `time` >= 0.3.47, which requires Rust 1.88 and so would raise the
@@ -50,6 +51,9 @@ allow = [
   "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",
   "BSD-3-Clause",
+  # rust-bip39 and its rust-bitcoin hash/hex dependencies are dedicated to
+  # the public domain under CC0. They implement the imported mnemonic codec.
+  "CC0-1.0",
   "ISC",
   "Unicode-3.0",
   "Zlib",
