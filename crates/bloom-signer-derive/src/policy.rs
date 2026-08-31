@@ -10,9 +10,6 @@ pub const GENERATE_WORDS: usize = 24;
 /// 21, or 24 words.
 pub const IMPORT_WORDS: [usize; 5] = [12, 15, 18, 21, 24];
 
-/// Generated wallets use the empty BIP-39 passphrase.
-pub const GENERATE_PASSPHRASE: &str = "";
-
 /// Entropy byte length for a valid BIP-39 word count, or `None`.
 ///
 /// 12 words = 128 bits, 15 = 160, 18 = 192, 21 = 224, 24 = 256; the
@@ -28,16 +25,6 @@ pub const fn entropy_bytes_for_words(words: usize) -> Option<usize> {
     }
 }
 
-/// Whether an import passphrase is permitted for the v1 profile.
-///
-/// v1 rejects non-empty import passphrases: losing or omitting a passphrase
-/// silently yields a different wallet while the words still validate, and
-/// the two-part recovery UX for that case is deliberately not designed yet.
-/// Adding it requires an explicit new profile version.
-pub const fn import_passphrase_allowed(passphrase: &str) -> bool {
-    passphrase.is_empty()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,7 +38,5 @@ mod tests {
         assert_eq!(entropy_bytes_for_words(21), Some(28));
         assert_eq!(entropy_bytes_for_words(24), Some(32));
         assert_eq!(entropy_bytes_for_words(13), None);
-        assert!(import_passphrase_allowed(""));
-        assert!(!import_passphrase_allowed("TREZOR"));
     }
 }

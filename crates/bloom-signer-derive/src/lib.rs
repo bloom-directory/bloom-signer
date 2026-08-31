@@ -6,8 +6,8 @@
 //!
 //! * [`mnemonic`] — 256-bit BIP-39 entropy and the English 24-word
 //!   encoding, with checksum validation and strict normalization;
-//! * [`seed`] — the BIP-39 passphrase-to-seed PBKDF2 (HMAC-SHA512, 2048
-//!   iterations, 64 bytes); the v1 profile freezes the **empty** passphrase;
+//! * [`seed`] — the BIP-39 mnemonic-to-seed PBKDF2 (HMAC-SHA512, 2048
+//!   iterations, 64 bytes); the v1 product surface has no passphrase input;
 //! * [`bip32`] — BIP-32 secp256k1 derivation for the
 //!   `bip44-evm-secp256k1-v1` profile (`m/44'/60'/<account>'/0/<index>`,
 //!   hardened purpose/coin/account, non-hardened change and index);
@@ -23,8 +23,7 @@
 //! - **Everything is vector-pinned.** The integration tests reproduce the
 //!   frozen corpus and the official BIP-32 / SLIP-10 test-vector-1 masters
 //!   byte-for-byte before any derivation is trusted.
-//! - Non-empty BIP-39 passphrases are deliberately absent: the v1 profile
-//!   freezes the empty passphrase and the plan defers others explicitly.
+//! - BIP-39 passphrases are deliberately absent from the product surface.
 
 #![forbid(unsafe_code)]
 
@@ -41,9 +40,6 @@ pub use mnemonic::{
     MnemonicError, ParsedMnemonic, entropy_from_mnemonic, generate_entropy, mnemonic_from_entropy,
     parse_mnemonic, seed_from_mnemonic,
 };
-pub use policy::{
-    GENERATE_PASSPHRASE, GENERATE_WORDS, IMPORT_WORDS, entropy_bytes_for_words,
-    import_passphrase_allowed,
-};
+pub use policy::{GENERATE_WORDS, IMPORT_WORDS, entropy_bytes_for_words};
 pub use seed::SEED_BYTES;
 pub use slip10::{DerivedEd25519, Ed25519DeriveError, derive_solana_account};

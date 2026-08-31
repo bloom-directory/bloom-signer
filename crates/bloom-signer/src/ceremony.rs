@@ -1674,15 +1674,8 @@ impl SignerCeremonyService {
                                 serde_json::from_slice(input.expose_to_backend())
                                     .map_err(malformed)?;
                             // Strict NFKD + checksum via the reference parser;
-                            // v1 imports accept every valid English length with
-                            // the empty passphrase. Non-empty passphrases are
-                            // rejected by the profile policy.
-                            if !bloom_signer_derive::import_passphrase_allowed(&import.passphrase) {
-                                return Err(protocol(
-                                    ProtocolErrorCode::BackendInvalidRequest,
-                                    "bip39-multicurve-v1 rejects non-empty passphrases",
-                                ));
-                            }
+                            // v1 imports accept every valid English length.
+                            // The input schema has no passphrase field.
                             let parsed = bloom_signer_derive::parse_mnemonic(&import.mnemonic)
                                 .map_err(|cause| {
                                     protocol(ProtocolErrorCode::MalformedFrame, cause.to_string())
@@ -2802,8 +2795,6 @@ struct RawWalletImportInput {
 struct Bip39MnemonicImportInput {
     credential_prf: Base64UrlBytes,
     mnemonic: Zeroizing<String>,
-    #[serde(default)]
-    passphrase: Zeroizing<String>,
 }
 
 #[derive(Deserialize)]

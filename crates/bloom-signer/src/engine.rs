@@ -7930,7 +7930,7 @@ mod require_key_tests {
             .unwrap(),
         );
         let mnemonic = bloom_signer_derive::mnemonic_from_entropy(&[7_u8; 16]).unwrap();
-        let seed = bloom_signer_derive::seed_from_mnemonic(&mnemonic, "").unwrap();
+        let seed = bloom_signer_derive::seed_from_mnemonic(&mnemonic).unwrap();
         let derived = bloom_signer_derive::derive_evm_account(&seed, 0, 0).unwrap();
         let child = KeyRef {
             backend: Token::new("local").unwrap(),

@@ -46,7 +46,7 @@ fn bip39_backend() -> (LocalSignerBackend, Vec<u8>) {
 
 fn bip39_child(entropy: &[u8], profile: DerivationProfile) -> (KeyRef, Vec<u8>, Vec<CryptoSuite>) {
     let mnemonic = bloom_signer_derive::mnemonic_from_entropy(entropy).unwrap();
-    let seed = bloom_signer_derive::seed_from_mnemonic(&mnemonic, "").unwrap();
+    let seed = bloom_signer_derive::seed_from_mnemonic(&mnemonic).unwrap();
     let (path, key_spec, spki, fingerprint, suites) = match profile {
         DerivationProfile::Bip44EvmSecp256k1V1 => {
             let derived = bloom_signer_derive::derive_evm_account(&seed, 0, 0).unwrap();

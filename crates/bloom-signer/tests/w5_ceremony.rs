@@ -2959,7 +2959,7 @@ fn attempt_bip39_mnemonic_import(
     wallet_id: &Token,
     operation_id: &OperationId,
     mnemonic: &str,
-    passphrase: &str,
+    passphrase_field: Option<&str>,
     now_ms: u64,
 ) -> Result<CustodyResult, ProtocolError> {
     let prepared = service
@@ -2983,12 +2983,14 @@ fn attempt_bip39_mnemonic_import(
     let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
     let prf_assertion =
         authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
-    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+    let mut input = serde_json::json!({
         "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
         "mnemonic": mnemonic,
-        "passphrase": passphrase,
-    }))
-    .unwrap();
+    });
+    if let Some(passphrase) = passphrase_field {
+        input["passphrase"] = serde_json::json!(passphrase);
+    }
+    let plaintext = serde_jcs::to_vec(&input).unwrap();
     let aad = CustodyHpkeAad {
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletImport,
@@ -3599,26 +3601,28 @@ fn bip39_import_rejects_nfkd_unnormalized_mnemonic() {
         &Token::new("unnormalized").unwrap(),
         &operation("d0"),
         &unnormalized,
-        "",
+        None,
         20_000,
     );
     assert!(result.is_err());
 }
 
 #[test]
-fn bip39_import_rejects_non_empty_passphrase() {
+fn bip39_import_schema_rejects_any_passphrase_field() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, _engine, _registry) = bip39_service(&authenticator);
-    let result = attempt_bip39_mnemonic_import(
-        &service,
-        &authenticator,
-        &Token::new("passphrase").unwrap(),
-        &operation("d1"),
-        bloom_signer_vectors::BIP39_MNEMONIC,
-        "TREZOR",
-        20_000,
-    );
-    assert!(result.is_err());
+    for (suffix, passphrase) in [("empty", ""), ("nonempty", "TREZOR")] {
+        let result = attempt_bip39_mnemonic_import(
+            &service,
+            &authenticator,
+            &Token::new(format!("passphrase-{suffix}")).unwrap(),
+            &operation(if suffix == "empty" { "d1" } else { "d2" }),
+            bloom_signer_vectors::BIP39_MNEMONIC,
+            Some(passphrase),
+            20_000,
+        );
+        assert!(result.is_err(), "passphrase field {suffix} was accepted");
+    }
 }
 
 /// Solana-child backup/restore round-trip: a BIP-39 wallet with an allocated

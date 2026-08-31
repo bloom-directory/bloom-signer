@@ -838,7 +838,7 @@ impl LocalSignerBackend {
         let entropy = self.active_seed()?;
         let mnemonic = bloom_signer_derive::mnemonic_from_entropy(&entropy)
             .map_err(|_| BackendError::InvalidRequest)?;
-        bloom_signer_derive::seed_from_mnemonic(&mnemonic, "")
+        bloom_signer_derive::seed_from_mnemonic(&mnemonic)
             .map_err(|_| BackendError::DefinitiveRejected)
     }
 

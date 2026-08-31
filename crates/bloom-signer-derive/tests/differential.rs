@@ -144,18 +144,8 @@ fn randomized_mnemonics_agree_with_the_independent_codec() {
             let recovered = bloom_signer_derive::entropy_from_mnemonic(&phrase).unwrap();
             assert_eq!(*recovered, entropy);
 
-            // Crate seed vs hand-rolled PBKDF2 (passphrase "TREZOR": the
-            // reference PBKDF2 is specification-derived; the crate NFKD
-            // normalizes, which is identity for ASCII).
-            let crate_seed = seed_from_mnemonic(&phrase, "TREZOR").unwrap();
-            let reference_seed = reference::pbkdf2_seed(&phrase, "TREZOR");
-            assert_eq!(
-                *crate_seed, reference_seed,
-                "seed disagreement at {words} words"
-            );
-
-            // Empty passphrase too — the v1 profile.
-            let crate_empty = seed_from_mnemonic(&phrase, "").unwrap();
+            // The v1 product profile has no passphrase input.
+            let crate_empty = seed_from_mnemonic(&phrase).unwrap();
             let reference_empty = reference::pbkdf2_seed(&phrase, "");
             assert_eq!(*crate_empty, reference_empty);
         }
@@ -182,7 +172,7 @@ fn official_trezor_vectors_reproduce_for_every_available_length() {
     ];
     for (mnemonic, seed) in cases {
         assert_eq!(
-            hex::encode(seed_from_mnemonic(mnemonic, "TREZOR").unwrap().as_slice()),
+            hex::encode(bip39::Mnemonic::parse(mnemonic).unwrap().to_seed("TREZOR")),
             seed
         );
         assert_eq!(
@@ -208,16 +198,6 @@ fn nfkd_unnormalized_separators_are_rejected() {
     ));
     let parsed = parse_mnemonic(&canonical).unwrap();
     assert_eq!(*parsed.entropy(), entropy);
-}
-
-#[test]
-fn non_empty_passphrase_policy_is_enforced_at_the_wallet_layer() {
-    // The codec itself is passphrase-capable (the differentials above use
-    // "TREZOR"); v1 policy lives in `policy::import_passphrase_allowed`.
-    assert!(!bloom_signer_derive::policy::import_passphrase_allowed(
-        "TREZOR"
-    ));
-    assert!(bloom_signer_derive::policy::import_passphrase_allowed(""));
 }
 
 // ---------------------------------------------------------------------------
@@ -323,7 +303,7 @@ fn zeroizing_wrappers_cover_every_secret_stage() {
     let entropy = bloom_signer_derive::generate_entropy();
     let phrase = mnemonic_from_entropy(entropy.as_slice()).unwrap();
     let parsed = parse_mnemonic(&phrase).unwrap();
-    let seed = parsed.seed("");
+    let seed = parsed.seed();
     // Compile-time existence of the wrappers is the contract; this test
     // pins the API shape so a refactor cannot silently drop Zeroizing.
     let _: &Zeroizing<[u8; 64]> = &seed;

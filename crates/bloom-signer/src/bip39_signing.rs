@@ -104,8 +104,7 @@ pub fn entropy_to_seed(
         mnemonic_from_entropy(&entropy)
             .map_err(|error| SigningEdgeError::Derivation(error.to_string()))?,
     );
-    seed_from_mnemonic(&mnemonic, "")
-        .map_err(|error| SigningEdgeError::Derivation(error.to_string()))
+    seed_from_mnemonic(&mnemonic).map_err(|error| SigningEdgeError::Derivation(error.to_string()))
 }
 
 /// The BIP-39 root material can never sign: only a registered, activated

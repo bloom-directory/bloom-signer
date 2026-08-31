@@ -184,7 +184,7 @@ impl UnlockedWallet {
         }
         let mnemonic = bloom_signer_derive::mnemonic_from_entropy(self.root.as_slice())
             .map_err(|error| protocol(ProtocolErrorCode::MalformedFrame, error.to_string()))?;
-        bloom_signer_derive::seed_from_mnemonic(&mnemonic, "")
+        bloom_signer_derive::seed_from_mnemonic(&mnemonic)
             .map_err(|error| protocol(ProtocolErrorCode::MalformedFrame, error.to_string()))
     }
 

@@ -155,7 +155,7 @@ fn the_seed_is_never_a_signable_root() {
     // ActivatedAccount with a registered child descriptor. The mnemonic and
     // seed never cross the boundary; only their derived signature does.
     let mnemonic = mnemonic_from_entropy(&[0u8; 32]).unwrap();
-    let seed_value = seed_from_mnemonic(&mnemonic, "").unwrap();
+    let seed_value = seed_from_mnemonic(&mnemonic).unwrap();
     assert_eq!(seed_value.as_slice().len(), 64);
     // The frozen entropy's derived accounts match the canonical addresses'
     // keys, pinned by the vectors crate.

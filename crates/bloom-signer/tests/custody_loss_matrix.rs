@@ -154,7 +154,7 @@ fn bip39_mnemonic_export_reconstructs_the_frozen_words() {
     assert_eq!(*mnemonic, vectors::BIP39_MNEMONIC);
 
     // The mnemonic round-trips to the same derived keys (portable recovery).
-    let recovered_seed = seed_from_mnemonic(&mnemonic, "").unwrap();
+    let recovered_seed = seed_from_mnemonic(&mnemonic).unwrap();
     let expected: [u8; 64] = hex::decode(vectors::BIP39_SEED_HEX)
         .unwrap()
         .try_into()

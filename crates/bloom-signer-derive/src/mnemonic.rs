@@ -4,14 +4,11 @@
 //! The production mnemonic/checksum path uses the established [`bip39`]
 //! crate; Bloom owns policy enforcement, word-count rules, and the
 //! zeroizing wrappers around every secret. The crate applies BIP-39 NFKD
-//! normalization exactly — `Mnemonic::parse` normalizes the phrase and
-//! `to_seed` normalizes the passphrase — and the v1 policy rejects
-//! non-empty passphrases before derivation, so the frozen empty-passphrase
-//! profile needs no normalization of its own.
+//! normalization exactly. The v1 product surface has no passphrase input;
+//! seed derivation always uses the BIP-39 default empty salt suffix.
 //!
 //! Generated wallets always use 256-bit entropy (24 words); imports accept
-//! every valid length (see [`crate::policy`]). Passphrase policy is
-//! enforced by the wallet layer, not here.
+//! every valid length (see [`crate::policy`]).
 
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -51,11 +48,11 @@ impl ParsedMnemonic {
         Zeroizing::new(self.mnemonic.to_string())
     }
 
-    /// The 64-byte BIP-39 seed. The passphrase must already be
-    /// policy-approved (empty for v1); NFKD normalization of both phrase
-    /// and passphrase is applied by the reference implementation.
-    pub fn seed(&self, passphrase: &str) -> Zeroizing<[u8; 64]> {
-        Zeroizing::new(self.mnemonic.to_seed(passphrase))
+    /// The 64-byte BIP-39 seed for the frozen v1 profile.
+    ///
+    /// There is intentionally no passphrase parameter in the product API.
+    pub fn seed(&self) -> Zeroizing<[u8; 64]> {
+        Zeroizing::new(self.mnemonic.to_seed(""))
     }
 }
 
@@ -126,14 +123,9 @@ pub fn entropy_from_mnemonic(mnemonic: &str) -> Result<Zeroizing<Vec<u8>>, Mnemo
     Ok(parse_mnemonic(mnemonic)?.entropy())
 }
 
-/// Derive the 64-byte BIP-39 seed. `passphrase` must be policy-approved
-/// (empty for v1; see [`policy::import_passphrase_allowed`]); the reference
-/// implementation NFKD-normalizes both phrase and passphrase.
-pub fn seed_from_mnemonic(
-    mnemonic: &str,
-    passphrase: &str,
-) -> Result<Zeroizing<[u8; 64]>, MnemonicError> {
-    Ok(parse_mnemonic(mnemonic)?.seed(passphrase))
+/// Derive the 64-byte BIP-39 seed for the frozen v1 profile.
+pub fn seed_from_mnemonic(mnemonic: &str) -> Result<Zeroizing<[u8; 64]>, MnemonicError> {
+    Ok(parse_mnemonic(mnemonic)?.seed())
 }
 
 #[cfg(test)]
