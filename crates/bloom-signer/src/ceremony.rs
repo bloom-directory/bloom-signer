@@ -63,6 +63,7 @@ fn ceremony_kind_name(kind: CeremonyKind) -> &'static str {
         CeremonyKind::BackendEnrollment => "backend_enrollment",
         CeremonyKind::KeyDerive => "key_derive",
         CeremonyKind::PolicyUpdate => "policy_update",
+        CeremonyKind::PetalRegistration => "petal_registration",
     }
 }
 
@@ -437,6 +438,12 @@ impl SignerCeremonyService {
         request: CustodyPrepareRequest,
         now_ms: u64,
     ) -> Result<PreparedCustodyCeremony, ProtocolError> {
+        if request.ceremony_kind == CeremonyKind::PetalRegistration {
+            return Err(protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                "Petal registration is not available",
+            ));
+        }
         if request.ceremony_kind == CeremonyKind::SealedApproval {
             return Err(kind_mismatch());
         }
@@ -1020,6 +1027,12 @@ impl SignerCeremonyService {
         now_ms: u64,
         policy_update: bool,
     ) -> Result<CustodyResult, ProtocolError> {
+        if request.ceremony_kind == CeremonyKind::PetalRegistration {
+            return Err(protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                "Petal registration is not available",
+            ));
+        }
         if policy_update != (request.ceremony_kind == CeremonyKind::PolicyUpdate) {
             return Err(kind_mismatch());
         }
@@ -1193,6 +1206,7 @@ impl SignerCeremonyService {
             _ => None,
         };
         let mut result = CustodyResult {
+            petal_registration_terms_digest: None,
             ceremony_kind: request.ceremony_kind,
             custody_operation_id: request.custody_operation_id.clone(),
             public_status: request
@@ -1907,7 +1921,7 @@ impl SignerCeremonyService {
                 self.advance_counter(&verified.credential_id, verified.sign_count);
                 Ok(())
             }
-            CeremonyKind::SealedApproval => Err(kind_mismatch()),
+            CeremonyKind::SealedApproval | CeremonyKind::PetalRegistration => Err(kind_mismatch()),
         };
         effect?;
         Ok(CustodyApplyOutcome {
@@ -2510,6 +2524,7 @@ enum GenericCustodyEffect {
         authority_signature: Option<Base64UrlBytes>,
     },
     PolicyUpdate,
+    PetalRegistration {},
 }
 
 #[derive(Deserialize)]
@@ -2730,4 +2745,24 @@ fn malformed(error: impl std::fmt::Display) -> ProtocolError {
 
 fn protocol(code: ProtocolErrorCode, message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(code, message)
+}
+
+#[cfg(test)]
+mod petal_registration_contract_tests {
+    use super::*;
+
+    #[test]
+    fn petal_registration_has_a_distinct_closed_custody_effect() {
+        let input: GenericCustodyInput = serde_json::from_str(
+            r#"{"credential_prf":"AQ","effect":{"kind":"petal_registration"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            input.effect,
+            GenericCustodyEffect::PetalRegistration {}
+        ));
+        assert!(serde_json::from_str::<GenericCustodyInput>(
+            r#"{"credential_prf":"AQ","effect":{"kind":"petal_registration","wallet_delete":true}}"#,
+        ).is_err());
+    }
 }

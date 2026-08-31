@@ -494,6 +494,9 @@ impl crate::TypedRequestMethod for BrokerSignerRequest {
                 crate::SignerCeremonyPrepareRequest::SealedApproval(request) => {
                     request.activation_operation_id.clone()
                 }
+                crate::SignerCeremonyPrepareRequest::PetalRegistration(request) => {
+                    request.custody.custody_operation_id.clone()
+                }
                 crate::SignerCeremonyPrepareRequest::PolicyUpdate(request) => {
                     request.custody.custody_operation_id.clone()
                 }
@@ -501,6 +504,9 @@ impl crate::TypedRequestMethod for BrokerSignerRequest {
             Request::CeremonyComplete(request) => Some(match request {
                 crate::SignerCeremonyCompleteRequest::SealedApproval(request) => {
                     request.activation_operation_id.clone()
+                }
+                crate::SignerCeremonyCompleteRequest::PetalRegistration(request) => {
+                    request.custody_operation_id.clone()
                 }
                 crate::SignerCeremonyCompleteRequest::PolicyUpdate(request) => {
                     request.custody.custody_operation_id.clone()

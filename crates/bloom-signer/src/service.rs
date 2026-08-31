@@ -184,6 +184,12 @@ impl SignerRpcService {
                         self.ceremony.prepare_approval(*request, now_ms)?,
                     )?)
                 }
+                SignerCeremonyPrepareRequest::PetalRegistration(_) => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "Petal registration is not available",
+                    ));
+                }
                 SignerCeremonyPrepareRequest::PolicyUpdate(request) => {
                     SignerCeremonyPrepareResponse::PolicyUpdate(prepared_custody(
                         &self.ceremony,
@@ -196,6 +202,12 @@ impl SignerRpcService {
                     SignerCeremonyCompleteResponse::SealedApproval(Box::new(
                         self.ceremony.complete_approval(*request, now_ms).await?,
                     ))
+                }
+                SignerCeremonyCompleteRequest::PetalRegistration(_) => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "Petal registration is not available",
+                    ));
                 }
                 SignerCeremonyCompleteRequest::PolicyUpdate(request) => {
                     SignerCeremonyCompleteResponse::PolicyUpdate(Box::new(
@@ -823,6 +835,29 @@ mod tests {
         return "macos-managed-timed";
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         panic!("Signer service tests require a reviewed trusted-time platform");
+    }
+
+    #[tokio::test]
+    async fn petal_registration_cannot_use_generic_custody_before_handlers_exist() {
+        let (service, _, _) = fixture().await;
+        let error = service
+            .ceremony
+            .prepare_custody(
+                CustodyPrepareRequest {
+                    ceremony_kind: CeremonyKind::PetalRegistration,
+                    custody_operation_id: OperationId::from_bytes([99; 32]),
+                    wallet_id: Some(Token::new("wallet-service-test").unwrap()),
+                    key_ref: None,
+                    exact_terms_digest: Digest32::from_bytes([88; 32]),
+                    expected_input_class: Token::new("petal_registration").unwrap(),
+                    browser_output_recipient_key: None,
+                    petal_key_scope: None,
+                    legacy_passkey_migration: None,
+                },
+                now_ms().unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
     }
 
     #[tokio::test]

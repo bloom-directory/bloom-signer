@@ -505,6 +505,7 @@ fn policy_cas_fails_before_a_completed_policy_ceremony() {
             assurance_level: Token::new("user_verified").unwrap(),
         },
         ceremony_receipt: CustodyResult {
+            petal_registration_terms_digest: None,
             ceremony_kind: CeremonyKind::PolicyUpdate,
             custody_operation_id: operation_id,
             public_status: CeremonyState::Completed,

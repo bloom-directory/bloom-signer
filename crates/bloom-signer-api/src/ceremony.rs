@@ -21,6 +21,7 @@ pub enum CeremonyKind {
     BackendEnrollment,
     KeyDerive,
     PolicyUpdate,
+    PetalRegistration,
 }
 
 impl CeremonyKind {
@@ -40,7 +41,8 @@ impl CeremonyKind {
             | Self::CredentialRemove
             | Self::BackendEnrollment
             | Self::KeyDerive
-            | Self::PolicyUpdate => Some(crate::CeremonyState::Succeeded),
+            | Self::PolicyUpdate
+            | Self::PetalRegistration => Some(crate::CeremonyState::Succeeded),
         }
     }
 }
@@ -482,14 +484,13 @@ pub enum SignerCeremonyStatus {
     Missing,
 }
 
-/// The generic `ceremony.prepare` body. Policy update is the sole custody kind
-/// whose semantic review is originated by Broker and therefore shares this
-/// method with sealed-approval preparation.
+/// Typed Broker-originated semantic review, sharing `ceremony.prepare`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "ceremony_kind", content = "request", rename_all = "snake_case")]
 pub enum SignerCeremonyPrepareRequest {
     SealedApproval(Box<CeremonyPrepareRequest>),
     PolicyUpdate(Box<crate::PolicyUpdateCeremonyPrepareRequest>),
+    PetalRegistration(Box<crate::PetalRegistrationCeremonyPrepareRequest>),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -500,6 +501,7 @@ pub enum SignerCeremonyPrepareRequest {
 pub enum SignerCeremonyPrepareResponse {
     SealedApproval(SignerPreparedApproval),
     PolicyUpdate(SignerPreparedCustody),
+    PetalRegistration(SignerPreparedCustody),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -507,6 +509,7 @@ pub enum SignerCeremonyPrepareResponse {
 pub enum SignerCeremonyCompleteRequest {
     SealedApproval(Box<CeremonyCompleteRequest>),
     PolicyUpdate(Box<crate::PolicyUpdateCeremonyCompleteRequest>),
+    PetalRegistration(Box<CustodyCompleteRequest>),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -514,6 +517,7 @@ pub enum SignerCeremonyCompleteRequest {
 pub enum SignerCeremonyCompleteResponse {
     SealedApproval(Box<SignerActivationReceipt>),
     PolicyUpdate(Box<CustodyResult>),
+    PetalRegistration(Box<CustodyResult>),
 }
 
 impl CustodySignerContribution {
@@ -718,6 +722,8 @@ pub struct CustodyResult {
     pub credential_summaries: Vec<CredentialSummary>,
     pub initial_policy: Option<crate::SignedPolicySnapshot>,
     pub receipt_digest: Digest32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub petal_registration_terms_digest: Option<Digest32>,
     pub encrypted_browser_result: Option<HpkeEnvelope>,
     pub signer_key_id: Token,
     pub signer_signature: Base64UrlBytes,
@@ -733,6 +739,7 @@ pub struct CredentialSummary {
 
 impl CustodyResult {
     pub fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, crate::ProtocolError> {
+        self.validate_petal_registration_shape()?;
         #[derive(Serialize)]
         struct Unsigned<'a> {
             ceremony_kind: CeremonyKind,
@@ -743,6 +750,8 @@ impl CustodyResult {
             credential_summaries: &'a [CredentialSummary],
             initial_policy: &'a Option<crate::SignedPolicySnapshot>,
             receipt_digest: &'a Digest32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            petal_registration_terms_digest: &'a Option<Digest32>,
             encrypted_browser_result: &'a Option<HpkeEnvelope>,
             signer_key_id: &'a Token,
         }
@@ -755,6 +764,7 @@ impl CustodyResult {
             credential_summaries: &self.credential_summaries,
             initial_policy: &self.initial_policy,
             receipt_digest: &self.receipt_digest,
+            petal_registration_terms_digest: &self.petal_registration_terms_digest,
             encrypted_browser_result: &self.encrypted_browser_result,
             signer_key_id: &self.signer_key_id,
         })

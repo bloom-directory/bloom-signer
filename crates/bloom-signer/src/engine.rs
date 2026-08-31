@@ -5643,6 +5643,7 @@ fn ceremony_mutation_kind(kind: bloom_signer_api::CeremonyKind) -> &'static str 
         | Kind::WalletRecovery => "wallet",
         Kind::CredentialAdd | Kind::CredentialReplace | Kind::CredentialRemove => "credential",
         Kind::PolicyUpdate => "policy",
+        Kind::PetalRegistration => "petal_registration",
         Kind::BackendEnrollment | Kind::KeyDerive => "key",
         Kind::SealedApproval => "approval",
     }
