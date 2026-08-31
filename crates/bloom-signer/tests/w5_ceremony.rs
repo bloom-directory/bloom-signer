@@ -31,6 +31,718 @@ fn audit_keys() -> SignerAuditKeys {
     }
 }
 
+fn petal_registration_request(
+    wallet: &Token,
+    op: OperationId,
+) -> PetalRegistrationCeremonyPrepareRequest {
+    let terms = PetalRegistrationTerms {
+        schema: Token::new(PETAL_REGISTRATION_SCHEMA).unwrap(),
+        operation_id: op.clone(),
+        enrollment_digest: petal_registration_enrollment_digest(
+            &Token::new("broker-app-1").unwrap(),
+            &SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            &Token::new("signer-ceremony-key").unwrap(),
+            &SigningKey::from_bytes(&[9; 32]).verifying_key(),
+        )
+        .unwrap(),
+        owner_wallet_id: wallet.clone(),
+        package_hash: digest("31"),
+        manifest_digest: digest("32"),
+        permissions_digest: digest("33"),
+        lineage_id: format!("pln1_{}", "a".repeat(52)),
+    };
+    PetalRegistrationCeremonyPrepareRequest {
+        custody: CustodyPrepareRequest {
+            ceremony_kind: CeremonyKind::PetalRegistration,
+            custody_operation_id: op,
+            wallet_id: Some(wallet.clone()),
+            key_ref: None,
+            exact_terms_digest: terms.digest().unwrap(),
+            expected_input_class: Token::new(PETAL_REGISTRATION_INPUT_CLASS).unwrap(),
+            browser_output_recipient_key: None,
+            petal_key_scope: None,
+            legacy_passkey_migration: None,
+        },
+        terms,
+    }
+}
+
+fn petal_registration_completion(
+    prepared: &bloom_signer::ceremony::PreparedCustodyCeremony,
+    authenticator: &VirtualAuthenticator,
+    effect: serde_json::Value,
+) -> CustodyCompleteRequest {
+    petal_registration_completion_with_prf(
+        prepared,
+        authenticator,
+        effect,
+        &authenticator.deterministic_prf(),
+    )
+}
+
+fn petal_registration_completion_with_prf(
+    prepared: &bloom_signer::ceremony::PreparedCustodyCeremony,
+    authenticator: &VirtualAuthenticator,
+    effect: serde_json::Value,
+    credential_prf: &[u8],
+) -> CustodyCompleteRequest {
+    let contribution = &prepared.contribution;
+    let assertion =
+        authenticator.assertion(&prepared.challenges[0].canonical_bytes().unwrap(), 10_000);
+    let aad = CustodyHpkeAad {
+        ceremony_id: contribution.ceremony_id.clone(),
+        ceremony_kind: contribution.ceremony_kind,
+        custody_operation_id: contribution.custody_operation_id.clone(),
+        signer_nonce: contribution.signer_nonce.clone(),
+        signer_contribution_digest: contribution.digest().unwrap(),
+        wallet_id: contribution.wallet_id.clone(),
+        key_ref: None,
+        credential_id: Some(assertion.credential_id.clone()),
+        expected_input_class: contribution.expected_input_class.clone(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(credential_prf), "effect": effect,
+    }))
+    .unwrap();
+    CustodyCompleteRequest {
+        ceremony_kind: contribution.ceremony_kind,
+        custody_operation_id: contribution.custody_operation_id.clone(),
+        ceremony_id: contribution.ceremony_id.clone(),
+        proof: WebAuthnCeremonyProof::Assertion { assertion },
+        encrypted_input: Some(
+            seal_hpke(
+                &contribution.hpke_recipient_key,
+                b"bloom-custody-input/v1",
+                &aad,
+                &plaintext,
+            )
+            .unwrap(),
+        ),
+        public_binding_digest: prepared.challenges[0].exact_terms_digest.clone(),
+    }
+}
+
+#[test]
+fn petal_registration_authenticates_owner_and_preserves_wallet_authority() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, approval_key, engine, registry) = service(&authenticator);
+    let approval = engine
+        .install_approval_for_test(&terms(approval_key))
+        .unwrap();
+    let (wallet, _) = register_wallet(&service, &authenticator, operation("71"), 1_000);
+    let request = petal_registration_request(&wallet, operation("72"));
+    let policy = engine.policy_snapshot(&wallet).unwrap();
+    let keys = engine.enrolled_key_refs(&wallet).unwrap();
+    let approval_state = engine.approval_public_status(&approval, 2_000).unwrap();
+    let approvals = engine.active_approvals_expiring_by(u64::MAX).unwrap();
+    let available = registry.key_is_available(&keys[0]).unwrap();
+    let prepared = service
+        .prepare_petal_registration(request.clone(), 2_000)
+        .unwrap();
+    assert_eq!(prepared.verification_credentials.len(), 1);
+    assert_eq!(
+        prepared.challenges[0].exact_terms_digest,
+        request.terms.digest().unwrap()
+    );
+    let complete = petal_registration_completion(
+        &prepared,
+        &authenticator,
+        serde_json::json!({"kind":"petal_registration"}),
+    );
+    assert!(
+        service.complete_custody(complete.clone(), 2_100).is_err(),
+        "untyped completion must not bypass registration checks"
+    );
+    let result = service
+        .complete_petal_registration(complete.clone(), 2_100)
+        .unwrap();
+    result
+        .validate_petal_registration_binding(&request.terms)
+        .unwrap();
+    let mut message = b"bloom-signer-ceremony-receipt/v1".to_vec();
+    message.extend(result.unsigned_canonical_bytes().unwrap());
+    SigningKey::from_bytes(&[9; 32])
+        .verifying_key()
+        .verify_strict(
+            &message,
+            &ed25519_dalek::Signature::from_slice(&result.signer_signature.decode()).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(result.public_status, CeremonyState::Succeeded);
+    assert!(result.public_key_refs.is_empty() && result.credential_summaries.is_empty());
+    assert!(result.initial_policy.is_none() && result.encrypted_browser_result.is_none());
+    assert_eq!(engine.policy_snapshot(&wallet).unwrap(), policy);
+    assert_eq!(engine.enrolled_key_refs(&wallet).unwrap(), keys);
+    assert_eq!(
+        engine.approval_public_status(&approval, 2_000).unwrap(),
+        approval_state
+    );
+    assert_eq!(
+        engine.active_approvals_expiring_by(u64::MAX).unwrap(),
+        approvals
+    );
+    assert_eq!(registry.key_is_available(&keys[0]).unwrap(), available);
+    assert_eq!(
+        service
+            .complete_petal_registration(complete.clone(), 400_000)
+            .unwrap(),
+        result
+    );
+    let mut changed = complete;
+    changed.public_binding_digest = digest("ff");
+    assert!(
+        service
+            .complete_petal_registration(changed, 400_000)
+            .is_err()
+    );
+}
+
+#[test]
+fn petal_registration_rejects_tampered_prepare_before_pending_replay() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, _, _) = service(&authenticator);
+    let (wallet, _) = register_wallet(&service, &authenticator, operation("73"), 1_000);
+    let request = petal_registration_request(&wallet, operation("74"));
+    let mut foreign_enrollment = request.clone();
+    foreign_enrollment.terms.enrollment_digest = digest("ff");
+    foreign_enrollment.custody.exact_terms_digest = foreign_enrollment.terms.digest().unwrap();
+    assert_eq!(
+        service
+            .prepare_petal_registration(foreign_enrollment.clone(), 2_000)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyKindMismatch,
+        "a fresh operation must use the locally configured custody pins"
+    );
+    assert!(
+        service
+            .prepare_custody(request.custody.clone(), 2_000)
+            .is_err()
+    );
+    let prepared = service
+        .prepare_petal_registration(request.clone(), 2_000)
+        .unwrap();
+    assert_eq!(
+        service
+            .prepare_petal_registration(foreign_enrollment, 2_001)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyKindMismatch,
+        "enrollment validation must precede cached request-digest conflict handling"
+    );
+    assert_eq!(
+        service
+            .prepare_petal_registration(request.clone(), 2_001)
+            .unwrap()
+            .contribution,
+        prepared.contribution
+    );
+    for mutation in 0..6 {
+        let mut changed = request.clone();
+        match mutation {
+            0 => changed.terms.enrollment_digest = digest("ff"),
+            1 => changed.terms.package_hash = digest("ff"),
+            2 => changed.custody.wallet_id = Some(Token::new("other-wallet").unwrap()),
+            3 => changed.custody.ceremony_kind = CeremonyKind::PolicyUpdate,
+            4 => changed.custody.expected_input_class = Token::new("generic-custody-v1").unwrap(),
+            _ => changed.custody.exact_terms_digest = digest("ff"),
+        }
+        if mutation < 2 {
+            changed.custody.exact_terms_digest = changed.terms.digest().unwrap();
+        }
+        assert!(
+            service.prepare_petal_registration(changed, 2_001).is_err(),
+            "mutation {mutation}"
+        );
+    }
+}
+
+#[test]
+fn petal_registration_invalid_proofs_and_effects_fail_terminally() {
+    for case in 0..8 {
+        let authenticator = VirtualAuthenticator::generate();
+        let (service, _, engine, registry) = service(&authenticator);
+        let (wallet, _) = register_wallet(&service, &authenticator, operation("75"), 1_000);
+        let request = petal_registration_request(&wallet, operation("76"));
+        let prepared = service.prepare_petal_registration(request, 2_000).unwrap();
+        let actor = if case == 1 {
+            VirtualAuthenticator::generate()
+        } else {
+            authenticator
+        };
+        let effect = if case == 2 {
+            serde_json::json!({"kind":"wallet_delete"})
+        } else {
+            serde_json::json!({"kind":"petal_registration"})
+        };
+        let mut complete = if case == 6 {
+            petal_registration_completion_with_prf(&prepared, &actor, effect, &[0; 32])
+        } else if case == 7 {
+            petal_registration_completion(
+                &prepared,
+                &actor,
+                serde_json::json!({"kind":"petal_registration", "wallet_delete":true}),
+            )
+        } else {
+            petal_registration_completion(&prepared, &actor, effect)
+        };
+        if case == 0 {
+            if let WebAuthnCeremonyProof::Assertion { assertion } = &mut complete.proof {
+                assertion.signature = Base64UrlBytes::from_bytes(&[0; 64]);
+            }
+        }
+        if case == 3 {
+            complete.public_binding_digest = digest("ff");
+        }
+        if case == 4 {
+            service.cancel(&operation("76")).unwrap();
+        }
+        let now = if case == 5 {
+            assert!(
+                service
+                    .prepare_petal_registration(
+                        petal_registration_request(&wallet, operation("76")),
+                        prepared.contribution.expires_at_ms.get()
+                    )
+                    .is_err()
+            );
+            prepared.contribution.expires_at_ms.get()
+        } else {
+            2_100
+        };
+        assert!(
+            service
+                .complete_petal_registration(complete.clone(), now)
+                .is_err(),
+            "case {case}"
+        );
+        let expected_state = match case {
+            4 => CeremonyState::Cancelled,
+            5 => CeremonyState::Expired,
+            _ => CeremonyState::Failed,
+        };
+        assert_eq!(
+            service.public_status(&operation("76")).unwrap().state,
+            expected_state
+        );
+        assert!(
+            service
+                .complete_petal_registration(complete, now + 1)
+                .is_err()
+        );
+        assert!(
+            service
+                .prepare_petal_registration(
+                    petal_registration_request(&wallet, operation("76")),
+                    now + 1
+                )
+                .is_err()
+        );
+        let keys = engine.enrolled_key_refs(&wallet).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(registry.key_is_available(&keys[0]).unwrap());
+        assert_eq!(engine.policy_snapshot(&wallet).unwrap().version.get(), 1);
+    }
+}
+
+fn reopen_petal_service(
+    database: &std::path::Path,
+    broker_seed: u8,
+    signer_seed: u8,
+) -> (
+    SignerCeremonyService,
+    Arc<SignerEngine>,
+    Arc<BackendRegistry>,
+) {
+    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+    let engine = Arc::new(
+        SignerEngine::open(
+            database,
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[broker_seed; 32]).verifying_key(),
+            SigningKey::from_bytes(&[9; 32]).verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
+            registry.clone(),
+        )
+        .unwrap(),
+    );
+    let service = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[signer_seed; 32]),
+    )
+    .unwrap();
+    (service, engine, registry)
+}
+
+#[test]
+fn petal_registration_durable_replay_rechecks_terms_and_current_enrollment() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let actor = VirtualAuthenticator::generate();
+    let (service, engine, registry) = reopen_petal_service(&database, 7, 9);
+    let (wallet, _) = register_wallet(&service, &actor, operation("81"), 1_000);
+    drop((service, engine, registry));
+    let (service, engine, registry) = reopen_petal_service(&database, 7, 9);
+    let root = engine.enrolled_key_refs(&wallet).unwrap().remove(0);
+    assert!(
+        !registry.key_is_available(&root).unwrap(),
+        "reopened backend starts locked"
+    );
+    let request = petal_registration_request(&wallet, operation("82"));
+    let prepared = service
+        .prepare_petal_registration(request.clone(), 2_000)
+        .unwrap();
+    let completion = petal_registration_completion(
+        &prepared,
+        &actor,
+        serde_json::json!({"kind":"petal_registration"}),
+    );
+    let result = service
+        .complete_petal_registration(completion.clone(), 2_100)
+        .unwrap();
+    assert!(
+        !registry.key_is_available(&root).unwrap(),
+        "registration cannot activate a locked backend"
+    );
+    drop((service, engine, registry));
+    let (service, engine, registry) = reopen_petal_service(&database, 7, 9);
+    assert_eq!(
+        service
+            .complete_petal_registration(completion.clone(), 900_000)
+            .unwrap(),
+        result
+    );
+    assert!(matches!(
+        service.status(&operation("82")).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::CompletedCustody(_)
+    ));
+    let mut changed = completion.clone();
+    changed.public_binding_digest = digest("ff");
+    assert!(
+        service
+            .complete_petal_registration(changed, 900_000)
+            .is_err(),
+        "durable replay must bind exact terms"
+    );
+    let mut changed = completion.clone();
+    changed.ceremony_id = digest("ff");
+    assert!(
+        service
+            .complete_petal_registration(changed, 900_000)
+            .is_err(),
+        "durable replay must bind ceremony identity"
+    );
+    drop((service, engine, registry));
+    for (broker, signer) in [(8, 9), (7, 10)] {
+        let (service, engine, registry) = reopen_petal_service(&database, broker, signer);
+        assert!(
+            service
+                .complete_petal_registration(completion.clone(), 900_000)
+                .is_err(),
+            "changed custody key bytes invalidate enrollment"
+        );
+        assert!(
+            service.status(&operation("82")).is_err(),
+            "status must not adopt an old-enrollment receipt"
+        );
+        assert!(
+            service
+                .prepare_petal_registration(request.clone(), 900_000)
+                .is_err()
+        );
+        drop((service, engine, registry));
+    }
+}
+
+#[test]
+fn petal_registration_persisted_receipt_tampering_is_not_adopted() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let actor = VirtualAuthenticator::generate();
+    let (service, engine, registry) = reopen_petal_service(&database, 7, 9);
+    let (wallet, _) = register_wallet(&service, &actor, operation("83"), 1_000);
+    let prepared = service
+        .prepare_petal_registration(petal_registration_request(&wallet, operation("84")), 2_000)
+        .unwrap();
+    let completion = petal_registration_completion(
+        &prepared,
+        &actor,
+        serde_json::json!({"kind":"petal_registration"}),
+    );
+    let result = service
+        .complete_petal_registration(completion.clone(), 2_100)
+        .unwrap();
+    drop((service, engine, registry));
+    for field in [
+        "petal_registration_terms_digest",
+        "signer_signature",
+        "signer_key_id",
+        "wallet_id",
+        "custody_operation_id",
+        "ceremony_kind",
+    ] {
+        let mut changed = serde_json::to_value(&result).unwrap();
+        changed[field] = match field {
+            "petal_registration_terms_digest" => serde_json::Value::Null,
+            "signer_signature" => serde_json::json!(Base64UrlBytes::from_bytes(&[0; 64])),
+            "signer_key_id" | "wallet_id" => serde_json::json!("another-identity"),
+            "custody_operation_id" => serde_json::json!(operation("ff")),
+            _ => serde_json::json!("policy_update"),
+        };
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE ceremony_receipts SET receipt_jcs = ?1 WHERE operation_id = ?2",
+                rusqlite::params![
+                    serde_jcs::to_string(&changed).unwrap(),
+                    operation("84").as_str()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        let (service, engine, registry) = reopen_petal_service(&database, 7, 9);
+        assert!(
+            service
+                .complete_petal_registration(completion.clone(), 900_000)
+                .is_err(),
+            "tampered {field}"
+        );
+        assert!(
+            service.status(&operation("84")).is_err(),
+            "status tampered {field}"
+        );
+        drop((service, engine, registry));
+    }
+}
+
+#[test]
+fn petal_registration_removed_credential_and_precompletion_restart_fail_closed() {
+    let actor = VirtualAuthenticator::generate();
+    let replacement = VirtualAuthenticator::generate();
+    let (service, _, engine, _) = service(&actor);
+    let (wallet, _) = register_wallet(&service, &actor, operation("85"), 1_000);
+    complete_credential_change(
+        &service,
+        &actor,
+        &replacement,
+        &wallet,
+        CeremonyKind::CredentialReplace,
+        operation("86"),
+        2,
+        1_200,
+    );
+    let request = petal_registration_request(&wallet, operation("87"));
+    let prepared = service
+        .prepare_petal_registration(request.clone(), 2_000)
+        .unwrap();
+    let old_credential_submission = petal_registration_completion(
+        &prepared,
+        &actor,
+        serde_json::json!({"kind":"petal_registration"}),
+    );
+    assert!(
+        service
+            .complete_petal_registration(old_credential_submission, 2_100)
+            .is_err()
+    );
+    let request = petal_registration_request(&wallet, operation("88"));
+    let prepared = service.prepare_petal_registration(request, 2_200).unwrap();
+    let stale_submission = petal_registration_completion(
+        &prepared,
+        &replacement,
+        serde_json::json!({"kind":"petal_registration"}),
+    );
+    drop(service);
+    let restarted = SignerCeremonyService::new(
+        engine,
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    assert!(
+        restarted
+            .complete_petal_registration(stale_submission, 2_300)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn petal_registration_typed_rpc_issues_the_authenticated_receipt() {
+    let actor = VirtualAuthenticator::generate();
+    let (ceremony, _, engine, _) = service(&actor);
+    let (wallet, _) = register_wallet(&ceremony, &actor, operation("89"), 1_000);
+    let ceremony = Arc::new(ceremony);
+    let epoch = BootEpoch::from_bytes([3; 16]);
+    let source = if cfg!(target_os = "macos") {
+        "macos-managed-timed"
+    } else {
+        "linux-system-clock"
+    };
+    let clock = Arc::new(
+        bloom_signer::clock::SignerClock::new(engine.clone(), source, epoch.clone()).unwrap(),
+    );
+    let rpc = bloom_signer::service::SignerRpcService::new(
+        engine,
+        ceremony,
+        clock,
+        epoch,
+        digest("01"),
+        "test",
+    );
+    let request = petal_registration_request(&wallet, operation("8a"));
+    let response = BrokerSignerService::dispatch(
+        &rpc,
+        BrokerSignerRequest::CeremonyPrepare(SignerCeremonyPrepareRequest::PetalRegistration(
+            Box::new(request.clone()),
+        )),
+    )
+    .await
+    .unwrap();
+    let BrokerSignerResponse::CeremonyPrepare(SignerCeremonyPrepareResponse::PetalRegistration(
+        prepared,
+    )) = response
+    else {
+        panic!("wrong typed prepare response");
+    };
+    let prepared = bloom_signer::ceremony::PreparedCustodyCeremony {
+        contribution: prepared.contribution,
+        challenges: prepared.challenges,
+        webauthn_options: prepared.webauthn_options,
+        verification_credentials: prepared.verification_credentials,
+    };
+    let completion = petal_registration_completion(
+        &prepared,
+        &actor,
+        serde_json::json!({"kind":"petal_registration"}),
+    );
+    let response = BrokerSignerService::dispatch(
+        &rpc,
+        BrokerSignerRequest::CeremonyComplete(SignerCeremonyCompleteRequest::PetalRegistration(
+            Box::new(completion),
+        )),
+    )
+    .await
+    .unwrap();
+    let BrokerSignerResponse::CeremonyComplete(SignerCeremonyCompleteResponse::PetalRegistration(
+        result,
+    )) = response
+    else {
+        panic!("wrong typed complete response");
+    };
+    result
+        .validate_petal_registration_binding(&request.terms)
+        .unwrap();
+}
+
+#[test]
+fn petal_registration_terms_and_receipt_commit_atomically() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let actor = VirtualAuthenticator::generate();
+    let (service, engine, registry) = reopen_petal_service(&database, 7, 9);
+    let (wallet, credential) = register_wallet(&service, &actor, operation("8b"), 1_000);
+    let before = service
+        .credential(&wallet, &credential.credential_id)
+        .unwrap();
+    let request = petal_registration_request(&wallet, operation("8c"));
+    let prepared = service.prepare_petal_registration(request, 2_000).unwrap();
+    let completion = petal_registration_completion(
+        &prepared,
+        &actor,
+        serde_json::json!({"kind":"petal_registration"}),
+    );
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection.execute_batch("CREATE TRIGGER reject_registration_terms BEFORE INSERT ON petal_registration_terms BEGIN SELECT RAISE(ABORT, 'injected registration persistence failure'); END;").unwrap();
+    assert!(
+        service
+            .complete_petal_registration(completion.clone(), 2_100)
+            .is_err()
+    );
+    assert_eq!(
+        service
+            .credential(&wallet, &credential.credential_id)
+            .unwrap(),
+        before
+    );
+    for table in ["ceremony_receipts", "petal_registration_terms"] {
+        let rows: i64 = connection
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE operation_id = ?1"),
+                [operation("8c").as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "failed transaction leaves no partial {table}");
+    }
+    drop((connection, service, engine, registry));
+    let (service, _, _) = reopen_petal_service(&database, 7, 9);
+    assert!(
+        service
+            .complete_petal_registration(completion, 900_000)
+            .is_err()
+    );
+    assert!(matches!(
+        service.status(&operation("8c")).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Failed)
+    ));
+}
+
+#[test]
+fn petal_registration_missing_or_changed_durable_terms_fail_closed_even_when_cached() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let actor = VirtualAuthenticator::generate();
+    let (service, _, _) = reopen_petal_service(&database, 7, 9);
+    let (wallet, _) = register_wallet(&service, &actor, operation("8d"), 1_000);
+    let request = petal_registration_request(&wallet, operation("8e"));
+    let prepared = service
+        .prepare_petal_registration(request.clone(), 2_000)
+        .unwrap();
+    let completion = petal_registration_completion(
+        &prepared,
+        &actor,
+        serde_json::json!({"kind":"petal_registration"}),
+    );
+    service
+        .complete_petal_registration(completion.clone(), 2_100)
+        .unwrap();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let mut changed = request.terms;
+    changed.permissions_digest = digest("ff");
+    connection
+        .execute(
+            "UPDATE petal_registration_terms SET terms_jcs = ?1 WHERE operation_id = ?2",
+            rusqlite::params![
+                serde_jcs::to_string(&changed).unwrap(),
+                operation("8e").as_str()
+            ],
+        )
+        .unwrap();
+    assert!(
+        service
+            .complete_petal_registration(completion.clone(), 3_000)
+            .is_err()
+    );
+    assert!(service.status(&operation("8e")).is_err());
+    connection
+        .execute(
+            "DELETE FROM petal_registration_terms WHERE operation_id = ?1",
+            [operation("8e").as_str()],
+        )
+        .unwrap();
+    assert!(
+        service
+            .complete_petal_registration(completion, 3_000)
+            .is_err()
+    );
+    assert!(service.status(&operation("8e")).is_err());
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HpkeVector {

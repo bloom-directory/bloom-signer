@@ -2,11 +2,11 @@ use bloom_signer_api::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
     ApprovalTombstone, Base64UrlBytes, CeremonyPublicStatus, CredentialPublic, CredentialState,
     CustodyResult, DecimalU64, Digest32, KeyRef, OperationId, OperationPublicStatus,
-    OperationState, PetalKeyScope, PolicyCommitReceipt, PolicyCompareAndSwapRequest,
-    PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest, PolicyValidationReceipt,
-    ProtocolError, ProtocolErrorCode, RevocationState, SealedApprovalTerms, SelectorKind,
-    SignRequest, SignedPolicySnapshot, SignerActivationReceipt, SigningResult, Token,
-    WalletTombstone, WebAuthnCredential,
+    OperationState, PetalKeyScope, PetalRegistrationTerms, PolicyCommitReceipt,
+    PolicyCompareAndSwapRequest, PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest,
+    PolicyValidationReceipt, ProtocolError, ProtocolErrorCode, RevocationState,
+    SealedApprovalTerms, SelectorKind, SignRequest, SignedPolicySnapshot, SignerActivationReceipt,
+    SigningResult, Token, WalletTombstone, WebAuthnCredential,
 };
 use bloom_trusted_time::{DurableClockCondition, PersistedClockState, evaluate_durable_clock};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
@@ -823,6 +823,10 @@ impl SignerEngine {
                     receipt_kind TEXT NOT NULL,
                     receipt_jcs TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS petal_registration_terms (
+                    operation_id TEXT PRIMARY KEY,
+                    terms_jcs TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS ceremony_statuses (
                     operation_id TEXT PRIMARY KEY,
                     status_jcs TEXT NOT NULL
@@ -1510,6 +1514,10 @@ impl SignerEngine {
         Ok(approval_id)
     }
 
+    pub(crate) fn broker_signing_identity(&self) -> (&Token, &VerifyingKey) {
+        (&self.broker_key_id, &self.broker_public_key)
+    }
+
     pub(crate) fn activation_receipt(
         &self,
         operation_id: &OperationId,
@@ -1537,6 +1545,23 @@ impl SignerEngine {
             .query_row(
                 "SELECT receipt_jcs FROM ceremony_receipts
                  WHERE operation_id = ?1 AND receipt_kind = 'custody'",
+                [operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?
+            .map(|encoded| serde_json::from_str(&encoded).map_err(malformed))
+            .transpose()
+    }
+
+    pub(crate) fn petal_registration_terms(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<PetalRegistrationTerms>, ProtocolError> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT terms_jcs FROM petal_registration_terms WHERE operation_id = ?1",
                 [operation_id.as_str()],
                 |row| row.get::<_, String>(0),
             )
@@ -1605,6 +1630,7 @@ impl SignerEngine {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_custody_snapshot_with_effect(
         &self,
         result: &CustodyResult,
@@ -1613,7 +1639,26 @@ impl SignerEngine {
         committed_at_ms: u64,
         status: &CeremonyPublicStatus,
         effect: CeremonyDatabaseEffect,
+        registration_terms: Option<&PetalRegistrationTerms>,
     ) -> Result<(), ProtocolError> {
+        result.validate_petal_registration_shape()?;
+        if (result.ceremony_kind == bloom_signer_api::CeremonyKind::PetalRegistration)
+            != registration_terms.is_some()
+        {
+            return Err(error(
+                ProtocolErrorCode::CeremonyKindMismatch,
+                "missing registration terms",
+            ));
+        }
+        if let Some(terms) = registration_terms {
+            result.validate_petal_registration_binding(terms)?;
+            if !matches!(effect, CeremonyDatabaseEffect::None) {
+                return Err(error(
+                    ProtocolErrorCode::CeremonyKindMismatch,
+                    "registration cannot mutate authority",
+                ));
+            }
+        }
         let mut connection = self.connection.lock();
         let transaction = self.mutation_transaction(&mut connection)?;
         let wallet_snapshot_digest = Digest32::from_bytes(
@@ -1622,7 +1667,7 @@ impl SignerEngine {
         let credential_snapshot_digest = Digest32::from_bytes(
             Sha256::digest(serde_jcs::to_vec(credentials).map_err(malformed)?).into(),
         );
-        let database_effect = match &effect {
+        let mut database_effect = match &effect {
             CeremonyDatabaseEffect::None => serde_json::json!({ "kind": "custody_only" }),
             CeremonyDatabaseEffect::InitialPolicy {
                 snapshot,
@@ -1869,6 +1914,19 @@ impl SignerEngine {
                     }
                 }
             }
+        }
+        if let Some(terms) = registration_terms {
+            transaction
+                .execute(
+                    "INSERT INTO petal_registration_terms(operation_id, terms_jcs) VALUES (?1, ?2)",
+                    params![
+                        terms.operation_id.as_str(),
+                        serde_jcs::to_string(terms).map_err(malformed)?
+                    ],
+                )
+                .map_err(storage)?;
+            database_effect["petal_registration_terms"] =
+                serde_json::to_value(terms).map_err(malformed)?;
         }
         transaction
             .execute(

@@ -184,11 +184,11 @@ impl SignerRpcService {
                         self.ceremony.prepare_approval(*request, now_ms)?,
                     )?)
                 }
-                SignerCeremonyPrepareRequest::PetalRegistration(_) => {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::ServiceUnavailable,
-                        "Petal registration is not available",
-                    ));
+                SignerCeremonyPrepareRequest::PetalRegistration(request) => {
+                    SignerCeremonyPrepareResponse::PetalRegistration(prepared_custody(
+                        &self.ceremony,
+                        self.ceremony.prepare_petal_registration(*request, now_ms)?,
+                    )?)
                 }
                 SignerCeremonyPrepareRequest::PolicyUpdate(request) => {
                     SignerCeremonyPrepareResponse::PolicyUpdate(prepared_custody(
@@ -203,11 +203,11 @@ impl SignerRpcService {
                         self.ceremony.complete_approval(*request, now_ms).await?,
                     ))
                 }
-                SignerCeremonyCompleteRequest::PetalRegistration(_) => {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::ServiceUnavailable,
-                        "Petal registration is not available",
-                    ));
+                SignerCeremonyCompleteRequest::PetalRegistration(request) => {
+                    SignerCeremonyCompleteResponse::PetalRegistration(Box::new(
+                        self.ceremony
+                            .complete_petal_registration(*request, now_ms)?,
+                    ))
                 }
                 SignerCeremonyCompleteRequest::PolicyUpdate(request) => {
                     SignerCeremonyCompleteResponse::PolicyUpdate(Box::new(
@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn petal_registration_cannot_use_generic_custody_before_handlers_exist() {
+    async fn petal_registration_cannot_use_untyped_generic_custody() {
         let (service, _, _) = fixture().await;
         let error = service
             .ceremony
@@ -857,7 +857,7 @@ mod tests {
                 now_ms().unwrap(),
             )
             .unwrap_err();
-        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+        assert_eq!(error.code, ProtocolErrorCode::CeremonyKindMismatch);
     }
 
     #[tokio::test]

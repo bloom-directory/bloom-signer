@@ -2,6 +2,13 @@ use bloom_signer_api::*;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use serde_json::json;
 
+#[test]
+fn registration_requires_the_connected_1_5_authority_edge() {
+    assert!(SIGNER_API_RANGE.contains(ProtocolVersion::new(1, 5)));
+    assert!(!SIGNER_API_RANGE.contains(ProtocolVersion::new(1, 4)));
+    assert!(!SIGNER_API_RANGE.contains(ProtocolVersion::new(1, 6)));
+}
+
 fn terms() -> PetalRegistrationTerms {
     serde_json::from_value(json!({
         "schema": "bloom.petal-registration/1",

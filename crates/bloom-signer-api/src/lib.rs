@@ -40,13 +40,12 @@ pub use bloom_rpc_wire::{
     WireError, WireErrorCode, decode_frame, encode_frame,
 };
 
-/// Broker-to-Signer authority contract. Version 1.4 adds the durable terminal
-/// ceremony-status response. It is intentionally a strict minor bump: a 1.3
-/// peer cannot deserialize the new `Terminal` response variant, so it must not
-/// negotiate this contract.
+/// Broker-to-Signer authority contract. Version 1.5 connects owner-approved
+/// Petal registration with exact signed terms and enrollment binding. Earlier
+/// peers cannot enforce this contract and must not negotiate it.
 pub const SIGNER_API_MAJOR: u16 = 1;
-pub const SIGNER_API_MINOR_MIN: u16 = 4;
-pub const SIGNER_API_MINOR_MAX: u16 = 4;
+pub const SIGNER_API_MINOR_MIN: u16 = 5;
+pub const SIGNER_API_MINOR_MAX: u16 = 5;
 pub const SIGNER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(SIGNER_API_MAJOR, SIGNER_API_MINOR_MAX);
 pub const SIGNER_API_RANGE: ProtocolVersionRange =

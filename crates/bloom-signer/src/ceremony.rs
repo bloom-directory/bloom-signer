@@ -4,9 +4,10 @@ use bloom_signer_api::{
     CeremonyWebAuthnOptions, CredentialPrfInput, CredentialSummary, CryptoSuite,
     CustodyCompleteRequest, CustodyHpkeAad, CustodyOutputHpkeAad, CustodyPrepareRequest,
     CustodyResult, CustodySignerContribution, DecimalU64, Digest32, LocalPrfHpkeAad, OperationId,
-    PetalKeyScope, PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest,
-    ProtocolError, ProtocolErrorCode, SignerActivationReceipt, SignerCeremonyContribution, Token,
-    WebAuthnCeremonyProof, WebAuthnCredential,
+    PetalKeyScope, PetalRegistrationCeremonyPrepareRequest, PetalRegistrationTerms,
+    PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest, ProtocolError,
+    ProtocolErrorCode, SignerActivationReceipt, SignerCeremonyContribution, Token,
+    WebAuthnCeremonyProof, WebAuthnCredential, petal_registration_enrollment_digest,
 };
 use bloom_signer_backend_api::SecretBytes;
 use ed25519_dalek::{Signer as _, SigningKey};
@@ -94,6 +95,7 @@ enum PendingRequest {
     Approval(Box<CeremonyPrepareRequest>),
     Custody(Box<CustodyPrepareRequest>),
     PolicyUpdate(Box<PolicyUpdateCeremonyPrepareRequest>),
+    PetalRegistration(Box<PetalRegistrationCeremonyPrepareRequest>),
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -188,6 +190,7 @@ pub struct SignerCeremonyService {
     engine: Arc<SignerEngine>,
     signer_key_id: Token,
     signing_key: SigningKey,
+    enrollment_digest: Digest32,
     pending: Mutex<HashMap<OperationId, PendingCeremony>>,
     completed: Mutex<HashMap<OperationId, CompletedCeremony>>,
     credentials: Mutex<BTreeMap<String, BoundCredential>>,
@@ -200,6 +203,108 @@ pub struct SignerCeremonyService {
 pub(crate) struct VerifiedCeremonyActivation(());
 
 impl SignerCeremonyService {
+    pub fn prepare_petal_registration(
+        &self,
+        request: PetalRegistrationCeremonyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<PreparedCustodyCeremony, ProtocolError> {
+        request.validate_binding()?;
+        self.validate_registration_enrollment(&request.terms)?;
+        self.wallet(&request.terms.owner_wallet_id)?;
+        if self
+            .options_for_wallet(Some(&request.terms.owner_wallet_id))
+            .allowed_credentials
+            .is_empty()
+        {
+            return Err(kind_mismatch());
+        }
+        self.prepare_custody_inner(request.custody.clone(), now_ms, Some(Box::new(request)))
+    }
+
+    pub fn complete_petal_registration(
+        &self,
+        request: CustodyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, ProtocolError> {
+        self.complete_custody_inner(request, now_ms, Some(CeremonyKind::PetalRegistration))
+    }
+
+    fn validate_registration_enrollment(
+        &self,
+        terms: &PetalRegistrationTerms,
+    ) -> Result<(), ProtocolError> {
+        terms.validate_shape()?;
+        if terms.enrollment_digest != self.enrollment_digest {
+            return Err(kind_mismatch());
+        }
+        Ok(())
+    }
+
+    /// Authenticate durable registration evidence using this service's actual
+    /// current custody pins. Neither a cached result nor a restarted process
+    /// may adopt a receipt based only on its operation ID.
+    fn validate_custody_receipt(
+        &self,
+        operation_id: &OperationId,
+        result: &CustodyResult,
+    ) -> Result<(), ProtocolError> {
+        result.validate_petal_registration_shape()?;
+        let terms = self.engine.petal_registration_terms(operation_id)?;
+        if result.ceremony_kind != CeremonyKind::PetalRegistration && terms.is_none() {
+            return Ok(());
+        }
+        let terms = terms.ok_or_else(kind_mismatch)?;
+        self.validate_registration_enrollment(&terms)?;
+        result.validate_petal_registration_binding(&terms)?;
+        if &terms.operation_id != operation_id || result.signer_key_id != self.signer_key_id {
+            return Err(kind_mismatch());
+        }
+        let mut message = RECEIPT_DOMAIN.to_vec();
+        message.extend(result.unsigned_canonical_bytes()?);
+        let signature = ed25519_dalek::Signature::from_slice(&result.signer_signature.decode())
+            .map_err(|_| kind_mismatch())?;
+        self.signing_key
+            .verifying_key()
+            .verify_strict(&message, &signature)
+            .map_err(|_| kind_mismatch())?;
+        let status = self
+            .engine
+            .ceremony_public_status(operation_id)?
+            .ok_or_else(kind_mismatch)?;
+        if status.operation_id != *operation_id
+            || status.ceremony_kind != result.ceremony_kind
+            || status.state != result.public_status
+            || status.receipt_digest.as_ref() != Some(&result.receipt_digest)
+        {
+            return Err(kind_mismatch());
+        }
+        Ok(())
+    }
+
+    fn validate_custody_replay(
+        &self,
+        request: &CustodyCompleteRequest,
+        result: &CustodyResult,
+    ) -> Result<(), ProtocolError> {
+        self.validate_custody_receipt(&request.custody_operation_id, result)?;
+        if result.ceremony_kind != request.ceremony_kind {
+            return Err(operation_conflict());
+        }
+        if request.ceremony_kind == CeremonyKind::PetalRegistration {
+            let status = self
+                .engine
+                .ceremony_public_status(&request.custody_operation_id)?
+                .ok_or_else(kind_mismatch)?;
+            if result.petal_registration_terms_digest.as_ref()
+                != Some(&request.public_binding_digest)
+                || status.ceremony_id != request.ceremony_id
+            {
+                return Err(operation_conflict());
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(
         engine: Arc<SignerEngine>,
         signer_key_id: Token,
@@ -253,10 +358,18 @@ impl SignerCeremonyService {
                 )
             })
             .collect();
+        let (broker_key_id, broker_public_key) = engine.broker_signing_identity();
+        let enrollment_digest = petal_registration_enrollment_digest(
+            broker_key_id,
+            broker_public_key,
+            &signer_key_id,
+            &signing_key.verifying_key(),
+        )?;
         Ok(Self {
             engine,
             signer_key_id,
             signing_key,
+            enrollment_digest,
             pending: Mutex::new(HashMap::new()),
             completed: Mutex::new(HashMap::new()),
             credentials: Mutex::new(credentials),
@@ -439,11 +552,21 @@ impl SignerCeremonyService {
         now_ms: u64,
     ) -> Result<PreparedCustodyCeremony, ProtocolError> {
         if request.ceremony_kind == CeremonyKind::PetalRegistration {
-            return Err(protocol(
-                ProtocolErrorCode::ServiceUnavailable,
-                "Petal registration is not available",
-            ));
+            return Err(kind_mismatch());
         }
+        self.prepare_custody_inner(request, now_ms, None)
+    }
+
+    fn prepare_custody_inner(
+        &self,
+        request: CustodyPrepareRequest,
+        now_ms: u64,
+        registration: Option<Box<PetalRegistrationCeremonyPrepareRequest>>,
+    ) -> Result<PreparedCustodyCeremony, ProtocolError> {
+        let pending_request = match registration {
+            Some(registration) => PendingRequest::PetalRegistration(registration),
+            None => PendingRequest::Custody(Box::new(request.clone())),
+        };
         if request.ceremony_kind == CeremonyKind::SealedApproval {
             return Err(kind_mismatch());
         }
@@ -460,7 +583,10 @@ impl SignerCeremonyService {
             self.engine
                 .require_enrolled_parent_key(&scope.wallet_id, &scope.parent_key_ref)?;
         }
-        let request_digest = canonical_digest(&request)?;
+        let request_digest = match &pending_request {
+            PendingRequest::PetalRegistration(registration) => canonical_digest(registration)?,
+            _ => canonical_digest(&request)?,
+        };
         if let Some(existing) = self.pending.lock().get(&request.custody_operation_id) {
             if existing.request_digest != request_digest {
                 tracing::warn!(
@@ -472,6 +598,11 @@ impl SignerCeremonyService {
                 return Err(operation_conflict());
             }
             if let PendingContribution::Custody(contribution) = &existing.contribution {
+                if request.ceremony_kind == CeremonyKind::PetalRegistration
+                    && contribution.expires_at_ms.get() <= now_ms
+                {
+                    return Err(replay());
+                }
                 tracing::info!(
                     event = "signer.ceremony_recovered",
                     operation_id = request.custody_operation_id.as_str(),
@@ -677,7 +808,7 @@ impl SignerCeremonyService {
             request.custody_operation_id.clone(),
             PendingCeremony {
                 request_digest,
-                request: PendingRequest::Custody(Box::new(request)),
+                request: pending_request,
                 contribution: PendingContribution::Custody(contribution),
                 challenges,
                 hpke_recipient: Some(recipient),
@@ -1010,7 +1141,7 @@ impl SignerCeremonyService {
         request: CustodyCompleteRequest,
         now_ms: u64,
     ) -> Result<CustodyResult, ProtocolError> {
-        self.complete_custody_inner(request, now_ms, false)
+        self.complete_custody_inner(request, now_ms, None)
     }
 
     pub fn complete_policy_update(
@@ -1018,28 +1149,29 @@ impl SignerCeremonyService {
         request: PolicyUpdateCeremonyCompleteRequest,
         now_ms: u64,
     ) -> Result<CustodyResult, ProtocolError> {
-        self.complete_custody_inner(request.custody, now_ms, true)
+        self.complete_custody_inner(request.custody, now_ms, Some(CeremonyKind::PolicyUpdate))
     }
 
     fn complete_custody_inner(
         &self,
         request: CustodyCompleteRequest,
         now_ms: u64,
-        policy_update: bool,
+        typed_kind: Option<CeremonyKind>,
     ) -> Result<CustodyResult, ProtocolError> {
-        if request.ceremony_kind == CeremonyKind::PetalRegistration {
-            return Err(protocol(
-                ProtocolErrorCode::ServiceUnavailable,
-                "Petal registration is not available",
-            ));
-        }
-        if policy_update != (request.ceremony_kind == CeremonyKind::PolicyUpdate) {
+        let required_typed_kind = match request.ceremony_kind {
+            CeremonyKind::PolicyUpdate | CeremonyKind::PetalRegistration => {
+                Some(request.ceremony_kind)
+            }
+            _ => None,
+        };
+        if typed_kind != required_typed_kind {
             return Err(kind_mismatch());
         }
         let _completion_barrier = self.custody_completion_barrier.lock();
         if let Some(CompletedCeremony::Custody { result, .. }) =
             self.completed.lock().get(&request.custody_operation_id)
         {
+            self.validate_custody_replay(&request, result)?;
             tracing::info!(
                 event = "signer.ceremony_recovered",
                 operation_id = request.custody_operation_id.as_str(),
@@ -1050,6 +1182,7 @@ impl SignerCeremonyService {
             return Ok((**result).clone());
         }
         if let Some(result) = self.engine.custody_receipt(&request.custody_operation_id)? {
+            self.validate_custody_replay(&request, &result)?;
             if result.ceremony_kind != request.ceremony_kind {
                 tracing::warn!(
                     event = "signer.ceremony_retry_conflict",
@@ -1074,7 +1207,7 @@ impl SignerCeremonyService {
             .lock()
             .remove(&operation_id)
             .ok_or_else(replay)?;
-        match self.apply_custody_completion(request, now_ms, policy_update, &mut pending) {
+        match self.apply_custody_completion(request, now_ms, typed_kind, &mut pending) {
             Ok(result) => Ok(result),
             Err(error) => {
                 self.terminalize_consumed_ceremony(&operation_id, &pending.contribution, now_ms);
@@ -1093,21 +1226,33 @@ impl SignerCeremonyService {
         &self,
         request: CustodyCompleteRequest,
         now_ms: u64,
-        policy_update: bool,
+        typed_kind: Option<CeremonyKind>,
         pending: &mut PendingCeremony,
     ) -> Result<CustodyResult, ProtocolError> {
-        let (prepare, policy_prepare, contribution) =
+        let (prepare, policy_prepare, registration_prepare, contribution) =
             match (&pending.request, &pending.contribution) {
                 (PendingRequest::Custody(prepare), PendingContribution::Custody(contribution)) => {
-                    (prepare.as_ref(), None, contribution)
+                    (prepare.as_ref(), None, None, contribution)
                 }
                 (
                     PendingRequest::PolicyUpdate(policy),
                     PendingContribution::Custody(contribution),
-                ) => (&policy.custody, Some(policy.as_ref()), contribution),
+                ) => (&policy.custody, Some(policy.as_ref()), None, contribution),
+                (
+                    PendingRequest::PetalRegistration(registration),
+                    PendingContribution::Custody(contribution),
+                ) => (
+                    &registration.custody,
+                    None,
+                    Some(registration.as_ref()),
+                    contribution,
+                ),
                 _ => return Err(kind_mismatch()),
             };
-        if policy_update != policy_prepare.is_some() {
+        if (typed_kind == Some(CeremonyKind::PolicyUpdate)) != policy_prepare.is_some()
+            || (typed_kind == Some(CeremonyKind::PetalRegistration))
+                != registration_prepare.is_some()
+        {
             return Err(kind_mismatch());
         }
         if request.ceremony_kind != prepare.ceremony_kind
@@ -1120,6 +1265,10 @@ impl SignerCeremonyService {
             )
         {
             return Err(kind_mismatch());
+        }
+        if let Some(registration) = registration_prepare {
+            registration.validate_binding()?;
+            self.validate_registration_enrollment(&registration.terms)?;
         }
         if prepare.petal_key_scope.is_some() {
             contribution.validate_petal_key_scope_binding(prepare)?;
@@ -1192,7 +1341,7 @@ impl SignerCeremonyService {
                 self.credentials
                     .lock()
                     .values()
-                    .filter(|bound| &bound.wallet_id == wallet_id)
+                    .filter(|bound| registration_prepare.is_none() && &bound.wallet_id == wallet_id)
                     .map(|bound| CredentialSummary {
                         credential_id: bound.credential.credential_id.clone(),
                         rp_id: bound.credential.rp_id.clone(),
@@ -1206,7 +1355,9 @@ impl SignerCeremonyService {
             _ => None,
         };
         let mut result = CustodyResult {
-            petal_registration_terms_digest: None,
+            petal_registration_terms_digest: registration_prepare
+                .map(|registration| registration.terms.digest())
+                .transpose()?,
             ceremony_kind: request.ceremony_kind,
             custody_operation_id: request.custody_operation_id.clone(),
             public_status: request
@@ -1222,6 +1373,9 @@ impl SignerCeremonyService {
             signer_key_id: self.signer_key_id.clone(),
             signer_signature: Base64UrlBytes::from_bytes(&[]),
         };
+        if let Some(registration) = registration_prepare {
+            result.validate_petal_registration_binding(&registration.terms)?;
+        }
         result.signer_signature = self.sign_receipt(&result.unsigned_canonical_bytes()?);
         let after = self.custody_snapshot();
         let durable_status = CeremonyPublicStatus {
@@ -1240,6 +1394,7 @@ impl SignerCeremonyService {
             now_ms,
             &durable_status,
             apply_outcome.database_effect,
+            registration_prepare.map(|registration| &registration.terms),
         ) {
             self.rollback_derived_key(apply_outcome.rollback_derived_key.as_ref())?;
             self.rollback_provisioned_backend(apply_outcome.rollback_provisioned_backend.as_ref());
@@ -1417,6 +1572,7 @@ impl SignerCeremonyService {
                     SignerCeremonyStatus::CompletedApproval(Box::new((**receipt).clone()))
                 }
                 CompletedCeremony::Custody { result, .. } => {
+                    self.validate_custody_receipt(operation_id, result)?;
                     SignerCeremonyStatus::CompletedCustody(result.clone())
                 }
             });
@@ -1425,6 +1581,7 @@ impl SignerCeremonyService {
             return Ok(SignerCeremonyStatus::CompletedApproval(Box::new(receipt)));
         }
         if let Some(result) = self.engine.custody_receipt(operation_id)? {
+            self.validate_custody_receipt(operation_id, &result)?;
             return Ok(SignerCeremonyStatus::CompletedCustody(Box::new(result)));
         }
         if self.pending.lock().contains_key(operation_id) {
@@ -1458,15 +1615,18 @@ impl SignerCeremonyService {
                     result,
                     ceremony_id,
                     expires_at_ms,
-                } => Ok(CeremonyPublicStatus {
-                    ceremony_id: ceremony_id.clone(),
-                    ceremony_kind: result.ceremony_kind,
-                    operation_id: operation_id.clone(),
-                    state: result.public_status,
-                    expires_at_ms: expires_at_ms.clone(),
-                    ceremony_url: None,
-                    receipt_digest: Some(result.receipt_digest.clone()),
-                }),
+                } => {
+                    self.validate_custody_receipt(operation_id, result)?;
+                    Ok(CeremonyPublicStatus {
+                        ceremony_id: ceremony_id.clone(),
+                        ceremony_kind: result.ceremony_kind,
+                        operation_id: operation_id.clone(),
+                        state: result.public_status,
+                        expires_at_ms: expires_at_ms.clone(),
+                        ceremony_url: None,
+                        receipt_digest: Some(result.receipt_digest.clone()),
+                    })
+                }
             };
         }
         if let Some(pending) = self.pending.lock().get(operation_id) {
@@ -1492,6 +1652,15 @@ impl SignerCeremonyService {
             });
         }
         if let Some(status) = self.engine.ceremony_public_status(operation_id)? {
+            if status.ceremony_kind == CeremonyKind::PetalRegistration
+                && status.state == CeremonyState::Succeeded
+            {
+                let result = self
+                    .engine
+                    .custody_receipt(operation_id)?
+                    .ok_or_else(kind_mismatch)?;
+                self.validate_custody_receipt(operation_id, &result)?;
+            }
             return Ok(status);
         }
         Err(protocol(
@@ -1866,7 +2035,8 @@ impl SignerCeremonyService {
             | CeremonyKind::WalletDelete
             | CeremonyKind::BackendEnrollment
             | CeremonyKind::KeyDerive
-            | CeremonyKind::PolicyUpdate => {
+            | CeremonyKind::PolicyUpdate
+            | CeremonyKind::PetalRegistration => {
                 let wallet_id = prepare.wallet_id.as_ref().ok_or_else(kind_mismatch)?;
                 let assertion = assertion_only(&complete.proof)?;
                 let bound = self.bound_credential(&assertion.credential_id, wallet_id)?;
@@ -1921,7 +2091,7 @@ impl SignerCeremonyService {
                 self.advance_counter(&verified.credential_id, verified.sign_count);
                 Ok(())
             }
-            CeremonyKind::SealedApproval | CeremonyKind::PetalRegistration => Err(kind_mismatch()),
+            CeremonyKind::SealedApproval => Err(kind_mismatch()),
         };
         effect?;
         Ok(CustodyApplyOutcome {
@@ -1942,6 +2112,16 @@ impl SignerCeremonyService {
     ) -> Result<GenericCustodyOutcome, ProtocolError> {
         let wallet_id = prepare.wallet_id.as_ref().ok_or_else(kind_mismatch)?;
         match (prepare.ceremony_kind, effect) {
+            (CeremonyKind::PetalRegistration, GenericCustodyEffect::PetalRegistration {}) => {
+                // Owner verification and PRF unlock have already succeeded. Registration
+                // records consent only: no key derivation, policy, backend or approval effect.
+                Ok(GenericCustodyOutcome {
+                    sensitive_output: None,
+                    database_effect: CeremonyDatabaseEffect::None,
+                    rollback_derived_key: None,
+                    public_key_refs: Vec::new(),
+                })
+            }
             (CeremonyKind::WalletExport, GenericCustodyEffect::WalletExport) => {
                 let export = WalletExportBundle {
                     wallet: self.wallet(wallet_id)?.backup(),
@@ -2288,6 +2468,9 @@ impl SignerCeremonyService {
                 PendingRequest::Approval(request) => &request.terms.wallet_id == wallet_id,
                 PendingRequest::Custody(request) => request.wallet_id.as_ref() == Some(wallet_id),
                 PendingRequest::PolicyUpdate(request) => &request.update.wallet_id == wallet_id,
+                PendingRequest::PetalRegistration(request) => {
+                    &request.terms.owner_wallet_id == wallet_id
+                }
             })
         {
             return Err(protocol(
@@ -2357,6 +2540,9 @@ impl SignerCeremonyService {
                         PendingRequest::PolicyUpdate(request) => {
                             self.options_for_wallet(Some(&request.update.wallet_id))
                         }
+                        PendingRequest::PetalRegistration(request) => {
+                            self.options_for_wallet(Some(&request.terms.owner_wallet_id))
+                        }
                     };
                     options.registration_user_handle = Some(creation.user_handle.clone());
                     options.registration_prf_salt = Some(creation.prf_salt.clone());
@@ -2373,6 +2559,9 @@ impl SignerCeremonyService {
                 PendingRequest::PolicyUpdate(request) => {
                     self.options_for_wallet(Some(&request.update.wallet_id))
                 }
+                PendingRequest::PetalRegistration(request) => {
+                    self.options_for_wallet(Some(&request.terms.owner_wallet_id))
+                }
             })
     }
 
@@ -2388,6 +2577,7 @@ impl SignerCeremonyService {
             PendingRequest::Approval(request) => Some(&request.terms.wallet_id),
             PendingRequest::Custody(request) => request.wallet_id.as_ref(),
             PendingRequest::PolicyUpdate(request) => Some(&request.update.wallet_id),
+            PendingRequest::PetalRegistration(request) => Some(&request.terms.owner_wallet_id),
         };
         let Some(wallet_id) = wallet_id else {
             return Vec::new();

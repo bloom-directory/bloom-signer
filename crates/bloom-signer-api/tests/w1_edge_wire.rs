@@ -592,12 +592,12 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer requests",
         signer_requests(),
-        "991df6448dae330b1f6b70e99f22b3966373e2cc27fc8f56f3662aeed84a1552",
+        "2d9dd1adc29336eecc48ebf0a213df67408e5d6c512f2e74445b03b0e0c61c7a",
     );
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "de0dc430a3047886d53189fc66efea2ba2afe0e9551e1090f5eb7d91bbb2f8b5",
+        "93ebd00437f73a5d346b1f15a405f1114cf7ba8ad03efa2b8ac3bc9fb3875579",
     );
     assert_wire_digest(
         "control requests",
