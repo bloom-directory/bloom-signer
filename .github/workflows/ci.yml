@@ -28,3 +28,15 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run tests
         run: cargo test --workspace --all-features --locked
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Advisories, licences, sources, and wildcard pins, configured in
+      # deny.toml. Runs as its own job so a dependency advisory is
+      # distinguishable from a code failure, and so it still reports when
+      # the workspace job fails.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
