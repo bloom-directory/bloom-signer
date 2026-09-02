@@ -133,6 +133,8 @@ pub fn migrate(connection: &Connection) -> Result<(), ProtocolError> {
                 key_spec TEXT NOT NULL,
                 public_key_spki_der TEXT,
                 public_key_fingerprint TEXT,
+                authority_committed INTEGER NOT NULL DEFAULT 1
+                    CHECK (authority_committed IN (0, 1)),
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (wallet_id, operation_id),
@@ -163,6 +165,30 @@ pub fn migrate(connection: &Connection) -> Result<(), ProtocolError> {
             ",
         )
         .map_err(storage)?;
+    let has_authority_committed = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(derivation_allocations)")
+            .map_err(storage)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?
+            .iter()
+            .any(|column| column == "authority_committed")
+    };
+    if !has_authority_committed {
+        // Existing allocations predate crash-window recovery and were already
+        // treated as committed. New allocations explicitly start at zero.
+        connection
+            .execute(
+                "ALTER TABLE derivation_allocations
+                 ADD COLUMN authority_committed INTEGER NOT NULL DEFAULT 1
+                 CHECK (authority_committed IN (0, 1))",
+                [],
+            )
+            .map_err(storage)?;
+    }
     Ok(())
 }
 
@@ -528,8 +554,8 @@ pub fn prepare_allocation(
         .execute(
             "INSERT INTO derivation_allocations (
                 wallet_id, operation_id, profile, role, account, \"index\", path,
-                state, key_spec, created_at_ms, updated_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'PREPARED', ?8, ?9, ?9)",
+                state, key_spec, authority_committed, created_at_ms, updated_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'PREPARED', ?8, 0, ?9, ?9)",
             rusqlite::params![
                 wallet_id.as_str(),
                 operation_id,

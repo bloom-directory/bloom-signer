@@ -167,8 +167,10 @@ struct CustodyApplyContext {
     legacy_migration: Option<PreparedLegacyMigration>,
 }
 
+type SensitiveCustodyOutput = Zeroizing<Vec<u8>>;
+
 struct CustodyApplyOutcome {
-    sensitive_output: Option<Vec<u8>>,
+    sensitive_output: Option<SensitiveCustodyOutput>,
     database_effect: CeremonyDatabaseEffect,
     rollback_derived_key: Option<bloom_signer_api::KeyRef>,
     rollback_provisioned_backend: Option<bloom_signer_api::KeyRef>,
@@ -177,7 +179,7 @@ struct CustodyApplyOutcome {
 }
 
 struct GenericCustodyOutcome {
-    sensitive_output: Option<Vec<u8>>,
+    sensitive_output: Option<SensitiveCustodyOutput>,
     database_effect: CeremonyDatabaseEffect,
     rollback_derived_key: Option<bloom_signer_api::KeyRef>,
     public_key_refs: Vec<bloom_signer_api::KeyRef>,
@@ -241,6 +243,23 @@ impl SignerCeremonyService {
         signer_key_id: Token,
         signing_key: SigningKey,
     ) -> Result<Self, ProtocolError> {
+        let recovery_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "system clock is before the Unix epoch",
+                )
+            })?
+            .as_millis()
+            .try_into()
+            .map_err(|_| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "system clock exceeds the supported millisecond range",
+                )
+            })?;
+        engine.recover_incomplete_bip39_allocations(recovery_now_ms)?;
         #[cfg(feature = "local")]
         for enrollment in engine.load_ceremony_backend_enrollments()? {
             if enrollment.backend.as_str() != "local" {
@@ -1768,13 +1787,13 @@ impl SignerCeremonyService {
                         registration.recovery_id.clone(),
                         &recovery_key,
                     )?;
-                    sensitive_output = Some(
+                    sensitive_output = Some(Zeroizing::new(
                         serde_jcs::to_vec(&RegistrationRecoveryOutput {
                             recovery_id: registration.recovery_id,
                             recovery_secret: registration.recovery_secret,
                         })
                         .map_err(malformed)?,
-                    );
+                    ));
                 }
                 {
                     let mut wallets = self.wallets.lock();
@@ -2131,7 +2150,9 @@ impl SignerCeremonyService {
                                 .collect(),
                         };
                         Ok(GenericCustodyOutcome {
-                            sensitive_output: Some(serde_jcs::to_vec(&export).map_err(malformed)?),
+                            sensitive_output: Some(Zeroizing::new(
+                                serde_jcs::to_vec(&export).map_err(malformed)?,
+                            )),
                             database_effect: CeremonyDatabaseEffect::None,
                             rollback_derived_key: None,
                             public_key_refs: Vec::new(),
@@ -2146,7 +2167,7 @@ impl SignerCeremonyService {
                             .export_mnemonic(unlocked)
                             .map_err(|_| kind_mismatch())?;
                         Ok(GenericCustodyOutcome {
-                            sensitive_output: Some(mnemonic.as_bytes().to_vec()),
+                            sensitive_output: Some(Zeroizing::new(mnemonic.as_bytes().to_vec())),
                             database_effect: CeremonyDatabaseEffect::None,
                             rollback_derived_key: None,
                             public_key_refs: Vec::new(),
@@ -2251,7 +2272,9 @@ impl SignerCeremonyService {
                     )?;
                     let derived_key_ref = description.key_ref.clone();
                     Ok(GenericCustodyOutcome {
-                        sensitive_output: Some(serde_jcs::to_vec(&description).map_err(malformed)?),
+                        sensitive_output: Some(Zeroizing::new(
+                            serde_jcs::to_vec(&description).map_err(malformed)?,
+                        )),
                         database_effect: CeremonyDatabaseEffect::EnrollKey {
                             key_ref: description.key_ref.clone(),
                             petal_scope: None,

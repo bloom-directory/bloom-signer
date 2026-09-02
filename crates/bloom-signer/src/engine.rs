@@ -1918,6 +1918,14 @@ impl SignerEngine {
             .map_err(storage)?;
         transaction
             .execute(
+                "UPDATE derivation_allocations
+                 SET authority_committed = 1
+                 WHERE operation_id = ?1",
+                [result.custody_operation_id.as_str()],
+            )
+            .map_err(storage)?;
+        transaction
+            .execute(
                 "INSERT INTO ceremony_statuses(operation_id, status_jcs)
                  VALUES (?1, ?2)
                  ON CONFLICT(operation_id) DO UPDATE SET status_jcs = excluded.status_jcs",
@@ -2251,6 +2259,57 @@ impl SignerEngine {
             now_ms,
             &audit,
         )
+    }
+
+    /// Fail closed allocations whose custody ceremony never committed a
+    /// durable receipt. A process can stop after the public allocation and
+    /// backend child are persisted but before the ceremony snapshot commits;
+    /// on restart those children must not become usable or visible.
+    pub(crate) fn recover_incomplete_bip39_allocations(
+        &self,
+        now_ms: u64,
+    ) -> Result<(), ProtocolError> {
+        let mut connection = self.connection.lock();
+        let incomplete = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT wallet_id, operation_id, public_key_fingerprint
+                     FROM derivation_allocations
+                     WHERE state = 'ACTIVATED' AND authority_committed = 0",
+                )
+                .map_err(storage)?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage)?
+        };
+        let audit = |tx: &Transaction, event: &str, payload: serde_json::Value| {
+            self.append_audit(tx, event, &payload)
+        };
+        for (wallet_id, operation_id, fingerprint) in incomplete {
+            connection
+                .execute(
+                    "UPDATE enrolled_keys SET available = 0
+                     WHERE key_fingerprint = ?1 AND authority_class = 'derived'",
+                    [fingerprint],
+                )
+                .map_err(storage)?;
+            crate::derivation_registry::tombstone(
+                &mut connection,
+                &Token::new(wallet_id)?,
+                &operation_id,
+                now_ms,
+                &audit,
+            )?;
+        }
+        Ok(())
     }
 
     /// Drive the full allocation lifecycle for one BIP-39 derived child, in
@@ -4504,8 +4563,8 @@ impl SignerEngine {
                     "INSERT INTO derivation_allocations(
                         wallet_id, operation_id, profile, role, account, \"index\", path,
                         state, key_spec, public_key_spki_der, public_key_fingerprint,
-                        created_at_ms, updated_at_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                        authority_committed, created_at_ms, updated_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13)
                      ON CONFLICT(wallet_id, operation_id) DO UPDATE SET
                         profile = excluded.profile,
                         role = excluded.role,
@@ -4516,6 +4575,7 @@ impl SignerEngine {
                         key_spec = excluded.key_spec,
                         public_key_spki_der = excluded.public_key_spki_der,
                         public_key_fingerprint = excluded.public_key_fingerprint,
+                        authority_committed = 1,
                         created_at_ms = excluded.created_at_ms,
                         updated_at_ms = excluded.updated_at_ms",
                     params![
@@ -8008,7 +8068,9 @@ mod require_key_tests {
             .connection
             .lock()
             .execute(
-                "UPDATE derivation_allocations SET state = 'ACTIVATED' WHERE operation_id = 'op-retired'",
+                "UPDATE derivation_allocations
+                 SET state = 'ACTIVATED', authority_committed = 0
+                 WHERE operation_id = 'op-retired'",
                 [],
             )
             .unwrap();
@@ -8028,5 +8090,44 @@ mod require_key_tests {
         );
         registry.rollback_local_derived_key(&child).unwrap();
         assert!(!registry.key_is_registered(&child).unwrap());
+    }
+
+    #[test]
+    fn restart_recovery_tombstones_allocations_without_custody_receipts() {
+        let (engine, child, _registry) = retired_bip39_child_engine();
+        engine
+            .connection
+            .lock()
+            .execute(
+                "UPDATE derivation_allocations
+                 SET state = 'ACTIVATED', authority_committed = 0
+                 WHERE operation_id = 'op-retired'",
+                [],
+            )
+            .unwrap();
+
+        engine.recover_incomplete_bip39_allocations(99).unwrap();
+
+        let connection = engine.connection.lock();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state FROM derivation_allocations WHERE operation_id = 'op-retired'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "TOMBSTONED"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT available FROM enrolled_keys WHERE key_fingerprint = ?1",
+                    [child.public_key_fingerprint.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 }
