@@ -463,6 +463,121 @@ fn owner_attestation_succeeds_and_persists_without_domain_mutation() {
 }
 
 #[test]
+fn owner_attestation_counter_transition_is_cross_kind_monotonic_and_zero_preserving() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (registration_service, _, engine, _) = service(&authenticator);
+    let (wallet_id, credential) = register_wallet(
+        &registration_service,
+        &authenticator,
+        operation("91"),
+        9_000,
+    );
+    let stale_owner = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    let custody = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+
+    let mut stale_terms = owner_attestation_terms(operation("92"));
+    stale_terms.owner_wallet_id = wallet_id.clone();
+    let stale_prepared = stale_owner
+        .prepare_owner_attestation(
+            OwnerAttestationPrepareRequest {
+                terms: stale_terms.clone(),
+            },
+            10_000,
+        )
+        .unwrap();
+    let output_recipient = HpkeRecipient::generate();
+    complete_generic(
+        &custody,
+        &authenticator,
+        &wallet_id,
+        None,
+        (
+            CeremonyKind::WalletExport,
+            operation("93"),
+            serde_json::json!({"kind": "wallet_export"}),
+        ),
+        Some(&output_recipient),
+        20_000,
+    )
+    .unwrap();
+
+    let stale_lower = owner_attestation_complete_request(&authenticator, &stale_prepared, 2);
+    assert_eq!(
+        stale_owner
+            .complete_owner_attestation(stale_lower, 20_100)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::UnauthenticatedPeer,
+        "a stale owner completion must not replace a newer custody counter"
+    );
+    assert!(matches!(
+        stale_owner.status(&stale_terms.operation_id).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Failed)
+    ));
+
+    let current = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    assert_eq!(
+        current
+            .credential(&wallet_id, &credential.credential_id)
+            .unwrap()
+            .sign_count
+            .get(),
+        20_000
+    );
+
+    let mut zero_terms = owner_attestation_terms(operation("94"));
+    zero_terms.owner_wallet_id = wallet_id.clone();
+    let zero_prepared = current
+        .prepare_owner_attestation(OwnerAttestationPrepareRequest { terms: zero_terms }, 20_200)
+        .unwrap();
+    current
+        .complete_owner_attestation(
+            owner_attestation_complete_request(&authenticator, &zero_prepared, 0),
+            20_300,
+        )
+        .unwrap();
+    assert_eq!(
+        current
+            .credential(&wallet_id, &credential.credential_id)
+            .unwrap()
+            .sign_count
+            .get(),
+        20_000,
+        "a valid zero-counter assertion must not erase a previously observed counter"
+    );
+    let restarted = SignerCeremonyService::new(
+        engine,
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    assert_eq!(
+        restarted
+            .credential(&wallet_id, &credential.credential_id)
+            .unwrap()
+            .sign_count
+            .get(),
+        20_000,
+        "the zero-counter completion must preserve the higher durable counter"
+    );
+}
+
+#[test]
 fn owner_attestation_cancel_is_durable_idempotent_and_consumes_pending_proof() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, _, _, _) = service(&authenticator);

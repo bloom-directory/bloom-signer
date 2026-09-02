@@ -1591,7 +1591,7 @@ impl SignerEngine {
         expires_at_ms: &DecimalU64,
         public_binding_digest: &Digest32,
         wallet_id: &Token,
-        credential: &WebAuthnCredential,
+        proposed_credential: &WebAuthnCredential,
     ) -> Result<(), ProtocolError> {
         let status = OwnerAttestationStoredStatus {
             operation_id: &receipt.operation_id,
@@ -1603,14 +1603,58 @@ impl SignerEngine {
         };
         let mut connection = self.connection.lock();
         let transaction = self.mutation_transaction(&mut connection)?;
+        let stored_credential_jcs = transaction
+            .query_row(
+                "SELECT credential_jcs FROM webauthn_credentials
+                 WHERE credential_id = ?1 AND wallet_id = ?2",
+                params![
+                    proposed_credential.credential_id.encoded(),
+                    wallet_id.as_str()
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?
+            .ok_or_else(|| {
+                error(
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "owner attestation credential is not durably bound to the wallet",
+                )
+            })?;
+        let mut stored_credential: WebAuthnCredential =
+            serde_json::from_str(&stored_credential_jcs).map_err(malformed)?;
+        let stored_count = stored_credential.sign_count.get();
+        let proposed_count = proposed_credential.sign_count.get();
+        let mut expected_metadata = proposed_credential.clone();
+        expected_metadata.sign_count = stored_credential.sign_count.clone();
+        if stored_credential != expected_metadata
+            || stored_count > u64::from(u32::MAX)
+            || proposed_count > u64::from(u32::MAX)
+        {
+            return Err(error(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "owner attestation credential metadata is not the current durable enrollment",
+            ));
+        }
+        let committed_count = if proposed_count == 0 {
+            stored_count
+        } else if stored_count != 0 && proposed_count <= stored_count {
+            return Err(error(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "authenticator signature counter did not advance",
+            ));
+        } else {
+            proposed_count
+        };
+        stored_credential.sign_count = DecimalU64::new(committed_count);
         let updated = transaction
             .execute(
                 "UPDATE webauthn_credentials SET credential_jcs = ?3
                  WHERE credential_id = ?1 AND wallet_id = ?2",
                 params![
-                    credential.credential_id.encoded(),
+                    stored_credential.credential_id.encoded(),
                     wallet_id.as_str(),
-                    serde_jcs::to_string(credential).map_err(malformed)?,
+                    serde_jcs::to_string(&stored_credential).map_err(malformed)?,
                 ],
             )
             .map_err(storage)?;
@@ -1645,8 +1689,8 @@ impl SignerEngine {
             &serde_json::json!({
                 "receipt": receipt,
                 "status": status,
-                "credential_id": credential.credential_id,
-                "credential_sign_count": credential.sign_count,
+                "credential_id": stored_credential.credential_id,
+                "credential_sign_count": stored_credential.sign_count,
             }),
         )?;
         transaction.commit().map_err(storage)?;

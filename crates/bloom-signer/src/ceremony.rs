@@ -2575,7 +2575,11 @@ impl SignerCeremonyService {
 
     fn advance_counter(&self, credential_id: &Base64UrlBytes, sign_count: u32) {
         if let Some(bound) = self.credentials.lock().get_mut(credential_id.encoded()) {
-            bound.credential.sign_count = DecimalU64::new(u64::from(sign_count));
+            let current = bound.credential.sign_count.get();
+            let proposed = u64::from(sign_count);
+            if proposed != 0 && (current == 0 || proposed > current) {
+                bound.credential.sign_count = DecimalU64::new(proposed);
+            }
         }
     }
 
