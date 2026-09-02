@@ -221,14 +221,17 @@ impl SignerRpcService {
             }
             Request::CeremonyCancel(request) => {
                 let operation_id = OperationId::new(request.id.as_str().to_owned())?;
-                self.ceremony.cancel(&operation_id)?;
-                // Report the durable status rather than asserting `CANCELLED`:
-                // a ceremony that already failed closed answers cancellation
-                // idempotently, and callers reconciling it must see the state
-                // `ceremony.status` will keep reporting.
-                Ok(Response::CeremonyCancel(
-                    self.ceremony.public_status(&operation_id)?,
-                ))
+                let status = self.ceremony.cancel(&operation_id)?;
+                Ok(Response::CeremonyCancel(match status {
+                    crate::ceremony::SignerCeremonyCancellation::Public(status) => {
+                        bloom_signer_api::SignerCeremonyCancelResponse::Public(status)
+                    }
+                    crate::ceremony::SignerCeremonyCancellation::OwnerAttestation(status) => {
+                        bloom_signer_api::SignerCeremonyCancelResponse::OwnerAttestation(
+                            signer_ceremony_status(status),
+                        )
+                    }
+                }))
             }
             Request::SealedApprovalStatus(request) => Ok(Response::SealedApprovalStatus(
                 self.engine.approval_public_status(&request.id, now_ms)?,
@@ -770,6 +773,9 @@ fn signer_ceremony_status(
         }
         crate::ceremony::SignerCeremonyStatus::CompletedCustody(result) => {
             bloom_signer_api::SignerCeremonyStatus::CompletedCustody(result)
+        }
+        crate::ceremony::SignerCeremonyStatus::CompletedOwnerAttestation(receipt) => {
+            bloom_signer_api::SignerCeremonyStatus::CompletedOwnerAttestation(receipt)
         }
         crate::ceremony::SignerCeremonyStatus::Terminal(state) => {
             bloom_signer_api::SignerCeremonyStatus::Terminal(state)

@@ -1590,6 +1590,8 @@ impl SignerEngine {
         receipt: &OwnerAttestationReceipt,
         expires_at_ms: &DecimalU64,
         public_binding_digest: &Digest32,
+        wallet_id: &Token,
+        credential: &WebAuthnCredential,
     ) -> Result<(), ProtocolError> {
         let status = OwnerAttestationStoredStatus {
             operation_id: &receipt.operation_id,
@@ -1601,6 +1603,23 @@ impl SignerEngine {
         };
         let mut connection = self.connection.lock();
         let transaction = self.mutation_transaction(&mut connection)?;
+        let updated = transaction
+            .execute(
+                "UPDATE webauthn_credentials SET credential_jcs = ?3
+                 WHERE credential_id = ?1 AND wallet_id = ?2",
+                params![
+                    credential.credential_id.encoded(),
+                    wallet_id.as_str(),
+                    serde_jcs::to_string(credential).map_err(malformed)?,
+                ],
+            )
+            .map_err(storage)?;
+        if updated != 1 {
+            return Err(error(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "owner attestation credential is not durably bound to the wallet",
+            ));
+        }
         transaction
             .execute(
                 "INSERT INTO ceremony_receipts(operation_id, receipt_kind, receipt_jcs)
@@ -1623,7 +1642,12 @@ impl SignerEngine {
         self.append_audit(
             &transaction,
             "owner_attestation.commit",
-            &serde_json::json!({ "receipt": receipt, "status": status }),
+            &serde_json::json!({
+                "receipt": receipt,
+                "status": status,
+                "credential_id": credential.credential_id,
+                "credential_sign_count": credential.sign_count,
+            }),
         )?;
         transaction.commit().map_err(storage)?;
         Ok(())

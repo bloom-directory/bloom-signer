@@ -382,7 +382,7 @@ pub enum BrokerSignerResponse {
     #[serde(rename = "ceremony.complete")]
     CeremonyComplete(crate::SignerCeremonyCompleteResponse),
     #[serde(rename = "ceremony.cancel")]
-    CeremonyCancel(CeremonyPublicStatus),
+    CeremonyCancel(crate::SignerCeremonyCancelResponse),
     #[serde(rename = "operation.status")]
     OperationStatus(OperationPublicStatus),
     #[serde(rename = "ceremony.status")]

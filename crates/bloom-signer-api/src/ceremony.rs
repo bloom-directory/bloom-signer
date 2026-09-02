@@ -476,10 +476,18 @@ pub enum SignerCeremonyStatus {
     Pending,
     CompletedApproval(Box<SignerActivationReceipt>),
     CompletedCustody(Box<CustodyResult>),
+    CompletedOwnerAttestation(Box<crate::OwnerAttestationReceipt>),
     /// A durable non-successful terminal ceremony state, distinct from an
     /// operation unknown to Signer.
     Terminal(CeremonyState),
     Missing,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum SignerCeremonyCancelResponse {
+    Public(crate::CeremonyPublicStatus),
+    OwnerAttestation(SignerCeremonyStatus),
 }
 
 /// The generic `ceremony.prepare` body. Policy update is the sole custody kind

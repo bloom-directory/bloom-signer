@@ -173,16 +173,23 @@ enum CompletedCeremony {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SignerCeremonyStatus {
     Pending,
     CompletedApproval(Box<SignerActivationReceipt>),
     CompletedCustody(Box<CustodyResult>),
+    CompletedOwnerAttestation(Box<OwnerAttestationReceipt>),
     /// A ceremony that ran and reached a durable non-successful terminal:
     /// failed closed, expired, or cancelled. Distinct from `Missing`, which
     /// means Signer holds no record of the operation at all.
     Terminal(CeremonyState),
     Missing,
+}
+
+#[derive(Debug)]
+pub enum SignerCeremonyCancellation {
+    Public(CeremonyPublicStatus),
+    OwnerAttestation(SignerCeremonyStatus),
 }
 
 struct CustodyApplyContext {
@@ -223,6 +230,7 @@ pub struct SignerCeremonyService {
     credentials: Mutex<BTreeMap<String, BoundCredential>>,
     wallets: Mutex<BTreeMap<Token, Arc<WalletCustody>>>,
     legacy_migrations: Option<Arc<LegacyMigrationStore>>,
+    preparation_barrier: Mutex<()>,
     approval_completion_barrier: AsyncMutex<()>,
     custody_completion_barrier: Mutex<()>,
     owner_attestation_completion_barrier: Mutex<()>,
@@ -294,6 +302,7 @@ impl SignerCeremonyService {
             credentials: Mutex::new(credentials),
             wallets: Mutex::new(wallets),
             legacy_migrations: None,
+            preparation_barrier: Mutex::new(()),
             approval_completion_barrier: AsyncMutex::new(()),
             custody_completion_barrier: Mutex::new(()),
             owner_attestation_completion_barrier: Mutex::new(()),
@@ -333,6 +342,7 @@ impl SignerCeremonyService {
         request: OwnerAttestationPrepareRequest,
         now_ms: u64,
     ) -> Result<PreparedOwnerAttestation, ProtocolError> {
+        let _preparation_barrier = self.preparation_barrier.lock();
         let terms_digest = request.terms.digest()?;
         if self.signing_key.verifying_key() != *self.engine.ceremony_public_key() {
             return Err(protocol(
@@ -416,6 +426,7 @@ impl SignerCeremonyService {
         request: OwnerAttestationCompleteRequest,
         now_ms: u64,
     ) -> Result<OwnerAttestationReceipt, ProtocolError> {
+        let _preparation_barrier = self.preparation_barrier.lock();
         let _completion_barrier = self.owner_attestation_completion_barrier.lock();
         if let Some(receipt) = self
             .engine
@@ -495,17 +506,6 @@ impl SignerCeremonyService {
                 &pending.challenge.canonical_bytes()?,
                 true,
             )?;
-            if verified
-                .user_handle
-                .as_ref()
-                .is_some_and(|handle| handle != &bound.credential.user_handle)
-            {
-                return Err(protocol(
-                    ProtocolErrorCode::UnauthenticatedPeer,
-                    "owner attestation user handle does not match the wallet credential",
-                ));
-            }
-
             let receipt_digest = canonical_digest(&OwnerAttestationReceiptPreimage {
                 operation_id: &request.operation_id,
                 ceremony_id: &request.ceremony_id,
@@ -515,7 +515,7 @@ impl SignerCeremonyService {
             let mut receipt = OwnerAttestationReceipt {
                 operation_id: request.operation_id,
                 ceremony_id: request.ceremony_id,
-                owner_wallet_id: pending.terms.owner_wallet_id,
+                owner_wallet_id: pending.terms.owner_wallet_id.clone(),
                 authority_edge_digest: pending.terms.authority_edge_digest,
                 context_digest: pending.terms.context_digest,
                 subject_digest: pending.terms.subject_digest,
@@ -529,10 +529,14 @@ impl SignerCeremonyService {
                     .sign(&receipt.signature_message()?)
                     .to_bytes(),
             );
+            let mut advanced_credential = bound.credential;
+            advanced_credential.sign_count = DecimalU64::new(u64::from(verified.sign_count));
             self.engine.persist_owner_attestation(
                 &receipt,
                 &pending.expires_at_ms,
                 &request.public_binding_digest,
+                &pending.terms.owner_wallet_id,
+                &advanced_credential,
             )?;
             self.advance_counter(&verified.credential_id, verified.sign_count);
             Ok(receipt)
@@ -594,6 +598,7 @@ impl SignerCeremonyService {
         request: CeremonyPrepareRequest,
         now_ms: u64,
     ) -> Result<PreparedApprovalCeremony, ProtocolError> {
+        let _preparation_barrier = self.preparation_barrier.lock();
         request.terms.validate()?;
         self.engine
             .validate_petal_scope_for_approval(&request.terms, now_ms)?;
@@ -735,6 +740,15 @@ impl SignerCeremonyService {
     }
 
     pub fn prepare_custody(
+        &self,
+        request: CustodyPrepareRequest,
+        now_ms: u64,
+    ) -> Result<PreparedCustodyCeremony, ProtocolError> {
+        let _preparation_barrier = self.preparation_barrier.lock();
+        self.prepare_custody_inner(request, now_ms)
+    }
+
+    fn prepare_custody_inner(
         &self,
         request: CustodyPrepareRequest,
         now_ms: u64,
@@ -1002,6 +1016,7 @@ impl SignerCeremonyService {
         request: PolicyUpdateCeremonyPrepareRequest,
         now_ms: u64,
     ) -> Result<PreparedCustodyCeremony, ProtocolError> {
+        let _preparation_barrier = self.preparation_barrier.lock();
         self.engine.validate_policy_ceremony_prepare(&request)?;
         let request_digest = canonical_digest(&request)?;
         if let Some(existing) = self.pending.lock().get(&request.update.operation_id) {
@@ -1020,7 +1035,7 @@ impl SignerCeremonyService {
             }
             return Err(kind_mismatch());
         }
-        self.prepare_custody(request.custody.clone(), now_ms)?;
+        self.prepare_custody_inner(request.custody.clone(), now_ms)?;
         let mut pending = self.pending.lock();
         let entry = pending
             .get_mut(&request.update.operation_id)
@@ -1571,7 +1586,12 @@ impl SignerCeremonyService {
         Ok(result)
     }
 
-    pub fn cancel(&self, operation_id: &OperationId) -> Result<(), ProtocolError> {
+    pub fn cancel(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<SignerCeremonyCancellation, ProtocolError> {
+        let _preparation_barrier = self.preparation_barrier.lock();
+        let _owner_completion_barrier = self.owner_attestation_completion_barrier.lock();
         if self.completed.lock().contains_key(operation_id)
             || self
                 .engine
@@ -1580,8 +1600,32 @@ impl SignerCeremonyService {
         {
             return Err(committed_conflict());
         }
+        if let Some(pending) = self.pending_owner_attestations.lock().remove(operation_id) {
+            self.engine.persist_owner_attestation_terminal_status(
+                operation_id,
+                &pending.contribution.ceremony_id,
+                CeremonyState::Cancelled,
+                &pending.expires_at_ms,
+                &pending.contribution.public_binding_digest,
+            )?;
+            return Ok(SignerCeremonyCancellation::OwnerAttestation(
+                SignerCeremonyStatus::Terminal(CeremonyState::Cancelled),
+            ));
+        }
+        if let Some(state) = self.engine.owner_attestation_terminal_state(operation_id)? {
+            return match state {
+                CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed => {
+                    Ok(SignerCeremonyCancellation::OwnerAttestation(
+                        SignerCeremonyStatus::Terminal(state),
+                    ))
+                }
+                _ => Err(committed_conflict()),
+            };
+        }
         let Some(pending) = self.pending.lock().remove(operation_id) else {
-            return self.cancel_consumed_ceremony(operation_id);
+            return self
+                .cancel_consumed_ceremony(operation_id)
+                .map(SignerCeremonyCancellation::Public);
         };
         let status = pending_public_status(
             operation_id,
@@ -1589,7 +1633,7 @@ impl SignerCeremonyService {
             CeremonyState::Cancelled,
         );
         self.engine.persist_ceremony_public_status(&status)?;
-        Ok(())
+        Ok(SignerCeremonyCancellation::Public(status))
     }
 
     /// Answer cancellation for a ceremony whose pending record is gone.
@@ -1601,7 +1645,10 @@ impl SignerCeremonyService {
     /// as fatal abandons its own session mid-flight, so a ceremony that already
     /// reached a durable non-successful terminal answers idempotently. A
     /// committed ceremony still refuses.
-    fn cancel_consumed_ceremony(&self, operation_id: &OperationId) -> Result<(), ProtocolError> {
+    fn cancel_consumed_ceremony(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CeremonyPublicStatus, ProtocolError> {
         if self.engine.activation_receipt(operation_id)?.is_some()
             || self.engine.custody_receipt(operation_id)?.is_some()
             || self
@@ -1613,7 +1660,9 @@ impl SignerCeremonyService {
         }
         match self.engine.ceremony_public_status(operation_id)? {
             Some(status) => match status.state {
-                CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed => Ok(()),
+                CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed => {
+                    Ok(status)
+                }
                 _ => Err(committed_conflict()),
             },
             None => Err(protocol(
@@ -1712,12 +1761,10 @@ impl SignerCeremonyService {
         &self,
         operation_id: &OperationId,
     ) -> Result<SignerCeremonyStatus, ProtocolError> {
-        if self
-            .engine
-            .owner_attestation_receipt(operation_id)?
-            .is_some()
-        {
-            return Ok(SignerCeremonyStatus::Terminal(CeremonyState::Succeeded));
+        if let Some(receipt) = self.engine.owner_attestation_receipt(operation_id)? {
+            return Ok(SignerCeremonyStatus::CompletedOwnerAttestation(Box::new(
+                receipt,
+            )));
         }
         if self
             .pending_owner_attestations

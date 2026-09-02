@@ -239,6 +239,17 @@ fn owner_attestation_domain_counts(database: &std::path::Path) -> Vec<i64> {
     .collect()
 }
 
+fn receipt_kind_count(database: &std::path::Path, kind: &str) -> i64 {
+    rusqlite::Connection::open(database)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM ceremony_receipts WHERE receipt_kind = ?1",
+            [kind],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 fn terms(key_ref: KeyRef) -> SealedApprovalTerms {
     SealedApprovalTerms {
         subject: ApprovalSubject::Cli {
@@ -321,19 +332,31 @@ fn owner_attestation_succeeds_and_persists_without_domain_mutation() {
         SigningKey::from_bytes(&[9; 32]),
     )
     .unwrap();
-    let terms = owner_attestation_terms(operation("83"));
-    let owner_wallet_id = terms.owner_wallet_id.clone();
-    let prepared = prepare_owner_attestation(&service, &authenticator, terms.clone(), 10_000);
+    let (owner_wallet_id, credential) =
+        register_wallet(&service, &authenticator, operation("80"), 9_000);
+    let mut terms = owner_attestation_terms(operation("83"));
+    terms.owner_wallet_id = owner_wallet_id.clone();
+    let before_keys = engine.enrolled_key_refs(&owner_wallet_id).unwrap();
+    let before_policy = engine.policy_snapshot(&owner_wallet_id).unwrap();
+    let prepared = service
+        .prepare_owner_attestation(
+            OwnerAttestationPrepareRequest {
+                terms: terms.clone(),
+            },
+            10_000,
+        )
+        .unwrap();
     let before_domain_counts = owner_attestation_domain_counts(&database);
+    let before_custody_receipts = receipt_kind_count(&database, "custody");
     assert_eq!(prepared.challenges.len(), 1);
     assert_eq!(prepared.contribution.terms_digest, terms.digest().unwrap());
+    assert_eq!(prepared.verification_credentials.len(), 1);
     assert_eq!(
-        prepared.verification_credentials,
-        vec![authenticator.credential(0)]
+        prepared.verification_credentials[0].credential_id,
+        credential.credential_id
     );
 
-    let complete = owner_attestation_complete_request(&authenticator, &prepared, 1);
-    let complete_after_restart = complete.clone();
+    let complete = owner_attestation_complete_request(&authenticator, &prepared, 2);
     let receipt = service
         .complete_owner_attestation(complete.clone(), 10_100)
         .unwrap();
@@ -359,32 +382,29 @@ fn owner_attestation_succeeds_and_persists_without_domain_mutation() {
         receipt
     );
 
-    assert!(
-        engine
-            .enrolled_key_refs(&owner_wallet_id)
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        engine.enrolled_key_refs(&owner_wallet_id).unwrap(),
+        before_keys
     );
-    assert!(engine.policy_snapshot(&owner_wallet_id).is_err());
-    assert!(matches!(
+    assert_eq!(
+        engine.policy_snapshot(&owner_wallet_id).unwrap(),
+        before_policy
+    );
+    assert_eq!(
         service.status(&terms.operation_id).unwrap(),
-        bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Succeeded)
-    ));
+        bloom_signer::ceremony::SignerCeremonyStatus::CompletedOwnerAttestation(Box::new(
+            receipt.clone()
+        ))
+    );
     assert_eq!(
         owner_attestation_domain_counts(&database),
         before_domain_counts,
-        "owner attestation must not mutate wallet, credential, key, policy, or approval tables"
+        "owner attestation must not change wallet, credential, key, policy, or approval row counts"
     );
-    let connection = rusqlite::Connection::open(&database).unwrap();
-    let custody_receipts: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM ceremony_receipts WHERE receipt_kind = 'custody'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(custody_receipts, 0);
-    drop(connection);
+    assert_eq!(
+        receipt_kind_count(&database, "custody"),
+        before_custody_receipts
+    );
     drop(service);
     drop(engine);
 
@@ -403,16 +423,145 @@ fn owner_attestation_succeeds_and_persists_without_domain_mutation() {
         .unwrap(),
     );
     let restarted = SignerCeremonyService::new(
-        restarted_engine,
+        restarted_engine.clone(),
         Token::new("signer-ceremony-key").unwrap(),
         SigningKey::from_bytes(&[9; 32]),
     )
     .unwrap();
     assert_eq!(
+        restarted.status(&terms.operation_id).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::CompletedOwnerAttestation(Box::new(
+            receipt.clone()
+        ))
+    );
+    assert_eq!(
         restarted
-            .complete_owner_attestation(complete_after_restart, 10_300)
-            .unwrap(),
-        receipt
+            .credential(&owner_wallet_id, &credential.credential_id)
+            .unwrap()
+            .sign_count
+            .get(),
+        2
+    );
+
+    let mut later_terms = owner_attestation_terms(operation("8c"));
+    later_terms.owner_wallet_id = owner_wallet_id;
+    let later = restarted
+        .prepare_owner_attestation(
+            OwnerAttestationPrepareRequest { terms: later_terms },
+            10_400,
+        )
+        .unwrap();
+    let non_advancing = owner_attestation_complete_request(&authenticator, &later, 2);
+    assert_eq!(
+        restarted
+            .complete_owner_attestation(non_advancing, 10_500)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::UnauthenticatedPeer
+    );
+    restarted.cancel(&operation("8c")).unwrap();
+}
+
+#[test]
+fn owner_attestation_cancel_is_durable_idempotent_and_consumes_pending_proof() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, _, _) = service(&authenticator);
+    let terms = owner_attestation_terms(operation("8d"));
+    let prepared = prepare_owner_attestation(&service, &authenticator, terms.clone(), 10_000);
+    let complete = owner_attestation_complete_request(&authenticator, &prepared, 1);
+
+    assert!(matches!(
+        service.cancel(&terms.operation_id).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyCancellation::OwnerAttestation(
+            bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Cancelled)
+        )
+    ));
+    assert!(matches!(
+        service.status(&terms.operation_id).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Cancelled)
+    ));
+    service.cancel(&terms.operation_id).unwrap();
+    assert_eq!(
+        service
+            .complete_owner_attestation(complete, 10_100)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyReplay
+    );
+}
+
+#[test]
+fn owner_attestation_concurrent_identical_prepares_share_one_ceremony() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (owner_service, _, _, _) = service(&authenticator);
+    let terms = owner_attestation_terms(operation("8e"));
+    owner_service
+        .register_existing_credential(terms.owner_wallet_id.clone(), authenticator.credential(0))
+        .unwrap();
+    let shared_service = Arc::new(owner_service);
+    let barrier = Arc::new(std::sync::Barrier::new(16));
+    let handles = (0..16)
+        .map(|_| {
+            let service = shared_service.clone();
+            let barrier = barrier.clone();
+            let terms = terms.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                service
+                    .prepare_owner_attestation(OwnerAttestationPrepareRequest { terms }, 10_000)
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    let prepared = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert!(prepared.windows(2).all(|pair| pair[0] == pair[1]));
+
+    let cross_authenticator = VirtualAuthenticator::generate();
+    let (cross_service, _, _, _) = service(&cross_authenticator);
+    let cross_service = Arc::new(cross_service);
+    let cross_operation = operation("8f");
+    let cross_barrier = Arc::new(std::sync::Barrier::new(2));
+    let owner_handle = {
+        let service = cross_service.clone();
+        let barrier = cross_barrier.clone();
+        let terms = owner_attestation_terms(cross_operation.clone());
+        std::thread::spawn(move || {
+            barrier.wait();
+            service
+                .prepare_owner_attestation(OwnerAttestationPrepareRequest { terms }, 10_000)
+                .is_ok()
+        })
+    };
+    let custody_handle = {
+        let service = cross_service;
+        let barrier = cross_barrier;
+        std::thread::spawn(move || {
+            barrier.wait();
+            service
+                .prepare_custody(
+                    CustodyPrepareRequest {
+                        ceremony_kind: CeremonyKind::WalletRegistration,
+                        custody_operation_id: cross_operation,
+                        wallet_id: Some(Token::new("wallet-cross-kind").unwrap()),
+                        key_ref: None,
+                        exact_terms_digest: digest("90"),
+                        expected_input_class: Token::new("passkey-prf").unwrap(),
+                        browser_output_recipient_key: None,
+                        petal_key_scope: None,
+                        legacy_passkey_migration: None,
+                    },
+                    10_000,
+                )
+                .is_ok()
+        })
+    };
+    assert_ne!(
+        owner_handle.join().unwrap(),
+        custody_handle.join().unwrap(),
+        "exactly one ceremony kind may open a global operation ID"
     );
 }
 
@@ -469,7 +618,10 @@ fn owner_attestation_operation_and_ceremony_replays_conflict() {
             .code,
         ProtocolErrorCode::OperationIdConflict
     );
-    service.complete_owner_attestation(valid, 10_100).unwrap();
+    assert!(matches!(
+        service.status(&operation("88")).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::Pending
+    ));
 
     let expired_terms = owner_attestation_terms(operation("8b"));
     let expired_prepare_request = OwnerAttestationPrepareRequest {
@@ -490,6 +642,7 @@ fn owner_attestation_operation_and_ceremony_replays_conflict() {
         service.status(&operation("8b")).unwrap(),
         bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Expired)
     ));
+    service.cancel(&operation("8b")).unwrap();
     assert_eq!(
         service
             .prepare_owner_attestation(expired_prepare_request, 310_001)
