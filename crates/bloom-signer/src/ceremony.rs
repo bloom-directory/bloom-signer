@@ -4,9 +4,11 @@ use bloom_signer_api::{
     CeremonyWebAuthnOptions, CredentialPrfInput, CredentialSummary, CryptoSuite,
     CustodyCompleteRequest, CustodyHpkeAad, CustodyOutputHpkeAad, CustodyPrepareRequest,
     CustodyResult, CustodySignerContribution, DecimalU64, Digest32, LocalPrfHpkeAad, OperationId,
+    OwnerAttestationChallenge, OwnerAttestationCompleteRequest, OwnerAttestationPrepareRequest,
+    OwnerAttestationReceipt, OwnerAttestationSignerContribution, OwnerAttestationTerms,
     PetalKeyScope, PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest,
-    ProtocolError, ProtocolErrorCode, SignerActivationReceipt, SignerCeremonyContribution, Token,
-    WebAuthnCeremonyProof, WebAuthnCredential,
+    PreparedOwnerAttestation, ProtocolError, ProtocolErrorCode, SignerActivationReceipt,
+    SignerCeremonyContribution, Token, WebAuthnCeremonyProof, WebAuthnCredential,
 };
 use bloom_signer_backend_api::SecretBytes;
 use ed25519_dalek::{Signer as _, SigningKey};
@@ -73,6 +75,34 @@ const WRAP_INFO: &[u8] = b"bloom-passkey-wallet-wrap/v1";
 const DERIVATION_AUTHORITY_DOMAIN: &[u8] = b"bloom-key-derive-authority/v1";
 const PETAL_SUBKEY_NAMESPACE: &str = "petal-subkeys-v1";
 const PETAL_SUBKEY_PREFIX: &str = "m/44'/60'/0'/18735";
+
+#[derive(Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerAttestationPublicBinding<'a> {
+    terms_digest: &'a Digest32,
+    ceremony_id: &'a Digest32,
+    signer_nonce: &'a Digest32,
+    expires_at_ms: &'a DecimalU64,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerAttestationReceiptPreimage<'a> {
+    operation_id: &'a OperationId,
+    ceremony_id: &'a Digest32,
+    terms_digest: &'a Digest32,
+    public_binding_digest: &'a Digest32,
+}
+
+#[derive(Clone)]
+struct PendingOwnerAttestation {
+    request_digest: Digest32,
+    terms: OwnerAttestationTerms,
+    contribution: OwnerAttestationSignerContribution,
+    challenge: OwnerAttestationChallenge,
+    signer_nonce: Digest32,
+    expires_at_ms: DecimalU64,
+}
 
 #[derive(Clone, Debug)]
 pub struct PreparedApprovalCeremony {
@@ -188,12 +218,14 @@ pub struct SignerCeremonyService {
     signer_key_id: Token,
     signing_key: SigningKey,
     pending: Mutex<HashMap<OperationId, PendingCeremony>>,
+    pending_owner_attestations: Mutex<HashMap<OperationId, PendingOwnerAttestation>>,
     completed: Mutex<HashMap<OperationId, CompletedCeremony>>,
     credentials: Mutex<BTreeMap<String, BoundCredential>>,
     wallets: Mutex<BTreeMap<Token, Arc<WalletCustody>>>,
     legacy_migrations: Option<Arc<LegacyMigrationStore>>,
     approval_completion_barrier: AsyncMutex<()>,
     custody_completion_barrier: Mutex<()>,
+    owner_attestation_completion_barrier: Mutex<()>,
 }
 
 pub(crate) struct VerifiedCeremonyActivation(());
@@ -257,12 +289,14 @@ impl SignerCeremonyService {
             signer_key_id,
             signing_key,
             pending: Mutex::new(HashMap::new()),
+            pending_owner_attestations: Mutex::new(HashMap::new()),
             completed: Mutex::new(HashMap::new()),
             credentials: Mutex::new(credentials),
             wallets: Mutex::new(wallets),
             legacy_migrations: None,
             approval_completion_barrier: AsyncMutex::new(()),
             custody_completion_barrier: Mutex::new(()),
+            owner_attestation_completion_barrier: Mutex::new(()),
         })
     }
 
@@ -292,6 +326,267 @@ impl SignerCeremonyService {
             },
         );
         Ok(())
+    }
+
+    pub fn prepare_owner_attestation(
+        &self,
+        request: OwnerAttestationPrepareRequest,
+        now_ms: u64,
+    ) -> Result<PreparedOwnerAttestation, ProtocolError> {
+        let terms_digest = request.terms.digest()?;
+        if self.signing_key.verifying_key() != *self.engine.ceremony_public_key() {
+            return Err(protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "owner attestation ceremony key does not match Signer configuration",
+            ));
+        }
+        if request.terms.authority_edge_digest != self.authority_edge_digest() {
+            return Err(protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "owner attestation authority edge does not match this Signer",
+            ));
+        }
+        let request_digest = canonical_digest(&request)?;
+        if let Some(existing) = self
+            .pending_owner_attestations
+            .lock()
+            .get(&request.terms.operation_id)
+        {
+            if existing.request_digest != request_digest {
+                return Err(operation_conflict());
+            }
+            return Ok(self.prepared_owner_attestation(existing));
+        }
+        if self
+            .pending
+            .lock()
+            .contains_key(&request.terms.operation_id)
+        {
+            return Err(kind_mismatch());
+        }
+        self.require_unopened_operation_id(&request.terms.operation_id)?;
+
+        let ceremony_id = random_digest();
+        let signer_nonce = random_digest();
+        let expires_at_ms = DecimalU64::new(now_ms.saturating_add(CEREMONY_TTL_MS));
+        let public_binding_digest = canonical_digest(&OwnerAttestationPublicBinding {
+            terms_digest: &terms_digest,
+            ceremony_id: &ceremony_id,
+            signer_nonce: &signer_nonce,
+            expires_at_ms: &expires_at_ms,
+        })?;
+        let mut contribution = OwnerAttestationSignerContribution {
+            ceremony_id: ceremony_id.clone(),
+            operation_id: request.terms.operation_id.clone(),
+            terms_digest: terms_digest.clone(),
+            public_binding_digest: public_binding_digest.clone(),
+            signer_key_id: self.signer_key_id.clone(),
+            signer_signature: Base64UrlBytes::from_bytes(&[]),
+        };
+        contribution.signer_signature = Base64UrlBytes::from_bytes(
+            &self
+                .signing_key
+                .sign(&contribution.signature_message()?)
+                .to_bytes(),
+        );
+        let challenge = OwnerAttestationChallenge {
+            ceremony_id,
+            operation_id: request.terms.operation_id.clone(),
+            terms_digest,
+            public_binding_digest,
+            signer_contribution_digest: contribution.digest()?,
+        };
+        let pending = PendingOwnerAttestation {
+            request_digest,
+            terms: request.terms.clone(),
+            contribution,
+            challenge,
+            signer_nonce,
+            expires_at_ms,
+        };
+        let prepared = self.prepared_owner_attestation(&pending);
+        self.pending_owner_attestations
+            .lock()
+            .insert(request.terms.operation_id, pending);
+        Ok(prepared)
+    }
+
+    pub fn complete_owner_attestation(
+        &self,
+        request: OwnerAttestationCompleteRequest,
+        now_ms: u64,
+    ) -> Result<OwnerAttestationReceipt, ProtocolError> {
+        let _completion_barrier = self.owner_attestation_completion_barrier.lock();
+        if let Some(receipt) = self
+            .engine
+            .owner_attestation_receipt(&request.operation_id)?
+        {
+            let terms = OwnerAttestationTerms {
+                schema: Token::new(bloom_signer_api::OWNER_ATTESTATION_SCHEMA)?,
+                operation_id: receipt.operation_id.clone(),
+                owner_wallet_id: receipt.owner_wallet_id.clone(),
+                authority_edge_digest: receipt.authority_edge_digest.clone(),
+                context_digest: receipt.context_digest.clone(),
+                subject_digest: receipt.subject_digest.clone(),
+            };
+            let expected_receipt_digest = canonical_digest(&OwnerAttestationReceiptPreimage {
+                operation_id: &receipt.operation_id,
+                ceremony_id: &receipt.ceremony_id,
+                terms_digest: &terms.digest()?,
+                public_binding_digest: &request.public_binding_digest,
+            })?;
+            if receipt.ceremony_id != request.ceremony_id
+                || receipt.receipt_digest != expected_receipt_digest
+            {
+                return Err(operation_conflict());
+            }
+            return Ok(receipt);
+        }
+
+        let pending = self
+            .pending_owner_attestations
+            .lock()
+            .get(&request.operation_id)
+            .cloned()
+            .ok_or_else(replay)?;
+        if request.ceremony_id != pending.contribution.ceremony_id
+            || request.public_binding_digest != pending.contribution.public_binding_digest
+        {
+            return Err(operation_conflict());
+        }
+        self.pending_owner_attestations
+            .lock()
+            .remove(&request.operation_id)
+            .ok_or_else(replay)?;
+
+        let terminal_operation_id = request.operation_id.clone();
+        let terminal_ceremony_id = pending.contribution.ceremony_id.clone();
+        let terminal_expires_at_ms = pending.expires_at_ms.clone();
+        let terminal_public_binding_digest = pending.contribution.public_binding_digest.clone();
+        let result = (|| {
+            let terms_digest = pending.terms.digest()?;
+            let expected_binding = canonical_digest(&OwnerAttestationPublicBinding {
+                terms_digest: &terms_digest,
+                ceremony_id: &pending.contribution.ceremony_id,
+                signer_nonce: &pending.signer_nonce,
+                expires_at_ms: &pending.expires_at_ms,
+            })?;
+            if pending.expires_at_ms.get() <= now_ms
+                || pending.contribution.operation_id != request.operation_id
+                || pending.contribution.terms_digest != terms_digest
+                || pending.contribution.public_binding_digest != expected_binding
+                || pending.challenge.ceremony_id != pending.contribution.ceremony_id
+                || pending.challenge.operation_id != request.operation_id
+                || pending.challenge.terms_digest != terms_digest
+                || pending.challenge.public_binding_digest != expected_binding
+                || pending.challenge.signer_contribution_digest != pending.contribution.digest()?
+            {
+                return Err(replay());
+            }
+            let assertion = match &request.browser_proof {
+                WebAuthnCeremonyProof::Assertion { assertion } => assertion,
+                _ => return Err(kind_mismatch()),
+            };
+            let bound =
+                self.bound_credential(&assertion.credential_id, &pending.terms.owner_wallet_id)?;
+            let verified = verify_webauthn_assertion(
+                assertion,
+                &bound.credential,
+                &pending.challenge.canonical_bytes()?,
+                true,
+            )?;
+            if verified
+                .user_handle
+                .as_ref()
+                .is_some_and(|handle| handle != &bound.credential.user_handle)
+            {
+                return Err(protocol(
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "owner attestation user handle does not match the wallet credential",
+                ));
+            }
+
+            let receipt_digest = canonical_digest(&OwnerAttestationReceiptPreimage {
+                operation_id: &request.operation_id,
+                ceremony_id: &request.ceremony_id,
+                terms_digest: &terms_digest,
+                public_binding_digest: &request.public_binding_digest,
+            })?;
+            let mut receipt = OwnerAttestationReceipt {
+                operation_id: request.operation_id,
+                ceremony_id: request.ceremony_id,
+                owner_wallet_id: pending.terms.owner_wallet_id,
+                authority_edge_digest: pending.terms.authority_edge_digest,
+                context_digest: pending.terms.context_digest,
+                subject_digest: pending.terms.subject_digest,
+                receipt_digest,
+                signer_key_id: self.signer_key_id.clone(),
+                signer_signature: Base64UrlBytes::from_bytes(&[]),
+            };
+            receipt.signer_signature = Base64UrlBytes::from_bytes(
+                &self
+                    .signing_key
+                    .sign(&receipt.signature_message()?)
+                    .to_bytes(),
+            );
+            self.engine.persist_owner_attestation(
+                &receipt,
+                &pending.expires_at_ms,
+                &request.public_binding_digest,
+            )?;
+            self.advance_counter(&verified.credential_id, verified.sign_count);
+            Ok(receipt)
+        })();
+        if result.is_err() {
+            let state = if terminal_expires_at_ms.get() <= now_ms {
+                CeremonyState::Expired
+            } else {
+                CeremonyState::Failed
+            };
+            if let Err(error) = self.engine.persist_owner_attestation_terminal_status(
+                &terminal_operation_id,
+                &terminal_ceremony_id,
+                state,
+                &terminal_expires_at_ms,
+                &terminal_public_binding_digest,
+            ) {
+                tracing::warn!(
+                    event = "signer.owner_attestation_terminalization_failed",
+                    operation_id = terminal_operation_id.as_str(),
+                    error_code = error.code.as_str(),
+                    "Signer could not persist a rejected owner attestation's terminal state"
+                );
+            }
+        }
+        result
+    }
+
+    fn prepared_owner_attestation(
+        &self,
+        pending: &PendingOwnerAttestation,
+    ) -> PreparedOwnerAttestation {
+        PreparedOwnerAttestation {
+            contribution: pending.contribution.clone(),
+            challenges: vec![pending.challenge.clone()],
+            webauthn_options: self.options_for_wallet(Some(&pending.terms.owner_wallet_id)),
+            verification_credentials: self
+                .options_for_wallet(Some(&pending.terms.owner_wallet_id))
+                .allowed_credentials
+                .into_iter()
+                .filter_map(|allowed| {
+                    self.credential(&pending.terms.owner_wallet_id, &allowed.credential_id)
+                        .ok()
+                })
+                .collect(),
+        }
+    }
+
+    fn authority_edge_digest(&self) -> Digest32 {
+        let mut hasher = Sha256::new();
+        hasher.update(b"bloom-authority-edge/v1\0");
+        hasher.update(self.engine.broker_public_key().as_bytes());
+        hasher.update(self.engine.ceremony_public_key().as_bytes());
+        Digest32::from_bytes(hasher.finalize().into())
     }
 
     pub fn prepare_approval(
@@ -339,6 +634,13 @@ impl SignerCeremonyService {
             ));
         }
         let request_digest = canonical_digest(&request)?;
+        if self
+            .pending_owner_attestations
+            .lock()
+            .contains_key(&request.activation_operation_id)
+        {
+            return Err(kind_mismatch());
+        }
         if let Some(existing) = self.pending.lock().get(&request.activation_operation_id) {
             if existing.request_digest != request_digest {
                 tracing::warn!(
@@ -454,6 +756,13 @@ impl SignerCeremonyService {
                 .require_enrolled_parent_key(&scope.wallet_id, &scope.parent_key_ref)?;
         }
         let request_digest = canonical_digest(&request)?;
+        if self
+            .pending_owner_attestations
+            .lock()
+            .contains_key(&request.custody_operation_id)
+        {
+            return Err(kind_mismatch());
+        }
         if let Some(existing) = self.pending.lock().get(&request.custody_operation_id) {
             if existing.request_digest != request_digest {
                 tracing::warn!(
@@ -1263,7 +1572,12 @@ impl SignerCeremonyService {
     }
 
     pub fn cancel(&self, operation_id: &OperationId) -> Result<(), ProtocolError> {
-        if self.completed.lock().contains_key(operation_id) {
+        if self.completed.lock().contains_key(operation_id)
+            || self
+                .engine
+                .owner_attestation_receipt(operation_id)?
+                .is_some()
+        {
             return Err(committed_conflict());
         }
         let Some(pending) = self.pending.lock().remove(operation_id) else {
@@ -1290,6 +1604,10 @@ impl SignerCeremonyService {
     fn cancel_consumed_ceremony(&self, operation_id: &OperationId) -> Result<(), ProtocolError> {
         if self.engine.activation_receipt(operation_id)?.is_some()
             || self.engine.custody_receipt(operation_id)?.is_some()
+            || self
+                .engine
+                .owner_attestation_receipt(operation_id)?
+                .is_some()
         {
             return Err(committed_conflict());
         }
@@ -1320,10 +1638,7 @@ impl SignerCeremonyService {
         &self,
         operation_id: &OperationId,
     ) -> Result<(), ProtocolError> {
-        if self.engine.activation_receipt(operation_id)?.is_some()
-            || self.engine.custody_receipt(operation_id)?.is_some()
-            || self.engine.ceremony_public_status(operation_id)?.is_some()
-        {
+        if self.engine.ceremony_operation_exists(operation_id)? {
             return Err(terminal_conflict());
         }
         Ok(())
@@ -1397,6 +1712,23 @@ impl SignerCeremonyService {
         &self,
         operation_id: &OperationId,
     ) -> Result<SignerCeremonyStatus, ProtocolError> {
+        if self
+            .engine
+            .owner_attestation_receipt(operation_id)?
+            .is_some()
+        {
+            return Ok(SignerCeremonyStatus::Terminal(CeremonyState::Succeeded));
+        }
+        if self
+            .pending_owner_attestations
+            .lock()
+            .contains_key(operation_id)
+        {
+            return Ok(SignerCeremonyStatus::Pending);
+        }
+        if let Some(state) = self.engine.owner_attestation_terminal_state(operation_id)? {
+            return Ok(SignerCeremonyStatus::Terminal(state));
+        }
         if let Some(completed) = self.completed.lock().get(operation_id) {
             return Ok(match completed {
                 CompletedCeremony::Approval(receipt) => {

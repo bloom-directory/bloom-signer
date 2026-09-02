@@ -190,11 +190,10 @@ impl SignerRpcService {
                         self.ceremony.prepare_policy_update(*request, now_ms)?,
                     )?)
                 }
-                SignerCeremonyPrepareRequest::OwnerAttestationPrepare(_) => {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::CeremonyKindMismatch,
-                        "owner attestation preparation is not supported by this Signer build",
-                    ));
+                SignerCeremonyPrepareRequest::OwnerAttestationPrepare(request) => {
+                    SignerCeremonyPrepareResponse::OwnerAttestationPrepare(
+                        self.ceremony.prepare_owner_attestation(*request, now_ms)?,
+                    )
                 }
             })),
             Request::CeremonyComplete(request) => Ok(Response::CeremonyComplete(match request {
@@ -208,11 +207,10 @@ impl SignerRpcService {
                         self.ceremony.complete_policy_update(*request, now_ms)?,
                     ))
                 }
-                SignerCeremonyCompleteRequest::OwnerAttestationComplete(_) => {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::CeremonyKindMismatch,
-                        "owner attestation completion is not supported by this Signer build",
-                    ));
+                SignerCeremonyCompleteRequest::OwnerAttestationComplete(request) => {
+                    SignerCeremonyCompleteResponse::OwnerAttestationComplete(Box::new(
+                        self.ceremony.complete_owner_attestation(*request, now_ms)?,
+                    ))
                 }
             })),
             Request::CeremonyStatus(request) => {

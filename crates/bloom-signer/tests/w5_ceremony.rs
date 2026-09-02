@@ -171,6 +171,74 @@ fn service(
     (service, key_ref, engine, registry)
 }
 
+fn owner_attestation_terms(operation_id: OperationId) -> OwnerAttestationTerms {
+    OwnerAttestationTerms {
+        schema: Token::new(OWNER_ATTESTATION_SCHEMA).unwrap(),
+        operation_id,
+        owner_wallet_id: Token::new("wallet-owner").unwrap(),
+        authority_edge_digest: Digest32::new(
+            "c37d8c70dae8c6b72f0ce36a06ea4f1a9d2c17eca9636780d8428174f98f6bc9",
+        )
+        .unwrap(),
+        context_digest: digest("81"),
+        subject_digest: digest("82"),
+    }
+}
+
+fn prepare_owner_attestation(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    terms: OwnerAttestationTerms,
+    now_ms: u64,
+) -> PreparedOwnerAttestation {
+    service
+        .register_existing_credential(terms.owner_wallet_id.clone(), authenticator.credential(0))
+        .unwrap();
+    service
+        .prepare_owner_attestation(OwnerAttestationPrepareRequest { terms }, now_ms)
+        .unwrap()
+}
+
+fn owner_attestation_complete_request(
+    authenticator: &VirtualAuthenticator,
+    prepared: &PreparedOwnerAttestation,
+    sign_count: u32,
+) -> OwnerAttestationCompleteRequest {
+    OwnerAttestationCompleteRequest {
+        operation_id: prepared.contribution.operation_id.clone(),
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        public_binding_digest: prepared.contribution.public_binding_digest.clone(),
+        browser_proof: WebAuthnCeremonyProof::Assertion {
+            assertion: authenticator.assertion(
+                &prepared.challenges[0].canonical_bytes().unwrap(),
+                sign_count,
+            ),
+        },
+    }
+}
+
+fn owner_attestation_domain_counts(database: &std::path::Path) -> Vec<i64> {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    [
+        "ceremony_wallets",
+        "webauthn_credentials",
+        "enrolled_keys",
+        "policies",
+        "approvals",
+        "policy_authorizations",
+        "policy_commit_receipts",
+    ]
+    .into_iter()
+    .map(|table| {
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    })
+    .collect()
+}
+
 fn terms(key_ref: KeyRef) -> SealedApprovalTerms {
     SealedApprovalTerms {
         subject: ApprovalSubject::Cli {
@@ -226,6 +294,209 @@ fn complete_local_approval(
         now_ms,
     )
     .unwrap()
+}
+
+#[test]
+fn owner_attestation_succeeds_and_persists_without_domain_mutation() {
+    let authenticator = VirtualAuthenticator::generate();
+    let temporary = tempfile::tempdir().unwrap();
+    let database = temporary.path().join("owner-attestation.sqlite");
+    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+    let engine = Arc::new(
+        SignerEngine::open(
+            &database,
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            SigningKey::from_bytes(&[9; 32]).verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
+            registry,
+        )
+        .unwrap(),
+    );
+    let service = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    let terms = owner_attestation_terms(operation("83"));
+    let owner_wallet_id = terms.owner_wallet_id.clone();
+    let prepared = prepare_owner_attestation(&service, &authenticator, terms.clone(), 10_000);
+    let before_domain_counts = owner_attestation_domain_counts(&database);
+    assert_eq!(prepared.challenges.len(), 1);
+    assert_eq!(prepared.contribution.terms_digest, terms.digest().unwrap());
+    assert_eq!(
+        prepared.verification_credentials,
+        vec![authenticator.credential(0)]
+    );
+
+    let complete = owner_attestation_complete_request(&authenticator, &prepared, 1);
+    let complete_after_restart = complete.clone();
+    let receipt = service
+        .complete_owner_attestation(complete.clone(), 10_100)
+        .unwrap();
+    assert_eq!(receipt.operation_id, terms.operation_id);
+    assert_eq!(receipt.ceremony_id, prepared.contribution.ceremony_id);
+    assert_eq!(receipt.owner_wallet_id, owner_wallet_id);
+    assert_eq!(receipt.authority_edge_digest, terms.authority_edge_digest);
+    assert_eq!(receipt.context_digest, terms.context_digest);
+    assert_eq!(receipt.subject_digest, terms.subject_digest);
+    assert!(
+        SigningKey::from_bytes(&[9; 32])
+            .verifying_key()
+            .verify_strict(
+                &receipt.signature_message().unwrap(),
+                &ed25519_dalek::Signature::from_slice(&receipt.signer_signature.decode()).unwrap(),
+            )
+            .is_ok()
+    );
+    assert_eq!(
+        service
+            .complete_owner_attestation(complete, 10_200)
+            .unwrap(),
+        receipt
+    );
+
+    assert!(
+        engine
+            .enrolled_key_refs(&owner_wallet_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(engine.policy_snapshot(&owner_wallet_id).is_err());
+    assert!(matches!(
+        service.status(&terms.operation_id).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Succeeded)
+    ));
+    assert_eq!(
+        owner_attestation_domain_counts(&database),
+        before_domain_counts,
+        "owner attestation must not mutate wallet, credential, key, policy, or approval tables"
+    );
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let custody_receipts: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM ceremony_receipts WHERE receipt_kind = 'custody'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(custody_receipts, 0);
+    drop(connection);
+    drop(service);
+    drop(engine);
+
+    let restarted_registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+    let restarted_engine = Arc::new(
+        SignerEngine::open(
+            &database,
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            SigningKey::from_bytes(&[9; 32]).verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
+            restarted_registry,
+        )
+        .unwrap(),
+    );
+    let restarted = SignerCeremonyService::new(
+        restarted_engine,
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    assert_eq!(
+        restarted
+            .complete_owner_attestation(complete_after_restart, 10_300)
+            .unwrap(),
+        receipt
+    );
+}
+
+#[test]
+fn owner_attestation_changed_subject_digest_is_a_conflicting_retry() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, _, _) = service(&authenticator);
+    let terms = owner_attestation_terms(operation("84"));
+    let _prepared = prepare_owner_attestation(&service, &authenticator, terms.clone(), 10_000);
+    let mut changed = terms;
+    changed.subject_digest = digest("85");
+    let error = service
+        .prepare_owner_attestation(OwnerAttestationPrepareRequest { terms: changed }, 10_001)
+        .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::OperationIdConflict);
+}
+
+#[test]
+fn owner_attestation_rejects_wrong_local_authority_edge() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, _, _) = service(&authenticator);
+    let mut terms = owner_attestation_terms(operation("86"));
+    terms.authority_edge_digest = digest("87");
+    let error = service
+        .prepare_owner_attestation(OwnerAttestationPrepareRequest { terms }, 10_000)
+        .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
+}
+
+#[test]
+fn owner_attestation_operation_and_ceremony_replays_conflict() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, _, _) = service(&authenticator);
+    let terms = owner_attestation_terms(operation("88"));
+    let prepared = prepare_owner_attestation(&service, &authenticator, terms, 10_000);
+    let valid = owner_attestation_complete_request(&authenticator, &prepared, 1);
+
+    let mut wrong_operation = valid.clone();
+    wrong_operation.operation_id = operation("89");
+    assert_eq!(
+        service
+            .complete_owner_attestation(wrong_operation, 10_100)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyReplay
+    );
+
+    let mut wrong_ceremony = valid.clone();
+    wrong_ceremony.ceremony_id = digest("8a");
+    assert_eq!(
+        service
+            .complete_owner_attestation(wrong_ceremony, 10_100)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::OperationIdConflict
+    );
+    service.complete_owner_attestation(valid, 10_100).unwrap();
+
+    let expired_terms = owner_attestation_terms(operation("8b"));
+    let expired_prepare_request = OwnerAttestationPrepareRequest {
+        terms: expired_terms,
+    };
+    let expired = service
+        .prepare_owner_attestation(expired_prepare_request.clone(), 10_000)
+        .unwrap();
+    let expired_complete = owner_attestation_complete_request(&authenticator, &expired, 2);
+    assert_eq!(
+        service
+            .complete_owner_attestation(expired_complete, 310_000)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyReplay
+    );
+    assert!(matches!(
+        service.status(&operation("8b")).unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Expired)
+    ));
+    assert_eq!(
+        service
+            .prepare_owner_attestation(expired_prepare_request, 310_001)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::OperationIdConflict
+    );
 }
 
 fn try_complete_local_approval(

@@ -2,11 +2,11 @@ use bloom_signer_api::{
     ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector, ApprovalSubject,
     ApprovalTombstone, Base64UrlBytes, CeremonyPublicStatus, CredentialPublic, CredentialState,
     CustodyResult, DecimalU64, Digest32, KeyRef, OperationId, OperationPublicStatus,
-    OperationState, PetalKeyScope, PolicyCommitReceipt, PolicyCompareAndSwapRequest,
-    PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest, PolicyValidationReceipt,
-    ProtocolError, ProtocolErrorCode, RevocationState, SealedApprovalTerms, SelectorKind,
-    SignRequest, SignedPolicySnapshot, SignerActivationReceipt, SigningResult, Token,
-    WalletTombstone, WebAuthnCredential,
+    OperationState, OwnerAttestationReceipt, PetalKeyScope, PolicyCommitReceipt,
+    PolicyCompareAndSwapRequest, PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest,
+    PolicyValidationReceipt, ProtocolError, ProtocolErrorCode, RevocationState,
+    SealedApprovalTerms, SelectorKind, SignRequest, SignedPolicySnapshot, SignerActivationReceipt,
+    SigningResult, Token, WalletTombstone, WebAuthnCredential,
 };
 use bloom_trusted_time::{DurableClockCondition, PersistedClockState, evaluate_durable_clock};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
@@ -72,6 +72,17 @@ pub(crate) struct CeremonyPolicyUpdate {
     update: PolicyUpdateRequest,
     validation: PolicyValidationReceipt,
     receipt: PolicyCommitReceipt,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerAttestationStoredStatus<'a> {
+    operation_id: &'a OperationId,
+    ceremony_id: &'a Digest32,
+    state: bloom_signer_api::CeremonyState,
+    expires_at_ms: &'a DecimalU64,
+    receipt_digest: Option<&'a Digest32>,
+    public_binding_digest: &'a Digest32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -380,6 +391,7 @@ pub struct SignerEngine {
     audit_tail: Mutex<AuditTailState>,
     broker_key_id: Token,
     broker_public_key: VerifyingKey,
+    ceremony_public_key: VerifyingKey,
     revocation_key_id: Token,
     revocation_signing_key: Arc<SigningKey>,
     audit_keys: RwLock<AuditKeyState>,
@@ -446,6 +458,14 @@ pub struct SignerAuditKeys {
 impl SignerEngine {
     pub(crate) fn backend_registry(&self) -> &Arc<BackendRegistry> {
         &self.backend_registry
+    }
+
+    pub(crate) const fn broker_public_key(&self) -> &VerifyingKey {
+        &self.broker_public_key
+    }
+
+    pub(crate) const fn ceremony_public_key(&self) -> &VerifyingKey {
+        &self.ceremony_public_key
     }
 
     /// Return the startup-verified, incrementally maintained audit head.
@@ -633,7 +653,7 @@ impl SignerEngine {
         path: impl AsRef<Path>,
         broker_key_id: Token,
         broker_public_key: VerifyingKey,
-        _ceremony_public_key: VerifyingKey,
+        ceremony_public_key: VerifyingKey,
         revocation_key_id: Token,
         revocation_signing_key: SigningKey,
         audit_keys: SignerAuditKeys,
@@ -643,7 +663,7 @@ impl SignerEngine {
             Connection::open(path).map_err(storage)?,
             broker_key_id,
             broker_public_key,
-            _ceremony_public_key,
+            ceremony_public_key,
             revocation_key_id,
             revocation_signing_key,
             audit_keys,
@@ -655,7 +675,7 @@ impl SignerEngine {
     pub fn open_in_memory(
         broker_key_id: Token,
         broker_public_key: VerifyingKey,
-        _ceremony_public_key: VerifyingKey,
+        ceremony_public_key: VerifyingKey,
         revocation_key_id: Token,
         revocation_signing_key: SigningKey,
         audit_keys: SignerAuditKeys,
@@ -665,7 +685,7 @@ impl SignerEngine {
             Connection::open_in_memory().map_err(storage)?,
             broker_key_id,
             broker_public_key,
-            _ceremony_public_key,
+            ceremony_public_key,
             revocation_key_id,
             revocation_signing_key,
             audit_keys,
@@ -678,7 +698,7 @@ impl SignerEngine {
         connection: Connection,
         broker_key_id: Token,
         broker_public_key: VerifyingKey,
-        _ceremony_public_key: VerifyingKey,
+        ceremony_public_key: VerifyingKey,
         revocation_key_id: Token,
         revocation_signing_key: SigningKey,
         mut audit_keys: SignerAuditKeys,
@@ -687,7 +707,7 @@ impl SignerEngine {
         if audit_keys.current_key_id == revocation_key_id
             || audit_keys.current_signing_key.verifying_key()
                 == revocation_signing_key.verifying_key()
-            || audit_keys.current_signing_key.verifying_key() == _ceremony_public_key
+            || audit_keys.current_signing_key.verifying_key() == ceremony_public_key
             || audit_keys.current_signing_key.verifying_key() == broker_public_key
         {
             return Err(error(
@@ -920,6 +940,7 @@ impl SignerEngine {
             }),
             broker_key_id,
             broker_public_key,
+            ceremony_public_key,
             revocation_key_id,
             revocation_signing_key: Arc::new(revocation_signing_key),
             audit_keys: RwLock::new(AuditKeyState {
@@ -1544,6 +1565,158 @@ impl SignerEngine {
             .map_err(storage)?
             .map(|encoded| serde_json::from_str(&encoded).map_err(malformed))
             .transpose()
+    }
+
+    pub(crate) fn owner_attestation_receipt(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<OwnerAttestationReceipt>, ProtocolError> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT receipt_jcs FROM ceremony_receipts
+                 WHERE operation_id = ?1 AND receipt_kind = 'owner_attestation'",
+                [operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?
+            .map(|encoded| serde_json::from_str(&encoded).map_err(malformed))
+            .transpose()
+    }
+
+    pub(crate) fn persist_owner_attestation(
+        &self,
+        receipt: &OwnerAttestationReceipt,
+        expires_at_ms: &DecimalU64,
+        public_binding_digest: &Digest32,
+    ) -> Result<(), ProtocolError> {
+        let status = OwnerAttestationStoredStatus {
+            operation_id: &receipt.operation_id,
+            ceremony_id: &receipt.ceremony_id,
+            state: bloom_signer_api::CeremonyState::Succeeded,
+            expires_at_ms,
+            receipt_digest: Some(&receipt.receipt_digest),
+            public_binding_digest,
+        };
+        let mut connection = self.connection.lock();
+        let transaction = self.mutation_transaction(&mut connection)?;
+        transaction
+            .execute(
+                "INSERT INTO ceremony_receipts(operation_id, receipt_kind, receipt_jcs)
+                 VALUES (?1, 'owner_attestation', ?2)",
+                params![
+                    receipt.operation_id.as_str(),
+                    serde_jcs::to_string(receipt).map_err(malformed)?
+                ],
+            )
+            .map_err(storage)?;
+        transaction
+            .execute(
+                "INSERT INTO ceremony_statuses(operation_id, status_jcs) VALUES (?1, ?2)",
+                params![
+                    receipt.operation_id.as_str(),
+                    serde_jcs::to_string(&status).map_err(malformed)?
+                ],
+            )
+            .map_err(storage)?;
+        self.append_audit(
+            &transaction,
+            "owner_attestation.commit",
+            &serde_json::json!({ "receipt": receipt, "status": status }),
+        )?;
+        transaction.commit().map_err(storage)?;
+        Ok(())
+    }
+
+    pub(crate) fn persist_owner_attestation_terminal_status(
+        &self,
+        operation_id: &OperationId,
+        ceremony_id: &Digest32,
+        state: bloom_signer_api::CeremonyState,
+        expires_at_ms: &DecimalU64,
+        public_binding_digest: &Digest32,
+    ) -> Result<(), ProtocolError> {
+        let status = OwnerAttestationStoredStatus {
+            operation_id,
+            ceremony_id,
+            state,
+            expires_at_ms,
+            receipt_digest: None,
+            public_binding_digest,
+        };
+        let mut connection = self.connection.lock();
+        let transaction = self.mutation_transaction(&mut connection)?;
+        transaction
+            .execute(
+                "INSERT INTO ceremony_statuses(operation_id, status_jcs) VALUES (?1, ?2)",
+                params![
+                    operation_id.as_str(),
+                    serde_jcs::to_string(&status).map_err(malformed)?
+                ],
+            )
+            .map_err(storage)?;
+        self.append_audit(
+            &transaction,
+            "owner_attestation.status",
+            &serde_json::json!({ "status": status }),
+        )?;
+        transaction.commit().map_err(storage)?;
+        Ok(())
+    }
+
+    pub(crate) fn owner_attestation_terminal_state(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<bloom_signer_api::CeremonyState>, ProtocolError> {
+        let encoded = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT status_jcs FROM ceremony_statuses WHERE operation_id = ?1",
+                [operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        let status: serde_json::Value = serde_json::from_str(&encoded).map_err(malformed)?;
+        if status.get("public_binding_digest").is_none() || status.get("ceremony_kind").is_some() {
+            return Ok(None);
+        }
+        status
+            .get("state")
+            .cloned()
+            .map(|state| serde_json::from_value(state).map_err(malformed))
+            .transpose()
+    }
+
+    pub(crate) fn ceremony_operation_exists(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<bool, ProtocolError> {
+        let connection = self.connection.lock();
+        let receipt = connection
+            .query_row(
+                "SELECT 1 FROM ceremony_receipts WHERE operation_id = ?1",
+                [operation_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(storage)?
+            .is_some();
+        let status = connection
+            .query_row(
+                "SELECT 1 FROM ceremony_statuses WHERE operation_id = ?1",
+                [operation_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(storage)?
+            .is_some();
+        Ok(receipt || status)
     }
 
     pub(crate) fn load_ceremony_custody(&self) -> Result<PersistedCeremonyCustody, ProtocolError> {
