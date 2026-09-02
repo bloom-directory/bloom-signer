@@ -328,6 +328,40 @@ fn owner_attestation_receipt() -> OwnerAttestationReceipt {
     }
 }
 
+fn owner_attestation_contribution() -> OwnerAttestationSignerContribution {
+    OwnerAttestationSignerContribution {
+        ceremony_id: digest(71),
+        operation_id: operation(67),
+        terms_digest: owner_attestation_terms().digest().unwrap(),
+        public_binding_digest: digest(72),
+        signer_key_id: token("signer-key"),
+        signer_signature: Base64UrlBytes::from_bytes(&[75; 64]),
+    }
+}
+
+fn owner_attestation_challenge() -> OwnerAttestationChallenge {
+    OwnerAttestationChallenge {
+        ceremony_id: digest(71),
+        operation_id: operation(67),
+        terms_digest: owner_attestation_terms().digest().unwrap(),
+        public_binding_digest: digest(72),
+        signer_contribution_digest: owner_attestation_contribution().digest().unwrap(),
+    }
+}
+
+fn prepared_owner_attestation() -> PreparedOwnerAttestation {
+    PreparedOwnerAttestation {
+        contribution: owner_attestation_contribution(),
+        challenges: vec![owner_attestation_challenge()],
+        webauthn_options: CeremonyWebAuthnOptions {
+            allowed_credentials: Vec::new(),
+            registration_user_handle: None,
+            registration_prf_salt: None,
+        },
+        verification_credentials: Vec::new(),
+    }
+}
+
 fn signer_contribution() -> SignerCeremonyContribution {
     SignerCeremonyContribution {
         ceremony_id: digest(46),
@@ -545,7 +579,7 @@ fn signer_responses() -> Vec<BrokerSignerResponse> {
             prepared_approval(),
         )),
         BrokerSignerResponse::CeremonyPrepare(
-            SignerCeremonyPrepareResponse::OwnerAttestationPrepare(custody_prepared.clone()),
+            SignerCeremonyPrepareResponse::OwnerAttestationPrepare(prepared_owner_attestation()),
         ),
         BrokerSignerResponse::CeremonyComplete(SignerCeremonyCompleteResponse::SealedApproval(
             Box::new(SignerActivationReceipt {
@@ -652,7 +686,7 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "ef8112ab985d37aae544458415efde26716bff2c834597c3c7462745dade3d53",
+        "5550b053d9ad275e4f080523d4cd3b3c617a5d0c04c3a09f7a361cc73c521d33",
     );
     assert_wire_digest(
         "control requests",

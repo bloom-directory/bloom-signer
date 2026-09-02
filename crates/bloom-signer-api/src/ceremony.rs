@@ -501,7 +501,7 @@ pub enum SignerCeremonyPrepareRequest {
 pub enum SignerCeremonyPrepareResponse {
     SealedApproval(SignerPreparedApproval),
     PolicyUpdate(SignerPreparedCustody),
-    OwnerAttestationPrepare(SignerPreparedCustody),
+    OwnerAttestationPrepare(crate::PreparedOwnerAttestation),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

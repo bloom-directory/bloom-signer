@@ -42,8 +42,8 @@ fn receipt() -> OwnerAttestationReceipt {
 #[test]
 fn terms_round_trip_through_canonical_json() {
     let original = terms();
-    let json = serde_json::to_value(&original).unwrap();
-    let decoded: OwnerAttestationTerms = serde_json::from_value(json).unwrap();
+    let canonical = serde_jcs::to_vec(&original).unwrap();
+    let decoded: OwnerAttestationTerms = serde_json::from_slice(&canonical).unwrap();
 
     assert_eq!(decoded, original);
     assert_eq!(
