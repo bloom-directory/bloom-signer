@@ -51,7 +51,7 @@ fn operation(byte: &str) -> OperationId {
     OperationId::new(byte.repeat(32)).unwrap()
 }
 
-fn signed_petal_request(
+fn signed_delegated_request(
     terms: &SealedApprovalTerms,
     broker: &SigningKey,
     operation_id: OperationId,
@@ -63,7 +63,7 @@ fn signed_petal_request(
         crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
         ordered_payload_digests: vec![digest("b5")],
         ordered_hashes: vec![digest("b6")],
-        petal_use_claim_digest: Some(digest("bd")),
+        delegated_use_claim_digest: Some(digest("bd")),
         claim_assurance_digest: Some(digest("be")),
         policy_version: terms.policy_version.clone(),
         policy_digest: terms.policy_digest.clone(),
@@ -82,11 +82,11 @@ fn signed_petal_request(
         wallet_id: terms.wallet_id.clone(),
         key_ref: terms.key_ref.clone(),
         crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
-        selector_kind: SelectorKind::Petal,
+        selector_kind: SelectorKind::Delegated,
         ordered_payload_digests: vec![digest("b5")],
         ordered_hashes: vec![digest("b6")],
         signature_count: DecimalU64::new(1),
-        petal_use_claim_digest: Some(digest("bd")),
+        delegated_use_claim_digest: Some(digest("bd")),
         claim_assurance_digest: Some(digest("be")),
         policy_version: terms.policy_version.clone(),
         policy_digest: terms.policy_digest.clone(),
@@ -665,7 +665,7 @@ fn owner_attestation_concurrent_identical_prepares_share_one_ceremony() {
                         exact_terms_digest: digest("90"),
                         expected_input_class: Token::new("passkey-prf").unwrap(),
                         browser_output_recipient_key: None,
-                        petal_key_scope: None,
+                        delegated_key_scope: None,
                         legacy_passkey_migration: None,
                     },
                     10_000,
@@ -781,7 +781,7 @@ fn try_complete_local_approval(
             ordered_payload_digests,
             ordered_hashes,
         } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
-        ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
+        ApprovalSelector::Delegated { .. } => (Vec::new(), Vec::new()),
     };
     let prepared = service.prepare_approval(
         CeremonyPrepareRequest {
@@ -849,7 +849,7 @@ fn register_wallet(
         exact_terms_digest: digest("a1"),
         expected_input_class: Token::new("passkey-prf").unwrap(),
         browser_output_recipient_key: None,
-        petal_key_scope: None,
+        delegated_key_scope: None,
         legacy_passkey_migration: None,
     };
     let prepared = service.prepare_custody(prepare, now_ms).unwrap();
@@ -922,7 +922,7 @@ fn complete_new_wallet(
                 exact_terms_digest: digest("d1"),
                 expected_input_class: expected_input_class.clone(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             now_ms,
@@ -1011,7 +1011,7 @@ fn complete_generic(
             exact_terms_digest: exact_terms_digest.clone(),
             expected_input_class: Token::new("generic-custody-v1").unwrap(),
             browser_output_recipient_key: None,
-            petal_key_scope: None,
+            delegated_key_scope: None,
             legacy_passkey_migration: None,
         },
         now_ms,
@@ -1088,7 +1088,7 @@ fn complete_credential_change(
                 exact_terms_digest: digest("e1"),
                 expected_input_class: Token::new("credential-change-prfs").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             now_ms,
@@ -1159,10 +1159,10 @@ fn assert_approval_capacity_unused(engine: &SignerEngine, approval_id: &Digest32
     assert_eq!(counter.committed_signatures.get(), 0);
 }
 
-fn complete_petal_key_derivation(
+fn complete_delegated_key_derivation(
     service: &SignerCeremonyService,
     authenticator: &VirtualAuthenticator,
-    scope: PetalKeyScope,
+    scope: DelegatedKeyScope,
     browser_effect: Option<serde_json::Value>,
     now_ms: u64,
 ) -> Result<(CustodyResult, CustodyCompleteRequest), ProtocolError> {
@@ -1174,14 +1174,17 @@ fn complete_petal_key_derivation(
             wallet_id: Some(scope.wallet_id.clone()),
             key_ref: Some(scope.parent_key_ref.clone()),
             exact_terms_digest: scope_digest.clone(),
-            expected_input_class: Token::new("petal-subkey-v1").unwrap(),
+            expected_input_class: Token::new("delegated-subkey-v1").unwrap(),
             browser_output_recipient_key: None,
-            petal_key_scope: Some(scope.clone()),
+            delegated_key_scope: Some(scope.clone()),
             legacy_passkey_migration: None,
         },
         now_ms,
     )?;
-    assert_eq!(prepared.contribution.petal_key_scope, Some(scope.clone()));
+    assert_eq!(
+        prepared.contribution.delegated_key_scope,
+        Some(scope.clone())
+    );
     let assertion =
         authenticator.assertion(&prepared.challenges[0].canonical_bytes()?, now_ms as u32);
     let aad = CustodyHpkeAad {
@@ -1193,7 +1196,7 @@ fn complete_petal_key_derivation(
         wallet_id: Some(scope.wallet_id.clone()),
         key_ref: Some(scope.parent_key_ref.clone()),
         credential_id: Some(assertion.credential_id.clone()),
-        expected_input_class: Token::new("petal-subkey-v1").unwrap(),
+        expected_input_class: Token::new("delegated-subkey-v1").unwrap(),
     }
     .canonical_bytes()?;
     let plaintext = serde_jcs::to_vec(&serde_json::json!({
@@ -1249,7 +1252,7 @@ fn complete_policy_update(
             exact_terms_digest: update.terms_digest()?,
             expected_input_class: Token::new("policy_update_credential_prf").unwrap(),
             browser_output_recipient_key: None,
-            petal_key_scope: None,
+            delegated_key_scope: None,
             legacy_passkey_migration: None,
         },
         update,
@@ -1312,7 +1315,7 @@ fn complete_policy_update(
 }
 
 #[test]
-fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals() {
+fn delegated_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals() {
     let temp = tempfile::tempdir().unwrap();
     let database = temp.path().join("signer.sqlite");
     let authenticator = VirtualAuthenticator::generate();
@@ -1340,14 +1343,13 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     .unwrap();
     let (wallet_id, _) = register_wallet(&service, &authenticator, operation("b1"), 10_000);
     let parent = engine.enrolled_key_refs(&wallet_id).unwrap().remove(0);
-    let base_scope = PetalKeyScope {
+    let base_scope = DelegatedKeyScope {
         wallet_id: wallet_id.clone(),
         parent_key_ref: parent.clone(),
-        package_hash: digest("b2"),
-        route: "/petals/exchange/sign".into(),
-        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-        key_slot: Token::new("account-a").unwrap(),
-        allowed_routes: vec!["/petals/exchange/sign".into()],
+        authority_id: digest("b2"),
+        active_subject_id: digest("b3"),
+        delegate_id: Token::new("account-a").unwrap(),
+        allowed_resource_ids: vec![digest("b4")],
         allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
         allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
         maximum_lifetime_ms: DecimalU64::new(20_000),
@@ -1365,9 +1367,9 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
                     wallet_id: Some(cross_wallet.wallet_id.clone()),
                     key_ref: Some(parent.clone()),
                     exact_terms_digest: cross_wallet.request_digest().unwrap(),
-                    expected_input_class: Token::new("petal-subkey-v1").unwrap(),
+                    expected_input_class: Token::new("delegated-subkey-v1").unwrap(),
                     browser_output_recipient_key: None,
-                    petal_key_scope: Some(cross_wallet),
+                    delegated_key_scope: Some(cross_wallet),
                     legacy_passkey_migration: None,
                 },
                 10_150,
@@ -1380,7 +1382,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     let mut browser_controlled = base_scope.clone();
     browser_controlled.custody_operation_id = operation("bc");
     assert_eq!(
-        complete_petal_key_derivation(
+        complete_delegated_key_derivation(
             &service,
             &authenticator,
             browser_controlled,
@@ -1403,9 +1405,14 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         ProtocolErrorCode::BackendInvalidRequest
     );
 
-    let (first, first_complete) =
-        complete_petal_key_derivation(&service, &authenticator, base_scope.clone(), None, 10_200)
-            .unwrap();
+    let (first, first_complete) = complete_delegated_key_derivation(
+        &service,
+        &authenticator,
+        base_scope.clone(),
+        None,
+        10_200,
+    )
+    .unwrap();
     assert!(first.encrypted_browser_result.is_none());
     assert_eq!(first.public_key_refs.len(), 1);
     // Completion replay returns the same public receipt and never allocates a
@@ -1418,7 +1425,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     let mut second_scope = base_scope.clone();
     second_scope.custody_operation_id = operation("b4");
     let (second, _) =
-        complete_petal_key_derivation(&service, &authenticator, second_scope, None, 10_500)
+        complete_delegated_key_derivation(&service, &authenticator, second_scope, None, 10_500)
             .unwrap();
     assert_ne!(first.public_key_refs[0], second.public_key_refs[0]);
     let child = first.public_key_refs[0].clone();
@@ -1454,10 +1461,11 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         .unwrap()
         .wallet_revocation_epoch;
     let scoped_terms = SealedApprovalTerms {
-        subject: ApprovalSubject::Petal {
-            package_hash: base_scope.package_hash.clone(),
-            route: base_scope.route.clone(),
-            agent_id: Some(base_scope.key_slot.as_str().into()),
+        subject: ApprovalSubject::Delegated {
+            authority_id: base_scope.authority_id.clone(),
+            active_subject_id: base_scope.active_subject_id.clone(),
+            resource_id: base_scope.allowed_resource_ids[0].clone(),
+            delegate_id: base_scope.delegate_id.clone(),
         },
         wallet_id: wallet_id.clone(),
         key_ref: child,
@@ -1514,28 +1522,52 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
             .code,
         ProtocolErrorCode::SelectorMismatch
     );
-    let mut another_petal = scoped_terms.clone();
-    another_petal.subject = ApprovalSubject::Petal {
-        package_hash: digest("b9"),
-        route: base_scope.route.clone(),
-        agent_id: Some(base_scope.key_slot.as_str().into()),
+    let mut another_delegated = scoped_terms.clone();
+    another_delegated.subject = ApprovalSubject::Delegated {
+        authority_id: base_scope.authority_id.clone(),
+        active_subject_id: digest("b9"),
+        resource_id: base_scope.allowed_resource_ids[0].clone(),
+        delegate_id: base_scope.delegate_id.clone(),
     };
     assert_eq!(
         restarted_engine
-            .install_approval_for_test(&another_petal)
+            .install_approval_for_test(&another_delegated)
             .unwrap_err()
             .code,
         ProtocolErrorCode::SelectorMismatch
     );
-    let mut another_agent = scoped_terms.clone();
-    another_agent.subject = ApprovalSubject::Petal {
-        package_hash: base_scope.package_hash.clone(),
-        route: base_scope.route.clone(),
-        agent_id: Some("account-b".into()),
+    let mut another_authority = scoped_terms.clone();
+    if let ApprovalSubject::Delegated { authority_id, .. } = &mut another_authority.subject {
+        *authority_id = digest("be");
+    }
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&another_authority)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+    let mut another_resource = scoped_terms.clone();
+    if let ApprovalSubject::Delegated { resource_id, .. } = &mut another_resource.subject {
+        *resource_id = digest("bf");
+    }
+    assert_eq!(
+        restarted_engine
+            .install_approval_for_test(&another_resource)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+    let mut another_delegate = scoped_terms.clone();
+    another_delegate.subject = ApprovalSubject::Delegated {
+        authority_id: base_scope.authority_id.clone(),
+        active_subject_id: base_scope.active_subject_id.clone(),
+        resource_id: base_scope.allowed_resource_ids[0].clone(),
+        delegate_id: Token::new("account-b").unwrap(),
     };
     assert_eq!(
         restarted_engine
-            .install_approval_for_test(&another_agent)
+            .install_approval_for_test(&another_delegate)
             .unwrap_err()
             .code,
         ProtocolErrorCode::SelectorMismatch
@@ -1568,11 +1600,12 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         ProtocolErrorCode::ApprovalExpired
     );
     let mut wrong_purpose = scoped_terms.clone();
-    wrong_purpose.selector = ApprovalSelector::Petal {
-        package_hash: base_scope.package_hash.clone(),
-        route: base_scope.route.clone(),
+    wrong_purpose.selector = ApprovalSelector::Delegated {
+        authority_id: base_scope.authority_id.clone(),
+        active_subject_id: base_scope.active_subject_id.clone(),
+        resource_id: base_scope.allowed_resource_ids[0].clone(),
         allowed_operation_classes: vec![Token::new("payment-key").unwrap()],
-        route_grants: Vec::new(),
+        resource_grants: Vec::new(),
         required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
     };
     wrong_purpose.request_nonce = RequestNonce::new("ca".repeat(16)).unwrap();
@@ -1584,7 +1617,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         ProtocolErrorCode::SelectorMismatch
     );
     let mut empty_purpose = wrong_purpose.clone();
-    if let ApprovalSelector::Petal {
+    if let ApprovalSelector::Delegated {
         allowed_operation_classes,
         ..
     } = &mut empty_purpose.selector
@@ -1601,11 +1634,12 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     );
 
     let mut reusable = scoped_terms.clone();
-    reusable.selector = ApprovalSelector::Petal {
-        package_hash: base_scope.package_hash.clone(),
-        route: base_scope.route.clone(),
+    reusable.selector = ApprovalSelector::Delegated {
+        authority_id: base_scope.authority_id.clone(),
+        active_subject_id: base_scope.active_subject_id.clone(),
+        resource_id: base_scope.allowed_resource_ids[0].clone(),
         allowed_operation_classes: base_scope.allowed_operation_classes.clone(),
-        route_grants: Vec::new(),
+        resource_grants: Vec::new(),
         required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
     };
     reusable.request_nonce = RequestNonce::new("cb".repeat(16)).unwrap();
@@ -1628,7 +1662,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         .query_row(
             "SELECT wallet_id, custody_operation_id, scope_digest, scope_jcs,
                     created_at_ms, expires_at_ms
-             FROM petal_key_scopes WHERE key_fingerprint = ?1",
+             FROM delegated_key_scopes WHERE key_fingerprint = ?1",
             [scope_fingerprint],
             |row| {
                 Ok((
@@ -1644,12 +1678,12 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         .unwrap();
     connection
         .execute(
-            "DELETE FROM petal_key_scopes WHERE key_fingerprint = ?1",
+            "DELETE FROM delegated_key_scopes WHERE key_fingerprint = ?1",
             [scope_fingerprint],
         )
         .unwrap();
     drop(connection);
-    let missing_scope = signed_petal_request(&reusable, &broker, operation("c9"));
+    let missing_scope = signed_delegated_request(&reusable, &broker, operation("c9"));
     assert_eq!(
         restarted_engine
             .authorize_sign(
@@ -1669,7 +1703,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     let connection = rusqlite::Connection::open(&database).unwrap();
     connection
         .execute(
-            "INSERT INTO petal_key_scopes(
+            "INSERT INTO delegated_key_scopes(
                 key_fingerprint, wallet_id, custody_operation_id, scope_digest,
                 scope_jcs, created_at_ms, expires_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1690,7 +1724,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     // authorize_sign must independently apply the scope-purpose check rather
     // than trusting the earlier activation decision.
     let mut corrupted = reusable.clone();
-    if let ApprovalSelector::Petal {
+    if let ApprovalSelector::Delegated {
         allowed_operation_classes,
         ..
     } = &mut corrupted.selector
@@ -1708,7 +1742,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         )
         .unwrap();
     drop(connection);
-    let signed = signed_petal_request(&reusable, &broker, operation("cc"));
+    let signed = signed_delegated_request(&reusable, &broker, operation("cc"));
     assert_eq!(
         restarted_engine
             .authorize_sign(
@@ -1729,11 +1763,12 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         .install_approval_for_test(&scoped_terms)
         .unwrap();
 
-    // Exercise expiry and revocation against the actual persisted Petal child,
+    // Exercise expiry and revocation against the actual persisted Delegated child,
     // rather than relying on the generic approval tests.  The approval is
     // necessarily bounded by the child scope, so once the scope window has
     // elapsed no request using that child can remain valid.
-    let mut expired_scoped_request = signed_petal_request(&scoped_terms, &broker, operation("d0"));
+    let mut expired_scoped_request =
+        signed_delegated_request(&scoped_terms, &broker, operation("d0"));
     // Keep the attempt itself live just beyond the child boundary so the
     // failure is Signer's independent persisted-scope check, not the generic
     // attempt-expiry guard.
@@ -1762,19 +1797,19 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     assert_eq!(scope_expired.code, ProtocolErrorCode::ApprovalExpired);
     assert_eq!(
         scope_expired.message,
-        "approval validity exceeds the Petal derived-key scope"
+        "approval validity exceeds the Delegated derived-key scope"
     );
 
     let scoped_approval_id = scoped_terms.approval_id().unwrap();
     restarted_engine
         .revoke_approval(
             &scoped_approval_id,
-            "fixture Petal child approval revoked".into(),
+            "fixture Delegated child approval revoked".into(),
             operation("d2"),
             10_600,
         )
         .unwrap();
-    let revoked_scoped_request = signed_petal_request(&scoped_terms, &broker, operation("d3"));
+    let revoked_scoped_request = signed_delegated_request(&scoped_terms, &broker, operation("d3"));
     assert_eq!(
         restarted_engine
             .authorize_sign(
@@ -2083,7 +2118,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
         exact_terms_digest: digest("88"),
         expected_input_class: Token::new("passkey-prf").unwrap(),
         browser_output_recipient_key: None,
-        petal_key_scope: None,
+        delegated_key_scope: None,
         legacy_passkey_migration: None,
     };
     let prepared = service.prepare_custody(prepare, 3_000).unwrap();
@@ -2145,7 +2180,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
         exact_terms_digest: digest("89"),
         expected_input_class: Token::new("passkey-prf").unwrap(),
         browser_output_recipient_key: None,
-        petal_key_scope: None,
+        delegated_key_scope: None,
         legacy_passkey_migration: None,
     };
     let prepared = service.prepare_custody(retry, 3_600).unwrap();
@@ -2261,7 +2296,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 exact_terms_digest: digest("90"),
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             3_900,
@@ -2281,7 +2316,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 exact_terms_digest: digest("91"),
                 expected_input_class: Token::new("credential-change-prfs").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             4_000,
@@ -2343,7 +2378,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 exact_terms_digest: digest("92"),
                 expected_input_class: Token::new("policy-document").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             4_200,
@@ -2379,7 +2414,7 @@ fn registration_requires_and_reserves_the_requested_wallet_id() {
                 exact_terms_digest: digest("c3"),
                 expected_input_class: Token::new("passkey-prf").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             5_000,
@@ -2397,7 +2432,7 @@ fn registration_requires_and_reserves_the_requested_wallet_id() {
                 exact_terms_digest: digest("c4"),
                 expected_input_class: Token::new("passkey-prf").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             5_000,
@@ -2481,7 +2516,7 @@ fn legacy_passkey_import_converts_existing_credential_into_current_custody() {
         exact_terms_digest: receipt.exact_terms_digest.clone(),
         expected_input_class: Token::new(LEGACY_PASSKEY_INPUT_CLASS).unwrap(),
         browser_output_recipient_key: None,
-        petal_key_scope: None,
+        delegated_key_scope: None,
         legacy_passkey_migration: Some(receipt.public_terms().unwrap()),
     };
     let initially_prepared = service.prepare_custody(request, 40_000).unwrap();
@@ -2622,7 +2657,7 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
                 exact_terms_digest: digest("d2"),
                 expected_input_class: Token::new("recovery-factor-v1").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             6_000,
@@ -2709,7 +2744,7 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
                 exact_terms_digest: digest("d3"),
                 expected_input_class: Token::new("passkey-prf").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             7_000,
@@ -2880,7 +2915,7 @@ fn credential_replace_remove_and_backend_enrollment_do_not_spend_approval_capaci
                 exact_terms_digest: digest("e6"),
                 expected_input_class: Token::new("credential-remove-v1").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: None,
+                delegated_key_scope: None,
                 legacy_passkey_migration: None,
             },
             23_000,
@@ -3156,10 +3191,10 @@ fn generic_custody_export_policy_and_delete_apply_exact_typed_effects() {
 }
 
 #[test]
-fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
+fn delegated_key_ceremony_stages_without_a_previously_activated_backend() {
     // Staging a key-derive ceremony must not require an already activated
     // backend. Completing that very ceremony is what activates it, so
-    // demanding activation up front makes Petal session creation impossible on
+    // demanding activation up front makes Delegated session creation impossible on
     // a Signer that has not performed some other owner ceremony recently --
     // for example any time after a restart. Before this was split, staging
     // shared one check with application and failed with KEYREF_MISMATCH.
@@ -3204,14 +3239,13 @@ fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
         "test precondition: the restored backend must not be activated"
     );
 
-    let scope = PetalKeyScope {
+    let scope = DelegatedKeyScope {
         wallet_id: wallet_id.clone(),
         parent_key_ref: parent.clone(),
-        package_hash: digest("c2"),
-        route: "/petals/exchange/sign".into(),
-        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-        key_slot: Token::new("account-a").unwrap(),
-        allowed_routes: vec!["/petals/exchange/sign".into()],
+        authority_id: digest("c2"),
+        active_subject_id: digest("c3"),
+        delegate_id: Token::new("account-a").unwrap(),
+        allowed_resource_ids: vec![digest("c4")],
         allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
         allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
         maximum_lifetime_ms: DecimalU64::new(20_000),
@@ -3226,9 +3260,9 @@ fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
                 wallet_id: Some(scope.wallet_id.clone()),
                 key_ref: Some(parent.clone()),
                 exact_terms_digest: scope.request_digest().unwrap(),
-                expected_input_class: Token::new("petal-subkey-v1").unwrap(),
+                expected_input_class: Token::new("delegated-subkey-v1").unwrap(),
                 browser_output_recipient_key: None,
-                petal_key_scope: Some(scope.clone()),
+                delegated_key_scope: Some(scope.clone()),
                 legacy_passkey_migration: None,
             },
             10_100,
@@ -3238,7 +3272,7 @@ fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
 
 #[test]
 fn key_derive_activates_the_local_backend_from_its_own_ceremony() {
-    // A Petal session is a KeyDerive followed by a SealedApproval that
+    // A Delegated session is a KeyDerive followed by a SealedApproval that
     // registers the derived key. Only the second used to activate the local
     // backend, and they cannot be reordered, so on a Signer with no owner
     // ceremony since boot the derivation failed outright. KeyDerive now arms
@@ -3283,21 +3317,20 @@ fn key_derive_activates_the_local_backend_from_its_own_ceremony() {
         "test precondition: the restored backend must not be armed"
     );
 
-    let scope = PetalKeyScope {
+    let scope = DelegatedKeyScope {
         wallet_id: wallet_id.clone(),
         parent_key_ref: parent.clone(),
-        package_hash: digest("e2"),
-        route: "/petals/exchange/sign".into(),
-        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-        key_slot: Token::new("account-a").unwrap(),
-        allowed_routes: vec!["/petals/exchange/sign".into()],
+        authority_id: digest("e2"),
+        active_subject_id: digest("e3"),
+        delegate_id: Token::new("account-a").unwrap(),
+        allowed_resource_ids: vec![digest("e4")],
         allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
         allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
         maximum_lifetime_ms: DecimalU64::new(20_000),
         custody_operation_id: operation("e3"),
     };
 
-    complete_petal_key_derivation(&service, &authenticator, scope, None, 10_100)
+    complete_delegated_key_derivation(&service, &authenticator, scope, None, 10_100)
         .expect("KeyDerive must arm the backend from its own credential PRF");
 
     assert!(
@@ -3307,10 +3340,10 @@ fn key_derive_activates_the_local_backend_from_its_own_ceremony() {
 }
 
 #[test]
-fn only_petal_key_derivation_arms_the_backend() {
+fn only_delegated_key_derivation_arms_the_backend() {
     // The block that decrypts the credential PRF is shared by WalletExport,
     // WalletDelete, BackendEnrollment, KeyDerive and PolicyUpdate. Arming
-    // belongs to the innermost Petal-scope branch alone; hooking it into the
+    // belongs to the innermost Delegated-scope branch alone; hooking it into the
     // shared prefix would silently make the other four activation vectors.
     let source = std::fs::read_to_string("src/ceremony.rs").unwrap();
     let armings = source.matches("activate_key_blocking(").count();
@@ -3318,15 +3351,15 @@ fn only_petal_key_derivation_arms_the_backend() {
         armings, 1,
         "exactly one activation call belongs on the custody apply path"
     );
-    let petal_branch = source
-        .split("if let Some(scope) = &prepare.petal_key_scope")
+    let delegated_branch = source
+        .split("if let Some(scope) = &prepare.delegated_key_scope")
         .nth(1)
-        .expect("Petal key scope branch must exist");
-    let branch_end = petal_branch
-        .find("return self.apply_petal_key_derivation")
+        .expect("Delegated key scope branch must exist");
+    let branch_end = delegated_branch
+        .find("return self.apply_delegated_key_derivation")
         .expect("branch must apply the derivation");
     assert!(
-        petal_branch[..branch_end].contains("activate_key_blocking("),
-        "activation must sit inside the Petal key scope branch"
+        delegated_branch[..branch_end].contains("activate_key_blocking("),
+        "activation must sit inside the Delegated key scope branch"
     );
 }

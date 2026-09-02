@@ -115,7 +115,7 @@ fn custody_prepare() -> CustodyPrepareRequest {
         exact_terms_digest: digest(15),
         expected_input_class: token("none"),
         browser_output_recipient_key: None,
-        petal_key_scope: None,
+        delegated_key_scope: None,
         legacy_passkey_migration: None,
     }
 }
@@ -219,7 +219,7 @@ fn sign_request() -> SignRequest {
             ordered_payload_digests: vec![digest(40)],
             ordered_hashes: vec![digest(41)],
             signature_count: DecimalU64::new(1),
-            petal_use_claim_digest: None,
+            delegated_use_claim_digest: None,
             claim_assurance_digest: None,
             policy_version: DecimalU64::new(1),
             policy_digest: digest(16),
@@ -420,7 +420,7 @@ fn custody_contribution() -> CustodySignerContribution {
         required_user_verification: true,
         hpke_recipient_key: Base64UrlBytes::from_bytes(&[56; 32]),
         browser_output_recipient_key: None,
-        petal_key_scope: None,
+        delegated_key_scope: None,
         expires_at_ms: DecimalU64::new(20),
         signer_key_id: token("signer-key"),
         signer_signature: Base64UrlBytes::from_bytes(&[57; 64]),
@@ -689,12 +689,12 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer requests",
         signer_requests(),
-        "1ff0dedfe5c86346428582b77d7bccb7f59c35569f45dab210f4e76f4a80b7e3",
+        "1ccd293a8f47970f641818363c17488006b405384c49b6442bace6593ccce89e",
     );
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "bff5b636cd75f7e5ff850b4ba60237e255b7c5c704e16511e5deeb07f32fa67c",
+        "23fddf77d5850df9b2d3ee358cbd03a35b7c82d7fdefb700a16b48ada7e62fa0",
     );
     assert_wire_digest(
         "control requests",

@@ -12,10 +12,11 @@ const APPROVAL_DOMAIN: &[u8] = b"bloom-sealed-approval-terms/v1";
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalSubject {
-    Petal {
-        package_hash: Digest32,
-        route: String,
-        agent_id: Option<String>,
+    Delegated {
+        authority_id: Digest32,
+        active_subject_id: Digest32,
+        resource_id: Digest32,
+        delegate_id: Token,
     },
     Cli {
         client_id: Token,
@@ -42,24 +43,23 @@ pub enum ApprovalSelector {
         ordered_payload_digests: Vec<Digest32>,
         ordered_hashes: Vec<Digest32>,
     },
-    Petal {
-        package_hash: Digest32,
-        route: String,
+    Delegated {
+        authority_id: Digest32,
+        active_subject_id: Digest32,
+        resource_id: Digest32,
         allowed_operation_classes: Vec<Token>,
-        /// Complete route-specific grant set for the immutable package.
-        /// Empty preserves the v1 singleton `route` semantics. When nonempty,
-        /// it must include a grant identical to the legacy route, classes, and
-        /// top-level provenance digest.
+        /// Complete resource-specific grant set for the authority. When
+        /// nonempty, it must include the top-level resource and provenance.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        route_grants: Vec<PetalRouteGrant>,
+        resource_grants: Vec<DelegatedResourceGrant>,
         required_claim_assurance: ClaimAssuranceLevel,
     },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct PetalRouteGrant {
-    pub route: String,
+pub struct DelegatedResourceGrant {
+    pub resource_id: Digest32,
     pub allowed_operation_classes: Vec<Token>,
     pub provenance_digest: Digest32,
 }
@@ -152,24 +152,27 @@ impl SealedApprovalTerms {
 
         match (&self.subject, &self.selector) {
             (
-                ApprovalSubject::Petal {
-                    package_hash,
-                    route,
+                ApprovalSubject::Delegated {
+                    authority_id,
+                    active_subject_id,
+                    resource_id,
                     ..
                 },
-                ApprovalSelector::Petal {
-                    package_hash: selector_hash,
-                    route: selector_route,
+                ApprovalSelector::Delegated {
+                    authority_id: selector_authority,
+                    active_subject_id: selector_subject,
+                    resource_id: selector_resource,
                     allowed_operation_classes,
-                    route_grants,
+                    resource_grants,
                     ..
                 },
-            ) if package_hash == selector_hash
-                && route == selector_route
+            ) if authority_id == selector_authority
+                && active_subject_id == selector_subject
+                && resource_id == selector_resource
                 && classes_are_canonical(allowed_operation_classes)
-                && valid_route_grants(
-                    route_grants,
-                    selector_route,
+                && valid_resource_grants(
+                    resource_grants,
+                    selector_resource,
                     allowed_operation_classes,
                     &self.provenance_digest,
                 ) => {}
@@ -216,20 +219,21 @@ impl SealedApprovalTerms {
     }
 }
 
-fn valid_route_grants(
-    grants: &[PetalRouteGrant],
-    primary_route: &str,
+fn valid_resource_grants(
+    grants: &[DelegatedResourceGrant],
+    primary_resource: &Digest32,
     primary_classes: &[Token],
     primary_provenance: &Digest32,
 ) -> bool {
     grants.is_empty()
-        || grants.iter().all(|grant| {
-            !grant.route.is_empty() && classes_are_canonical(&grant.allowed_operation_classes)
-        }) && grants
-            .windows(2)
-            .all(|pair| pair[0].route.as_bytes() < pair[1].route.as_bytes())
+        || grants
+            .iter()
+            .all(|grant| classes_are_canonical(&grant.allowed_operation_classes))
+            && grants
+                .windows(2)
+                .all(|pair| pair[0].resource_id.as_str() < pair[1].resource_id.as_str())
             && grants.iter().any(|grant| {
-                grant.route == primary_route
+                &grant.resource_id == primary_resource
                     && grant.allowed_operation_classes == primary_classes
                     && &grant.provenance_digest == primary_provenance
             })
@@ -355,31 +359,35 @@ mod tests {
     }
 
     #[test]
-    fn petal_route_grants_are_canonical_and_legacy_singletons_decode() {
+    fn delegated_resource_grants_are_canonical_and_primary_bound() {
         let mut terms = exact_terms("02".repeat(16).as_str());
-        let package_hash = Digest32::new("66".repeat(32)).unwrap();
-        terms.subject = ApprovalSubject::Petal {
-            package_hash: package_hash.clone(),
-            route: "r000001".into(),
-            agent_id: None,
+        let authority_id = Digest32::new("65".repeat(32)).unwrap();
+        let active_subject_id = Digest32::new("66".repeat(32)).unwrap();
+        let resource_id = Digest32::new("67".repeat(32)).unwrap();
+        terms.subject = ApprovalSubject::Delegated {
+            authority_id: authority_id.clone(),
+            active_subject_id: active_subject_id.clone(),
+            resource_id: resource_id.clone(),
+            delegate_id: Token::new("delegate-1").unwrap(),
         };
-        terms.selector = ApprovalSelector::Petal {
-            package_hash,
-            route: "r000001".into(),
+        terms.selector = ApprovalSelector::Delegated {
+            authority_id,
+            active_subject_id,
+            resource_id: resource_id.clone(),
             allowed_operation_classes: vec![Token::new("session.create").unwrap()],
-            route_grants: vec![
-                PetalRouteGrant {
-                    route: "r000001".into(),
+            resource_grants: vec![
+                DelegatedResourceGrant {
+                    resource_id,
                     allowed_operation_classes: vec![Token::new("session.create").unwrap()],
                     provenance_digest: terms.provenance_digest.clone(),
                 },
-                PetalRouteGrant {
-                    route: "r000002".into(),
+                DelegatedResourceGrant {
+                    resource_id: Digest32::new("77".repeat(32)).unwrap(),
                     allowed_operation_classes: vec![Token::new("order.place").unwrap()],
                     provenance_digest: Digest32::new("77".repeat(32)).unwrap(),
                 },
-                PetalRouteGrant {
-                    route: "r000003".into(),
+                DelegatedResourceGrant {
+                    resource_id: Digest32::new("88".repeat(32)).unwrap(),
                     allowed_operation_classes: vec![Token::new("order.cancel").unwrap()],
                     provenance_digest: Digest32::new("88".repeat(32)).unwrap(),
                 },
@@ -390,8 +398,11 @@ mod tests {
         terms.validate().unwrap();
 
         let mut reversed = terms.clone();
-        if let ApprovalSelector::Petal { route_grants, .. } = &mut reversed.selector {
-            route_grants.reverse();
+        if let ApprovalSelector::Delegated {
+            resource_grants, ..
+        } = &mut reversed.selector
+        {
+            resource_grants.reverse();
         }
         assert_eq!(
             reversed.validate().unwrap_err().code,
@@ -399,8 +410,11 @@ mod tests {
         );
 
         let mut missing_primary = terms.clone();
-        if let ApprovalSelector::Petal { route_grants, .. } = &mut missing_primary.selector {
-            route_grants.remove(0);
+        if let ApprovalSelector::Delegated {
+            resource_grants, ..
+        } = &mut missing_primary.selector
+        {
+            resource_grants.remove(0);
         }
         assert_eq!(
             missing_primary.validate().unwrap_err().code,
@@ -408,8 +422,11 @@ mod tests {
         );
 
         let mut unsorted_classes = terms.clone();
-        if let ApprovalSelector::Petal { route_grants, .. } = &mut unsorted_classes.selector {
-            route_grants[1].allowed_operation_classes = vec![
+        if let ApprovalSelector::Delegated {
+            resource_grants, ..
+        } = &mut unsorted_classes.selector
+        {
+            resource_grants[1].allowed_operation_classes = vec![
                 Token::new("order.place").unwrap(),
                 Token::new("order.cancel").unwrap(),
             ];
@@ -419,11 +436,14 @@ mod tests {
             ProtocolErrorCode::SelectorMismatch
         );
 
-        if let ApprovalSelector::Petal { route_grants, .. } = &mut terms.selector {
-            route_grants.clear();
+        if let ApprovalSelector::Delegated {
+            resource_grants, ..
+        } = &mut terms.selector
+        {
+            resource_grants.clear();
         }
         let encoded = serde_json::to_value(&terms).unwrap();
-        assert!(encoded["selector"].get("route_grants").is_none());
+        assert!(encoded["selector"].get("resource_grants").is_none());
         serde_json::from_value::<SealedApprovalTerms>(encoded)
             .unwrap()
             .validate()

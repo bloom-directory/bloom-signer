@@ -17,7 +17,7 @@ const POLICY_COMMIT_RECEIPT_DOMAIN: &[u8] = b"bloom-policy-commit-receipt/v1";
 pub struct CanonicalWalletPolicy {
     pub wallet_id: Token,
     pub maximum_approval_lifetime_ms: u64,
-    pub allowed_petal_packages: Vec<Digest32>,
+    pub allowed_delegated_authorities: Vec<Digest32>,
     pub allowed_destinations: Vec<PolicyDestination>,
     pub required_verifiers: Vec<RequiredVerifier>,
 }

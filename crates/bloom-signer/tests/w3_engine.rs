@@ -108,18 +108,20 @@ fn exact_terms() -> SealedApprovalTerms {
     }
 }
 
-fn petal_terms() -> SealedApprovalTerms {
+fn delegated_terms() -> SealedApprovalTerms {
     let mut terms = exact_terms();
-    terms.subject = ApprovalSubject::Petal {
-        package_hash: digest("77"),
-        route: "/sign".into(),
-        agent_id: None,
+    terms.subject = ApprovalSubject::Delegated {
+        authority_id: digest("76"),
+        active_subject_id: digest("77"),
+        resource_id: digest("78"),
+        delegate_id: Token::new("delegate-1").unwrap(),
     };
-    terms.selector = ApprovalSelector::Petal {
-        package_hash: digest("77"),
-        route: "/sign".into(),
+    terms.selector = ApprovalSelector::Delegated {
+        authority_id: digest("76"),
+        active_subject_id: digest("77"),
+        resource_id: digest("78"),
         allowed_operation_classes: vec![Token::new("transfer").unwrap()],
-        route_grants: Vec::new(),
+        resource_grants: Vec::new(),
         required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
     };
     terms
@@ -153,14 +155,16 @@ fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> Unsign
             ordered_hashes.clone(),
             SelectorKind::Exact,
         ),
-        ApprovalSelector::Petal { .. } => {
-            (vec![digest("22")], vec![digest("33")], SelectorKind::Petal)
-        }
+        ApprovalSelector::Delegated { .. } => (
+            vec![digest("22")],
+            vec![digest("33")],
+            SelectorKind::Delegated,
+        ),
     };
     let claim_digest =
-        matches!(&terms.selector, ApprovalSelector::Petal { .. }).then(|| digest("ab"));
+        matches!(&terms.selector, ApprovalSelector::Delegated { .. }).then(|| digest("ab"));
     let assurance_digest =
-        matches!(&terms.selector, ApprovalSelector::Petal { .. }).then(|| digest("ac"));
+        matches!(&terms.selector, ApprovalSelector::Delegated { .. }).then(|| digest("ac"));
     let identity = SignOperationIdentity {
         operation_id: OperationId::new(operation_byte.repeat(32)).unwrap(),
         approval_id: terms.approval_id().unwrap(),
@@ -168,7 +172,7 @@ fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> Unsign
         crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
         ordered_payload_digests: payloads.clone(),
         ordered_hashes: hashes.clone(),
-        petal_use_claim_digest: claim_digest.clone(),
+        delegated_use_claim_digest: claim_digest.clone(),
         claim_assurance_digest: assurance_digest.clone(),
         policy_version: terms.policy_version.clone(),
         policy_digest: terms.policy_digest.clone(),
@@ -191,7 +195,7 @@ fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> Unsign
         ordered_payload_digests: payloads,
         ordered_hashes: hashes.clone(),
         signature_count: DecimalU64::new(hashes.len() as u64),
-        petal_use_claim_digest: claim_digest,
+        delegated_use_claim_digest: claim_digest,
         claim_assurance_digest: assurance_digest,
         policy_version: terms.policy_version.clone(),
         policy_digest: terms.policy_digest.clone(),
@@ -227,7 +231,7 @@ fn resign(broker: &SigningKey, request: &mut SignRequest) {
 }
 
 #[test]
-fn ac11_replay_retry_revocation_and_structural_failures_are_closed() {
+fn ac11_replay_retry_revocation_delegated_and_structural_failures_are_closed() {
     let broker = SigningKey::from_bytes(&[7; 32]);
     let mut terms = exact_terms();
     terms.limits.operation_rate_limits = vec![SlidingWindow {
@@ -362,10 +366,10 @@ fn ac11_forged_expired_wrong_key_unsupported_and_excessive_requests_fail() {
         ProtocolErrorCode::SuiteNotAllowed
     );
 
-    let petal = petal_terms();
+    let delegated = delegated_terms();
     let engine = new_engine(&broker);
-    engine.install_approval_for_test(&petal).unwrap();
-    let mut excessive = signed(&broker, unsigned_request(&petal, "06"));
+    engine.install_approval_for_test(&delegated).unwrap();
+    let mut excessive = signed(&broker, unsigned_request(&delegated, "06"));
     excessive
         .unsigned
         .ordered_payload_digests
@@ -421,8 +425,8 @@ fn ac11_approval_ceiling_selector_issuer_key_state_retry_and_release_are_closed(
     );
 
     let mut wrong_selector = signed(&broker, unsigned_request(&terms, "0b"));
-    wrong_selector.unsigned.selector_kind = SelectorKind::Petal;
-    wrong_selector.unsigned.petal_use_claim_digest = Some(digest("ab"));
+    wrong_selector.unsigned.selector_kind = SelectorKind::Delegated;
+    wrong_selector.unsigned.delegated_use_claim_digest = Some(digest("ab"));
     wrong_selector.unsigned.claim_assurance_digest = Some(digest("ac"));
     resign(&broker, &mut wrong_selector);
     assert_eq!(
@@ -549,7 +553,7 @@ fn ac32_backup_restore_refuses_missing_registry_for_derivation_and_lower_state()
         derivation_registry: None,
         backend_enrollments: vec![],
         policy: None,
-        petal_key_scopes: vec![],
+        delegated_key_scopes: vec![],
         approvals: vec![],
         approval_tombstones: vec![],
         wallet_tombstone: None,

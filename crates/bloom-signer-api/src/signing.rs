@@ -12,7 +12,7 @@ const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
 #[serde(rename_all = "snake_case")]
 pub enum SelectorKind {
     Exact,
-    Petal,
+    Delegated,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -39,7 +39,7 @@ pub struct SignOperationIdentity {
     pub crypto_suite: CryptoSuite,
     pub ordered_payload_digests: Vec<Digest32>,
     pub ordered_hashes: Vec<Digest32>,
-    pub petal_use_claim_digest: Option<Digest32>,
+    pub delegated_use_claim_digest: Option<Digest32>,
     pub claim_assurance_digest: Option<Digest32>,
     pub policy_version: DecimalU64,
     pub policy_digest: Digest32,
@@ -79,7 +79,7 @@ pub struct UnsignedSignRequest {
     pub ordered_payload_digests: Vec<Digest32>,
     pub ordered_hashes: Vec<Digest32>,
     pub signature_count: DecimalU64,
-    pub petal_use_claim_digest: Option<Digest32>,
+    pub delegated_use_claim_digest: Option<Digest32>,
     pub claim_assurance_digest: Option<Digest32>,
     pub policy_version: DecimalU64,
     pub policy_digest: Digest32,
@@ -137,7 +137,7 @@ impl UnsignedSignRequest {
             crypto_suite: self.crypto_suite,
             ordered_payload_digests: self.ordered_payload_digests.clone(),
             ordered_hashes: self.ordered_hashes.clone(),
-            petal_use_claim_digest: self.petal_use_claim_digest.clone(),
+            delegated_use_claim_digest: self.delegated_use_claim_digest.clone(),
             claim_assurance_digest: self.claim_assurance_digest.clone(),
             policy_version: self.policy_version.clone(),
             policy_digest: self.policy_digest.clone(),

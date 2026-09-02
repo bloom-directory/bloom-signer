@@ -3,10 +3,10 @@ use bloom_signer_api::{
     CeremonyPhase, CeremonyPrepareRequest, CeremonyPublicStatus, CeremonyState,
     CeremonyWebAuthnOptions, CredentialPrfInput, CredentialSummary, CryptoSuite,
     CustodyCompleteRequest, CustodyHpkeAad, CustodyOutputHpkeAad, CustodyPrepareRequest,
-    CustodyResult, CustodySignerContribution, DecimalU64, Digest32, LocalPrfHpkeAad, OperationId,
-    OwnerAttestationChallenge, OwnerAttestationCompleteRequest, OwnerAttestationPrepareRequest,
-    OwnerAttestationReceipt, OwnerAttestationSignerContribution, OwnerAttestationTerms,
-    PetalKeyScope, PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest,
+    CustodyResult, CustodySignerContribution, DecimalU64, DelegatedKeyScope, Digest32,
+    LocalPrfHpkeAad, OperationId, OwnerAttestationChallenge, OwnerAttestationCompleteRequest,
+    OwnerAttestationPrepareRequest, OwnerAttestationReceipt, OwnerAttestationSignerContribution,
+    OwnerAttestationTerms, PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest,
     PreparedOwnerAttestation, ProtocolError, ProtocolErrorCode, SignerActivationReceipt,
     SignerCeremonyContribution, Token, WebAuthnCeremonyProof, WebAuthnCredential,
 };
@@ -73,8 +73,8 @@ const CONTRIBUTION_DOMAIN: &[u8] = b"bloom-signer-ceremony-contribution/v1";
 const RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1";
 const WRAP_INFO: &[u8] = b"bloom-passkey-wallet-wrap/v1";
 const DERIVATION_AUTHORITY_DOMAIN: &[u8] = b"bloom-key-derive-authority/v1";
-const PETAL_SUBKEY_NAMESPACE: &str = "petal-subkeys-v1";
-const PETAL_SUBKEY_PREFIX: &str = "m/44'/60'/0'/18735";
+const DELEGATED_SUBKEY_NAMESPACE: &str = "delegated-subkeys-v1";
+const DELEGATED_SUBKEY_PREFIX: &str = "m/44'/60'/0'/18735";
 
 #[derive(Clone, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -601,7 +601,7 @@ impl SignerCeremonyService {
         let _preparation_barrier = self.preparation_barrier.lock();
         request.terms.validate()?;
         self.engine
-            .validate_petal_scope_for_approval(&request.terms, now_ms)?;
+            .validate_delegated_scope_for_approval(&request.terms, now_ms)?;
         if request.terms.approval_digest()? != request.terms.approval_id()? {
             return Err(protocol(
                 ProtocolErrorCode::SelectorMismatch,
@@ -764,8 +764,8 @@ impl SignerCeremonyService {
         }
         request.validate_wallet_creation_binding()?;
         request.validate_legacy_passkey_migration_binding()?;
-        request.validate_petal_key_scope_binding()?;
-        if let Some(scope) = &request.petal_key_scope {
+        request.validate_delegated_key_scope_binding()?;
+        if let Some(scope) = &request.delegated_key_scope {
             self.engine
                 .require_enrolled_parent_key(&scope.wallet_id, &scope.parent_key_ref)?;
         }
@@ -913,7 +913,7 @@ impl SignerCeremonyService {
             required_user_verification: true,
             hpke_recipient_key: recipient.public_key().clone(),
             browser_output_recipient_key: request.browser_output_recipient_key.clone(),
-            petal_key_scope: request.petal_key_scope.clone(),
+            delegated_key_scope: request.delegated_key_scope.clone(),
             expires_at_ms: DecimalU64::new(now_ms.saturating_add(CEREMONY_TTL_MS)),
             signer_key_id: self.signer_key_id.clone(),
             signer_signature: Base64UrlBytes::from_bytes(&[]),
@@ -1432,8 +1432,8 @@ impl SignerCeremonyService {
         {
             return Err(kind_mismatch());
         }
-        if prepare.petal_key_scope.is_some() {
-            contribution.validate_petal_key_scope_binding(prepare)?;
+        if prepare.delegated_key_scope.is_some() {
+            contribution.validate_delegated_key_scope_binding(prepare)?;
         }
         let before = self.custody_snapshot();
         let apply_outcome = match self.verify_custody_proof_and_apply(
@@ -2000,7 +2000,7 @@ impl SignerCeremonyService {
                 let initial_policy = bloom_signer_api::CanonicalWalletPolicy {
                     wallet_id: registration.wallet_id.clone(),
                     maximum_approval_lifetime_ms: 30 * 24 * 60 * 60 * 1_000,
-                    allowed_petal_packages: Vec::new(),
+                    allowed_delegated_authorities: Vec::new(),
                     allowed_destinations: Vec::new(),
                     required_verifiers: Vec::new(),
                 };
@@ -2349,7 +2349,7 @@ impl SignerCeremonyService {
                     sensitive_output: None,
                     database_effect: CeremonyDatabaseEffect::EnrollKey {
                         key_ref: key_ref.clone(),
-                        petal_scope: None,
+                        delegated_scope: None,
                     },
                     rollback_derived_key: None,
                     public_key_refs: vec![key_ref.clone()],
@@ -2366,19 +2366,19 @@ impl SignerCeremonyService {
                 let root = prepare.key_ref.as_ref().ok_or_else(kind_mismatch)?;
                 #[cfg(feature = "local")]
                 {
-                    if let Some(scope) = &prepare.petal_key_scope {
+                    if let Some(scope) = &prepare.delegated_key_scope {
                         if namespace_id.is_some()
                             || grant.is_some()
                             || authority_signature.is_some()
                         {
                             return Err(protocol(
                                 ProtocolErrorCode::BackendInvalidRequest,
-                                "Petal key derivation parameters are owned by Signer",
+                                "Delegated key derivation parameters are owned by Signer",
                             ));
                         }
                         // Activate from this ceremony's own credential PRF.
                         //
-                        // A Petal session is created by a KeyDerive followed by
+                        // A Delegated session is created by a KeyDerive followed by
                         // a SealedApproval that registers the derived key with
                         // the venue. Only the second activates the local
                         // backend, and they cannot be reordered because the
@@ -2402,7 +2402,7 @@ impl SignerCeremonyService {
                         // the distinct error keeps that case diagnosable.
                         self.engine
                             .require_activated_parent_key(&scope.wallet_id, root)?;
-                        return self.apply_petal_key_derivation(root, scope);
+                        return self.apply_delegated_key_derivation(root, scope);
                     }
                     let namespace_id = namespace_id.ok_or_else(kind_mismatch)?;
                     let grant = grant.ok_or_else(kind_mismatch)?;
@@ -2425,7 +2425,7 @@ impl SignerCeremonyService {
                         sensitive_output: Some(serde_jcs::to_vec(&description).map_err(malformed)?),
                         database_effect: CeremonyDatabaseEffect::EnrollKey {
                             key_ref: description.key_ref.clone(),
-                            petal_scope: None,
+                            delegated_scope: None,
                         },
                         rollback_derived_key: Some(derived_key_ref),
                         public_key_refs: vec![description.key_ref],
@@ -2448,16 +2448,16 @@ impl SignerCeremonyService {
     }
 
     #[cfg(feature = "local")]
-    fn apply_petal_key_derivation(
+    fn apply_delegated_key_derivation(
         &self,
         root: &bloom_signer_api::KeyRef,
-        scope: &PetalKeyScope,
+        scope: &DelegatedKeyScope,
     ) -> Result<GenericCustodyOutcome, ProtocolError> {
-        let namespace_id = Token::new(PETAL_SUBKEY_NAMESPACE).expect("static token");
+        let namespace_id = Token::new(DELEGATED_SUBKEY_NAMESPACE).expect("static token");
         let grant = bloom_signer_backend_local::DerivationGrant {
             authority_kind: Token::new("ceremony").expect("static token"),
             namespace_id: namespace_id.clone(),
-            canonical_prefix: PETAL_SUBKEY_PREFIX.to_owned(),
+            canonical_prefix: DELEGATED_SUBKEY_PREFIX.to_owned(),
             starting_index: DecimalU64::new(0),
             maximum_children: DecimalU64::new(0x8000_0000),
         };
@@ -2484,7 +2484,7 @@ impl SignerCeremonyService {
             sensitive_output: None,
             database_effect: CeremonyDatabaseEffect::EnrollKey {
                 key_ref: description.key_ref.clone(),
-                petal_scope: Some(scope.clone()),
+                delegated_scope: Some(scope.clone()),
             },
             rollback_derived_key: Some(derived_key_ref),
             public_key_refs: vec![description.key_ref],

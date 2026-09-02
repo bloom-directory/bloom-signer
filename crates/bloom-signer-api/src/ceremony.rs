@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActivationMode, Base64UrlBytes, CeremonyState, CryptoSuite, DecimalU64, Digest32, HpkeEnvelope,
-    KeyRef, OperationId, PetalKeyScope, ProtocolError, ProtocolErrorCode, SealedApprovalTerms,
-    Token,
+    ActivationMode, Base64UrlBytes, CeremonyState, CryptoSuite, DecimalU64, DelegatedKeyScope,
+    Digest32, HpkeEnvelope, KeyRef, OperationId, ProtocolError, ProtocolErrorCode,
+    SealedApprovalTerms, Token,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -324,7 +324,7 @@ pub struct CustodyPrepareRequest {
     pub expected_input_class: Token,
     pub browser_output_recipient_key: Option<Base64UrlBytes>,
     #[serde(default)]
-    pub petal_key_scope: Option<PetalKeyScope>,
+    pub delegated_key_scope: Option<DelegatedKeyScope>,
     #[serde(default)]
     pub legacy_passkey_migration: Option<LegacyPasskeyMigrationPublic>,
 }
@@ -374,7 +374,7 @@ impl CustodyPrepareRequest {
             || self.expected_input_class.as_str() != "legacy_passkey_v1_prf"
             || self.wallet_id.is_some()
             || self.key_ref.is_some()
-            || self.petal_key_scope.is_some()
+            || self.delegated_key_scope.is_some()
             || migration.schema.as_str() != "bloom.legacy_passkey_migration_receipt.v1"
             || migration.policy_mode.as_str() != "restrictive_current_policy"
             || migration.legacy_format_version != 1
@@ -388,48 +388,48 @@ impl CustodyPrepareRequest {
         Ok(())
     }
 
-    /// Validate the full Petal scope carried by the existing key-derivation
+    /// Validate the full Delegated scope carried by the existing key-derivation
     /// surface. Broker and Signer both call this before accepting the scope.
-    pub fn validate_petal_key_scope_binding(&self) -> Result<(), ProtocolError> {
-        let Some(scope) = &self.petal_key_scope else {
+    pub fn validate_delegated_key_scope_binding(&self) -> Result<(), ProtocolError> {
+        let Some(scope) = &self.delegated_key_scope else {
             return Ok(());
         };
 
         if self.ceremony_kind != CeremonyKind::KeyDerive {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::CeremonyKindMismatch,
-                "Petal key scope is valid only for key-derive custody",
+                "Delegated key scope is valid only for key-derive custody",
             ));
         }
         scope.validate()?;
         if scope.custody_operation_id != self.custody_operation_id {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::OperationIdConflict,
-                "Petal key scope custody operation does not match the request",
+                "Delegated key scope custody operation does not match the request",
             ));
         }
         if self.wallet_id.as_ref() != Some(&scope.wallet_id) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::KeyrefMismatch,
-                "Petal key scope wallet does not match the custody request",
+                "Delegated key scope wallet does not match the custody request",
             ));
         }
         if self.key_ref.as_ref() != Some(&scope.parent_key_ref) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::KeyrefMismatch,
-                "Petal key scope parent KeyRef does not match the custody request",
+                "Delegated key scope parent KeyRef does not match the custody request",
             ));
         }
         if self.exact_terms_digest != scope.request_digest()? {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::OperationIdConflict,
-                "key-derive exact terms digest does not match the Petal key scope",
+                "key-derive exact terms digest does not match the Delegated key scope",
             ));
         }
         if self.browser_output_recipient_key.is_some() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
-                "Petal key derivation cannot return Browser-provided key material",
+                "Delegated key derivation cannot return Browser-provided key material",
             ));
         }
         Ok(())
@@ -451,7 +451,7 @@ pub struct CustodySignerContribution {
     pub hpke_recipient_key: Base64UrlBytes,
     pub browser_output_recipient_key: Option<Base64UrlBytes>,
     #[serde(default)]
-    pub petal_key_scope: Option<PetalKeyScope>,
+    pub delegated_key_scope: Option<DelegatedKeyScope>,
     pub expires_at_ms: DecimalU64,
     pub signer_key_id: Token,
     pub signer_signature: Base64UrlBytes,
@@ -529,18 +529,18 @@ pub enum SignerCeremonyCompleteResponse {
 }
 
 impl CustodySignerContribution {
-    /// Verify that the Signer-signed contribution carries exactly the Petal
+    /// Verify that the Signer-signed contribution carries exactly the Delegated
     /// scope accepted on the corresponding Broker-to-Signer request.
-    pub fn validate_petal_key_scope_binding(
+    pub fn validate_delegated_key_scope_binding(
         &self,
         request: &CustodyPrepareRequest,
     ) -> Result<(), ProtocolError> {
-        request.validate_petal_key_scope_binding()?;
-        if request.petal_key_scope.is_none() {
-            if self.petal_key_scope.is_some() {
+        request.validate_delegated_key_scope_binding()?;
+        if request.delegated_key_scope.is_none() {
+            if self.delegated_key_scope.is_some() {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::OperationIdConflict,
-                    "Signer introduced a Petal key scope on an unscoped custody request",
+                    "Signer introduced a Delegated key scope on an unscoped custody request",
                 ));
             }
             return Ok(());
@@ -549,11 +549,11 @@ impl CustodySignerContribution {
             || self.custody_operation_id != request.custody_operation_id
             || self.wallet_id != request.wallet_id
             || self.key_ref != request.key_ref
-            || self.petal_key_scope != request.petal_key_scope
+            || self.delegated_key_scope != request.delegated_key_scope
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::OperationIdConflict,
-                "Signer custody contribution does not match the requested Petal key scope",
+                "Signer custody contribution does not match the requested Delegated key scope",
             ));
         }
         Ok(())
@@ -573,7 +573,7 @@ impl CustodySignerContribution {
             required_user_verification: bool,
             hpke_recipient_key: &'a Base64UrlBytes,
             browser_output_recipient_key: &'a Option<Base64UrlBytes>,
-            petal_key_scope: &'a Option<PetalKeyScope>,
+            delegated_key_scope: &'a Option<DelegatedKeyScope>,
             expires_at_ms: &'a DecimalU64,
             signer_key_id: &'a Token,
         }
@@ -589,7 +589,7 @@ impl CustodySignerContribution {
             required_user_verification: self.required_user_verification,
             hpke_recipient_key: &self.hpke_recipient_key,
             browser_output_recipient_key: &self.browser_output_recipient_key,
-            petal_key_scope: &self.petal_key_scope,
+            delegated_key_scope: &self.delegated_key_scope,
             expires_at_ms: &self.expires_at_ms,
             signer_key_id: &self.signer_key_id,
         })
@@ -796,8 +796,8 @@ mod tests {
         OperationId::from_bytes([byte; 32])
     }
 
-    fn petal_scope() -> PetalKeyScope {
-        PetalKeyScope {
+    fn delegated_scope() -> DelegatedKeyScope {
+        DelegatedKeyScope {
             wallet_id: Token::new("primary").unwrap(),
             parent_key_ref: KeyRef {
                 backend: Token::new("local").unwrap(),
@@ -810,11 +810,10 @@ mod tests {
                     path: "m/44'/60'/0'".into(),
                 }),
             },
-            package_hash: digest(2),
-            route: "/petals/exchange/orders".into(),
-            lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            key_slot: Token::new("desk-a").unwrap(),
-            allowed_routes: vec!["/petals/exchange/orders".into()],
+            authority_id: digest(2),
+            active_subject_id: digest(3),
+            delegate_id: Token::new("desk-a").unwrap(),
+            allowed_resource_ids: vec![digest(4)],
             allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
             allowed_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
             maximum_lifetime_ms: DecimalU64::new(86_400_000),
@@ -823,16 +822,16 @@ mod tests {
     }
 
     fn scoped_prepare() -> CustodyPrepareRequest {
-        let scope = petal_scope();
+        let scope = delegated_scope();
         CustodyPrepareRequest {
             ceremony_kind: CeremonyKind::KeyDerive,
             custody_operation_id: scope.custody_operation_id.clone(),
             wallet_id: Some(scope.wallet_id.clone()),
             key_ref: Some(scope.parent_key_ref.clone()),
             exact_terms_digest: scope.request_digest().unwrap(),
-            expected_input_class: Token::new("petal-key-scope-v1").unwrap(),
+            expected_input_class: Token::new("delegated-key-scope-v1").unwrap(),
             browser_output_recipient_key: None,
-            petal_key_scope: Some(scope),
+            delegated_key_scope: Some(scope),
             legacy_passkey_migration: None,
         }
     }
@@ -846,7 +845,7 @@ mod tests {
             exact_terms_digest: digest(5),
             expected_input_class: Token::new("passkey-prf").unwrap(),
             browser_output_recipient_key: None,
-            petal_key_scope: None,
+            delegated_key_scope: None,
             legacy_passkey_migration: None,
         }
     }
@@ -898,37 +897,54 @@ mod tests {
     }
 
     #[test]
-    fn petal_key_scope_is_exactly_bound_to_key_derive_request() {
-        assert!(scoped_prepare().validate_petal_key_scope_binding().is_ok());
+    fn delegated_key_scope_is_exactly_bound_to_key_derive_request() {
+        assert!(
+            scoped_prepare()
+                .validate_delegated_key_scope_binding()
+                .is_ok()
+        );
 
         let mut request = scoped_prepare();
-        request.petal_key_scope.as_mut().unwrap().route = "/petals/exchange/cancel".into();
+        request
+            .delegated_key_scope
+            .as_mut()
+            .unwrap()
+            .active_subject_id = digest(9);
         assert_eq!(
-            request.validate_petal_key_scope_binding().unwrap_err().code,
+            request
+                .validate_delegated_key_scope_binding()
+                .unwrap_err()
+                .code,
             ProtocolErrorCode::OperationIdConflict
         );
     }
 
     #[test]
-    fn petal_scope_rejects_cross_operation_and_non_derivation_reuse() {
+    fn delegated_scope_rejects_cross_operation_and_non_derivation_reuse() {
         let mut request = scoped_prepare();
         request.custody_operation_id = operation(9);
         assert_eq!(
-            request.validate_petal_key_scope_binding().unwrap_err().code,
+            request
+                .validate_delegated_key_scope_binding()
+                .unwrap_err()
+                .code,
             ProtocolErrorCode::OperationIdConflict
         );
 
         let mut request = scoped_prepare();
         request.ceremony_kind = CeremonyKind::WalletImport;
         assert_eq!(
-            request.validate_petal_key_scope_binding().unwrap_err().code,
+            request
+                .validate_delegated_key_scope_binding()
+                .unwrap_err()
+                .code,
             ProtocolErrorCode::CeremonyKindMismatch
         );
     }
 
     #[test]
-    fn signed_custody_contribution_binds_full_petal_scope() {
-        let scope = petal_scope();
+    fn signed_custody_contribution_binds_full_delegated_scope() {
+        let scope = delegated_scope();
         let contribution = CustodySignerContribution {
             ceremony_id: digest(4),
             ceremony_kind: CeremonyKind::KeyDerive,
@@ -937,31 +953,31 @@ mod tests {
             review_manifest_digest: digest(6),
             wallet_id: Some(scope.wallet_id.clone()),
             key_ref: Some(scope.parent_key_ref.clone()),
-            expected_input_class: Token::new("petal-key-scope-v1").unwrap(),
+            expected_input_class: Token::new("delegated-key-scope-v1").unwrap(),
             required_user_verification: true,
             hpke_recipient_key: Base64UrlBytes::from_bytes(&[7; 32]),
             browser_output_recipient_key: None,
-            petal_key_scope: Some(scope),
+            delegated_key_scope: Some(scope),
             expires_at_ms: DecimalU64::new(1000),
             signer_key_id: Token::new("signer-identity").unwrap(),
             signer_signature: Base64UrlBytes::from_bytes(&[8; 64]),
         };
         assert!(
             contribution
-                .validate_petal_key_scope_binding(&scoped_prepare())
+                .validate_delegated_key_scope_binding(&scoped_prepare())
                 .is_ok()
         );
         let original = contribution.unsigned_canonical_bytes().unwrap();
         let mut tampered = contribution;
         tampered
-            .petal_key_scope
+            .delegated_key_scope
             .as_mut()
             .unwrap()
             .allowed_operation_classes = vec![Token::new("payment-key").unwrap()];
         assert_ne!(original, tampered.unsigned_canonical_bytes().unwrap());
         assert_eq!(
             tampered
-                .validate_petal_key_scope_binding(&scoped_prepare())
+                .validate_delegated_key_scope_binding(&scoped_prepare())
                 .unwrap_err()
                 .code,
             ProtocolErrorCode::OperationIdConflict
