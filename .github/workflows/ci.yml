@@ -28,6 +28,13 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run tests
         run: cargo test --workspace --all-features --locked
+      # `--all-features` turns on `triad-dev-harness`, so every step above
+      # builds the harness arm of each `#[cfg(feature = ...)]` and never the
+      # one that ships. Release behaviour was going unlinted and untested.
+      - name: Run clippy on the shipped feature set
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run tests on the shipped feature set
+        run: cargo test --workspace --locked
       - name: Keep the accepted time advisory out of the default artifact
         run: |
           if cargo tree --locked -p bloom-signer -e normal --prefix none | grep -Eq '^time v'; then

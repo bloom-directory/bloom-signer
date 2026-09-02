@@ -72,6 +72,31 @@ fn ceremony_kind_name(kind: CeremonyKind) -> &'static str {
 }
 
 const CEREMONY_TTL_MS: u64 = 5 * 60 * 1_000;
+/// The developer harness drives ceremonies by hand: a person has to read the
+/// review, switch to a browser, and touch a security key. Five minutes bounds
+/// an attended production flow; it does not bound how long someone takes to
+/// notice a prompt during a test session, where lapsing just forces a re-issue
+/// and teaches nothing.
+#[cfg(feature = "triad-dev-harness")]
+const DEVELOPER_HARNESS_CEREMONY_TTL_MS: u64 = 30 * 60 * 1_000;
+
+/// How long a freshly minted ceremony stays open.
+///
+/// The harness window needs the feature *and* a developer root at run time.
+/// `main.rs` gates identity loading and history ownership the same way, so a
+/// harness-featured binary pointed at production identity paths keeps
+/// production behaviour; the feature alone is not enough to relax anything.
+///
+/// This governs custody ceremonies. Sealed approvals are separately clamped in
+/// [`Ceremonies::prepare_approval`] to the terms they activate, which the
+/// Machine sets far shorter, so raising this value does not lengthen them.
+fn ceremony_ttl_ms() -> u64 {
+    #[cfg(feature = "triad-dev-harness")]
+    if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
+        return DEVELOPER_HARNESS_CEREMONY_TTL_MS;
+    }
+    CEREMONY_TTL_MS
+}
 const CONTRIBUTION_DOMAIN: &[u8] = b"bloom-signer-ceremony-contribution/v1";
 const RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1";
 const WRAP_INFO: &[u8] = b"bloom-passkey-wallet-wrap/v1";
@@ -494,7 +519,7 @@ impl SignerCeremonyService {
             // the generic five-minute browser TTL.
             expires_at_ms: DecimalU64::new(
                 now_ms
-                    .saturating_add(CEREMONY_TTL_MS)
+                    .saturating_add(ceremony_ttl_ms())
                     .min(request.terms.expires_at_ms.get()),
             ),
             signer_key_id: self.signer_key_id.clone(),
@@ -701,7 +726,7 @@ impl SignerCeremonyService {
             browser_output_recipient_key: request.browser_output_recipient_key.clone(),
             petal_key_scope: request.petal_key_scope.clone(),
             wallet_seed_profile: request.wallet_seed_profile,
-            expires_at_ms: DecimalU64::new(now_ms.saturating_add(CEREMONY_TTL_MS)),
+            expires_at_ms: DecimalU64::new(now_ms.saturating_add(ceremony_ttl_ms())),
             signer_key_id: self.signer_key_id.clone(),
             signer_signature: Base64UrlBytes::from_bytes(&[]),
         };
