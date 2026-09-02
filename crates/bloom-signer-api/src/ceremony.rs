@@ -490,6 +490,7 @@ pub enum SignerCeremonyStatus {
 pub enum SignerCeremonyPrepareRequest {
     SealedApproval(Box<CeremonyPrepareRequest>),
     PolicyUpdate(Box<crate::PolicyUpdateCeremonyPrepareRequest>),
+    OwnerAttestationPrepare(Box<crate::OwnerAttestationPrepareRequest>),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -500,6 +501,7 @@ pub enum SignerCeremonyPrepareRequest {
 pub enum SignerCeremonyPrepareResponse {
     SealedApproval(SignerPreparedApproval),
     PolicyUpdate(SignerPreparedCustody),
+    OwnerAttestationPrepare(SignerPreparedCustody),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -507,6 +509,7 @@ pub enum SignerCeremonyPrepareResponse {
 pub enum SignerCeremonyCompleteRequest {
     SealedApproval(Box<CeremonyCompleteRequest>),
     PolicyUpdate(Box<crate::PolicyUpdateCeremonyCompleteRequest>),
+    OwnerAttestationComplete(Box<crate::OwnerAttestationCompleteRequest>),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -514,6 +517,7 @@ pub enum SignerCeremonyCompleteRequest {
 pub enum SignerCeremonyCompleteResponse {
     SealedApproval(Box<SignerActivationReceipt>),
     PolicyUpdate(Box<CustodyResult>),
+    OwnerAttestationComplete(Box<crate::OwnerAttestationReceipt>),
 }
 
 impl CustodySignerContribution {

@@ -497,6 +497,9 @@ impl crate::TypedRequestMethod for BrokerSignerRequest {
                 crate::SignerCeremonyPrepareRequest::PolicyUpdate(request) => {
                     request.custody.custody_operation_id.clone()
                 }
+                crate::SignerCeremonyPrepareRequest::OwnerAttestationPrepare(request) => {
+                    request.terms.operation_id.clone()
+                }
             }),
             Request::CeremonyComplete(request) => Some(match request {
                 crate::SignerCeremonyCompleteRequest::SealedApproval(request) => {
@@ -504,6 +507,9 @@ impl crate::TypedRequestMethod for BrokerSignerRequest {
                 }
                 crate::SignerCeremonyCompleteRequest::PolicyUpdate(request) => {
                     request.custody.custody_operation_id.clone()
+                }
+                crate::SignerCeremonyCompleteRequest::OwnerAttestationComplete(request) => {
+                    request.operation_id.clone()
                 }
             }),
             Request::SealedApprovalRevoke(request) => Some(request.operation_id.clone()),

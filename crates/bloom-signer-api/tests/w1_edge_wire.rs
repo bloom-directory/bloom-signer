@@ -292,6 +292,42 @@ fn custody_complete() -> CustodyCompleteRequest {
     }
 }
 
+fn owner_attestation_terms() -> OwnerAttestationTerms {
+    OwnerAttestationTerms {
+        schema: token("bloom.owner-attestation/1"),
+        operation_id: operation(67),
+        owner_wallet_id: token("wallet-owner"),
+        authority_edge_digest: digest(68),
+        context_digest: digest(69),
+        subject_digest: digest(70),
+    }
+}
+
+fn owner_attestation_complete() -> OwnerAttestationCompleteRequest {
+    OwnerAttestationCompleteRequest {
+        operation_id: operation(67),
+        ceremony_id: digest(71),
+        public_binding_digest: digest(72),
+        browser_proof: WebAuthnCeremonyProof::Assertion {
+            assertion: webauthn_assertion(),
+        },
+    }
+}
+
+fn owner_attestation_receipt() -> OwnerAttestationReceipt {
+    OwnerAttestationReceipt {
+        operation_id: operation(67),
+        ceremony_id: digest(71),
+        owner_wallet_id: token("wallet-owner"),
+        authority_edge_digest: digest(68),
+        context_digest: digest(69),
+        subject_digest: digest(70),
+        receipt_digest: digest(73),
+        signer_key_id: token("signer-key"),
+        signer_signature: Base64UrlBytes::from_bytes(&[74; 64]),
+    }
+}
+
 fn signer_contribution() -> SignerCeremonyContribution {
     SignerCeremonyContribution {
         ceremony_id: digest(46),
@@ -429,6 +465,18 @@ fn signer_requests() -> Vec<BrokerSignerRequest> {
                 encrypted_local_prf: None,
             }),
         )),
+        BrokerSignerRequest::CeremonyPrepare(
+            SignerCeremonyPrepareRequest::OwnerAttestationPrepare(Box::new(
+                OwnerAttestationPrepareRequest {
+                    terms: owner_attestation_terms(),
+                },
+            )),
+        ),
+        BrokerSignerRequest::CeremonyComplete(
+            SignerCeremonyCompleteRequest::OwnerAttestationComplete(Box::new(
+                owner_attestation_complete(),
+            )),
+        ),
         BrokerSignerRequest::CeremonyStatus(id.clone()),
         BrokerSignerRequest::CeremonyCancel(id.clone()),
         BrokerSignerRequest::SealedApprovalStatus(IdRequest { id: digest(35) }),
@@ -496,6 +544,9 @@ fn signer_responses() -> Vec<BrokerSignerResponse> {
         BrokerSignerResponse::CeremonyPrepare(SignerCeremonyPrepareResponse::SealedApproval(
             prepared_approval(),
         )),
+        BrokerSignerResponse::CeremonyPrepare(
+            SignerCeremonyPrepareResponse::OwnerAttestationPrepare(custody_prepared.clone()),
+        ),
         BrokerSignerResponse::CeremonyComplete(SignerCeremonyCompleteResponse::SealedApproval(
             Box::new(SignerActivationReceipt {
                 activation_operation_id: operation(54),
@@ -514,6 +565,11 @@ fn signer_responses() -> Vec<BrokerSignerResponse> {
                 signer_signature: Base64UrlBytes::from_bytes(&[66; 64]),
             }),
         )),
+        BrokerSignerResponse::CeremonyComplete(
+            SignerCeremonyCompleteResponse::OwnerAttestationComplete(Box::new(
+                owner_attestation_receipt(),
+            )),
+        ),
         BrokerSignerResponse::CeremonyCancel(ceremony_status()),
         BrokerSignerResponse::OperationStatus(operation_status),
         BrokerSignerResponse::CeremonyStatus(SignerCeremonyStatus::Pending),
@@ -591,12 +647,12 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer requests",
         signer_requests(),
-        "991df6448dae330b1f6b70e99f22b3966373e2cc27fc8f56f3662aeed84a1552",
+        "1ff0dedfe5c86346428582b77d7bccb7f59c35569f45dab210f4e76f4a80b7e3",
     );
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "de0dc430a3047886d53189fc66efea2ba2afe0e9551e1090f5eb7d91bbb2f8b5",
+        "ef8112ab985d37aae544458415efde26716bff2c834597c3c7462745dade3d53",
     );
     assert_wire_digest(
         "control requests",
