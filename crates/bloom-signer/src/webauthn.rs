@@ -15,6 +15,22 @@ use bloom_signer_api::{
 pub const CEREMONY_ORIGIN: &str = "http://localhost:18734";
 pub const CEREMONY_RP_ID: &str = "localhost";
 
+fn configured_ceremony_origin() -> String {
+    #[cfg(feature = "triad-dev-harness")]
+    if let Some(value) = std::env::var_os("BLOOM_TRIAD_DEV_CEREMONY_PORT") {
+        let value = value
+            .into_string()
+            .expect("BLOOM_TRIAD_DEV_CEREMONY_PORT must be UTF-8");
+        let port = value
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .expect("BLOOM_TRIAD_DEV_CEREMONY_PORT must be an integer from 1 to 65535");
+        return format!("http://localhost:{port}");
+    }
+    CEREMONY_ORIGIN.to_owned()
+}
+
 const FLAG_USER_PRESENT: u8 = 0x01;
 const FLAG_USER_VERIFIED: u8 = 0x04;
 const FLAG_ATTESTED_CREDENTIAL: u8 = 0x40;
@@ -176,7 +192,7 @@ fn verify_client_data(
     let data: ClientData = serde_json::from_slice(&decoded)
         .map_err(|_| proof_error("WebAuthn clientDataJSON is malformed"))?;
     if data.ceremony_type != expected_type
-        || data.origin != CEREMONY_ORIGIN
+        || data.origin != configured_ceremony_origin()
         || data.cross_origin
         || Base64UrlBytes::parse(data.challenge)? != Base64UrlBytes::from_bytes(expected_challenge)
     {
