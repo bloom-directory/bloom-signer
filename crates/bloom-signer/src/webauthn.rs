@@ -369,4 +369,44 @@ mod tests {
         let error = verify_client_data(&encoded, "webauthn.get", challenge).unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
     }
+
+    #[test]
+    #[ignore = "requires BLOOM_TRIAD_DEV_CEREMONY_PORT from the focused CI invocation"]
+    fn developer_ceremony_origin_is_build_scoped_and_exact() {
+        let port = std::env::var("BLOOM_TRIAD_DEV_CEREMONY_PORT")
+            .expect("focused CI must select a developer ceremony port");
+        let selected = format!("http://localhost:{port}");
+        let expected = if cfg!(feature = "triad-dev-harness") {
+            selected.as_str()
+        } else {
+            CEREMONY_ORIGIN
+        };
+        assert_ne!(
+            selected, CEREMONY_ORIGIN,
+            "focused CI must select a non-default port"
+        );
+        assert_eq!(configured_ceremony_origin(), expected);
+
+        let challenge = b"developer-origin-challenge";
+        let accepted = client_data(serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": Base64UrlBytes::from_bytes(challenge),
+            "origin": expected,
+            "crossOrigin": false
+        }));
+        verify_client_data(&accepted, "webauthn.get", challenge).unwrap();
+
+        let rejected_origin = if expected == CEREMONY_ORIGIN {
+            selected.as_str()
+        } else {
+            CEREMONY_ORIGIN
+        };
+        let rejected = client_data(serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": Base64UrlBytes::from_bytes(challenge),
+            "origin": rejected_origin,
+            "crossOrigin": false
+        }));
+        assert!(verify_client_data(&rejected, "webauthn.get", challenge).is_err());
+    }
 }

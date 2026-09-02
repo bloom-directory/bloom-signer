@@ -28,6 +28,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run tests
         run: cargo test --workspace --all-features --locked
+      - name: Exercise isolated developer ceremony origin
+        env:
+          BLOOM_TRIAD_DEV_CEREMONY_PORT: "28735"
+        run: |
+          cargo test -p bloom-signer --locked \
+            webauthn::tests::developer_ceremony_origin_is_build_scoped_and_exact -- --exact --ignored
+          cargo test -p bloom-signer --features triad-dev-harness --locked \
+            webauthn::tests::developer_ceremony_origin_is_build_scoped_and_exact -- --exact --ignored
       - name: Keep the accepted time advisory out of the default artifact
         run: |
           if cargo tree --locked -p bloom-signer -e normal --prefix none | grep -Eq '^time v'; then
