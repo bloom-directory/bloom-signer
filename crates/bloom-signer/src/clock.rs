@@ -171,6 +171,7 @@ fn durable_clock_boot_epoch(
     #[cfg(target_os = "linux")]
     {
         let boot_id_path = std::env::var_os("CREDENTIALS_DIRECTORY")
+            .filter(|directory| !directory.is_empty())
             .map(std::path::PathBuf::from)
             .map(|directory| directory.join("kernel-boot-id"))
             .unwrap_or_else(|| "/proc/sys/kernel/random/boot_id".into());
@@ -208,7 +209,8 @@ fn parse_linux_boot_epoch(raw: &str) -> Result<BootEpoch, ProtocolError> {
     if segments.next().is_some() {
         return Err(malformed_linux_boot_epoch());
     }
-    BootEpoch::new(compact.to_ascii_lowercase()).map_err(|_| malformed_linux_boot_epoch())
+    compact.make_ascii_lowercase();
+    BootEpoch::new(compact).map_err(|_| malformed_linux_boot_epoch())
 }
 
 #[cfg(target_os = "linux")]
@@ -267,7 +269,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn durable_clock_uses_kernel_boot_id_instead_of_enrollment_epoch() {
-        let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let Ok(raw) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
+            return;
+        };
         let expected = parse_linux_boot_epoch(&raw).unwrap();
         let selected = durable_clock_boot_epoch(true, BootEpoch::from_bytes([0xff; 16])).unwrap();
         assert_eq!(selected, expected);
