@@ -54,6 +54,7 @@ impl SignerClock {
             ProtocolError::new(ProtocolErrorCode::ClockUntrusted, error.to_string())
         })?;
         let durable_clock_guard = sampler.source().requires_durable_clock_guard();
+        let boot_epoch = durable_clock_boot_epoch(durable_clock_guard, boot_epoch)?;
         let clock = Self {
             engine,
             sampler,
@@ -160,6 +161,57 @@ impl SignerClock {
     }
 }
 
+fn durable_clock_boot_epoch(
+    durable_clock_guard: bool,
+    enrollment_boot_epoch: BootEpoch,
+) -> Result<BootEpoch, ProtocolError> {
+    if !durable_clock_guard {
+        return Ok(enrollment_boot_epoch);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::ClockUntrusted,
+                format!("read Linux kernel boot ID: {error}"),
+            )
+        })?;
+        parse_linux_boot_epoch(&raw)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(ProtocolError::new(
+            ProtocolErrorCode::ClockUntrusted,
+            "durable clock guard requires a reviewed platform boot ID",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_boot_epoch(raw: &str) -> Result<BootEpoch, ProtocolError> {
+    let mut compact = String::with_capacity(32);
+    let mut segments = raw.trim().split('-');
+    for expected_len in [8, 4, 4, 4, 12] {
+        let segment = segments.next().ok_or_else(malformed_linux_boot_epoch)?;
+        if segment.len() != expected_len || !segment.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(malformed_linux_boot_epoch());
+        }
+        compact.push_str(segment);
+    }
+    if segments.next().is_some() {
+        return Err(malformed_linux_boot_epoch());
+    }
+    BootEpoch::new(compact.to_ascii_lowercase()).map_err(|_| malformed_linux_boot_epoch())
+}
+
+#[cfg(target_os = "linux")]
+fn malformed_linux_boot_epoch() -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::ClockUntrusted,
+        "Linux kernel boot ID is malformed",
+    )
+}
+
 fn host_wall_clock_decision(
     reading: PlatformTimeReading,
     boot_epoch: BootEpoch,
@@ -202,6 +254,28 @@ mod tests {
             .unwrap();
             assert_eq!(decision.effective_now_ms, utc_ms);
             assert_eq!(decision.condition, ClockCondition::Healthy);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_clock_uses_kernel_boot_id_instead_of_enrollment_epoch() {
+        let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let expected = parse_linux_boot_epoch(&raw).unwrap();
+        let selected = durable_clock_boot_epoch(true, BootEpoch::from_bytes([0xff; 16])).unwrap();
+        assert_eq!(selected, expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_boot_id_parser_rejects_noncanonical_input() {
+        for malformed in [
+            "00112233445566778899aabbccddeeff",
+            "00112233-4455-6677-8899-aabbccddeef",
+            "00112233-4455-6677-8899-aabbccddeefg",
+            "00112233-4455-6677-8899-aabbccddeeff-extra",
+        ] {
+            assert!(parse_linux_boot_epoch(malformed).is_err());
         }
     }
 
