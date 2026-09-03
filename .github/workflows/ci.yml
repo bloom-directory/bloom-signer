@@ -28,3 +28,21 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run tests
         run: cargo test --workspace --all-features --locked
+      - name: Keep the accepted time advisory out of the default artifact
+        run: |
+          if cargo tree --locked -p bloom-signer -e normal --prefix none | grep -Eq '^time v'; then
+            echo 'the default bloom-signer graph must not contain time while RUSTSEC-2026-0009 is ignored for the optional AWS KMS graph' >&2
+            exit 1
+          fi
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Advisories, licences, sources, and wildcard pins, configured in
+      # deny.toml. Runs as its own job so a dependency advisory is
+      # distinguishable from a code failure, and so it still reports when
+      # the workspace job fails.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check

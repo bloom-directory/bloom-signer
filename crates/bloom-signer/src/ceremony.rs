@@ -20,7 +20,10 @@ use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
 };
+use zeroize::Zeroizing;
 
+#[cfg(feature = "local")]
+use crate::registry::BackendRegistry;
 use crate::{
     custody::{UnlockedWallet, WalletCustody, WalletCustodyBackup},
     engine::{CeremonyDatabaseEffect, SignerEngine},
@@ -63,6 +66,8 @@ fn ceremony_kind_name(kind: CeremonyKind) -> &'static str {
         CeremonyKind::BackendEnrollment => "backend_enrollment",
         CeremonyKind::KeyDerive => "key_derive",
         CeremonyKind::PolicyUpdate => "policy_update",
+        CeremonyKind::AccountAllocate => "account_allocate",
+        CeremonyKind::AccountRetire => "account_retire",
     }
 }
 
@@ -162,8 +167,10 @@ struct CustodyApplyContext {
     legacy_migration: Option<PreparedLegacyMigration>,
 }
 
+type SensitiveCustodyOutput = Zeroizing<Vec<u8>>;
+
 struct CustodyApplyOutcome {
-    sensitive_output: Option<Vec<u8>>,
+    sensitive_output: Option<SensitiveCustodyOutput>,
     database_effect: CeremonyDatabaseEffect,
     rollback_derived_key: Option<bloom_signer_api::KeyRef>,
     rollback_provisioned_backend: Option<bloom_signer_api::KeyRef>,
@@ -172,10 +179,42 @@ struct CustodyApplyOutcome {
 }
 
 struct GenericCustodyOutcome {
-    sensitive_output: Option<Vec<u8>>,
+    sensitive_output: Option<SensitiveCustodyOutput>,
     database_effect: CeremonyDatabaseEffect,
     rollback_derived_key: Option<bloom_signer_api::KeyRef>,
     public_key_refs: Vec<bloom_signer_api::KeyRef>,
+}
+
+#[cfg(feature = "local")]
+struct ProvisionedLocalBackendRollback<'a> {
+    registry: &'a BackendRegistry,
+    backend_instance: Token,
+    armed: bool,
+}
+
+#[cfg(feature = "local")]
+impl<'a> ProvisionedLocalBackendRollback<'a> {
+    fn new(registry: &'a BackendRegistry, backend_instance: Token) -> Self {
+        Self {
+            registry,
+            backend_instance,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "local")]
+impl Drop for ProvisionedLocalBackendRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry
+                .remove_local_wallet_backend_instance(&self.backend_instance);
+        }
+    }
 }
 
 /// Signer-owned, single-use ceremony state.
@@ -204,19 +243,80 @@ impl SignerCeremonyService {
         signer_key_id: Token,
         signing_key: SigningKey,
     ) -> Result<Self, ProtocolError> {
+        let recovery_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "system clock is before the Unix epoch",
+                )
+            })?
+            .as_millis()
+            .try_into()
+            .map_err(|_| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "system clock exceeds the supported millisecond range",
+                )
+            })?;
+        engine.recover_incomplete_bip39_allocations(recovery_now_ms)?;
         #[cfg(feature = "local")]
         for enrollment in engine.load_ceremony_backend_enrollments()? {
-            if enrollment.backend.as_str() != "local" || enrollment.pinned_keys.len() != 1 {
+            if enrollment.backend.as_str() != "local" {
                 return Err(protocol(
                     ProtocolErrorCode::KeyrefMismatch,
                     "persisted ceremony backend enrollment is malformed",
                 ));
             }
-            engine.backend_registry().restore_local_wallet_backend(
-                &enrollment.backend_instance,
-                &enrollment.encrypted_record,
-                &enrollment.pinned_keys[0],
-            )?;
+            match enrollment
+                .pinned_keys
+                .iter()
+                .find(|key| key.derivation.is_none())
+            {
+                // Legacy / imported-scalar backend: exactly one root KeyRef.
+                Some(root) => {
+                    if enrollment.pinned_keys.len() != 1 {
+                        return Err(protocol(
+                            ProtocolErrorCode::KeyrefMismatch,
+                            "persisted ceremony backend enrollment is malformed",
+                        ));
+                    }
+                    engine.backend_registry().restore_local_wallet_backend(
+                        &enrollment.backend_instance,
+                        &enrollment.encrypted_record,
+                        root,
+                    )?;
+                }
+                // BIP-39 backend: no signable root; pinned keys are derived
+                // children (or none yet) and the root is entropy-only.
+                None => {
+                    let descriptors =
+                        engine.derived_account_descriptors(&enrollment.backend_instance)?;
+                    let public_descriptions = descriptors
+                        .iter()
+                        .map(|descriptor| bloom_signer_backend_api::KeyDescription {
+                            key_ref: descriptor.key_ref.clone(),
+                            canonical_spki_der: descriptor.canonical_public_key.clone(),
+                            public_key_fingerprint: descriptor.public_key_fingerprint.clone(),
+                            supported_crypto_suites: descriptor.supported_crypto_suites.clone(),
+                        })
+                        .collect();
+                    engine.backend_registry().restore_bip39_wallet_backend(
+                        &enrollment.backend_instance,
+                        &enrollment.encrypted_record,
+                        public_descriptions,
+                    )?;
+                    if let Some(descriptor) = descriptors.first() {
+                        // Persist the public-description migration immediately
+                        // so every later restart follows the ordinary backend
+                        // enrollment path without needing another repair.
+                        engine.refresh_backend_enrollment(
+                            &enrollment.backend_instance,
+                            &descriptor.key_ref,
+                        )?;
+                    }
+                }
+            }
         }
         #[cfg(feature = "local")]
         for (operation_id, key_ref) in engine.backend_registry().pending_local_derivations() {
@@ -388,7 +488,15 @@ impl SignerCeremonyService {
             ephemeral_encryption_public_key: recipient
                 .as_ref()
                 .map(|recipient| recipient.public_key().clone()),
-            expires_at_ms: DecimalU64::new(now_ms.saturating_add(CEREMONY_TTL_MS)),
+            // A browser ceremony cannot outlive the authority it activates.
+            // In particular, Solana exact-message approvals are bounded by the
+            // recent blockhash lifetime, which is normally much shorter than
+            // the generic five-minute browser TTL.
+            expires_at_ms: DecimalU64::new(
+                now_ms
+                    .saturating_add(CEREMONY_TTL_MS)
+                    .min(request.terms.expires_at_ms.get()),
+            ),
             signer_key_id: self.signer_key_id.clone(),
             signer_signature: Base64UrlBytes::from_bytes(&[]),
         };
@@ -449,6 +557,7 @@ impl SignerCeremonyService {
         request.validate_wallet_creation_binding()?;
         request.validate_legacy_passkey_migration_binding()?;
         request.validate_petal_key_scope_binding()?;
+        self.validate_seed_profile_and_allocation(&request)?;
         if let Some(scope) = &request.petal_key_scope {
             self.engine
                 .require_enrolled_parent_key(&scope.wallet_id, &scope.parent_key_ref)?;
@@ -591,6 +700,7 @@ impl SignerCeremonyService {
             hpke_recipient_key: recipient.public_key().clone(),
             browser_output_recipient_key: request.browser_output_recipient_key.clone(),
             petal_key_scope: request.petal_key_scope.clone(),
+            wallet_seed_profile: request.wallet_seed_profile,
             expires_at_ms: DecimalU64::new(now_ms.saturating_add(CEREMONY_TTL_MS)),
             signer_key_id: self.signer_key_id.clone(),
             signer_signature: Base64UrlBytes::from_bytes(&[]),
@@ -1118,6 +1228,7 @@ impl SignerCeremonyService {
             &pending.challenges,
             &request,
             policy_prepare,
+            now_ms,
             CustodyApplyContext {
                 recipient: pending.hpke_recipient.take(),
                 registration: pending.registration.take(),
@@ -1164,7 +1275,7 @@ impl SignerCeremonyService {
         let encrypted_browser_result = match encrypted_browser_result {
             Ok(result) => result,
             Err(error) => {
-                self.rollback_derived_key(apply_outcome.rollback_derived_key.as_ref())?;
+                self.rollback_derived_key(apply_outcome.rollback_derived_key.as_ref(), now_ms)?;
                 self.rollback_provisioned_backend(
                     apply_outcome.rollback_provisioned_backend.as_ref(),
                 );
@@ -1227,7 +1338,7 @@ impl SignerCeremonyService {
             &durable_status,
             apply_outcome.database_effect,
         ) {
-            self.rollback_derived_key(apply_outcome.rollback_derived_key.as_ref())?;
+            self.rollback_derived_key(apply_outcome.rollback_derived_key.as_ref(), now_ms)?;
             self.rollback_provisioned_backend(apply_outcome.rollback_provisioned_backend.as_ref());
             self.restore_custody_snapshot(before)?;
             return Err(error);
@@ -1494,6 +1605,7 @@ impl SignerCeremonyService {
         Ok(self.bound_credential(credential_id, wallet_id)?.credential)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn verify_custody_proof_and_apply(
         &self,
         prepare: &CustodyPrepareRequest,
@@ -1501,6 +1613,7 @@ impl SignerCeremonyService {
         challenges: &[CeremonyChallenge],
         complete: &CustodyCompleteRequest,
         policy_prepare: Option<&PolicyUpdateCeremonyPrepareRequest>,
+        now_ms: u64,
         mut context: CustodyApplyContext,
     ) -> Result<CustodyApplyOutcome, ProtocolError> {
         let mut sensitive_output = None;
@@ -1580,20 +1693,40 @@ impl SignerCeremonyService {
                         context.recipient.take(),
                         Some(&credential.credential_id),
                     )?;
+                    let is_bip39 = prepare.wallet_seed_profile
+                        == Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1);
                     let (root, prf) = if prepare.ceremony_kind == CeremonyKind::WalletImport {
-                        let import: RawWalletImportInput =
-                            serde_json::from_slice(input.expose_to_backend()).map_err(malformed)?;
-                        let raw_private_key = import.raw_private_key.decode();
-                        if raw_private_key.len() != 32 {
-                            return Err(protocol(
-                                ProtocolErrorCode::BackendInvalidRequest,
-                                "raw secp256k1 private key must contain exactly 32 bytes",
-                            ));
+                        if is_bip39 {
+                            let import: Bip39MnemonicImportInput =
+                                serde_json::from_slice(input.expose_to_backend())
+                                    .map_err(malformed)?;
+                            // Strict NFKD + checksum via the reference parser;
+                            // v1 imports accept every valid English length.
+                            // The input schema has no passphrase field.
+                            let parsed = bloom_signer_derive::parse_mnemonic(&import.mnemonic)
+                                .map_err(|cause| {
+                                    protocol(ProtocolErrorCode::MalformedFrame, cause.to_string())
+                                })?;
+                            (
+                                SecretBytes::new(parsed.entropy().to_vec()),
+                                SecretBytes::new(import.credential_prf.decode()),
+                            )
+                        } else {
+                            let import: RawWalletImportInput =
+                                serde_json::from_slice(input.expose_to_backend())
+                                    .map_err(malformed)?;
+                            let raw_private_key = import.raw_private_key.decode();
+                            if raw_private_key.len() != 32 {
+                                return Err(protocol(
+                                    ProtocolErrorCode::BackendInvalidRequest,
+                                    "raw secp256k1 private key must contain exactly 32 bytes",
+                                ));
+                            }
+                            (
+                                SecretBytes::new(raw_private_key),
+                                SecretBytes::new(import.credential_prf.decode()),
+                            )
                         }
-                        (
-                            SecretBytes::new(raw_private_key),
-                            SecretBytes::new(import.credential_prf.decode()),
-                        )
                     } else {
                         (registration.root, input)
                     };
@@ -1602,14 +1735,27 @@ impl SignerCeremonyService {
                 let backend_seed = root.expose_to_backend().to_vec();
                 let credential_key =
                     credential_wrap_key(&prf, &registration.wallet_id, &credential.credential_id)?;
-                let wallet = Arc::new(WalletCustody::register(
-                    registration.wallet_id.clone(),
-                    root,
-                    registration.policy_seed,
-                    registration.wkek,
-                    credential.credential_id.clone(),
-                    credential_key,
-                )?);
+                let is_bip39 = prepare.wallet_seed_profile
+                    == Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1);
+                let wallet = Arc::new(if is_bip39 {
+                    WalletCustody::register_bip39(
+                        registration.wallet_id.clone(),
+                        root,
+                        registration.policy_seed,
+                        registration.wkek,
+                        credential.credential_id.clone(),
+                        credential_key,
+                    )?
+                } else {
+                    WalletCustody::register_imported_secp256k1(
+                        registration.wallet_id.clone(),
+                        root,
+                        registration.policy_seed,
+                        registration.wkek,
+                        credential.credential_id.clone(),
+                        credential_key,
+                    )?
+                });
                 let unlock_key =
                     credential_wrap_key(&prf, &registration.wallet_id, &credential.credential_id)?;
                 let unlocked =
@@ -1641,13 +1787,13 @@ impl SignerCeremonyService {
                         registration.recovery_id.clone(),
                         &recovery_key,
                     )?;
-                    sensitive_output = Some(
+                    sensitive_output = Some(Zeroizing::new(
                         serde_jcs::to_vec(&RegistrationRecoveryOutput {
                             recovery_id: registration.recovery_id,
                             recovery_secret: registration.recovery_secret,
                         })
                         .map_err(malformed)?,
-                    );
+                    ));
                 }
                 {
                     let mut wallets = self.wallets.lock();
@@ -1662,31 +1808,90 @@ impl SignerCeremonyService {
                 self.register_existing_credential(registration.wallet_id.clone(), credential)?;
                 #[cfg(feature = "local")]
                 {
-                    let (root_key_ref, encrypted_record) = self
-                        .engine
-                        .backend_registry()
-                        .provision_local_wallet_backend(
+                    if is_bip39 {
+                        let _initial_record = self
+                            .engine
+                            .backend_registry()
+                            .provision_bip39_wallet_backend(
+                                &registration.wallet_id,
+                                SecretBytes::new(backend_seed),
+                                SecretBytes::new(backend_activation_secret),
+                                self.signing_key.verifying_key(),
+                            )?;
+                        let mut provisioned_backend = ProvisionedLocalBackendRollback::new(
+                            self.engine.backend_registry().as_ref(),
+                            registration.wallet_id.clone(),
+                        );
+                        // D1: allocate the canonical initial EVM account
+                        // m/44'/60'/0'/0/0 inside the same apply. The root is
+                        // never a signable KeyRef, so public_key_refs holds the
+                        // initial child only.
+                        let initial_request = bloom_signer_api::DerivedAccountRequest {
+                            derivation_profile:
+                                bloom_signer_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                            requested_role: Token::new("primary-evm").expect("static token"),
+                            account: Some(0),
+                        };
+                        let (child_key_ref, _descriptor) = self.engine.allocate_bip39_account(
                             &registration.wallet_id,
-                            SecretBytes::new(backend_seed),
-                            prepare.ceremony_kind == CeremonyKind::WalletImport,
-                            SecretBytes::new(backend_activation_secret),
-                            self.signing_key.verifying_key(),
+                            &prepare.custody_operation_id,
+                            &initial_request,
+                            &unlocked,
+                            now_ms,
                         )?;
-                    let enrollment = crate::engine::BackendEnrollmentBackup {
-                        backend: root_key_ref.backend.clone(),
-                        backend_instance: root_key_ref.backend_instance.clone(),
-                        encrypted_record,
-                        pinned_keys: vec![root_key_ref.clone()],
-                    };
-                    let CeremonyDatabaseEffect::InitialPolicy {
-                        backend_enrollment, ..
-                    } = &mut database_effect
-                    else {
-                        return Err(kind_mismatch());
-                    };
-                    *backend_enrollment = Some(enrollment);
-                    public_key_refs = vec![root_key_ref.clone()];
-                    rollback_provisioned_backend = Some(root_key_ref);
+                        // Capture the enrollment with the post-allocation
+                        // backend record so a restart re-registers the child.
+                        let encrypted_record = self
+                            .engine
+                            .backend_registry()
+                            .local_encrypted_backup(&child_key_ref)?;
+                        let enrollment = crate::engine::BackendEnrollmentBackup {
+                            backend: Token::new("local").expect("static token"),
+                            backend_instance: registration.wallet_id.clone(),
+                            encrypted_record,
+                            pinned_keys: vec![child_key_ref.clone()],
+                        };
+                        let CeremonyDatabaseEffect::InitialPolicy {
+                            backend_enrollment, ..
+                        } = &mut database_effect
+                        else {
+                            return Err(kind_mismatch());
+                        };
+                        *backend_enrollment = Some(enrollment);
+                        rollback_provisioned_backend = Some(child_key_ref.clone());
+                        public_key_refs = vec![child_key_ref];
+                        provisioned_backend.disarm();
+                    } else {
+                        let (root_key_ref, encrypted_record) = self
+                            .engine
+                            .backend_registry()
+                            .provision_imported_secp256k1_wallet_backend(
+                                &registration.wallet_id,
+                                SecretBytes::new(backend_seed),
+                                SecretBytes::new(backend_activation_secret),
+                                self.signing_key.verifying_key(),
+                            )?;
+                        let mut provisioned_backend = ProvisionedLocalBackendRollback::new(
+                            self.engine.backend_registry().as_ref(),
+                            registration.wallet_id.clone(),
+                        );
+                        let enrollment = crate::engine::BackendEnrollmentBackup {
+                            backend: root_key_ref.backend.clone(),
+                            backend_instance: root_key_ref.backend_instance.clone(),
+                            encrypted_record,
+                            pinned_keys: vec![root_key_ref.clone()],
+                        };
+                        let CeremonyDatabaseEffect::InitialPolicy {
+                            backend_enrollment, ..
+                        } = &mut database_effect
+                        else {
+                            return Err(kind_mismatch());
+                        };
+                        *backend_enrollment = Some(enrollment);
+                        public_key_refs = vec![root_key_ref.clone()];
+                        rollback_provisioned_backend = Some(root_key_ref);
+                        provisioned_backend.disarm();
+                    }
                 }
                 #[cfg(not(feature = "local"))]
                 {
@@ -1852,6 +2057,8 @@ impl SignerCeremonyService {
             | CeremonyKind::WalletDelete
             | CeremonyKind::BackendEnrollment
             | CeremonyKind::KeyDerive
+            | CeremonyKind::AccountAllocate
+            | CeremonyKind::AccountRetire
             | CeremonyKind::PolicyUpdate => {
                 let wallet_id = prepare.wallet_id.as_ref().ok_or_else(kind_mismatch)?;
                 let assertion = assertion_only(&complete.proof)?;
@@ -1898,7 +2105,7 @@ impl SignerCeremonyService {
                     if policy_prepare.is_some() {
                         return Err(kind_mismatch());
                     }
-                    self.apply_generic_custody_effect(prepare, input.effect, &unlocked)?
+                    self.apply_generic_custody_effect(prepare, input.effect, &unlocked, now_ms)?
                 };
                 sensitive_output = generic.sensitive_output;
                 database_effect = generic.database_effect;
@@ -1925,26 +2132,48 @@ impl SignerCeremonyService {
         prepare: &CustodyPrepareRequest,
         effect: GenericCustodyEffect,
         unlocked: &UnlockedWallet,
+        now_ms: u64,
     ) -> Result<GenericCustodyOutcome, ProtocolError> {
         let wallet_id = prepare.wallet_id.as_ref().ok_or_else(kind_mismatch)?;
         match (prepare.ceremony_kind, effect) {
-            (CeremonyKind::WalletExport, GenericCustodyEffect::WalletExport) => {
-                let export = WalletExportBundle {
-                    wallet: self.wallet(wallet_id)?.backup(),
-                    credentials: self
-                        .credentials
-                        .lock()
-                        .values()
-                        .filter(|bound| &bound.wallet_id == wallet_id)
-                        .map(|bound| bound.credential.clone())
-                        .collect(),
-                };
-                Ok(GenericCustodyOutcome {
-                    sensitive_output: Some(serde_jcs::to_vec(&export).map_err(malformed)?),
-                    database_effect: CeremonyDatabaseEffect::None,
-                    rollback_derived_key: None,
-                    public_key_refs: Vec::new(),
-                })
+            (CeremonyKind::WalletExport, GenericCustodyEffect::WalletExport { format }) => {
+                match format.unwrap_or(WalletExportFormat::LegacyBackup) {
+                    WalletExportFormat::LegacyBackup => {
+                        let export = WalletExportBundle {
+                            wallet: self.wallet(wallet_id)?.backup(),
+                            credentials: self
+                                .credentials
+                                .lock()
+                                .values()
+                                .filter(|bound| &bound.wallet_id == wallet_id)
+                                .map(|bound| bound.credential.clone())
+                                .collect(),
+                        };
+                        Ok(GenericCustodyOutcome {
+                            sensitive_output: Some(Zeroizing::new(
+                                serde_jcs::to_vec(&export).map_err(malformed)?,
+                            )),
+                            database_effect: CeremonyDatabaseEffect::None,
+                            rollback_derived_key: None,
+                            public_key_refs: Vec::new(),
+                        })
+                    }
+                    WalletExportFormat::Bip39Mnemonic => {
+                        // The words exist only in the sealed sensitive output,
+                        // bound to the custody output recipient; they never
+                        // enter public fields, audit, or logs.
+                        let mnemonic = self
+                            .wallet(wallet_id)?
+                            .export_mnemonic(unlocked)
+                            .map_err(|_| kind_mismatch())?;
+                        Ok(GenericCustodyOutcome {
+                            sensitive_output: Some(Zeroizing::new(mnemonic.as_bytes().to_vec())),
+                            database_effect: CeremonyDatabaseEffect::None,
+                            rollback_derived_key: None,
+                            public_key_refs: Vec::new(),
+                        })
+                    }
+                }
             }
             (CeremonyKind::WalletDelete, GenericCustodyEffect::WalletDelete) => {
                 self.wallets.lock().remove(wallet_id);
@@ -2043,7 +2272,9 @@ impl SignerCeremonyService {
                     )?;
                     let derived_key_ref = description.key_ref.clone();
                     Ok(GenericCustodyOutcome {
-                        sensitive_output: Some(serde_jcs::to_vec(&description).map_err(malformed)?),
+                        sensitive_output: Some(Zeroizing::new(
+                            serde_jcs::to_vec(&description).map_err(malformed)?,
+                        )),
                         database_effect: CeremonyDatabaseEffect::EnrollKey {
                             key_ref: description.key_ref.clone(),
                             petal_scope: None,
@@ -2063,6 +2294,41 @@ impl SignerCeremonyService {
             }
             (CeremonyKind::PolicyUpdate, GenericCustodyEffect::PolicyUpdate) => {
                 Err(kind_mismatch())
+            }
+            (CeremonyKind::AccountAllocate, GenericCustodyEffect::AccountAllocate) => {
+                let request = prepare
+                    .derivation_request
+                    .as_ref()
+                    .ok_or_else(kind_mismatch)?;
+                let (key_ref, _descriptor) = self.engine.allocate_bip39_account(
+                    wallet_id,
+                    &prepare.custody_operation_id,
+                    request,
+                    unlocked,
+                    now_ms,
+                )?;
+                self.engine
+                    .refresh_backend_enrollment(wallet_id, &key_ref)?;
+                // The child descriptor is public and projected on the read
+                // side from the registry entry; nothing secret leaves here.
+                Ok(GenericCustodyOutcome {
+                    sensitive_output: None,
+                    database_effect: CeremonyDatabaseEffect::None,
+                    rollback_derived_key: Some(key_ref.clone()),
+                    public_key_refs: vec![key_ref],
+                })
+            }
+            (CeremonyKind::AccountRetire, GenericCustodyEffect::AccountRetire) => {
+                let key_ref = prepare.key_ref.as_ref().ok_or_else(kind_mismatch)?;
+                self.engine
+                    .retire_bip39_account(wallet_id, key_ref, now_ms)?;
+                self.engine.refresh_backend_enrollment(wallet_id, key_ref)?;
+                Ok(GenericCustodyOutcome {
+                    sensitive_output: None,
+                    database_effect: CeremonyDatabaseEffect::None,
+                    rollback_derived_key: None,
+                    public_key_refs: Vec::new(),
+                })
             }
             _ => Err(kind_mismatch()),
         }
@@ -2115,12 +2381,15 @@ impl SignerCeremonyService {
     fn rollback_derived_key(
         &self,
         key_ref: Option<&bloom_signer_api::KeyRef>,
+        now_ms: u64,
     ) -> Result<(), ProtocolError> {
         let Some(key_ref) = key_ref else {
             return Ok(());
         };
         #[cfg(feature = "local")]
         {
+            self.engine
+                .tombstone_failed_bip39_account(key_ref, now_ms)?;
             self.engine
                 .backend_registry()
                 .rollback_local_derived_key(key_ref)
@@ -2400,6 +2669,98 @@ impl SignerCeremonyService {
         }
     }
 
+    fn validate_seed_profile_and_allocation(
+        &self,
+        request: &CustodyPrepareRequest,
+    ) -> Result<(), ProtocolError> {
+        // wallet_seed_profile is legal only for wallet creation ceremonies.
+        if request.wallet_seed_profile.is_some()
+            && !matches!(
+                request.ceremony_kind,
+                CeremonyKind::WalletRegistration | CeremonyKind::WalletImport
+            )
+        {
+            return Err(protocol(
+                ProtocolErrorCode::CeremonyKindMismatch,
+                "wallet_seed_profile is valid only for registration and import",
+            ));
+        }
+        // New wallets are always BIP-39; the imported-scalar profile exists
+        // only to import an existing private key, never to create one.
+        if request.ceremony_kind == CeremonyKind::WalletRegistration
+            && request.wallet_seed_profile
+                != Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1)
+        {
+            return Err(protocol(
+                ProtocolErrorCode::CeremonyKindMismatch,
+                "wallet registration requires the bip39-multicurve-v1 seed profile",
+            ));
+        }
+        // An omitted profile on import is legal only for the legacy passkey
+        // migration (validated separately); an ordinary import must name its
+        // profile explicitly.
+        if request.ceremony_kind == CeremonyKind::WalletImport
+            && request.wallet_seed_profile.is_none()
+            && request.legacy_passkey_migration.is_none()
+        {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                "wallet import requires an explicit seed profile",
+            ));
+        }
+        // A seed profile and a legacy passkey migration are mutually exclusive:
+        // the migration decrypts a single secp256k1 scalar, while the seed
+        // profile selects a BIP-39 derivation tree. Both present would let a
+        // crafted request register the decrypted scalar as if it were BIP-39
+        // entropy under a different derivation tree than the migration receipt
+        // authorized.
+        reject_seed_profile_with_migration(request)?;
+        // derivation_request is legal only for AccountAllocate.
+        if request.derivation_request.is_some()
+            && request.ceremony_kind != CeremonyKind::AccountAllocate
+        {
+            return Err(protocol(
+                ProtocolErrorCode::CeremonyKindMismatch,
+                "derivation_request is valid only for account allocation",
+            ));
+        }
+        if request.ceremony_kind == CeremonyKind::AccountAllocate {
+            if request.derivation_request.is_none() {
+                return Err(protocol(
+                    ProtocolErrorCode::MalformedFrame,
+                    "AccountAllocate requires a derivation_request",
+                ));
+            }
+            if request.wallet_id.is_none() {
+                return Err(protocol(
+                    ProtocolErrorCode::MalformedFrame,
+                    "AccountAllocate requires an authoritative wallet ID",
+                ));
+            }
+        }
+        if request.ceremony_kind == CeremonyKind::AccountRetire && request.key_ref.is_none() {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                "AccountRetire requires the derived-account KeyRef",
+            ));
+        }
+        // A bip39 wallet can only be provisioned on the local derivation
+        // backend. Reject the prepare early (and cleanly) when that backend is
+        // not compiled into this Signer artifact.
+        if request.wallet_seed_profile
+            == Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1)
+        {
+            #[cfg(not(feature = "local"))]
+            {
+                return Err(protocol(
+                    ProtocolErrorCode::BackendUnsupported,
+                    "bip39 wallets require the local derivation backend",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn sign_contribution(&self, unsigned: &[u8]) -> Base64UrlBytes {
         let message = [CONTRIBUTION_DOMAIN, unsigned].concat();
         Base64UrlBytes::from_bytes(&self.signing_key.sign(&message).to_bytes())
@@ -2462,6 +2823,13 @@ struct RawWalletImportInput {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Bip39MnemonicImportInput {
+    credential_prf: Base64UrlBytes,
+    mnemonic: Zeroizing<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LegacyPasskeyPrfInput {
     credential_prf: Base64UrlBytes,
 }
@@ -2498,7 +2866,10 @@ struct GenericCustodyInput {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum GenericCustodyEffect {
-    WalletExport,
+    WalletExport {
+        #[serde(default)]
+        format: Option<WalletExportFormat>,
+    },
     WalletDelete,
     BackendEnrollment,
     KeyDerive {
@@ -2509,7 +2880,16 @@ enum GenericCustodyEffect {
         #[serde(default)]
         authority_signature: Option<Base64UrlBytes>,
     },
+    AccountAllocate,
+    AccountRetire,
     PolicyUpdate,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WalletExportFormat {
+    LegacyBackup,
+    Bip39Mnemonic,
 }
 
 #[derive(Deserialize)]
@@ -2730,4 +3110,73 @@ fn malformed(error: impl std::fmt::Display) -> ProtocolError {
 
 fn protocol(code: ProtocolErrorCode, message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(code, message)
+}
+
+/// A wallet import cannot combine a seed profile with a legacy passkey
+/// migration: the former selects a BIP-39 derivation tree, the latter
+/// decrypts a single secp256k1 scalar from the legacy envelope. Treating both
+/// as present would register the scalar as if it were BIP-39 entropy under a
+/// different tree than the migration receipt authorized.
+fn reject_seed_profile_with_migration(
+    request: &CustodyPrepareRequest,
+) -> Result<(), ProtocolError> {
+    if request.wallet_seed_profile.is_some() && request.legacy_passkey_migration.is_some() {
+        return Err(protocol(
+            ProtocolErrorCode::MalformedFrame,
+            "wallet import cannot combine a seed profile with a legacy passkey migration",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloom_signer_api::{Digest32, Token};
+
+    fn migration() -> bloom_signer_api::LegacyPasskeyMigrationPublic {
+        bloom_signer_api::LegacyPasskeyMigrationPublic {
+            schema: Token::new("bloom.legacy_passkey_migration_receipt.v1").unwrap(),
+            wallet_name: Token::new("legacy-wallet").unwrap(),
+            address: "0x0000000000000000000000000000000000000000".into(),
+            public_key_fingerprint: Digest32::from_bytes([1; 32]),
+            credential_id_fingerprint: Digest32::from_bytes([2; 32]),
+            legacy_format_version: 1,
+            bundle_digest: Digest32::from_bytes([3; 32]),
+            policy_mode: Token::new("restrictive_current_policy").unwrap(),
+        }
+    }
+
+    fn import_request() -> CustodyPrepareRequest {
+        CustodyPrepareRequest {
+            ceremony_kind: CeremonyKind::WalletImport,
+            custody_operation_id: OperationId::from_bytes([9; 32]),
+            wallet_id: Some(Token::new("wallet").unwrap()),
+            key_ref: None,
+            exact_terms_digest: Digest32::from_bytes([4; 32]),
+            expected_input_class: Token::new("none").unwrap(),
+            browser_output_recipient_key: None,
+            petal_key_scope: None,
+            legacy_passkey_migration: None,
+            derivation_request: None,
+            wallet_seed_profile: None,
+        }
+    }
+
+    #[test]
+    fn seed_profile_and_legacy_migration_are_mutually_exclusive() {
+        let mut request = import_request();
+        request.legacy_passkey_migration = Some(migration());
+        assert!(reject_seed_profile_with_migration(&request).is_ok());
+
+        request.wallet_seed_profile = Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1);
+        let error = reject_seed_profile_with_migration(&request).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::MalformedFrame);
+
+        // A seed profile alone (no migration) is fine.
+        let mut mnemonic_only = import_request();
+        mnemonic_only.wallet_seed_profile =
+            Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1);
+        assert!(reject_seed_profile_with_migration(&mnemonic_only).is_ok());
+    }
 }

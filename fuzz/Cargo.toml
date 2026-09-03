@@ -1,0 +1,23 @@
+[package]
+name = "bloom-signer-derive-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.bloom-signer-derive]
+path = "../crates/bloom-signer-derive"
+
+[[bin]]
+name = "mnemonic_parse"
+path = "fuzz_targets/mnemonic_parse.rs"
+test = false
+doc = false
+bench = false

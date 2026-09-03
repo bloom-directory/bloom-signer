@@ -4,6 +4,9 @@ members = [
   "crates/bloom-signer-backend-api",
   "crates/bloom-signer-backend-local",
   "crates/bloom-signer-backend-aws-kms",
+  "crates/bloom-signer-derive",
+  "crates/bloom-signer-process-hardening",
+  "crates/bloom-signer-vectors",
   "crates/bloom-signer",
 ]
 resolver = "3"
@@ -13,9 +16,14 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
+# Internal crates. None of these is published: they carry the Signer's key
+# handling, and an accidental `cargo publish` would put it on crates.io.
+publish = false
 
 [workspace.dependencies]
 bloom-signer-api = { path = "crates/bloom-signer-api" }
+bloom-signer-derive = { path = "crates/bloom-signer-derive" }
+bloom-signer-process-hardening = { path = "crates/bloom-signer-process-hardening" }
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
@@ -26,14 +34,23 @@ bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-s
 aws-config = { version = "=1.8.1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-credential-types = "1"
 # Exact AWS service pins preserve the workspace's declared Rust 1.85 floor.
-aws-sdk-kms = "=1.77.0"
-aws-sdk-sts = "=1.76.0"
+#
+# `default-features = false` is deliberate. These SDKs default to their
+# `rustls` feature, which despite the name selects the *legacy* TLS stack
+# (aws-smithy-runtime/tls-rustls -> legacy-rustls-ring + hyper-0.14, i.e.
+# rustls 0.21 and h2 0.3). `default-https-client` selects the current one
+# (rustls 0.23 + aws-lc-rs). Both reach the same endpoints; only the second
+# is still maintained.
+aws-sdk-kms = { version = "=1.77.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sts = { version = "=1.76.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
 aws-types = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-zeroize = { version = "1", features = ["zeroize_derive"] }
+tracing = "0.1"
+unicode-normalization = "0.1"
+zeroize = { version = "1", features = ["serde", "zeroize_derive"] }
 futures = "0.3"
 bip32 = { version = "0.5", features = ["secp256k1"] }
 blake3 = "1"
@@ -49,10 +66,9 @@ k256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 parking_lot = "0.12"
 p256 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.8"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled", "backup"] }
 serde_jcs = "0.2"
 serde_json = "1"
 sha2 = "0.10"
 sha3 = "0.10"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
-tracing = "0.1"

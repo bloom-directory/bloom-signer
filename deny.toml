@@ -1,0 +1,76 @@
+# Supply-chain gate for the Bloom Signer.
+#
+# The Signer holds root key material, so the question this file answers is
+# narrow: what code ends up inside a Signer build, and is any of it known to
+# be vulnerable, unmaintained, or from somewhere we did not intend?
+
+[graph]
+# Gate what ships, not what tests. `cargo audit` and a default `cargo deny`
+# both read Cargo.lock, which lists dev-dependencies, so a test-only crate
+# reads as production exposure.
+#
+# This is load-bearing here rather than cosmetic. The AWS KMS backend's
+# test dependency `aws-smithy-runtime/test-util` unconditionally enables
+# `legacy-test-util`, which drags in the legacy hyper-0.14 / rustls-0.21
+# stack (h2 0.3.x, rustls-webpki 0.101.x, rustls-pemfile 1.x) purely so the
+# tests can use `StaticReplayClient`. That stack carries open advisories and
+# cannot be dropped without rewriting those tests against a hand-rolled
+# transport. None of it is reachable from a Signer build: see the
+# `default-features = false` pins on aws-sdk-kms / aws-sdk-sts in the
+# workspace manifest, which select the modern `default-https-client`
+# (rustls 0.23 + aws-lc-rs) instead of the misleadingly named `rustls`
+# feature that selects the legacy one.
+#
+# Verify the claim with:
+#   cargo tree -e no-dev -i h2@0.3.27 --workspace
+exclude-dev = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  # RUSTSEC-2026-0009 — `time` 0.3.45, stack exhaustion parsing untrusted
+  # date input (6.8 medium). It is present only when the optional AWS KMS
+  # graph is analyzed. The default `bloom-signer` release graph does not
+  # contain `time`; CI asserts that separately so this exception cannot
+  # silently spread into tonight's shipped local-backend artifact.
+  #
+  # This one is a genuine accepted risk, not a false positive. The fix is
+  # `time` >= 0.3.47, which requires Rust 1.88 and so would raise the
+  # workspace's declared 1.85 floor (see `rust-version` and the exact AWS
+  # pins that exist to hold it). Raising the floor is a maintainer decision,
+  # not a dependency bump — remove this entry when it is made.
+  "RUSTSEC-2026-0009",
+]
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  # rust-bip39 and its rust-bitcoin hash/hex dependencies are dedicated to
+  # the public domain under CC0. They implement the imported mnemonic codec.
+  "CC0-1.0",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+# Catch a dependency pinned to "*", which would let any future version in.
+# Intra-workspace crates are path dependencies carrying no version, which
+# is the same shape but not the same risk, so they are exempted.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The triad's shared runtime crates. The workspace pins each to an exact
+# revision; this allows the host they come from.
+allow-git = ["https://github.com/bloom-directory/bloom-service-runtime"]

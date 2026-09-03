@@ -38,6 +38,30 @@ pub struct BackendPublicCapability {
     pub crypto_suites: Vec<crate::CryptoSuite>,
     pub derivation_schemes: Vec<Token>,
     pub networked: bool,
+    /// Seed profiles this backend can provision (e.g. `bip39-multicurve-v1`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wallet_seed_profiles: Vec<crate::WalletSeedProfile>,
+    /// Derivation profiles this backend can allocate children for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derivation_profiles: Vec<crate::DerivationProfile>,
+    /// Whether this backend supports BIP-39 mnemonic export.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mnemonic_export: bool,
+    /// Per-namespace child-count limits, if the backend enforces any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derivation_namespace_limits: Vec<DerivationNamespaceLimit>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// A backend-advertised allocation cap for one derivation profile.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivationNamespaceLimit {
+    pub profile: crate::DerivationProfile,
+    pub maximum_children: DecimalU64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -209,6 +233,11 @@ pub struct KeyPublic {
     pub canonical_public_key: Base64UrlBytes,
     pub addresses: Vec<String>,
     pub supported_crypto_suites: Vec<crate::CryptoSuite>,
+    /// Present for a BIP-39 derived child; carries the full registry
+    /// descriptor (profile, path, fingerprint, lifecycle). Absent for legacy
+    /// roots/children so 1.3 peers see an unchanged shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_account: Option<crate::DerivedAccountDescriptor>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -292,6 +321,8 @@ pub enum BrokerSignerRequest {
     KeyDerivePrepare(CustodyPrepareRequest),
     #[serde(rename = "key.list_derived")]
     KeyListDerived(KeyRequest),
+    #[serde(rename = "wallet.derived_accounts")]
+    DerivedAccountList(WalletRequest),
     #[serde(rename = "key.enroll_prepare")]
     KeyEnrollPrepare(CustodyPrepareRequest),
     #[serde(rename = "key.enroll_status")]
@@ -371,6 +402,8 @@ pub enum BrokerSignerResponse {
     KeyDerivationCapabilities(Vec<Token>),
     #[serde(rename = "key.list_derived")]
     KeyListDerived(Vec<KeyPublic>),
+    #[serde(rename = "wallet.derived_accounts")]
+    DerivedAccountList(Vec<crate::DerivedAccountDescriptor>),
     #[serde(rename = "key.derive_prepare")]
     KeyDerivePrepare(crate::SignerPreparedCustody),
     #[serde(rename = "key.enroll_prepare")]
@@ -468,22 +501,15 @@ pub trait RevocationControlService: Send + Sync {
     fn dispatch<'a>(&'a self, request: ControlRequest) -> ServiceFuture<'a, ControlResponse>;
 }
 
-/// Transitional v1 method classification. Each edge API takes ownership of
-/// its own closed inventory when the monolithic protocol crate is split.
+/// Whether `method` may be served read-only.
+///
+/// Delegates to [`BrokerSignerMethod::is_read_only`], the single source of
+/// truth. Fails closed: a method outside the normative inventory is treated
+/// as a mutation rather than granted read-only handling by default.
 pub fn is_read_only_method(method: &Token) -> bool {
-    let method = method.as_str();
-    method.ends_with(".read")
-        || method.ends_with(".readiness")
-        || method.ends_with(".capabilities")
-        || method.ends_with(".status")
-        || method.ends_with(".list")
-        || method.ends_with(".list_public")
-        || method.ends_with(".get_public")
-        || method == "revocation.state"
-        || method == "key.derivation_capabilities"
-        || method == "key.list_derived"
-        || method == "credential.list_public"
-        || method == "custody.result"
+    crate::BrokerSignerMethod::parse(method.as_str())
+        .map(crate::BrokerSignerMethod::is_read_only)
+        .unwrap_or(false)
 }
 
 impl crate::TypedRequestMethod for BrokerSignerRequest {
@@ -555,8 +581,69 @@ impl crate::TypedRequestMethod for ControlRequest {
 
 #[cfg(test)]
 mod tests {
+
+    /// The read that PR #17 fixed and the revert removed. Charging it
+    /// against the mutation quota made derived-account listing unavailable
+    /// under audit degradation — the exact defect #17 existed to close.
+    #[test]
+    fn derived_account_listing_is_read_only() {
+        let method = crate::Token::new("wallet.derived_accounts").unwrap();
+        assert!(
+            crate::is_read_only_method(&method),
+            "wallet.derived_accounts must be read-only"
+        );
+        assert!(
+            crate::BrokerSignerMethod::parse("wallet.derived_accounts").is_ok(),
+            "it must also be in the normative method inventory"
+        );
+    }
+
+    /// Every method in the inventory classifies through the one source of
+    /// truth, and the shape-based rule this replaced is gone. These four
+    /// were misclassified as mutations by the old suffix heuristic: two
+    /// end in `_status` rather than `.status`, one was never listed, and
+    /// `system.hello` matched no rule at all.
+    #[test]
+    fn methods_the_suffix_heuristic_misclassified_are_read_only() {
+        for name in [
+            "system.hello",
+            "key.enroll_status",
+            "wallet.registration_status",
+            "wallet.derived_accounts",
+        ] {
+            let method = crate::Token::new(name).unwrap();
+            assert!(
+                crate::is_read_only_method(&method),
+                "{name} must be read-only"
+            );
+        }
+    }
+
+    /// Unknown methods fail closed: never granted read-only handling by
+    /// default just because they are unrecognised.
+    #[test]
+    fn unknown_methods_are_not_read_only() {
+        let method = crate::Token::new("wallet.not_a_real_method").unwrap();
+        assert!(!crate::is_read_only_method(&method));
+    }
+
+    /// Classification is reachable by wire name for every inventory entry,
+    /// so the string and enum paths cannot drift apart again.
+    #[test]
+    fn every_method_classifies_identically_by_name_and_by_variant() {
+        for method in crate::BrokerSignerMethod::ALL {
+            let token = crate::Token::new(method.as_str()).unwrap();
+            assert_eq!(
+                crate::is_read_only_method(&token),
+                method.is_read_only(),
+                "{} classifies differently by name than by variant",
+                method.as_str()
+            );
+        }
+    }
+
     #[test]
     fn typed_request_inventories_cover_every_normative_method() {
-        assert_eq!(crate::BrokerSignerMethod::ALL.len(), 38);
+        assert_eq!(crate::BrokerSignerMethod::ALL.len(), 39);
     }
 }

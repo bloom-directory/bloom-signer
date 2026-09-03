@@ -1,5 +1,6 @@
 use bloom_signer_api::*;
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -315,6 +316,36 @@ fn sign_request_rejects_issue_time_after_expiry() {
         request.validate_shape().unwrap_err().code,
         ProtocolErrorCode::MalformedFrame
     );
+}
+
+#[test]
+fn ed25519_sign_request_rejects_empty_and_oversized_messages() {
+    let vector: SignOperationVector =
+        serde_json::from_str(include_str!("../vectors/sign-operation-local-v1.json")).unwrap();
+
+    for message in [
+        Vec::new(),
+        vec![0u8; MAX_ED25519_MESSAGE_BYTES.saturating_add(1)],
+    ] {
+        let digest = Digest32::from_bytes(sha2::Sha256::digest(&message).into());
+        let mut unsigned = vector.unsigned_request.clone();
+        unsigned.crypto_suite = CryptoSuite::Ed25519Message;
+        unsigned.ordered_messages = vec![Base64UrlBytes::from_bytes(&message)];
+        unsigned.ordered_hashes = vec![digest.clone()];
+        unsigned.ordered_payload_digests = vec![digest];
+        unsigned.signature_count = DecimalU64::new(1);
+        unsigned.operation_digest = unsigned.operation_identity().digest().unwrap();
+        unsigned.attempt_digest = Digest32::new("00".repeat(32)).unwrap();
+        unsigned.attempt_digest = unsigned.computed_attempt_digest().unwrap();
+        let request = SignRequest {
+            unsigned,
+            broker_signature: Base64UrlBytes::from_bytes(&[0; 64]),
+        };
+        assert_eq!(
+            request.validate_shape().unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
+        );
+    }
 }
 
 #[test]
