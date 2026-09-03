@@ -170,10 +170,17 @@ fn durable_clock_boot_epoch(
     }
     #[cfg(target_os = "linux")]
     {
-        let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|error| {
+        let boot_id_path = std::env::var_os("CREDENTIALS_DIRECTORY")
+            .map(std::path::PathBuf::from)
+            .map(|directory| directory.join("kernel-boot-id"))
+            .unwrap_or_else(|| "/proc/sys/kernel/random/boot_id".into());
+        let raw = std::fs::read_to_string(&boot_id_path).map_err(|error| {
             ProtocolError::new(
                 ProtocolErrorCode::ClockUntrusted,
-                format!("read Linux kernel boot ID: {error}"),
+                format!(
+                    "read Linux kernel boot ID from {}: {error}",
+                    boot_id_path.display()
+                ),
             )
         })?;
         parse_linux_boot_epoch(&raw)
