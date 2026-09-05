@@ -3286,6 +3286,28 @@ impl SignerEngine {
         }
     }
 
+    pub fn petal_key_scope_expires_at_ms(
+        &self,
+        key_ref: &KeyRef,
+    ) -> Result<Option<DecimalU64>, ProtocolError> {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT expires_at_ms FROM petal_key_scopes WHERE key_fingerprint = ?1",
+                [key_ref.public_key_fingerprint.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?
+            .map(|expires_at_ms| {
+                expires_at_ms
+                    .parse::<u64>()
+                    .map(DecimalU64::new)
+                    .map_err(malformed)
+            })
+            .transpose()
+    }
+
     /// Durable enrollment of a Petal sub-key parent.
     ///
     /// This asserts only facts that survive a restart: the parent is enrolled,

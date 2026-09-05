@@ -1120,6 +1120,15 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
             },
         )
         .unwrap();
+    assert_eq!(
+        restarted_engine
+            .petal_key_scope_expires_at_ms(&reusable.key_ref)
+            .unwrap()
+            .unwrap()
+            .get(),
+        retained_scope.5.parse::<u64>().unwrap(),
+        "the public key projection must use Signer's authoritative scope expiry"
+    );
     connection
         .execute(
             "DELETE FROM petal_key_scopes WHERE key_fingerprint = ?1",

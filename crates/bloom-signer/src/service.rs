@@ -498,6 +498,7 @@ impl SignerRpcService {
             addresses,
             supported_crypto_suites: description.supported_crypto_suites,
             derived_account,
+            petal_scope_expires_at_ms: self.engine.petal_key_scope_expires_at_ms(key_ref)?,
         })
     }
 
