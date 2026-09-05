@@ -889,6 +889,9 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         complete_petal_key_derivation(&service, &authenticator, second_scope, None, 10_500)
             .unwrap();
     assert_ne!(first.public_key_refs[0], second.public_key_refs[0]);
+    engine
+        .export_wallet_backup(&wallet_id)
+        .expect("Petal allocation must remain immediately exportable");
     let child = first.public_key_refs[0].clone();
 
     drop(service);

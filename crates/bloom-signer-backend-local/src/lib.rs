@@ -298,7 +298,7 @@ impl LocalSignerBackend {
                             !paths.insert(path.clone()) || tombstones.contains(path)
                         }
                         Some(DerivationRef::Bip39Multicurve { path, .. }) => {
-                            !paths.insert(path.clone())
+                            !paths.insert(path.clone()) || tombstones.contains(path)
                         }
                         _ => true,
                     }
@@ -597,8 +597,7 @@ impl LocalSignerBackend {
             .clone()
             .ok_or(BackendError::DefinitiveRejected)?;
         let valid_parent = if snapshot.root_material_kind == LocalRootMaterialKind::Bip39Entropy {
-            root.key_spec == KeySpec::Secp256k1
-                && snapshot.derivation_registry.iter().any(|key| key == root)
+            snapshot.derivation_registry.iter().any(|key| key == root)
         } else {
             self.root_key_ref()? == *root
         };
@@ -608,10 +607,11 @@ impl LocalSignerBackend {
         if let Some(existing) = operation_id
             .and_then(|operation_id| snapshot.pending_derivations.get(operation_id.as_str()))
         {
-            let Some(DerivationRef::Bip32Secp256k1 { path, .. }) = &existing.derivation else {
-                return Err(BackendError::DefinitiveRejected);
+            return match &existing.derivation {
+                Some(DerivationRef::Bip32Secp256k1 { path, .. }) => self.describe_path(path),
+                Some(DerivationRef::Bip39Multicurve { .. }) => self.describe_bip39_child(existing),
+                None => Err(BackendError::DefinitiveRejected),
             };
-            return self.describe_path(path);
         }
         let namespace = snapshot
             .derivation_namespaces
@@ -628,23 +628,68 @@ impl LocalSignerBackend {
         {
             return Err(BackendError::InvalidRequest);
         }
-        let path = format!(
-            "{}/{}",
-            namespace.canonical_prefix,
-            namespace.next_index.get()
-        );
+        let path = if root.key_spec == KeySpec::Ed25519 {
+            format!(
+                "{}/{}'",
+                namespace.canonical_prefix,
+                namespace.next_index.get()
+            )
+        } else {
+            format!(
+                "{}/{}",
+                namespace.canonical_prefix,
+                namespace.next_index.get()
+            )
+        };
         if snapshot.derivation_tombstones.contains(&path)
             || snapshot.derivation_registry.iter().any(|key| {
                 matches!(
                     &key.derivation,
                     Some(DerivationRef::Bip32Secp256k1 { path: existing, .. })
+                        | Some(DerivationRef::Bip39Multicurve { path: existing, .. })
                         if existing == &path
                 )
             })
         {
             return Err(BackendError::DefinitiveRejected);
         }
-        let description = self.describe_path(&path)?;
+        let description = if root.key_spec == KeySpec::Ed25519 {
+            let Some(DerivationRef::Bip39Multicurve {
+                wallet_seed_ref,
+                profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                ..
+            }) = &root.derivation
+            else {
+                return Err(BackendError::InvalidRequest);
+            };
+            let (account, index) =
+                parse_bip39_path(DerivationProfile::Bip44SolanaSlip10Ed25519V1, &path)?;
+            let seed = self.bip39_seed()?;
+            let derived = derive_solana_key_for_path(&seed, account, index, &path)?;
+            let fingerprint = Digest32::from_bytes(derived.fingerprint);
+            let key_ref = KeyRef {
+                backend: self.backend_id(),
+                backend_instance: self.backend_instance_id.clone(),
+                locator: hex::encode(Sha256::digest(
+                    [wallet_seed_ref.as_str().as_bytes(), path.as_bytes()].concat(),
+                )),
+                key_spec: KeySpec::Ed25519,
+                public_key_fingerprint: fingerprint.clone(),
+                derivation: Some(DerivationRef::Bip39Multicurve {
+                    wallet_seed_ref: wallet_seed_ref.clone(),
+                    profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                    path: path.clone(),
+                }),
+            };
+            KeyDescription {
+                key_ref,
+                canonical_spki_der: Base64UrlBytes::from_bytes(&derived.spki_der),
+                public_key_fingerprint: fingerprint,
+                supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
+            }
+        } else {
+            self.describe_path(&path)?
+        };
         let mut state = self.state.write();
         let mut next = state
             .backup
@@ -903,10 +948,9 @@ impl LocalSignerBackend {
         if profile != DerivationProfile::Bip44SolanaSlip10Ed25519V1 {
             return Err(BackendError::InvalidRequest);
         }
-        let (account, _) = parse_bip39_path(profile, &path)?;
+        let (account, index) = parse_bip39_path(profile, &path)?;
         let seed = self.bip39_seed()?;
-        let derived = bloom_signer_derive::derive_solana_account(&seed, account)
-            .map_err(|_| BackendError::DefinitiveRejected)?;
+        let derived = derive_solana_key_for_path(&seed, account, index, &path)?;
         if derived.fingerprint != key_ref.public_key_fingerprint.to_bytes() {
             return Err(BackendError::DefinitiveRejected);
         }
@@ -1051,8 +1095,7 @@ impl LocalSignerBackend {
                 )
             }
             DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
-                let derived = bloom_signer_derive::derive_solana_account(seed, account)
-                    .map_err(|_| BackendError::DefinitiveRejected)?;
+                let derived = derive_solana_key_for_path(seed, account, index, path)?;
                 (derived.spki_der, vec![CryptoSuite::Ed25519Message])
             }
         };
@@ -1409,12 +1452,45 @@ fn parse_bip39_path(profile: DerivationProfile, path: &str) -> Result<(u32, u32)
             let tail = path
                 .strip_prefix("m/44'/501'/")
                 .ok_or(BackendError::InvalidRequest)?;
+            if let Some((account, index)) = tail.split_once("'/0'/18735'/") {
+                let account = account
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|value| *value < (1 << 31))
+                    .ok_or(BackendError::InvalidRequest)?;
+                let index = index
+                    .strip_suffix('\'')
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .filter(|value| *value < (1 << 31))
+                    .ok_or(BackendError::InvalidRequest)?;
+                return Ok((account, index));
+            }
             let account = tail
                 .strip_suffix("/0'")
                 .and_then(|value| value.strip_suffix('\''))
                 .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| *value < (1 << 31))
                 .ok_or(BackendError::InvalidRequest)?;
             Ok((account, 0))
         }
     }
+}
+
+fn derive_solana_key_for_path(
+    seed: &[u8; bloom_signer_derive::SEED_BYTES],
+    account: u32,
+    index: u32,
+    path: &str,
+) -> Result<bloom_signer_derive::DerivedEd25519, BackendError> {
+    let account_key = bloom_signer_derive::derive_solana_account(seed, account)
+        .map_err(|_| BackendError::DefinitiveRejected)?;
+    if account_key.path == path {
+        return Ok(account_key);
+    }
+    let petal_key = bloom_signer_derive::derive_solana_petal_key(seed, account, index)
+        .map_err(|_| BackendError::DefinitiveRejected)?;
+    if petal_key.path != path {
+        return Err(BackendError::InvalidRequest);
+    }
+    Ok(petal_key)
 }

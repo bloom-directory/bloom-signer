@@ -19,6 +19,7 @@ const HARDENED_OFFSET: u32 = 1 << 31;
 
 pub const PATH_PURPOSE: u32 = 44;
 pub const PATH_COIN: u32 = 501;
+pub const PETAL_BRANCH: u32 = 18_735;
 
 #[derive(Debug, Error)]
 pub enum Ed25519DeriveError {
@@ -128,6 +129,25 @@ pub fn derive_solana_account(
     Ok(described)
 }
 
+/// Derive a hardened Petal session key beneath a canonical Solana account.
+pub fn derive_solana_petal_key(
+    seed: &[u8; SEED_BYTES],
+    account: u32,
+    index: u32,
+) -> Result<DerivedEd25519, Ed25519DeriveError> {
+    if index >= HARDENED_OFFSET {
+        return Err(Ed25519DeriveError::InvalidIndex);
+    }
+    let parent = derive_solana_account(seed, account)?;
+    let (key, code) = hardened_child(&parent.private_key, &parent.chain_code, PETAL_BRANCH)?;
+    let (key, code) = hardened_child(&key, &code, index)?;
+    let mut described = describe_ed25519(&key);
+    described.chain_code = code;
+    described.path =
+        format!("m/{PATH_PURPOSE}'/{PATH_COIN}'/{account}'/0'/{PETAL_BRANCH}'/{index}'");
+    Ok(described)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +206,19 @@ mod tests {
                 oracle.expose(),
                 "SLIP-10 divergence for account {account}"
             );
+        }
+    }
+
+    #[test]
+    fn petal_derivation_matches_independent_ows_implementation() {
+        let seed = [0x5a_u8; SEED_BYTES];
+        for (account, index) in [(0, 0), (1, 7), (501, 65_535), ((1 << 31) - 1, 1)] {
+            let ours = derive_solana_petal_key(&seed, account, index).unwrap();
+            let path = format!("m/44'/501'/{account}'/0'/18735'/{index}'");
+            let oracle =
+                ows_signer::HdDeriver::derive(&seed, &path, ows_signer::Curve::Ed25519).unwrap();
+            assert_eq!(ours.path, path);
+            assert_eq!(ours.private_key.as_slice(), oracle.expose());
         }
     }
 }

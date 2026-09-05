@@ -1877,13 +1877,24 @@ impl SignerEngine {
                         .map_err(storage)?;
                     #[cfg(feature = "local")]
                     {
+                        let encrypted_record = self
+                            .backend_registry
+                            .local_encrypted_backup(&scope.parent_key_ref)?;
+                        let backup: bloom_signer_backend_local::EncryptedLocalBackup =
+                            serde_json::from_slice(&encrypted_record.decode())
+                                .map_err(malformed)?;
+                        let pinned_keys = if backup.root_material_kind
+                            == bloom_signer_backend_local::LocalRootMaterialKind::Bip39Entropy
+                        {
+                            backup.derivation_registry
+                        } else {
+                            vec![scope.parent_key_ref.clone()]
+                        };
                         let enrollment = BackendEnrollmentBackup {
                             backend: scope.parent_key_ref.backend.clone(),
                             backend_instance: scope.parent_key_ref.backend_instance.clone(),
-                            encrypted_record: self
-                                .backend_registry
-                                .local_encrypted_backup(&scope.parent_key_ref)?,
-                            pinned_keys: vec![scope.parent_key_ref.clone()],
+                            encrypted_record,
+                            pinned_keys,
                         };
                         let updated = transaction
                             .execute(
@@ -5885,15 +5896,16 @@ fn require_key_available(
     backend_registry: &BackendRegistry,
     key_ref: &KeyRef,
 ) -> Result<(), ProtocolError> {
-    let enrolled: Option<(String, bool)> = transaction
+    let enrolled: Option<(String, bool, String)> = transaction
         .query_row(
-            "SELECT key_ref_jcs, available FROM enrolled_keys WHERE key_fingerprint = ?1",
+            "SELECT key_ref_jcs, available, authority_class
+             FROM enrolled_keys WHERE key_fingerprint = ?1",
             [key_ref.public_key_fingerprint.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(storage)?;
-    if enrolled.as_ref().map(|(stored, _)| stored)
+    if enrolled.as_ref().map(|(stored, _, _)| stored)
         != Some(&serde_jcs::to_string(key_ref).map_err(malformed)?)
         || !backend_registry.key_is_available(key_ref)?
     {
@@ -5906,9 +5918,12 @@ fn require_key_available(
     // Retirement commits that transition before it deactivates enrolled_keys,
     // so a sign request that slips into that gap must fail closed here rather
     // than authorize a retired account.
-    if let Some(DerivationRef::Bip39Multicurve {
-        wallet_seed_ref, ..
-    }) = &key_ref.derivation
+    if enrolled
+        .as_ref()
+        .is_some_and(|(_, _, authority_class)| authority_class == "derived")
+        && let Some(DerivationRef::Bip39Multicurve {
+            wallet_seed_ref, ..
+        }) = &key_ref.derivation
     {
         let state: Option<String> = transaction
             .query_row(
@@ -8057,6 +8072,29 @@ mod require_key_tests {
         let error = require_key_available(&transaction, &registry, &child).unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
         assert!(error.message.contains("not an active derived account"));
+        drop(transaction);
+        drop(connection);
+    }
+
+    #[test]
+    fn require_key_available_accepts_a_petal_bip39_child_without_account_allocation() {
+        let (engine, child, registry) = retired_bip39_child_engine();
+        let mut connection = engine.connection.lock();
+        connection
+            .execute(
+                "UPDATE enrolled_keys SET authority_class = 'petal'
+                 WHERE key_fingerprint = ?1",
+                [child.public_key_fingerprint.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM derivation_allocations WHERE public_key_fingerprint = ?1",
+                [child.public_key_fingerprint.as_str()],
+            )
+            .unwrap();
+        let transaction = engine.mutation_transaction(&mut connection).unwrap();
+        require_key_available(&transaction, &registry, &child).unwrap();
         drop(transaction);
         drop(connection);
     }
