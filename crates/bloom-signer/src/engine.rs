@@ -2522,6 +2522,21 @@ impl SignerEngine {
             return Ok(None);
         };
         let connection = self.connection.lock();
+        let authority_class: Option<String> = connection
+            .query_row(
+                "SELECT authority_class FROM enrolled_keys WHERE key_fingerprint = ?1",
+                [key_ref.public_key_fingerprint.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        // Petal-scoped children carry their deterministic derivation path so
+        // the local backend can restore them, but they are not wallet accounts
+        // and therefore have no derivation_allocations row. Their public key
+        // remains describable; only the account-specific projection is absent.
+        if authority_class.as_deref() == Some("petal") {
+            return Ok(None);
+        }
         let row = connection
             .query_row(
                 "SELECT key_spec, public_key_spki_der, public_key_fingerprint, state

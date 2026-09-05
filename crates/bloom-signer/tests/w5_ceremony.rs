@@ -893,6 +893,13 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         .export_wallet_backup(&wallet_id)
         .expect("Petal allocation must remain immediately exportable");
     let child = first.public_key_refs[0].clone();
+    assert!(
+        engine
+            .derived_account_descriptor(&child)
+            .expect("Petal child public projection must remain readable")
+            .is_none(),
+        "a scoped Petal child is not a user-visible wallet account"
+    );
 
     drop(service);
     drop(engine);
