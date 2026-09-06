@@ -2729,7 +2729,7 @@ fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
         .expect("staging a key-derive ceremony must not require an activated backend");
     assert_eq!(
         prepared.contribution.expires_at_ms.get(),
-        10_100 + 15 * 60 * 1_000,
+        10_100 + 60 * 60 * 1_000,
         "the owner must have a full review window for a Petal scope"
     );
 }

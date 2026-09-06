@@ -74,7 +74,7 @@ fn ceremony_kind_name(kind: CeremonyKind) -> &'static str {
 // Owners need enough time to read the human review and complete a passkey
 // prompt without racing the page. Transaction approvals remain capped by the
 // earlier expiry in their signed terms.
-const CEREMONY_TTL_MS: u64 = 15 * 60 * 1_000;
+const CEREMONY_TTL_MS: u64 = 60 * 60 * 1_000;
 const CONTRIBUTION_DOMAIN: &[u8] = b"bloom-signer-ceremony-contribution/v1";
 const RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1";
 const WRAP_INFO: &[u8] = b"bloom-passkey-wallet-wrap/v1";
