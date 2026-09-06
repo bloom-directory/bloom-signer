@@ -489,7 +489,7 @@ impl SignerRpcService {
                 "backend public description changed the pinned KeyRef",
             ));
         }
-        let addresses = ethereum_address(&description)?;
+        let addresses = chain_addresses(&description)?;
         let derived_account = self.engine.derived_account_descriptor(key_ref)?;
         Ok(KeyPublic {
             key_ref: description.key_ref,
@@ -736,22 +736,46 @@ fn signer_receipt_digest(
     Ok(Digest32::from_bytes(hasher.finalize().into()))
 }
 
-fn ethereum_address(
+fn chain_addresses(
     description: &bloom_signer_backend_api::KeyDescription,
 ) -> Result<Vec<String>, ProtocolError> {
-    if description.key_ref.key_spec != bloom_signer_api::KeySpec::Secp256k1 {
-        return Ok(Vec::new());
+    match description.key_ref.key_spec {
+        bloom_signer_api::KeySpec::Ed25519 => {
+            const ED25519_SPKI_PREFIX: &[u8] = &[
+                0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+            ];
+            let encoded = description.canonical_spki_der.decode();
+            let raw: [u8; 32] = encoded
+                .strip_prefix(ED25519_SPKI_PREFIX)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::KeyrefMismatch,
+                        "ed25519 backend returned invalid canonical SPKI",
+                    )
+                })?;
+            ed25519_dalek::VerifyingKey::from_bytes(&raw).map_err(|_| {
+                ProtocolError::new(
+                    ProtocolErrorCode::KeyrefMismatch,
+                    "ed25519 backend returned invalid canonical SPKI",
+                )
+            })?;
+            Ok(vec![bs58::encode(raw).into_string()])
+        }
+        bloom_signer_api::KeySpec::Secp256k1 => {
+            let public_key =
+                k256::PublicKey::from_public_key_der(&description.canonical_spki_der.decode())
+                    .map_err(|_| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::KeyrefMismatch,
+                            "secp256k1 backend returned invalid canonical SPKI",
+                        )
+                    })?;
+            let point = public_key.to_encoded_point(false);
+            let digest = Keccak256::digest(&point.as_bytes()[1..]);
+            Ok(vec![format!("0x{}", hex::encode(&digest[12..]))])
+        }
     }
-    let public_key = k256::PublicKey::from_public_key_der(&description.canonical_spki_der.decode())
-        .map_err(|_| {
-            ProtocolError::new(
-                ProtocolErrorCode::KeyrefMismatch,
-                "secp256k1 backend returned invalid canonical SPKI",
-            )
-        })?;
-    let point = public_key.to_encoded_point(false);
-    let digest = Keccak256::digest(&point.as_bytes()[1..]);
-    Ok(vec![format!("0x{}", hex::encode(&digest[12..]))])
 }
 
 fn signer_ceremony_status(
@@ -852,8 +876,35 @@ mod tests {
         let description = backend.describe_key(&key_ref).await.unwrap();
 
         assert_eq!(
-            ethereum_address(&description).unwrap(),
+            chain_addresses(&description).unwrap(),
             vec!["0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"]
+        );
+    }
+
+    #[test]
+    fn ed25519_address_is_the_base58_solana_public_key() {
+        let raw = hex::decode("16380c17c6fd66e5afba88b21f194ec3e43440c532ce5580daf5cc5e731a4cb2")
+            .unwrap();
+        let mut spki = hex::decode("302a300506032b6570032100").unwrap();
+        spki.extend_from_slice(&raw);
+        let key_ref = KeyRef {
+            backend: Token::new("local").unwrap(),
+            backend_instance: Token::new("main").unwrap(),
+            locator: "petal-child".into(),
+            key_spec: KeySpec::Ed25519,
+            public_key_fingerprint: Digest32::from_bytes(Sha256::digest(&spki).into()),
+            derivation: None,
+        };
+        let description = bloom_signer_backend_api::KeyDescription {
+            key_ref,
+            canonical_spki_der: Base64UrlBytes::from_bytes(&spki),
+            public_key_fingerprint: Digest32::from_bytes(Sha256::digest(&spki).into()),
+            supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
+        };
+
+        assert_eq!(
+            chain_addresses(&description).unwrap(),
+            vec!["2VjYCCaH7HpPKVbhXtVJVi64wGUwH3kwk5ETbopKw9Eq"]
         );
     }
 
