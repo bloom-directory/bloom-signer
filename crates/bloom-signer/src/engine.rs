@@ -5783,6 +5783,9 @@ fn validate_against_approval(
         (ApprovalSelector::Petal { .. }, SelectorKind::Petal)
             if request.unsigned.petal_use_claim_digest.is_some()
                 && request.unsigned.claim_assurance_digest.is_some() => {}
+        // Broker verifies the System claim against `intent_digest`. Signer is
+        // deliberately parser-free and requires both Broker-authenticated
+        // opaque commitments before applying its own counters and key checks.
         (ApprovalSelector::System { .. }, SelectorKind::System)
             if request.unsigned.petal_use_claim_digest.is_some()
                 && request.unsigned.claim_assurance_digest.is_some() => {}

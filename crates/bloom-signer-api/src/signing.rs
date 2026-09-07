@@ -45,7 +45,10 @@ pub struct SignOperationIdentity {
     pub crypto_suite: CryptoSuite,
     pub ordered_payload_digests: Vec<Digest32>,
     pub ordered_hashes: Vec<Digest32>,
+    /// Digest of the Broker-validated scoped use claim. Despite the legacy
+    /// field name, this commits either a Petal or System use claim.
     pub petal_use_claim_digest: Option<Digest32>,
+    /// Digest of the assurance attached to the scoped use claim.
     pub claim_assurance_digest: Option<Digest32>,
     pub policy_version: DecimalU64,
     pub policy_digest: Digest32,
@@ -90,7 +93,10 @@ pub struct UnsignedSignRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ordered_messages: Vec<Base64UrlBytes>,
     pub signature_count: DecimalU64,
+    /// Digest of the Broker-validated scoped use claim. Signer treats this as
+    /// an opaque, Broker-authenticated commitment and does not parse claims.
     pub petal_use_claim_digest: Option<Digest32>,
+    /// Digest of the assurance attached to the scoped use claim.
     pub claim_assurance_digest: Option<Digest32>,
     pub policy_version: DecimalU64,
     pub policy_digest: Digest32,
