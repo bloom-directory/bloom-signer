@@ -112,6 +112,8 @@ impl SignRequest {
         let messages_are_bound = match self.unsigned.crypto_suite {
             CryptoSuite::Ed25519Message => {
                 self.unsigned.ordered_messages.len() == self.unsigned.ordered_hashes.len()
+                    && self.unsigned.ordered_payload_digests.len()
+                        == self.unsigned.ordered_hashes.len()
                     && self
                         .unsigned
                         .ordered_messages

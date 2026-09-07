@@ -349,6 +349,31 @@ fn ed25519_sign_request_rejects_empty_and_oversized_messages() {
 }
 
 #[test]
+fn ed25519_sign_request_requires_one_payload_digest_per_message() {
+    let vector: SignOperationVector =
+        serde_json::from_str(include_str!("../vectors/sign-operation-local-v1.json")).unwrap();
+    let message = b"solana-message";
+    let digest = Digest32::from_bytes(sha2::Sha256::digest(message).into());
+    let mut unsigned = vector.unsigned_request;
+    unsigned.crypto_suite = CryptoSuite::Ed25519Message;
+    unsigned.ordered_messages = vec![Base64UrlBytes::from_bytes(message)];
+    unsigned.ordered_hashes = vec![digest];
+    unsigned.ordered_payload_digests.clear();
+    unsigned.signature_count = DecimalU64::new(1);
+    unsigned.operation_digest = unsigned.operation_identity().digest().unwrap();
+    unsigned.attempt_digest = Digest32::new("00".repeat(32)).unwrap();
+    unsigned.attempt_digest = unsigned.computed_attempt_digest().unwrap();
+    let request = SignRequest {
+        unsigned,
+        broker_signature: Base64UrlBytes::from_bytes(&[0; 64]),
+    };
+    assert_eq!(
+        request.validate_shape().unwrap_err().code,
+        ProtocolErrorCode::MalformedFrame
+    );
+}
+
+#[test]
 fn broker_validation_receipt_signature_and_digest_golden() {
     let receipt = BrokerValidationReceipt {
         approval_id: Digest32::new("11".repeat(32)).unwrap(),

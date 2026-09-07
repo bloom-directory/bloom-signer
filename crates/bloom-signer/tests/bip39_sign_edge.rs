@@ -149,11 +149,11 @@ fn evm_child_signs_digest_and_recovers_the_frozen_address() {
     let recovery = k256::ecdsa::RecoveryId::from_byte(bytes[64]).unwrap();
     let recovered =
         k256::ecdsa::VerifyingKey::recover_from_prehash(&digest, &sig, recovery).unwrap();
-    // Recover the uncompressed SPKI and compare its fingerprint to the pinned
-    // descriptor.
-    let spki = recovered.to_encoded_point(false).as_bytes().to_vec();
-    let _ = spki;
-    assert_eq!(hex::encode(sig.to_bytes()), hex::encode(sig.to_bytes()),);
+    let expected = k256::ecdsa::VerifyingKey::from_sec1_bytes(
+        &hex::decode(vectors::BIP32_EVM_TERMINAL_PUBLIC_KEY_COMPRESSED_HEX).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(recovered, expected);
 }
 
 #[test]

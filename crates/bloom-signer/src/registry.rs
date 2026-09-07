@@ -460,6 +460,20 @@ impl BackendRegistry {
         operation_id: Option<bloom_signer_api::OperationId>,
     ) -> Result<(), ProtocolError> {
         let key_ref = &description.key_ref;
+        let wallet_matches = key_ref.backend_instance == *wallet_id
+            && matches!(
+                &key_ref.derivation,
+                Some(bloom_signer_api::DerivationRef::Bip39Multicurve {
+                    wallet_seed_ref,
+                    ..
+                }) if wallet_seed_ref == wallet_id
+            );
+        if !wallet_matches {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "bip39 child does not belong to the requested wallet",
+            ));
+        }
         let backends = self.backends.read();
         let backend = backends
             .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
@@ -469,7 +483,6 @@ impl BackendRegistry {
                     "backend instance is not compiled into this Signer",
                 )
             })?;
-        let _ = wallet_id;
         match backend {
             #[cfg(feature = "local")]
             CompiledBackend::Local(local) => local

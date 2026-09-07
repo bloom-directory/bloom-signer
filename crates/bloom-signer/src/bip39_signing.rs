@@ -39,6 +39,8 @@ pub enum SigningEdgeError {
     RootNotSignable,
     #[error("entropy length does not match the stored profile metadata")]
     EntropyLengthMismatch,
+    #[error("custody authentication failed")]
+    CustodyAuthenticationFailed,
     #[error("derived public key does not match the activated registry entry")]
     DescriptorMismatch,
     #[error("signature verification failed after signing")]
@@ -95,7 +97,7 @@ pub fn entropy_to_seed(
     let secret = bloom_signer_backend_api::SecretBytes::new(wkek.to_vec());
     let entropy = Zeroizing::new(
         crate::custody::decrypt(&secret, &blob, &aad)
-            .map_err(|_| SigningEdgeError::DescriptorMismatch)?,
+            .map_err(|_| SigningEdgeError::CustodyAuthenticationFailed)?,
     );
     if !crate::bip39_store::entropy_plaintext_matches_metadata(&entropy, entropy_bits) {
         return Err(SigningEdgeError::EntropyLengthMismatch);
