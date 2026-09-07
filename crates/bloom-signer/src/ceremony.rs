@@ -13,7 +13,7 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use futures::lock::Mutex as AsyncMutex;
 use hkdf::Hkdf;
 use parking_lot::Mutex;
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng as _, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -2434,12 +2434,24 @@ impl RegistrationSecrets {
         let mut user_handle = vec![0_u8; 32];
         let mut prf_salt = vec![0_u8; 32];
         let mut recovery_secret = vec![0_u8; 32];
-        OsRng.fill_bytes(&mut root);
-        OsRng.fill_bytes(&mut policy_seed);
-        OsRng.fill_bytes(&mut wkek);
-        OsRng.fill_bytes(&mut user_handle);
-        OsRng.fill_bytes(&mut prf_salt);
-        OsRng.fill_bytes(&mut recovery_secret);
+        SysRng
+            .try_fill_bytes(&mut root)
+            .expect("OS randomness unavailable");
+        SysRng
+            .try_fill_bytes(&mut policy_seed)
+            .expect("OS randomness unavailable");
+        SysRng
+            .try_fill_bytes(&mut wkek)
+            .expect("OS randomness unavailable");
+        SysRng
+            .try_fill_bytes(&mut user_handle)
+            .expect("OS randomness unavailable");
+        SysRng
+            .try_fill_bytes(&mut prf_salt)
+            .expect("OS randomness unavailable");
+        SysRng
+            .try_fill_bytes(&mut recovery_secret)
+            .expect("OS randomness unavailable");
         Ok(Self {
             wallet_id,
             user_handle: Base64UrlBytes::from_bytes(&user_handle),
@@ -2657,7 +2669,9 @@ fn random_digest() -> Digest32 {
 
 fn random_32() -> [u8; 32] {
     let mut bytes = [0_u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS randomness unavailable");
     bytes
 }
 

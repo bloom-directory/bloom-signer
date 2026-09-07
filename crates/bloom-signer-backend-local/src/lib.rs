@@ -18,7 +18,7 @@ use chacha20poly1305::{
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use k256::{ecdsa::SigningKey, pkcs8::EncodePublicKey};
 use parking_lot::RwLock;
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng as _, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -164,7 +164,9 @@ impl LocalSignerBackend {
             return Err(BackendError::InvalidRequest);
         }
         let mut nonce = [0_u8; 24];
-        OsRng.fill_bytes(&mut nonce);
+        SysRng
+            .try_fill_bytes(&mut nonce)
+            .expect("OS randomness unavailable");
         let aad = root_aad(&backend_instance_id, &root_key_id);
         let cipher = XChaCha20Poly1305::new(Key::from_slice(kek.expose_to_backend()));
         let encrypted_seed = cipher
