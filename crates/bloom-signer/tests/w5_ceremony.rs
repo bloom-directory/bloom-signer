@@ -226,7 +226,9 @@ fn try_complete_local_approval(
             ordered_payload_digests,
             ordered_hashes,
         } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
-        ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
+        ApprovalSelector::Petal { .. } | ApprovalSelector::System { .. } => {
+            (Vec::new(), Vec::new())
+        }
     };
     let prepared = service.prepare_approval(
         CeremonyPrepareRequest {

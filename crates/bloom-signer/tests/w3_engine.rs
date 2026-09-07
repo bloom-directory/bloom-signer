@@ -132,11 +132,16 @@ fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> Unsign
         ApprovalSelector::Petal { .. } => {
             (vec![digest("22")], vec![digest("33")], SelectorKind::Petal)
         }
+        ApprovalSelector::System { .. } => {
+            (vec![digest("22")], vec![digest("33")], SelectorKind::System)
+        }
     };
-    let claim_digest =
-        matches!(&terms.selector, ApprovalSelector::Petal { .. }).then(|| digest("ab"));
-    let assurance_digest =
-        matches!(&terms.selector, ApprovalSelector::Petal { .. }).then(|| digest("ac"));
+    let reusable = matches!(
+        &terms.selector,
+        ApprovalSelector::Petal { .. } | ApprovalSelector::System { .. }
+    );
+    let claim_digest = reusable.then(|| digest("ab"));
+    let assurance_digest = reusable.then(|| digest("ac"));
     let identity = SignOperationIdentity {
         operation_id: OperationId::new(operation_byte.repeat(32)).unwrap(),
         approval_id: terms.approval_id().unwrap(),
