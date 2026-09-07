@@ -7,7 +7,7 @@
 //! way), `c_i = I_R`. Canonical path: `m/44'/501'/<account>'/0'`.
 
 use ed25519_dalek::SigningKey;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest as _, Sha256, Sha512};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -131,7 +131,7 @@ pub fn derive_solana_account(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{RngCore as _, SeedableRng as _};
+    use rand::{Rng as _, RngExt as _, SeedableRng as _};
 
     fn seed_tv1() -> Vec<u8> {
         (0u8..16).collect()
@@ -176,7 +176,7 @@ mod tests {
             let account = edge_accounts
                 .get(case as usize)
                 .copied()
-                .unwrap_or_else(|| rand::Rng::gen_range(&mut rng, 0..(1 << 31)));
+                .unwrap_or_else(|| rng.random_range(0..(1 << 31)));
             let ours = derive_solana_account(&seed, account).unwrap();
             let path = format!("m/44'/501'/{account}'/0'");
             let oracle =
