@@ -54,6 +54,13 @@ pub enum ApprovalSelector {
         route_grants: Vec<PetalRouteGrant>,
         required_claim_assurance: ClaimAssuranceLevel,
     },
+    System {
+        component_id: Token,
+        action_class: Token,
+        allowed_operation_classes: Vec<Token>,
+        required_claim_assurance: ClaimAssuranceLevel,
+        intent_digest: Digest32,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -151,6 +158,22 @@ impl SealedApprovalTerms {
         }
 
         match (&self.subject, &self.selector) {
+            (
+                ApprovalSubject::System {
+                    component_id,
+                    operation_class,
+                },
+                ApprovalSelector::System {
+                    component_id: selector_component,
+                    action_class,
+                    allowed_operation_classes,
+                    ..
+                },
+            ) if component_id == selector_component
+                && operation_class == action_class
+                && classes_are_canonical(allowed_operation_classes)
+                && self.limits.max_operations.get() == 1
+                && self.limits.max_signatures.get() == 1 => {}
             (
                 ApprovalSubject::Petal {
                     package_hash,

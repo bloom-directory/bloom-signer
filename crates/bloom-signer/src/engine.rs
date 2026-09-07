@@ -5783,6 +5783,9 @@ fn validate_against_approval(
         (ApprovalSelector::Petal { .. }, SelectorKind::Petal)
             if request.unsigned.petal_use_claim_digest.is_some()
                 && request.unsigned.claim_assurance_digest.is_some() => {}
+        (ApprovalSelector::System { .. }, SelectorKind::System)
+            if request.unsigned.petal_use_claim_digest.is_some()
+                && request.unsigned.claim_assurance_digest.is_some() => {}
         _ => {
             return Err(error(
                 ProtocolErrorCode::SelectorMismatch,

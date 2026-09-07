@@ -18,6 +18,7 @@ pub const MAX_ED25519_MESSAGE_BYTES: usize = 1232;
 pub enum SelectorKind {
     Exact,
     Petal,
+    System,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
