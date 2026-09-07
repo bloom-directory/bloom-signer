@@ -22,7 +22,7 @@ use bloom_signer_backend_api::{
     BackendSignature, DerivationCapability, KeyDescription, ProviderIdempotency, SecretBytes,
     SignerBackend, SignerBackendDerivation,
 };
-use hmac::{Hmac, Mac as _};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use k256::{
     PublicKey,
     ecdsa::{RecoveryId, Signature, VerifyingKey},
@@ -31,7 +31,7 @@ use k256::{
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use sha3::Keccak256;
+use sha3::{Digest as _, Keccak256};
 use std::{
     collections::{BTreeMap, VecDeque},
     fs,

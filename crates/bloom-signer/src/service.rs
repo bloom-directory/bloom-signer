@@ -16,7 +16,7 @@ use bloom_signer_backend_api::{BackendError, BackendInput, BackendSignRequest};
 use k256::elliptic_curve::sec1::ToEncodedPoint as _;
 use k256::pkcs8::DecodePublicKey;
 use sha2::{Digest as _, Sha256};
-use sha3::Keccak256;
+use sha3::{Digest as _, Keccak256};
 use tokio::sync::Mutex;
 
 use crate::{

@@ -13,8 +13,11 @@ use hpke::{
     Deserializable, Kem as KemTrait, OpModeS, Serializable, aead::ChaCha20Poly1305,
     kdf::HkdfSha256, kem::X25519HkdfSha256, setup_sender,
 };
-use p256::ecdsa::{SigningKey, signature::Signer as _};
-use rand::{RngCore, rngs::OsRng};
+use p256::{
+    ecdsa::{SigningKey, signature::Signer as _},
+    elliptic_curve::Generate as _,
+};
+use rand::{TryRng as _, rngs::SysRng};
 use sha2::{Digest as _, Sha256};
 
 type BloomKem = X25519HkdfSha256;
@@ -29,10 +32,14 @@ impl VirtualAuthenticator {
     pub fn generate() -> Self {
         let mut credential_id = [0_u8; 32];
         let mut user_handle = [0_u8; 32];
-        OsRng.fill_bytes(&mut credential_id);
-        OsRng.fill_bytes(&mut user_handle);
+        SysRng
+            .try_fill_bytes(&mut credential_id)
+            .expect("OS randomness unavailable");
+        SysRng
+            .try_fill_bytes(&mut user_handle)
+            .expect("OS randomness unavailable");
         Self {
-            signing_key: SigningKey::random(&mut OsRng),
+            signing_key: SigningKey::generate(),
             credential_id: Base64UrlBytes::from_bytes(&credential_id),
             user_handle: Base64UrlBytes::from_bytes(&user_handle),
         }
@@ -45,7 +52,7 @@ impl VirtualAuthenticator {
     }
 
     pub fn legacy_passkey_json(&self, sign_count: u32) -> serde_json::Value {
-        let point = self.signing_key.verifying_key().to_encoded_point(false);
+        let point = self.signing_key.verifying_key().to_sec1_point(false);
         serde_json::json!({
             "cred": {
                 "cred_id": self.credential_id,
@@ -138,7 +145,7 @@ impl VirtualAuthenticator {
     }
 
     fn cose_public_key(&self) -> Result<Vec<u8>, ProtocolError> {
-        let point = self.signing_key.verifying_key().to_encoded_point(false);
+        let point = self.signing_key.verifying_key().to_sec1_point(false);
         let x = point.x().ok_or_else(driver_error)?;
         let y = point.y().ok_or_else(driver_error)?;
         let value = Value::Map(vec![
@@ -162,13 +169,9 @@ pub fn seal_hpke(
 ) -> Result<HpkeEnvelope, ProtocolError> {
     let public_key = <BloomKem as KemTrait>::PublicKey::from_bytes(&recipient_public_key.decode())
         .map_err(|_| driver_error())?;
-    let (encapped, mut context) = setup_sender::<ChaCha20Poly1305, HkdfSha256, BloomKem, _>(
-        &OpModeS::Base,
-        &public_key,
-        info,
-        &mut OsRng,
-    )
-    .map_err(|_| driver_error())?;
+    let (encapped, mut context) =
+        setup_sender::<ChaCha20Poly1305, HkdfSha256, BloomKem>(&OpModeS::Base, &public_key, info)
+            .map_err(|_| driver_error())?;
     let ciphertext = context.seal(plaintext, aad).map_err(|_| driver_error())?;
     Ok(HpkeEnvelope {
         kem_output: Base64UrlBytes::from_bytes(&encapped.to_bytes()),

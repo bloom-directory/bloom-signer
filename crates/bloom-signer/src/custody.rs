@@ -7,7 +7,7 @@ use chacha20poly1305::{
 use ed25519_dalek::{Signer as _, SigningKey};
 use hkdf::Hkdf;
 use parking_lot::Mutex;
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng as _, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -571,7 +571,9 @@ fn encrypt(
 ) -> Result<EncryptedBlob, ProtocolError> {
     validate_key(key)?;
     let mut nonce = [0_u8; 24];
-    OsRng.fill_bytes(&mut nonce);
+    SysRng
+        .try_fill_bytes(&mut nonce)
+        .expect("OS randomness unavailable");
     let ciphertext = XChaCha20Poly1305::new(Key::from_slice(key.expose_to_backend()))
         .encrypt(
             XNonce::from_slice(&nonce),
