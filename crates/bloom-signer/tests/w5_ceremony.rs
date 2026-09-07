@@ -20,6 +20,7 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use k256::pkcs8::EncodePublicKey as _;
 use k256::{SecretKey as Secp256k1Secret, elliptic_curve::sec1::ToEncodedPoint as _};
 use sha2::Digest as _;
+use sha3::Digest as _;
 use std::{collections::BTreeMap, os::unix::fs::MetadataExt as _, sync::Arc};
 use support::{VirtualAuthenticator, seal_hpke};
 

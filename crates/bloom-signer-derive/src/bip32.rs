@@ -17,7 +17,7 @@
 //! Callers cannot pass arbitrary paths: derivation is exposed per profile
 //! canonical template only.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use k256::ecdsa::SigningKey;
 use k256::pkcs8::EncodePublicKey;
 use k256::{Scalar, elliptic_curve::ops::Reduce};

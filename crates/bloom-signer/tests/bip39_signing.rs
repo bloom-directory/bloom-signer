@@ -144,9 +144,10 @@ fn entropy_to_seed_validates_length_against_metadata() {
     // Tampered ciphertext fails AEAD authentication.
     let mut bad_ciphertext = blob.1.clone();
     bad_ciphertext[0] ^= 0xFF;
-    assert!(
-        bip39_signing::entropy_to_seed(&wkek, &wallet, 1, &blob.0, &bad_ciphertext, 256).is_err()
-    );
+    assert!(matches!(
+        bip39_signing::entropy_to_seed(&wkek, &wallet, 1, &blob.0, &bad_ciphertext, 256),
+        Err(bip39_signing::SigningEdgeError::CustodyAuthenticationFailed)
+    ));
 }
 
 #[test]
