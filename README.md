@@ -5,6 +5,30 @@ Bloom's key custody and cryptographic-operation boundary.
 The normative architecture is
 [`2026-07-23-triad-process-architecture.md`](https://gist.github.com/josh-richardson/031521a48b6e044c443bc1e96e3703d2).
 
+## Backend key support
+
+This matrix describes the capabilities implemented by Bloom's signer backends.
+Update it when backend key types or derivation support change.
+
+| Capability | Local backend | AWS KMS backend |
+| --- | --- | --- |
+| secp256k1 signing | Yes | Yes |
+| Ed25519 signing | Yes, for BIP-39 derived accounts | No |
+| BIP-39 seed custody | Yes | No |
+| BIP-32 secp256k1 accounts from BIP-39 | Yes, EVM profile | No |
+| SLIP-10 Ed25519 accounts from BIP-39 | Yes, Solana profile | No |
+
+New local wallets use the `bip39-multicurve-v1` profile: one seed can back both
+EVM and Solana accounts, and only its registered derived accounts can sign.
+Imported raw secp256k1 keys remain single-key wallets without HD derivation.
+Legacy raw BIP-32 seed wallets remain supported for existing custody; new
+wallet creation does not use that profile.
+
+The AWS KMS backend signs with existing secp256k1 KMS keys and exposes no HD
+derivation. AWS service capabilities and Bloom adapter support are separate:
+adding another signing curve to the adapter would not by itself provide
+BIP-39 seed custody or shared-seed account derivation.
+
 ## One-time legacy passkey conversion
 
 `bloom-signer-migrate` is the administrative staging tool for the single
