@@ -921,6 +921,37 @@ fn backend_registry_accepts_only_compiled_variants() {
 }
 
 #[test]
+fn bip39_child_registration_rejects_a_foreign_wallet() {
+    let wallet = Token::new("wallet-a").unwrap();
+    let key_ref = KeyRef {
+        backend: Token::new("local").unwrap(),
+        backend_instance: wallet.clone(),
+        locator: "evm-0".into(),
+        key_spec: KeySpec::Secp256k1,
+        public_key_fingerprint: digest("11"),
+        derivation: Some(DerivationRef::Bip39Multicurve {
+            wallet_seed_ref: wallet,
+            profile: DerivationProfile::Bip44EvmSecp256k1V1,
+            path: "m/44'/60'/0'/0/0".into(),
+        }),
+    };
+    let description = bloom_signer_backend_api::KeyDescription {
+        public_key_fingerprint: key_ref.public_key_fingerprint.clone(),
+        key_ref,
+        canonical_spki_der: Base64UrlBytes::from_bytes(&[]),
+        supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+    };
+    let registry = BackendRegistry::from_compiled(vec![]).unwrap();
+    assert_eq!(
+        registry
+            .register_bip39_child(&Token::new("wallet-b").unwrap(), description, None)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::KeyrefMismatch
+    );
+}
+
+#[test]
 fn production_visible_constructor_rejects_shared_revocation_audit_key() {
     let shared = SigningKey::from_bytes(&[4; 32]);
     let result = SignerEngine::open_in_memory(

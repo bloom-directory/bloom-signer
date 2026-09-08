@@ -4,7 +4,6 @@ use hpke::{
     Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable, aead::ChaCha20Poly1305,
     kdf::HkdfSha256, kem::X25519HkdfSha256, setup_receiver, setup_sender,
 };
-use rand::rngs::OsRng;
 use zeroize::Zeroizing;
 
 type BloomKem = X25519HkdfSha256;
@@ -23,7 +22,7 @@ pub struct HpkeRecipient {
 
 impl HpkeRecipient {
     pub fn generate() -> Self {
-        let (private_key, public_key) = BloomKem::gen_keypair(&mut OsRng);
+        let (private_key, public_key) = BloomKem::gen_keypair();
         Self {
             private_key: Zeroizing::new(private_key.to_bytes().to_vec()),
             public_key: Base64UrlBytes::from_bytes(&public_key.to_bytes()),
@@ -84,13 +83,9 @@ pub fn seal_to_recipient(
 ) -> Result<HpkeEnvelope, ProtocolError> {
     let public_key = <BloomKem as KemTrait>::PublicKey::from_bytes(&recipient_public_key.decode())
         .map_err(|_| hpke_error("HPKE recipient public key is invalid"))?;
-    let (encapped, mut context) = setup_sender::<BloomAead, BloomKdf, BloomKem, _>(
-        &OpModeS::Base,
-        &public_key,
-        info,
-        &mut OsRng,
-    )
-    .map_err(|_| hpke_error("HPKE sender setup failed"))?;
+    let (encapped, mut context) =
+        setup_sender::<BloomAead, BloomKdf, BloomKem>(&OpModeS::Base, &public_key, info)
+            .map_err(|_| hpke_error("HPKE sender setup failed"))?;
     let ciphertext = context
         .seal(plaintext, aad)
         .map_err(|_| hpke_error("HPKE encryption failed"))?;

@@ -14,7 +14,7 @@ use bloom_signer_derive::{
     bip32::{hardened_child, master_secp256k1, non_hardened_child},
     mnemonic_from_entropy, parse_mnemonic, seed_from_mnemonic,
 };
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use zeroize::Zeroizing;
 
 fn deterministic_rng() -> StdRng {
@@ -110,7 +110,7 @@ mod reference {
     }
 
     type HmacSha512 = Hmac<Sha512>;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha512;
 }
 
@@ -124,7 +124,7 @@ fn randomized_mnemonics_agree_with_the_independent_codec() {
     for words in [12usize, 15, 18, 21, 24] {
         let entropy_bytes = bloom_signer_derive::policy::entropy_bytes_for_words(words).unwrap();
         for _ in 0..16 {
-            let entropy: Vec<u8> = (0..entropy_bytes).map(|_| rng.r#gen::<u8>()).collect();
+            let entropy: Vec<u8> = (0..entropy_bytes).map(|_| rng.random::<u8>()).collect();
 
             // Crate phrase vs codec indices.
             let phrase = mnemonic_from_entropy(&entropy).unwrap();
@@ -225,7 +225,7 @@ fn randomized_bip32_paths_agree_with_the_bip32_crate() {
     let mut rng = deterministic_rng();
     for _ in 0..64 {
         let seed: [u8; 64] = (0..64)
-            .map(|_| rng.r#gen::<u8>())
+            .map(|_| rng.random::<u8>())
             .collect::<Vec<u8>>()
             .try_into()
             .unwrap();
@@ -239,8 +239,8 @@ fn randomized_bip32_paths_agree_with_the_bip32_crate() {
         let mut my_code = mine_code;
         let mut walking = reference_xprv;
         for depth in 0..5 {
-            let index: u32 = rng.gen_range(0..(1 << 20));
-            let hardened = rng.r#gen::<bool>();
+            let index: u32 = rng.random_range(0..(1 << 20));
+            let hardened = rng.random::<bool>();
             let child_number =
                 bip32::ChildNumber::new(index, hardened).expect("valid child number");
             walking = walking

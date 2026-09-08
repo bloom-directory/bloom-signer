@@ -79,9 +79,11 @@ impl ParsedMnemonic {
 /// Generate 256 bits of cryptographically random BIP-39 entropy — the
 /// generated-wallet length frozen by the v1 policy.
 pub fn generate_entropy() -> Zeroizing<[u8; 32]> {
-    use rand::RngCore;
+    use rand::{TryRng as _, rngs::SysRng};
     let mut entropy = Zeroizing::new([0u8; 32]);
-    rand::rngs::OsRng.fill_bytes(entropy.as_mut());
+    SysRng
+        .try_fill_bytes(entropy.as_mut())
+        .expect("OS randomness unavailable");
     entropy
 }
 
