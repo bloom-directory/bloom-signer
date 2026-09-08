@@ -4,11 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 bloom-signer-backend-api = { path = "../bloom-signer-backend-api" }
 bip32.workspace = true
 bloom-signer-api.workspace = true
+bloom-signer-derive.workspace = true
 chacha20poly1305.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true

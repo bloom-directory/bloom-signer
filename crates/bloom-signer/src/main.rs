@@ -33,7 +33,7 @@ use bloom_signer::{
 use bloom_signer_api::{
     BrokerSignerRequest, BrokerSignerResponse, BrokerSignerService, ControlRequest,
     ControlResponse, Digest32, ProtocolError, ProtocolErrorCode, RevocationControlService,
-    ServiceFuture, SignedJournalHead, Token, is_read_only_method,
+    ServiceFuture, SignedJournalHead, Token, TypedRequestMethod, is_read_only_method,
 };
 #[cfg(feature = "aws-kms")]
 use bloom_signer_backend_api::SecretBytes;
@@ -138,6 +138,10 @@ async fn main() {
     {
         println!("bloom-signer {}", env!("CARGO_PKG_VERSION"));
         return;
+    }
+    if let Err(error) = bloom_signer_process_hardening::harden_process() {
+        eprintln!("Signer process hardening failed: {error}");
+        std::process::exit(1);
     }
     let output = match signer_log_output() {
         Ok(output) => output,
@@ -647,6 +651,95 @@ fn clock_repair_request() -> Result<Option<u64>, Box<dyn std::error::Error>> {
         .transpose()
 }
 
+/// Authority-edge dispatch. The transport negotiates and verifies the
+/// request's signed protocol against the supported range before dispatch.
+async fn dispatch_authority_connection<Dispatch, DispatchFuture>(
+    stream: &mut UnixStream,
+    identity: &LocalIdentity,
+    broker_acl: &PeerAcl,
+    quota: &EndpointQuota,
+    journals: &dyn JournalExchange<ProtocolError>,
+    dispatch: Dispatch,
+) -> Result<(), ProtocolError>
+where
+    Dispatch: Fn(BrokerSignerRequest, AuthenticatedRequestContext) -> DispatchFuture,
+    DispatchFuture: Future<Output = Result<BrokerSignerResponse, ProtocolError>>,
+{
+    use bloom_signer_api::JournalHeadPolicy;
+
+    let request = bloom_triad_local_transport::receive_request::<BrokerSignerRequest>(
+        stream,
+        identity,
+        broker_acl,
+        bloom_signer_api::SIGNER_API_CURRENT,
+        bloom_signer_api::SIGNER_API_RANGE,
+        JournalHeadPolicy::Required,
+    )
+    .await?;
+    let context = AuthenticatedRequestContext {
+        method: request.unsigned.method.clone(),
+        operation_id: request.unsigned.operation_id.clone(),
+        caller_service_id: request.unsigned.caller_service_id.clone(),
+        caller_boot_epoch: request.unsigned.caller_boot_epoch.clone(),
+        caller_application_key_id: request.unsigned.application_key_id.clone(),
+        sent_at_ms: request.unsigned.sent_at_ms.get(),
+        deadline_ms: request.unsigned.deadline_ms.get(),
+    };
+    let peer_head = request
+        .unsigned
+        .sender_journal_head
+        .as_ref()
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "authority-edge request omitted its authenticated journal head",
+            )
+        })?;
+    if let Err(error) = journals.checkpoint_request_head_with_context(&context, peer_head) {
+        let (sequence, head_hash) = journals.local_journal_head_with_context(&context)?;
+        let head = bloom_triad_local_transport::sign_journal_head(identity, sequence, head_hash);
+        return bloom_triad_local_transport::send_response_with_journal_head::<
+            BrokerSignerRequest,
+            BrokerSignerResponse,
+            ProtocolError,
+        >(stream, identity, &request, Err(error), head)
+        .await
+        .map_err(bloom_signer_api::ProtocolError::from);
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "system clock before epoch",
+            )
+        })?
+        .as_millis();
+    let now_ms = u64::try_from(now_ms).map_err(|_| {
+        ProtocolError::new(
+            ProtocolErrorCode::ServiceUnavailable,
+            "system clock overflow",
+        )
+    })?;
+    let result = match quota.admit(request.unsigned.body.is_read_only(), now_ms) {
+        Ok(admission) => {
+            let result = dispatch(request.unsigned.body.clone(), context.clone()).await;
+            drop(admission);
+            result
+        }
+        Err(error) => Err(error.into()),
+    };
+    let (sequence, head_hash) = journals.local_journal_head_with_context(&context)?;
+    let head = bloom_triad_local_transport::sign_journal_head(identity, sequence, head_hash);
+    bloom_triad_local_transport::send_response_with_journal_head::<
+        BrokerSignerRequest,
+        BrokerSignerResponse,
+        ProtocolError,
+    >(stream, identity, &request, result, head)
+    .await
+    .map_err(bloom_signer_api::ProtocolError::from)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serve_rpc(
     listener: UnixListener,
@@ -679,19 +772,10 @@ async fn serve_rpc(
         tokio::spawn(
             async move {
                 let _permit = permit;
-                let _ =
-                bloom_triad_local_transport::dispatch_connection_with_journal_heads_and_context::<
-                    BrokerSignerRequest,
-                    BrokerSignerResponse,
-                    ProtocolError,
-                    _,
-                    _,
-                >(
+                let _ = dispatch_authority_connection(
                     &mut stream,
                     &identity,
                     &broker_acl,
-                    bloom_signer_api::SIGNER_API_CURRENT,
-                    bloom_signer_api::SIGNER_API_RANGE,
                     &quota,
                     journals.as_ref(),
                     |request, context| {

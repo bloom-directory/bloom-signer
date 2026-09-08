@@ -20,6 +20,8 @@ pub enum CeremonyKind {
     CredentialRemove,
     BackendEnrollment,
     KeyDerive,
+    AccountAllocate,
+    AccountRetire,
     PolicyUpdate,
 }
 
@@ -40,6 +42,8 @@ impl CeremonyKind {
             | Self::CredentialRemove
             | Self::BackendEnrollment
             | Self::KeyDerive
+            | Self::AccountAllocate
+            | Self::AccountRetire
             | Self::PolicyUpdate => Some(crate::CeremonyState::Succeeded),
         }
     }
@@ -327,6 +331,14 @@ pub struct CustodyPrepareRequest {
     pub petal_key_scope: Option<PetalKeyScope>,
     #[serde(default)]
     pub legacy_passkey_migration: Option<LegacyPasskeyMigrationPublic>,
+    /// Selected root seed profile for wallet registration/import. `None`
+    /// keeps the legacy secp behavior; `Some(Bip39MulticurveV1)` provisions a
+    /// BIP-39 root. Broker selects; Signer validates against capabilities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet_seed_profile: Option<crate::WalletSeedProfile>,
+    /// Derived-account allocation request (AccountAllocate custody only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation_request: Option<crate::DerivedAccountRequest>,
 }
 
 impl CustodyPrepareRequest {
@@ -452,6 +464,10 @@ pub struct CustodySignerContribution {
     pub browser_output_recipient_key: Option<Base64UrlBytes>,
     #[serde(default)]
     pub petal_key_scope: Option<PetalKeyScope>,
+    /// Selected root seed profile for wallet registration/import. Passed to browser
+    /// to control the import format: BIP-39 mnemonic or raw private key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet_seed_profile: Option<crate::WalletSeedProfile>,
     pub expires_at_ms: DecimalU64,
     pub signer_key_id: Token,
     pub signer_signature: Base64UrlBytes,
@@ -562,6 +578,8 @@ impl CustodySignerContribution {
             hpke_recipient_key: &'a Base64UrlBytes,
             browser_output_recipient_key: &'a Option<Base64UrlBytes>,
             petal_key_scope: &'a Option<PetalKeyScope>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            wallet_seed_profile: &'a Option<crate::WalletSeedProfile>,
             expires_at_ms: &'a DecimalU64,
             signer_key_id: &'a Token,
         }
@@ -578,6 +596,7 @@ impl CustodySignerContribution {
             hpke_recipient_key: &self.hpke_recipient_key,
             browser_output_recipient_key: &self.browser_output_recipient_key,
             petal_key_scope: &self.petal_key_scope,
+            wallet_seed_profile: &self.wallet_seed_profile,
             expires_at_ms: &self.expires_at_ms,
             signer_key_id: &self.signer_key_id,
         })
@@ -822,6 +841,8 @@ mod tests {
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope),
             legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
         }
     }
 
@@ -836,6 +857,8 @@ mod tests {
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: None,
+            wallet_seed_profile: None,
+            derivation_request: None,
         }
     }
 
@@ -872,6 +895,8 @@ mod tests {
             CeremonyKind::BackendEnrollment,
             CeremonyKind::KeyDerive,
             CeremonyKind::PolicyUpdate,
+            CeremonyKind::AccountAllocate,
+            CeremonyKind::AccountRetire,
         ] {
             assert_eq!(
                 kind.successful_terminal_state(),
@@ -914,10 +939,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn signed_custody_contribution_binds_full_petal_scope() {
+    fn custody_contribution_with_petal_scope() -> CustodySignerContribution {
         let scope = petal_scope();
-        let contribution = CustodySignerContribution {
+        CustodySignerContribution {
             ceremony_id: digest(4),
             ceremony_kind: CeremonyKind::KeyDerive,
             custody_operation_id: scope.custody_operation_id.clone(),
@@ -930,10 +954,16 @@ mod tests {
             hpke_recipient_key: Base64UrlBytes::from_bytes(&[7; 32]),
             browser_output_recipient_key: None,
             petal_key_scope: Some(scope),
+            wallet_seed_profile: None,
             expires_at_ms: DecimalU64::new(1000),
             signer_key_id: Token::new("signer-identity").unwrap(),
             signer_signature: Base64UrlBytes::from_bytes(&[8; 64]),
-        };
+        }
+    }
+
+    #[test]
+    fn signed_custody_contribution_binds_full_petal_scope() {
+        let contribution = custody_contribution_with_petal_scope();
         assert!(
             contribution
                 .validate_petal_key_scope_binding(&scoped_prepare())
@@ -953,6 +983,20 @@ mod tests {
                 .unwrap_err()
                 .code,
             ProtocolErrorCode::OperationIdConflict
+        );
+    }
+
+    #[test]
+    fn signed_custody_contribution_binds_wallet_seed_profile() {
+        let without_profile = custody_contribution_with_petal_scope();
+        let original = without_profile.unsigned_canonical_bytes().unwrap();
+        let mut with_profile = without_profile;
+        with_profile.wallet_seed_profile = Some(crate::WalletSeedProfile::Bip39MulticurveV1);
+
+        assert_ne!(with_profile.unsigned_canonical_bytes().unwrap(), original);
+        assert_eq!(
+            serde_json::to_value(with_profile).unwrap()["wallet_seed_profile"],
+            "bip39-multicurve-v1"
         );
     }
 }

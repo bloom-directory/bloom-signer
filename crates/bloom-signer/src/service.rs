@@ -119,7 +119,10 @@ impl SignerRpcService {
         if signer_request_requires_containment(&request) {
             self.require_network_containment()?;
         }
-        let now_ms = if broker_signer_request_is_read_only(&request) {
+        // Read-only classification lives once, on `BrokerSignerMethod`.
+        // The duplicate variant list this replaced had drifted from it on
+        // four methods.
+        let now_ms = if bloom_signer_api::TypedRequestMethod::is_read_only(&request) {
             self.clock.now_ms_read_only()?
         } else {
             self.clock.now_ms(false)?
@@ -143,6 +146,10 @@ impl SignerRpcService {
                 }
                 Ok(Response::KeyListPublic(keys))
             }
+            Request::DerivedAccountList(request) => Ok(Response::DerivedAccountList(
+                self.engine
+                    .derived_account_descriptors(&request.wallet_id)?,
+            )),
             Request::KeyDerivationCapabilities(request) => {
                 let capabilities = self
                     .engine
@@ -410,16 +417,36 @@ impl SignerRpcService {
             .backend_registry()
             .capabilities()
             .into_iter()
-            .map(|capability| BackendPublicCapability {
-                backend_id: capability.backend_id,
-                backend_instance_id: capability.backend_instance_id,
-                crypto_suites: capability.supported_crypto_suites,
-                derivation_schemes: capability
-                    .supported_derivation
-                    .into_iter()
-                    .map(|derivation| derivation.scheme)
-                    .collect(),
-                networked: capability.networked,
+            .map(|capability| {
+                let is_bip39 = capability
+                    .supported_crypto_suites
+                    .contains(&bloom_signer_api::CryptoSuite::Ed25519Message);
+                BackendPublicCapability {
+                    backend_id: capability.backend_id,
+                    backend_instance_id: capability.backend_instance_id,
+                    crypto_suites: capability.supported_crypto_suites,
+                    derivation_schemes: capability
+                        .supported_derivation
+                        .into_iter()
+                        .map(|derivation| derivation.scheme)
+                        .collect(),
+                    networked: capability.networked,
+                    wallet_seed_profiles: if is_bip39 {
+                        vec![bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1]
+                    } else {
+                        Vec::new()
+                    },
+                    derivation_profiles: if is_bip39 {
+                        vec![
+                            bloom_signer_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                            bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                        ]
+                    } else {
+                        Vec::new()
+                    },
+                    mnemonic_export: is_bip39,
+                    derivation_namespace_limits: vec![],
+                }
             })
             .collect();
         Ok(ServiceCapabilities {
@@ -463,12 +490,14 @@ impl SignerRpcService {
             ));
         }
         let addresses = ethereum_address(&description)?;
+        let derived_account = self.engine.derived_account_descriptor(key_ref)?;
         Ok(KeyPublic {
             key_ref: description.key_ref,
             role: self.engine.key_role(key_ref)?,
             canonical_public_key: description.canonical_spki_der,
             addresses,
             supported_crypto_suites: description.supported_crypto_suites,
+            derived_account,
         })
     }
 
@@ -523,7 +552,7 @@ impl SignerRpcService {
                     digest: hash.clone(),
                 },
                 CryptoInputKind::Message => BackendInput::Message {
-                    message: Base64UrlBytes::from_bytes(&hash.to_bytes()),
+                    message: request.unsigned.ordered_messages[index].clone(),
                 },
             };
             let result = backend
@@ -637,30 +666,6 @@ fn signer_request_requires_containment(request: &BrokerSignerRequest) -> bool {
             | Request::RecoveryPrepare(_)
             | Request::CustodyBindOutputRecipient(_)
             | Request::CustodyComplete(_)
-    )
-}
-
-fn broker_signer_request_is_read_only(request: &BrokerSignerRequest) -> bool {
-    use BrokerSignerRequest as Request;
-    matches!(
-        request,
-        Request::SystemHello(_)
-            | Request::SignerReadiness(_)
-            | Request::SignerCapabilities(_)
-            | Request::KeyGetPublic(_)
-            | Request::KeyListPublic(_)
-            | Request::KeyDerivationCapabilities(_)
-            | Request::KeyListDerived(_)
-            | Request::KeyEnrollStatus(_)
-            | Request::CeremonyStatus(_)
-            | Request::SealedApprovalStatus(_)
-            | Request::RevocationState(_)
-            | Request::OperationStatus(_)
-            | Request::PolicyRead(_)
-            | Request::WalletRegistrationStatus(_)
-            | Request::CredentialListPublic(_)
-            | Request::CustodyResult(_)
-            | Request::CustodyStatus(_)
     )
 }
 
@@ -855,7 +860,7 @@ mod tests {
         let broker_key = SigningKey::from_bytes(&[7; 32]);
         let activation_secret = vec![9; 32];
         let backend = Arc::new(
-            LocalSignerBackend::provision(
+            LocalSignerBackend::provision_imported_secp256k1(
                 Token::new("wallet-service-test").unwrap(),
                 Token::new("root").unwrap(),
                 SecretBytes::new((0_u8..32).collect()),
@@ -1082,6 +1087,7 @@ mod tests {
             selector_kind: SelectorKind::Exact,
             ordered_payload_digests: payloads,
             ordered_hashes: hashes,
+            ordered_messages: Vec::new(),
             signature_count: DecimalU64::new(1),
             petal_use_claim_digest: None,
             claim_assurance_digest: None,
@@ -1113,6 +1119,11 @@ mod tests {
         request.unsigned.operation_id = OperationId::from_bytes([attempt_byte; 32]);
         request.unsigned.key_ref = key_ref.clone();
         request.unsigned.crypto_suite = CryptoSuite::Ed25519Message;
+        let message = vec![attempt_byte; 48];
+        let digest = Digest32::from_bytes(Sha256::digest(&message).into());
+        request.unsigned.ordered_payload_digests = vec![digest.clone()];
+        request.unsigned.ordered_hashes = vec![digest];
+        request.unsigned.ordered_messages = vec![Base64UrlBytes::from_bytes(&message)];
         request.unsigned.operation_digest = SignOperationIdentity {
             operation_id: request.unsigned.operation_id.clone(),
             approval_id: request.unsigned.approval_id.clone(),
@@ -1271,6 +1282,10 @@ mod tests {
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
                     legacy_passkey_migration: None,
+                    wallet_seed_profile: Some(
+                        bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1,
+                    ),
+                    derivation_request: None,
                 },
                 now_ms().unwrap(),
             )
@@ -1305,7 +1320,7 @@ mod tests {
     #[tokio::test]
     async fn dedicated_policy_key_is_unreachable_through_single_and_batch_signing() {
         let (service, broker_key, terms) = fixture().await;
-        let custody = WalletCustody::register(
+        let custody = WalletCustody::register_imported_secp256k1(
             terms.wallet_id.clone(),
             SecretBytes::new(vec![1; 32]),
             SecretBytes::new(vec![2; 32]),

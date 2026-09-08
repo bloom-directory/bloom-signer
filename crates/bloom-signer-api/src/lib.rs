@@ -15,6 +15,7 @@ mod policy;
 mod revocation;
 mod service;
 mod signing;
+mod wallet_seed;
 mod webauthn;
 
 pub use approval::*;
@@ -28,6 +29,7 @@ pub use policy::*;
 pub use revocation::*;
 pub use service::*;
 pub use signing::*;
+pub use wallet_seed::*;
 pub use webauthn::*;
 
 pub use bloom_rpc_wire::{
@@ -38,13 +40,16 @@ pub use bloom_rpc_wire::{
     WireError, WireErrorCode, decode_frame, encode_frame,
 };
 
-/// Broker-to-Signer authority contract. Version 1.4 adds the durable terminal
-/// ceremony-status response. It is intentionally a strict minor bump: a 1.3
-/// peer cannot deserialize the new `Terminal` response variant, so it must not
-/// negotiate this contract.
+/// Broker-to-Signer authority contract.
+///
+/// Version 1.5 is the first complete authority contract for BIP-39 wallets.
+/// It includes the durable terminal ceremony status introduced during 1.4
+/// development plus the wallet-seed profile, account-allocation ceremonies,
+/// and derived-account projection. Registration and import semantics require
+/// those fields, so a 1.4 peer must not negotiate this contract.
 pub const SIGNER_API_MAJOR: u16 = 1;
-pub const SIGNER_API_MINOR_MIN: u16 = 4;
-pub const SIGNER_API_MINOR_MAX: u16 = 4;
+pub const SIGNER_API_MINOR_MIN: u16 = 5;
+pub const SIGNER_API_MINOR_MAX: u16 = 5;
 pub const SIGNER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(SIGNER_API_MAJOR, SIGNER_API_MINOR_MAX);
 pub const SIGNER_API_RANGE: ProtocolVersionRange =

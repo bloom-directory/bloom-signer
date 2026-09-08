@@ -1,3 +1,9 @@
 target/
 .DS_Store
 
+# cargo-fuzz working state. The target and its invariants are tracked; the
+# generated lockfile, the accumulated corpus, and crash artifacts are local.
+fuzz/Cargo.lock
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
