@@ -55,7 +55,8 @@ jobs:
             --test w5_ceremony approval_ceremony_extends_to_but_never_past_its_terms_under_the_developer_ttl -- --exact --ignored
           BLOOM_TRIAD_DEVELOPER_ROOT=/tmp/bloom-triad-developer-root cargo test -p bloom-signer --features triad-dev-harness --locked \
             --test w5_ceremony approval_ceremony_extends_to_but_never_past_its_terms_under_the_developer_ttl -- --exact --ignored
-      - name: Keep the accepted time advisory out of the default artifact        run: |
+      - name: Keep the accepted time advisory out of the default artifact
+        run: |
           if cargo tree --locked -p bloom-signer -e normal --prefix none | grep -Eq '^time v'; then
             echo 'the default bloom-signer graph must not contain time while RUSTSEC-2026-0009 is ignored for the optional AWS KMS graph' >&2
             exit 1
