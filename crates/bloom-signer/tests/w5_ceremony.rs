@@ -3766,10 +3766,16 @@ fn bip39_solana_child_backup_restore_round_trips_derivation_registry() {
     // material is deterministic (seed + path), so byte-identity follows from
     // the registry round-trip.
     //
-    // NOTE: the descriptor *projection* (`derived_account_descriptor`) reads a
-    // separate `derivation_allocations` table that is not part of the backup;
-    // reconstructing it after restart is a distinct follow-up, not Fix 1.
+    // The descriptor projection is carried separately from the encrypted
+    // backend registry, so its signed export binding must also survive restore.
     let (_restored_service, restored_engine, _restored_registry) = bip39_service(&authenticator);
+    let mut tampered = backup.clone();
+    tampered.derivation_allocations[0].public_key_spki_der =
+        Base64UrlBytes::from_bytes(&[0x42; 44]);
+    assert_eq!(
+        restored_engine.restore_backup(&tampered).unwrap_err().code,
+        ProtocolErrorCode::MalformedFrame
+    );
     restored_engine
         .restore_backup(&backup)
         .expect("restore must accept the exported derivation registry");

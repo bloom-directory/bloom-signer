@@ -64,6 +64,13 @@ pub enum LocalRootMaterialKind {
     /// keep-until-migrated profile: a few real pre-launch wallets still use
     /// it and must keep unlocking/signing/backing up until their owners move
     /// funds to a BIP-39 wallet. Nothing creates a new one.
+    ///
+    /// This is the storage compatibility default: older `EncryptedLocalBackup`
+    /// records omit `root_material_kind`, whose `#[serde(default)]` must keep
+    /// interpreting their bytes as a raw BIP-32 seed. Changing this default to
+    /// `Bip39Entropy` would reinterpret existing backups and change their key
+    /// tree or prevent restoration. New wallet registration already requires
+    /// the explicit `Bip39MulticurveV1` profile.
     #[default]
     Bip32Seed,
     /// One imported secp256k1 private key, non-HD. A permanent first-class
