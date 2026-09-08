@@ -87,9 +87,14 @@ const DEVELOPER_HARNESS_CEREMONY_TTL_MS: u64 = 30 * 60 * 1_000;
 /// harness-featured binary pointed at production identity paths keeps
 /// production behaviour; the feature alone is not enough to relax anything.
 ///
-/// This governs custody ceremonies. Sealed approvals are separately clamped in
-/// [`Ceremonies::prepare_approval`] to the terms they activate, which the
-/// Machine sets far shorter, so raising this value does not lengthen them.
+/// Custody ceremonies are minted from the TTL alone. A sealed approval is
+/// minted from `min(now + TTL, terms expiry)` in
+/// [`SignerCeremonyService::prepare_approval`], so it can never outlive the
+/// authority it activates — but when those terms outlast the five-minute
+/// production TTL, this developer window does lengthen the approval ceremony,
+/// up to the terms cap. The Machine mints exact approvals with ten-minute
+/// terms, so under the developer window those ceremonies run ten minutes
+/// instead of five.
 fn ceremony_ttl_ms() -> u64 {
     #[cfg(feature = "triad-dev-harness")]
     if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
