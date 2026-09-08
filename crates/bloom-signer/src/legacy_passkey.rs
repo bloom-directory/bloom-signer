@@ -23,10 +23,10 @@ use chacha20poly1305::{
     aead::{Aead as _, KeyInit as _, Payload},
 };
 use k256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint as _};
-use rand::{RngCore as _, rngs::OsRng};
+use rand::{TryRng as _, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use sha3::Keccak256;
+use sha3::{Digest as _, Keccak256};
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::webauthn::es256_cose_public_key;
@@ -228,7 +228,9 @@ pub fn stage_legacy_wallet(
     let credential = credential_file.into_current(&wallet_name, prf_salt)?;
 
     let mut operation_bytes = [0_u8; 32];
-    OsRng.fill_bytes(&mut operation_bytes);
+    SysRng
+        .try_fill_bytes(&mut operation_bytes)
+        .expect("OS randomness unavailable");
     let operation_id = OperationId::from_bytes(operation_bytes);
     let mut staged = StagedLegacyPasskey {
         schema: STAGED_SCHEMA.to_owned(),
@@ -707,7 +709,9 @@ fn digest_bytes(bytes: &[u8]) -> Digest32 {
 
 fn random_hex() -> String {
     let mut bytes = [0_u8; 16];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS randomness unavailable");
     hex::encode(bytes)
 }
 
@@ -789,8 +793,9 @@ mod tests {
                 },
             )
             .unwrap();
+        use p256::elliptic_curve::sec1::ToSec1Point as _;
         let webauthn_secret = p256::SecretKey::from_slice(&[7_u8; 32]).unwrap();
-        let webauthn_public = webauthn_secret.public_key().to_encoded_point(false);
+        let webauthn_public = webauthn_secret.public_key().to_sec1_point(false);
         let x = Base64UrlBytes::from_bytes(webauthn_public.x().unwrap());
         let y = Base64UrlBytes::from_bytes(webauthn_public.y().unwrap());
         let credential_id = Base64UrlBytes::from_bytes(&[3_u8; 20]);

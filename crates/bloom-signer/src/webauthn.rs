@@ -1,6 +1,6 @@
 use ciborium::value::{Integer, Value};
 use p256::{
-    EncodedPoint,
+    Sec1Point,
     ecdsa::{Signature, VerifyingKey, signature::Verifier as _},
 };
 use serde::Deserialize;
@@ -235,8 +235,12 @@ fn verifying_key_from_cose(encoded: &Base64UrlBytes) -> Result<VerifyingKey, Pro
     let cose: Value = ciborium::from_reader(encoded.decode().as_slice())
         .map_err(|_| proof_error("credential COSE public key is malformed"))?;
     let (x, y) = validate_cose_value(&cose)?;
-    let point = EncodedPoint::from_affine_coordinates(x.into(), y.into(), false);
-    VerifyingKey::from_encoded_point(&point)
+    let point = Sec1Point::from_affine_coordinates(
+        x.try_into().expect("validated P-256 coordinate length"),
+        y.try_into().expect("validated P-256 coordinate length"),
+        false,
+    );
+    VerifyingKey::from_sec1_point(&point)
         .map_err(|_| proof_error("credential ES256 public key is invalid"))
 }
 
