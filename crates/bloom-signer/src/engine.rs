@@ -319,6 +319,13 @@ pub struct AuditPublicKeyBackup {
     pub verifying_key: Base64UrlBytes,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustodyExportAuditPayload {
+    wallet_id: Token,
+    backup_digest: Digest32,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignerBackupSet {
@@ -4226,6 +4233,9 @@ impl SignerEngine {
             &audit_keys.current_key_id,
             &audit_keys.trusted_keys,
         )?;
+        if !backup.derivation_allocations.is_empty() {
+            verify_backup_export_binding(backup)?;
+        }
         let current_epoch = wallet_epoch(&transaction, &backup.wallet_id)?;
         if backup.wallet_revocation_epoch.get() < current_epoch {
             return Err(error(
@@ -6170,6 +6180,25 @@ fn backup_export_material_digest(backup: &SignerBackupSet) -> Result<Digest32, P
     Ok(Digest32::from_bytes(
         Sha256::digest(serde_jcs::to_vec(&material).map_err(malformed)?).into(),
     ))
+}
+
+fn verify_backup_export_binding(backup: &SignerBackupSet) -> Result<(), ProtocolError> {
+    let export = backup
+        .audit_entries
+        .last()
+        .filter(|entry| entry.event_type == "custody.export")
+        .ok_or_else(|| malformed("backup audit chain does not end with custody.export"))?;
+    let payload: CustodyExportAuditPayload =
+        serde_json::from_str(&export.payload_jcs).map_err(malformed)?;
+    if payload.wallet_id != backup.wallet_id
+        || payload.backup_digest != backup_export_material_digest(backup)?
+    {
+        return Err(error(
+            ProtocolErrorCode::MalformedFrame,
+            "backup material differs from the signed custody.export event",
+        ));
+    }
+    Ok(())
 }
 
 fn load_audit_entries(connection: &Connection) -> Result<Vec<AuditEntryBackup>, ProtocolError> {
