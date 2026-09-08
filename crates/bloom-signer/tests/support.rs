@@ -184,7 +184,8 @@ fn client_data(kind: &str, challenge: &[u8]) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "type": kind,
         "challenge": Base64UrlBytes::from_bytes(challenge),
-        "origin": "http://localhost:18734",
+        "origin": bloom_signer::webauthn::configured_ceremony_origin()
+            .expect("the test environment selects a valid ceremony origin"),
         "crossOrigin": false
     }))
     .expect("client data serializes")
