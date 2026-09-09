@@ -2471,8 +2471,9 @@ impl SignerEngine {
                 let mut connection = self.connection.lock();
                 let mut number =
                     crate::derivation_registry::next_account_number(&connection, wallet_id)?;
-                // Skip BIP-32 invalid EVM children before touching the registry;
-                // the ordinary allocator tombstones them when it reaches them.
+                // A BIP-32 invalid EVM child at the chosen number is tombstoned
+                // exactly as the ordinary allocator would record it, and the
+                // next number is taken for both families.
                 if ordered.iter().any(|request| {
                     request.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1
                 }) {
@@ -2480,6 +2481,15 @@ impl SignerEngine {
                         bloom_signer_derive::derive_evm_account(&seed, 0, number),
                         Err(bloom_signer_derive::Secp256k1DeriveError::InvalidChild)
                     ) {
+                        crate::derivation_registry::record_invalid_child_tombstone(
+                            &connection,
+                            wallet_id,
+                            crate::derivation_registry::PROFILE_EVM,
+                            crate::derivation_registry::ROLE_EVM_ACCOUNT,
+                            0,
+                            number,
+                            now_ms,
+                        )?;
                         number = number.checked_add(1).ok_or_else(|| {
                             error(
                                 ProtocolErrorCode::LimitExceededOperations,

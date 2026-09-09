@@ -449,7 +449,38 @@ pub fn next_account_number(
         })
 }
 
-/// [`prepare_allocation`] with an explicit EVM address index. Used only by
+/// Record that `(account, index)` is a BIP-32 invalid child so no later
+/// allocation, targeted or ordinary, ever selects it. `INSERT OR IGNORE`
+/// keeps a retry with the same conclusion a no-op.
+#[allow(clippy::too_many_arguments)]
+pub fn record_invalid_child_tombstone(
+    connection: &Connection,
+    wallet_id: &Token,
+    profile: &str,
+    role: &str,
+    account: u32,
+    index: u32,
+    now_ms: u64,
+) -> Result<(), ProtocolError> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO derivation_tombstones
+                (wallet_id, profile, role, account, \"index\", reason, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'invalid-child', ?6)",
+            rusqlite::params![
+                wallet_id.as_str(),
+                profile,
+                role,
+                i64::from(account),
+                i64::from(index),
+                now_ms as i64
+            ],
+        )
+        .map_err(storage)?;
+    Ok(())
+}
+
+/// [`prepare_allocation`] with an explicit EVM address index.
 /// Signer's own multi-family allocation so both children of one account
 /// share a number; callers outside the engine cannot reach it. A target on
 /// an index that any allocation or tombstone already occupies is a typed
@@ -600,21 +631,15 @@ pub fn prepare_allocation_at(
             if invalid_child(account, index) {
                 // Record the invalid child so the next target skips it, then
                 // report it as invalid. Nothing else about the namespace moves.
-                transaction
-                    .execute(
-                        "INSERT OR IGNORE INTO derivation_tombstones
-                            (wallet_id, profile, role, account, \"index\", reason, created_at_ms)
-                         VALUES (?1, ?2, ?3, ?4, ?5, 'invalid-child', ?6)",
-                        rusqlite::params![
-                            wallet_id.as_str(),
-                            profile,
-                            role,
-                            i64::from(account),
-                            i64::from(index),
-                            now_ms as i64
-                        ],
-                    )
-                    .map_err(storage)?;
+                record_invalid_child_tombstone(
+                    &transaction,
+                    wallet_id,
+                    profile,
+                    role,
+                    account,
+                    index,
+                    now_ms,
+                )?;
                 transaction.commit().map_err(storage)?;
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::BackendInvalidRequest,

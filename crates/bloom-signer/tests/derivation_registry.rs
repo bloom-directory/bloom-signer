@@ -990,6 +990,52 @@ fn explicit_index_on_an_occupied_tombstoned_or_invalid_index_fails_typed() {
 }
 
 #[test]
+fn recorded_invalid_children_are_never_targeted() {
+    let mut connection = connection();
+    let wallet = primary();
+    registry::record_invalid_child_tombstone(
+        &connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        0,
+        3,
+        1_000,
+    )
+    .unwrap();
+    // Retrying the same conclusion is a no-op, not a duplicate row.
+    registry::record_invalid_child_tombstone(
+        &connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        0,
+        3,
+        1_100,
+    )
+    .unwrap();
+    let error = registry::prepare_allocation_at(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        None,
+        Some(3),
+        "op-target-invalid",
+        |_, _| false,
+        1_200,
+        &noop,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("tombstoned"), "{error}");
+    // The ordinary counter is untouched by a tombstone-only record.
+    assert_eq!(
+        registry::next_account_number(&connection, &wallet).unwrap(),
+        0
+    );
+}
+
+#[test]
 fn next_account_number_spans_both_families_and_counts_dead_paths() {
     let mut connection = connection();
     let wallet = primary();
@@ -1065,4 +1111,34 @@ fn next_account_number_spans_both_families_and_counts_dead_paths() {
         registry::next_account_number(&connection, &wallet).unwrap(),
         8
     );
+
+    // A retired row keeps its account and its index, so retirement never
+    // frees its number.
+    registry::commit_index(&mut connection, &wallet, "op-sol-7", 3_350, &noop).unwrap();
+    let (spki, fingerprint) = spki_fixture(3);
+    registry::commit_account(
+        &mut connection,
+        &wallet,
+        "op-sol-7",
+        &spki,
+        &fingerprint,
+        3_360,
+        &noop,
+    )
+    .unwrap();
+    registry::activate(&mut connection, &wallet, "op-sol-7", 3_370, &noop).unwrap();
+    registry::retire(&mut connection, &wallet, "op-sol-7", 3_400, &noop).unwrap();
+    assert_eq!(
+        registry::next_account_number(&connection, &wallet).unwrap(),
+        8
+    );
+    let retired: (String, i64) = connection
+        .query_row(
+            "SELECT state, account FROM derivation_allocations
+              WHERE wallet_id = ?1 AND operation_id = 'op-sol-7'",
+            rusqlite::params![wallet.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(retired, ("RETIRED".to_owned(), 7));
 }
