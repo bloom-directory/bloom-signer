@@ -1746,6 +1746,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
             .get(&registered_root.backend, &registered_root.backend_instance)
             .is_err()
     );
+    let engine_after_restart = engine.clone();
     let restarted = SignerCeremonyService::new(
         engine,
         Token::new("signer-ceremony-key").unwrap(),
@@ -1753,6 +1754,24 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
     )
     .unwrap();
     assert!(!registry.key_is_available(&registered_root).unwrap());
+    let restarted_accounts = engine_after_restart
+        .derived_account_descriptors(&registered_wallet_id)
+        .unwrap();
+    assert_eq!(
+        restarted_accounts.len(),
+        2,
+        "both registration children survive the restart"
+    );
+    assert!(
+        restarted_accounts
+            .iter()
+            .all(|account| account.lifecycle == AccountLifecycleState::Active)
+    );
+    assert!(
+        restarted_accounts
+            .iter()
+            .any(|account| account.path == "m/44'/501'/0'/0'")
+    );
     let mut activation_terms = terms(registered_root.clone());
     activation_terms.wallet_id = registered_wallet_id.clone();
     complete_local_approval(
@@ -3545,7 +3564,7 @@ fn failed_bip39_registration_removes_the_provisioned_backend_before_retry() {
         .unwrap(),
     );
     let service = SignerCeremonyService::new(
-        engine,
+        engine.clone(),
         Token::new("signer-ceremony-key").unwrap(),
         SigningKey::from_bytes(&[9; 32]),
     )
@@ -3555,9 +3574,10 @@ fn failed_bip39_registration_removes_the_provisioned_backend_before_retry() {
     let connection = rusqlite::Connection::open(&database).unwrap();
     connection
         .execute_batch(
-            "CREATE TRIGGER fail_initial_allocation
+            "CREATE TRIGGER fail_solana_allocation
              BEFORE INSERT ON derivation_allocations
-             BEGIN SELECT RAISE(FAIL, 'forced initial allocation failure'); END;",
+             WHEN NEW.profile = 'bip44-solana-slip10-ed25519-v1'
+             BEGIN SELECT RAISE(FAIL, 'forced solana allocation failure'); END;",
         )
         .unwrap();
     let error = try_complete_bip39_registration(
@@ -3575,9 +3595,21 @@ fn failed_bip39_registration_removes_the_provisioned_backend_before_retry() {
             .is_err(),
         "a failed registration must not retain the provisioned backend"
     );
+    let rows: Vec<(String, String)> = connection
+        .prepare("SELECT profile, state FROM derivation_allocations WHERE wallet_id = ?1")
+        .unwrap()
+        .query_map([wallet_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![("bip44-evm-secp256k1-v1".to_owned(), "TOMBSTONED".to_owned())],
+        "the already-activated EVM sibling is tombstoned and no other row survives"
+    );
 
     connection
-        .execute_batch("DROP TRIGGER fail_initial_allocation;")
+        .execute_batch("DROP TRIGGER fail_solana_allocation;")
         .unwrap();
     drop(connection);
     let retried = complete_bip39_registration(
@@ -3588,6 +3620,19 @@ fn failed_bip39_registration_removes_the_provisioned_backend_before_retry() {
         11_000,
     );
     assert_eq!(retried.public_key_refs.len(), 2);
+    let retried_evm = engine
+        .derived_account_descriptor(&retried.public_key_refs[0])
+        .unwrap()
+        .unwrap();
+    let retried_solana = engine
+        .derived_account_descriptor(&retried.public_key_refs[1])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retried_evm.path, "m/44'/60'/0'/0/1",
+        "the tombstoned number is never reused"
+    );
+    assert_eq!(retried_solana.path, "m/44'/501'/1'/0'");
 }
 
 #[test]
