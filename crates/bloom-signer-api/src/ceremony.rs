@@ -336,32 +336,19 @@ pub struct CustodyPrepareRequest {
     /// BIP-39 root. Broker selects; Signer validates against capabilities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wallet_seed_profile: Option<crate::WalletSeedProfile>,
-    /// Derived-account allocation request (AccountAllocate custody only).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub derivation_request: Option<crate::DerivedAccountRequest>,
-    /// Several families allocated under one account number in one ceremony
+    /// Families allocated under one account number in one ceremony
     /// (AccountAllocate custody only). Signer chooses the number; the request
-    /// carries none. Exactly one of `derivation_request` and this list is set.
+    /// carries none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derivation_requests: Vec<crate::DerivedAccountRequest>,
 }
 
 impl CustodyPrepareRequest {
-    /// Every derivation request this custody carries, in a fixed order.
-    pub fn effective_derivation_requests(&self) -> Vec<&crate::DerivedAccountRequest> {
-        self.derivation_request
-            .iter()
-            .chain(self.derivation_requests.iter())
-            .collect()
-    }
-
     /// Validate the derivation requests against the ceremony kind. Broker and
     /// Signer both call this before accepting an allocation.
     pub fn validate_derivation_requests(&self) -> Result<(), ProtocolError> {
-        let single = self.derivation_request.is_some();
-        let several = !self.derivation_requests.is_empty();
         if self.ceremony_kind != CeremonyKind::AccountAllocate {
-            if single || several {
+            if !self.derivation_requests.is_empty() {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::CeremonyKindMismatch,
                     "derivation requests are valid only for account allocation",
@@ -369,10 +356,10 @@ impl CustodyPrepareRequest {
             }
             return Ok(());
         }
-        if single == several {
+        if self.derivation_requests.is_empty() || self.derivation_requests.len() > 2 {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
-                "AccountAllocate requires exactly one of derivation_request or derivation_requests",
+                "AccountAllocate requires one or two derivation requests",
             ));
         }
         if self.wallet_id.is_none() {
@@ -381,31 +368,19 @@ impl CustodyPrepareRequest {
                 "AccountAllocate requires an authoritative wallet ID",
             ));
         }
-        let requests = self.effective_derivation_requests();
+        let requests = &self.derivation_requests;
         let mut profiles = std::collections::HashSet::new();
-        for request in &requests {
+        for request in requests {
             if !profiles.insert(request.derivation_profile) {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::MalformedFrame,
                     "one allocation names each derivation profile at most once",
                 ));
             }
-            // Bloom accounts live under hardened account 0 for EVM; a different
-            // hardened account is a different key tree, never a Bloom account.
-            if request.derivation_profile == crate::DerivationProfile::Bip44EvmSecp256k1V1
-                && request.account.is_some_and(|account| account != 0)
-            {
+            if request.account.is_some() {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::MalformedFrame,
-                    "EVM allocation requires hardened account 0",
-                ));
-            }
-            // A multi-family allocation is numbered by Signer, so no request
-            // in it may pin a Solana account either.
-            if several && request.account.is_some() {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::MalformedFrame,
-                    "a multi-family allocation cannot pin a derivation account",
+                    "allocation requests cannot pin derivation account numbers",
                 ));
             }
         }
@@ -912,7 +887,6 @@ mod tests {
             petal_key_scope: Some(scope),
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
-            derivation_request: None,
             derivation_requests: Vec::new(),
         }
     }
@@ -929,7 +903,6 @@ mod tests {
             petal_key_scope: None,
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
-            derivation_request: None,
             derivation_requests: Vec::new(),
         }
     }

@@ -297,7 +297,6 @@ fn register_wallet(
         petal_key_scope: None,
         legacy_passkey_migration: None,
         wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
-        derivation_request: None,
         derivation_requests: Vec::new(),
     };
     let prepared = service.prepare_custody(prepare, now_ms).unwrap();
@@ -377,7 +376,6 @@ fn complete_new_wallet(
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
-                derivation_request: None,
                 derivation_requests: Vec::new(),
                 wallet_seed_profile,
             },
@@ -469,7 +467,6 @@ fn complete_generic(
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: None,
-            derivation_request: None,
             derivation_requests: Vec::new(),
             wallet_seed_profile: None,
         },
@@ -549,7 +546,6 @@ fn complete_credential_change(
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
-                derivation_request: None,
                 derivation_requests: Vec::new(),
                 wallet_seed_profile: None,
             },
@@ -641,7 +637,6 @@ fn complete_petal_key_derivation(
             petal_key_scope: Some(scope.clone()),
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
-            derivation_request: None,
             derivation_requests: Vec::new(),
         },
         now_ms,
@@ -716,7 +711,6 @@ fn complete_policy_update(
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: None,
-            derivation_request: None,
             derivation_requests: Vec::new(),
             wallet_seed_profile: None,
         },
@@ -807,12 +801,16 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     )
     .unwrap();
     let (wallet_id, _) = register_wallet(&service, &authenticator, operation("b1"), 10_000);
-    // A BIP-39 wallet's root is a non-signable seed. Registration allocates
-    // its canonical primary EVM child, which is the valid Petal parent; do not
-    // manufacture a second role at the same derivation path.
+    // A BIP-39 wallet's root is a non-signable seed. Registration allocates both
+    // families and the primary EVM child is the canonical Petal parent.
     let accounts = engine.derived_account_descriptors(&wallet_id).unwrap();
-    assert_eq!(accounts.len(), 1);
-    let parent = accounts[0].key_ref.clone();
+    assert_eq!(accounts.len(), 2);
+    let parent = accounts
+        .iter()
+        .find(|account| account.key_ref.key_spec == KeySpec::Secp256k1)
+        .unwrap()
+        .key_ref
+        .clone();
     let base_scope = PetalKeyScope {
         wallet_id: wallet_id.clone(),
         parent_key_ref: parent.clone(),
@@ -843,7 +841,6 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
                     petal_key_scope: Some(cross_wallet),
                     legacy_passkey_migration: None,
                     wallet_seed_profile: None,
-                    derivation_request: None,
                     derivation_requests: Vec::new(),
                 },
                 10_150,
@@ -1607,7 +1604,6 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
         browser_output_recipient_key: None,
         petal_key_scope: None,
         legacy_passkey_migration: None,
-        derivation_request: None,
         derivation_requests: Vec::new(),
         wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
     };
@@ -1672,7 +1668,6 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
         browser_output_recipient_key: None,
         petal_key_scope: None,
         legacy_passkey_migration: None,
-        derivation_request: None,
         derivation_requests: Vec::new(),
         wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
     };
@@ -1716,28 +1711,24 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
         .complete_custody(successful_completion.clone(), 3_700)
         .unwrap();
     assert_eq!(result.public_status, CeremonyState::Completed);
-    assert_eq!(result.public_key_refs.len(), 1);
-    assert_eq!(result.public_key_refs[0].backend.as_str(), "local");
-    assert_eq!(
-        result.public_key_refs[0].backend_instance,
-        registered_wallet_id
-    );
-    result.public_key_refs[0].validate().unwrap();
+    assert_eq!(result.public_key_refs.len(), 2);
+    let evm_root = &result.public_key_refs[0];
+    let solana_root = &result.public_key_refs[1];
+    assert_eq!(evm_root.backend.as_str(), "local");
+    assert_eq!(evm_root.backend_instance, registered_wallet_id);
+    evm_root.validate().unwrap();
+    solana_root.validate().unwrap();
     let backend = registry
-        .get(
-            &result.public_key_refs[0].backend,
-            &result.public_key_refs[0].backend_instance,
-        )
+        .get(&evm_root.backend, &evm_root.backend_instance)
         .unwrap();
-    let description =
-        futures::executor::block_on(backend.describe_key(&result.public_key_refs[0])).unwrap();
+    let description = futures::executor::block_on(backend.describe_key(evm_root)).unwrap();
     assert_eq!(
         description.public_key_fingerprint,
-        result.public_key_refs[0].public_key_fingerprint
+        evm_root.public_key_fingerprint
     );
     let signature = futures::executor::block_on(backend.sign(BackendSignRequest {
         provider_attempt_id: digest("d4"),
-        key_ref: result.public_key_refs[0].clone(),
+        key_ref: evm_root.clone(),
         crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
         input: BackendInput::Digest32 {
             digest: digest("d5"),
@@ -1747,7 +1738,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
     .unwrap();
     assert_eq!(signature.bytes.decode().len(), 65);
 
-    let registered_root = result.public_key_refs[0].clone();
+    let registered_root = evm_root.clone();
     drop(service);
     registry.remove_local_wallet_backend(&registered_root);
     assert!(
@@ -1791,7 +1782,6 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
-                derivation_request: None,
                 derivation_requests: Vec::new(),
                 wallet_seed_profile: None,
             },
@@ -1814,7 +1804,6 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
-                derivation_request: None,
                 derivation_requests: Vec::new(),
                 wallet_seed_profile: None,
             },
@@ -1879,7 +1868,6 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
-                derivation_request: None,
                 derivation_requests: Vec::new(),
                 wallet_seed_profile: None,
             },
@@ -1918,7 +1906,6 @@ fn registration_requires_and_reserves_the_requested_wallet_id() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
-                derivation_request: None,
                 derivation_requests: Vec::new(),
                 wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
             },
@@ -1939,7 +1926,6 @@ fn registration_requires_and_reserves_the_requested_wallet_id() {
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
-                derivation_request: None,
                 derivation_requests: Vec::new(),
                 wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
             },
@@ -2027,7 +2013,6 @@ fn legacy_passkey_import_converts_existing_credential_into_current_custody() {
         petal_key_scope: None,
         legacy_passkey_migration: Some(receipt.public_terms().unwrap()),
         wallet_seed_profile: None,
-        derivation_request: None,
         derivation_requests: Vec::new(),
     };
     let initially_prepared = service.prepare_custody(request, 40_000).unwrap();
@@ -2170,7 +2155,6 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
-                derivation_request: None,
                 derivation_requests: Vec::new(),
                 wallet_seed_profile: None,
             },
@@ -2260,7 +2244,6 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
-                derivation_request: None,
                 derivation_requests: Vec::new(),
                 wallet_seed_profile: None,
             },
@@ -2434,7 +2417,6 @@ fn credential_replace_remove_and_backend_enrollment_do_not_spend_approval_capaci
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
-                derivation_request: None,
                 derivation_requests: Vec::new(),
                 wallet_seed_profile: None,
             },
@@ -2722,7 +2704,6 @@ fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
                 petal_key_scope: Some(scope.clone()),
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
-                derivation_request: None,
                 derivation_requests: Vec::new(),
             },
             10_100,
@@ -2882,7 +2863,6 @@ fn bip39_registration_prepare(
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
-                derivation_request: None,
                 derivation_requests: Vec::new(),
             },
             now_ms,
@@ -2969,7 +2949,6 @@ fn complete_bip39_mnemonic_import(
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
-                derivation_request: None,
                 derivation_requests: Vec::new(),
             },
             now_ms,
@@ -3043,7 +3022,6 @@ fn attempt_bip39_mnemonic_import(
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
-                derivation_request: None,
                 derivation_requests: Vec::new(),
             },
             now_ms,
@@ -3120,8 +3098,7 @@ fn complete_account_allocate(
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
-                derivation_request: Some(request),
-                derivation_requests: Vec::new(),
+                derivation_requests: vec![request],
             },
             now_ms,
         )
@@ -3175,7 +3152,6 @@ fn complete_account_allocate(
 fn account_allocate_prepare(
     wallet_id: &Token,
     operation_id: &OperationId,
-    single: Option<DerivedAccountRequest>,
     many: Vec<DerivedAccountRequest>,
 ) -> (CustodyPrepareRequest, Digest32, serde_json::Value) {
     let effect = serde_json::json!({ "kind": "account_allocate" });
@@ -3193,7 +3169,6 @@ fn account_allocate_prepare(
             petal_key_scope: None,
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
-            derivation_request: single,
             derivation_requests: many,
         },
         exact_terms_digest,
@@ -3211,7 +3186,7 @@ fn complete_account_allocate_many(
     now_ms: u64,
 ) -> CustodyResult {
     let (request, exact_terms_digest, effect) =
-        account_allocate_prepare(wallet_id, operation_id, None, requests);
+        account_allocate_prepare(wallet_id, operation_id, requests);
     let prepared = service.prepare_custody(request, now_ms).unwrap();
     let assertion = authenticator.assertion(
         &prepared.challenges[0].canonical_bytes().unwrap(),
@@ -3291,7 +3266,7 @@ fn bip39_two_family_allocation_shares_one_number_chosen_by_signer() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, engine, _registry) = bip39_service(&authenticator);
     let wallet_id = Token::new("bip39-wallet-pair").unwrap();
-    // Registration allocates EVM index 0.
+    // Registration allocates both families at index 0.
     complete_bip39_registration(
         &service,
         &authenticator,
@@ -3299,7 +3274,7 @@ fn bip39_two_family_allocation_shares_one_number_chosen_by_signer() {
         &operation("a0"),
         10_000,
     );
-    // A Solana-only allocation takes account 0, pairing with it.
+    // A Solana-only allocation takes account 1, the next shared number.
     let (solana_zero, _) = complete_account_allocate(
         &service,
         &authenticator,
@@ -3314,7 +3289,7 @@ fn bip39_two_family_allocation_shares_one_number_chosen_by_signer() {
             .unwrap()
             .unwrap()
             .path,
-        "m/44'/501'/0'/0'"
+        "m/44'/501'/1'/0'"
     );
 
     // Both families in one ceremony: one number, chosen by Signer.
@@ -3329,11 +3304,11 @@ fn bip39_two_family_allocation_shares_one_number_chosen_by_signer() {
     assert_eq!(pair.public_key_refs.len(), 2);
     assert_eq!(
         paths_by_family(&engine, &pair),
-        ("m/44'/60'/0'/0/1".to_owned(), "m/44'/501'/1'/0'".to_owned())
+        ("m/44'/60'/0'/0/2".to_owned(), "m/44'/501'/2'/0'".to_owned())
     );
 
-    // A Solana-only allocation advances Solana alone to account 2, so the next
-    // pair must jump EVM from index 2 to 3 to stay under one number.
+    // A Solana-only allocation advances Solana alone to account 3, so the next
+    // pair must jump both families to 4 to keep one shared number.
     complete_account_allocate(
         &service,
         &authenticator,
@@ -3352,7 +3327,7 @@ fn bip39_two_family_allocation_shares_one_number_chosen_by_signer() {
     );
     assert_eq!(
         paths_by_family(&engine, &jumped),
-        ("m/44'/60'/0'/0/3".to_owned(), "m/44'/501'/3'/0'".to_owned())
+        ("m/44'/60'/0'/0/4".to_owned(), "m/44'/501'/4'/0'".to_owned())
     );
 
     // The ordinary EVM allocator continues after the jump, never inside it.
@@ -3370,13 +3345,13 @@ fn bip39_two_family_allocation_shares_one_number_chosen_by_signer() {
             .unwrap()
             .unwrap()
             .path,
-        "m/44'/60'/0'/0/4"
+        "m/44'/60'/0'/0/5"
     );
     // Every child is listed, active, and unique.
     let listed = engine.derived_account_descriptors(&wallet_id).unwrap();
-    assert_eq!(listed.len(), 8);
+    assert_eq!(listed.len(), 9);
     let paths: std::collections::BTreeSet<_> = listed.iter().map(|d| d.path.clone()).collect();
-    assert_eq!(paths.len(), 8);
+    assert_eq!(paths.len(), 9);
 }
 
 #[test]
@@ -3392,33 +3367,41 @@ fn account_allocation_request_shapes_are_validated_at_prepare() {
         10_000,
     );
 
-    let rejected = |single: Option<DerivedAccountRequest>, many: Vec<DerivedAccountRequest>| {
-        let (request, _, _) = account_allocate_prepare(&wallet_id, &operation("b1"), single, many);
+    let rejected = |requests: Vec<DerivedAccountRequest>| {
+        let (request, _, _) = account_allocate_prepare(&wallet_id, &operation("b1"), requests);
         service.prepare_custody(request, 10_100).unwrap_err().code
     };
-    // Both shapes at once, or neither.
-    assert_eq!(
-        rejected(Some(evm_request(None)), vec![solana_request(None)]),
-        ProtocolErrorCode::MalformedFrame
-    );
-    assert_eq!(
-        rejected(None, Vec::new()),
-        ProtocolErrorCode::MalformedFrame
-    );
+    assert_eq!(rejected(vec![]), ProtocolErrorCode::MalformedFrame);
     // One request per profile.
     assert_eq!(
-        rejected(None, vec![solana_request(None), solana_request(None)]),
+        rejected(vec![solana_request(None), solana_request(None)]),
         ProtocolErrorCode::MalformedFrame
     );
     // A Bloom account never lives under a non-zero EVM hardened account.
+    // Signer allocations must not pin a derivation account.
     assert_eq!(
-        rejected(Some(evm_request(Some(1))), Vec::new()),
+        rejected(vec![evm_request(Some(1))]),
         ProtocolErrorCode::MalformedFrame
     );
-    // Signer numbers a multi-family allocation; a pinned account is refused.
     assert_eq!(
-        rejected(None, vec![evm_request(None), solana_request(Some(0))]),
+        rejected(vec![evm_request(Some(0))]),
         ProtocolErrorCode::MalformedFrame
+    );
+    // Multi-family allocation combines both profiles in one request.
+    assert_eq!(
+        rejected(vec![evm_request(None), solana_request(Some(0))]),
+        ProtocolErrorCode::MalformedFrame
+    );
+    assert_eq!(
+        service
+            .prepare_custody(
+                account_allocate_prepare(&wallet_id, &operation("b2"), vec![evm_request(None)]).0,
+                10_200,
+            )
+            .unwrap()
+            .contribution
+            .wallet_id,
+        Some(wallet_id.clone())
     );
 }
 
@@ -3446,7 +3429,6 @@ fn complete_account_retire(
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
-                derivation_request: None,
                 derivation_requests: Vec::new(),
             },
             now_ms,
@@ -3497,7 +3479,7 @@ fn complete_account_retire(
 }
 
 #[test]
-fn bip39_registration_allocates_the_initial_evm_child_without_a_root_keyref() {
+fn bip39_registration_allocates_both_initial_children_without_a_root_keyref() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, _engine, _registry) = bip39_service(&authenticator);
     let wallet_id = Token::new("bip39-wallet-a").unwrap();
@@ -3509,17 +3491,32 @@ fn bip39_registration_allocates_the_initial_evm_child_without_a_root_keyref() {
         10_000,
     );
     assert_eq!(result.wallet_id.as_ref(), Some(&wallet_id));
-    assert_eq!(result.public_key_refs.len(), 1);
-    let child = &result.public_key_refs[0];
+    assert_eq!(result.public_key_refs.len(), 2);
+    let evm_child = &result.public_key_refs[0];
+    let solana_child = &result.public_key_refs[1];
     // The child is a derived account, never a root, at the canonical EVM path.
     assert!(matches!(
-        child.derivation,
+        evm_child.derivation,
         Some(DerivationRef::Bip39Multicurve { .. })
     ));
-    assert_eq!(child.key_spec, KeySpec::Secp256k1);
-    let descriptor = _engine.derived_account_descriptor(child).unwrap().unwrap();
+    assert_eq!(evm_child.key_spec, KeySpec::Secp256k1);
+    let descriptor = _engine
+        .derived_account_descriptor(evm_child)
+        .unwrap()
+        .unwrap();
     assert_eq!(descriptor.path, "m/44'/60'/0'/0/0");
     assert_eq!(descriptor.lifecycle, AccountLifecycleState::Active);
+    assert!(matches!(
+        solana_child.derivation,
+        Some(DerivationRef::Bip39Multicurve { .. })
+    ));
+    assert_eq!(solana_child.key_spec, KeySpec::Ed25519);
+    let solana_descriptor = _engine
+        .derived_account_descriptor(solana_child)
+        .unwrap()
+        .unwrap();
+    assert_eq!(solana_descriptor.path, "m/44'/501'/0'/0'");
+    assert_eq!(solana_descriptor.lifecycle, AccountLifecycleState::Active);
     // The root is not signable: root_key_ref is absent for this backend.
     assert!(
         _registry
@@ -3590,7 +3587,7 @@ fn failed_bip39_registration_removes_the_provisioned_backend_before_retry() {
         &operation("a8"),
         11_000,
     );
-    assert_eq!(retried.public_key_refs.len(), 1);
+    assert_eq!(retried.public_key_refs.len(), 2);
 }
 
 #[test]
@@ -3623,7 +3620,7 @@ fn bip39_solana_allocation_is_deterministic_and_advances_accounts() {
         .derived_account_descriptor(&first_child)
         .unwrap()
         .unwrap();
-    assert_eq!(first_descriptor.path, "m/44'/501'/0'/0'");
+    assert_eq!(first_descriptor.path, "m/44'/501'/1'/0'");
 
     // A new operation allocates the next account (Solana paths are
     // account-scoped, so account advances, never a path index).
@@ -3644,7 +3641,7 @@ fn bip39_solana_allocation_is_deterministic_and_advances_accounts() {
         .derived_account_descriptor(&second_child)
         .unwrap()
         .unwrap();
-    assert_eq!(second_descriptor.path, "m/44'/501'/1'/0'");
+    assert_eq!(second_descriptor.path, "m/44'/501'/2'/0'");
     assert_ne!(first_child, second_child);
 }
 
@@ -3653,26 +3650,14 @@ fn bip39_retire_then_sign_is_refused() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, engine, registry) = bip39_service(&authenticator);
     let wallet_id = Token::new("bip39-wallet-c").unwrap();
-    complete_bip39_registration(
+    let registration = complete_bip39_registration(
         &service,
         &authenticator,
         &wallet_id,
         &operation("ee"),
         10_000,
     );
-    let (allocate, _) = complete_account_allocate(
-        &service,
-        &authenticator,
-        &wallet_id,
-        &operation("ff"),
-        DerivedAccountRequest {
-            derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-            requested_role: Token::new("solana-account").unwrap(),
-            account: Some(0),
-        },
-        10_100,
-    );
-    let child = allocate.public_key_refs[0].clone();
+    let child = registration.public_key_refs[1].clone();
     complete_account_retire(
         &service,
         &authenticator,
@@ -3715,7 +3700,7 @@ fn bip39_mnemonic_export_seals_words_and_frozen_import_reproduces_vectors() {
         bloom_signer_vectors::BIP39_MNEMONIC,
         10_000,
     );
-    assert_eq!(import_result.public_key_refs.len(), 1);
+    assert_eq!(import_result.public_key_refs.len(), 2);
     let frozen_child = import_result.public_key_refs[0].clone();
     let frozen_descriptor = engine
         .derived_account_descriptor(&frozen_child)
@@ -3745,7 +3730,6 @@ fn bip39_mnemonic_export_seals_words_and_frozen_import_reproduces_vectors() {
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
-                derivation_request: None,
                 derivation_requests: Vec::new(),
             },
             10_100,
@@ -3826,7 +3810,6 @@ fn bip39_import_accepts_12_to_24_words_and_records_the_entropy_bits() {
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
-                derivation_request: None,
                 derivation_requests: Vec::new(),
             },
             10_000,
@@ -3886,7 +3869,7 @@ fn bip39_import_accepts_12_to_24_words_and_records_the_entropy_bits() {
         twelve,
         10_200,
     );
-    assert_eq!(result.public_key_refs.len(), 1);
+    assert_eq!(result.public_key_refs.len(), 2);
     let descriptor = engine
         .derived_account_descriptor(&result.public_key_refs[0])
         .unwrap()
@@ -3959,26 +3942,14 @@ fn bip39_solana_child_backup_restore_round_trips_derivation_registry() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, engine, registry) = bip39_service(&authenticator);
     let wallet_id = Token::new("bip39-wallet-bk").unwrap();
-    complete_bip39_registration(
+    let registration = complete_bip39_registration(
         &service,
         &authenticator,
         &wallet_id,
         &operation("b1"),
         10_000,
     );
-    let (allocate, _) = complete_account_allocate(
-        &service,
-        &authenticator,
-        &wallet_id,
-        &operation("b2"),
-        DerivedAccountRequest {
-            derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-            requested_role: Token::new("solana-account").unwrap(),
-            account: Some(0),
-        },
-        10_100,
-    );
-    let child = allocate.public_key_refs[0].clone();
+    let child = registration.public_key_refs[1].clone();
     let before = engine
         .derived_account_descriptor(&child)
         .unwrap()
@@ -4044,26 +4015,14 @@ fn bip39_solana_child_export_refuses_empty_pinned_keys() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, engine, registry) = bip39_service(&authenticator);
     let wallet_id = Token::new("bip39-wallet-bk2").unwrap();
-    complete_bip39_registration(
+    let registration = complete_bip39_registration(
         &service,
         &authenticator,
         &wallet_id,
         &operation("c1"),
         10_000,
     );
-    let (allocate, _) = complete_account_allocate(
-        &service,
-        &authenticator,
-        &wallet_id,
-        &operation("c2"),
-        DerivedAccountRequest {
-            derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-            requested_role: Token::new("solana-account").unwrap(),
-            account: Some(0),
-        },
-        10_100,
-    );
-    let child = allocate.public_key_refs[0].clone();
+    let child = registration.public_key_refs[1].clone();
     let encrypted_record = registry.local_encrypted_backup(&child).unwrap();
     let enrollment = BackendEnrollmentBackup {
         backend: child.backend.clone(),

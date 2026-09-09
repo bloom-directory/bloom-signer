@@ -1838,33 +1838,44 @@ impl SignerCeremonyService {
                             registration.wallet_id.clone(),
                         );
                         // D1: allocate the canonical initial EVM account
-                        // m/44'/60'/0'/0/0 inside the same apply. The root is
-                        // never a signable KeyRef, so public_key_refs holds the
-                        // initial child only.
-                        let initial_request = bloom_signer_api::DerivedAccountRequest {
-                            derivation_profile:
-                                bloom_signer_api::DerivationProfile::Bip44EvmSecp256k1V1,
-                            requested_role: Token::new("primary-evm").expect("static token"),
-                            account: Some(0),
-                        };
-                        let (child_key_ref, _descriptor) = self.engine.allocate_bip39_account(
+                        // m/44'/60'/0'/0/0 and the canonical Solana child
+                        // inside the same apply. The root is never a signable
+                        // KeyRef, so both public_key_refs are allocated here.
+                        let requests = [
+                            bloom_signer_api::DerivedAccountRequest {
+                                derivation_profile:
+                                    bloom_signer_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                                requested_role: Token::new("primary-evm").expect("static token"),
+                                account: None,
+                            },
+                            bloom_signer_api::DerivedAccountRequest {
+                                derivation_profile:
+                                    bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                                requested_role: Token::new("solana-account").expect("static token"),
+                                account: None,
+                            },
+                        ];
+                        let children = self.engine.allocate_bip39_accounts(
                             &registration.wallet_id,
                             &prepare.custody_operation_id,
-                            &initial_request,
+                            &requests,
                             &unlocked,
                             now_ms,
                         )?;
                         // Capture the enrollment with the post-allocation
-                        // backend record so a restart re-registers the child.
+                        // backend record so a restart re-registers the children.
                         let encrypted_record = self
                             .engine
                             .backend_registry()
-                            .local_encrypted_backup(&child_key_ref)?;
+                            .local_encrypted_backup(&children[0].key_ref)?;
+                        let backup: bloom_signer_backend_local::EncryptedLocalBackup =
+                            serde_json::from_slice(&encrypted_record.decode())
+                                .map_err(malformed)?;
                         let enrollment = crate::engine::BackendEnrollmentBackup {
                             backend: Token::new("local").expect("static token"),
                             backend_instance: registration.wallet_id.clone(),
                             encrypted_record,
-                            pinned_keys: vec![child_key_ref.clone()],
+                            pinned_keys: backup.derivation_registry,
                         };
                         let CeremonyDatabaseEffect::InitialPolicy {
                             backend_enrollment, ..
@@ -1873,8 +1884,15 @@ impl SignerCeremonyService {
                             return Err(kind_mismatch());
                         };
                         *backend_enrollment = Some(enrollment);
-                        rollback_provisioned_backend = Some(child_key_ref.clone());
-                        public_key_refs = vec![child_key_ref];
+                        rollback_provisioned_backend = Some(children[0].key_ref.clone());
+                        public_key_refs = children.iter().map(|key| key.key_ref.clone()).collect();
+                        derived_keys = children
+                            .iter()
+                            .map(|key| DerivedKeyCommit {
+                                key_ref: key.key_ref.clone(),
+                                operation_id: key.operation_id.clone(),
+                            })
+                            .collect();
                         provisioned_backend.disarm();
                     } else {
                         let (root_key_ref, encrypted_record) = self
@@ -2314,11 +2332,7 @@ impl SignerCeremonyService {
                 Err(kind_mismatch())
             }
             (CeremonyKind::AccountAllocate, GenericCustodyEffect::AccountAllocate) => {
-                let requests: Vec<bloom_signer_api::DerivedAccountRequest> = prepare
-                    .effective_derivation_requests()
-                    .into_iter()
-                    .cloned()
-                    .collect();
+                let requests = prepare.derivation_requests.clone();
                 if requests.is_empty() {
                     return Err(kind_mismatch());
                 }
@@ -3188,7 +3202,6 @@ mod tests {
             browser_output_recipient_key: None,
             petal_key_scope: None,
             legacy_passkey_migration: None,
-            derivation_request: None,
             derivation_requests: Vec::new(),
             wallet_seed_profile: None,
         }
