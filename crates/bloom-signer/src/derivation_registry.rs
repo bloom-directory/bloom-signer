@@ -394,10 +394,96 @@ pub fn prepare_allocation(
     now_ms: u64,
     audit: AuditRecorder<'_>,
 ) -> Result<Reservation, ProtocolError> {
+    prepare_allocation_at(
+        connection,
+        wallet_id,
+        profile,
+        role,
+        account,
+        None,
+        operation_id,
+        invalid_child,
+        now_ms,
+        audit,
+    )
+}
+
+/// The account number one more than every path this wallet has ever used
+/// in either family: the EVM address-index counter under hardened account 0
+/// and the highest Solana hardened account, both of which already include
+/// retired and tombstoned rows. A multi-family allocation targets this number
+/// so both children land under one account and never on a dead path.
+pub fn next_account_number(
+    connection: &Connection,
+    wallet_id: &Token,
+) -> Result<u32, ProtocolError> {
+    // Namespaces are per role, but paths are unique per profile regardless of
+    // role, so the number spans every role's counter.
+    let evm_next: Option<i64> = connection
+        .query_row(
+            "SELECT MAX(next_index) FROM derivation_namespaces
+              WHERE wallet_id = ?1 AND profile = ?2 AND account = 0",
+            rusqlite::params![wallet_id.as_str(), PROFILE_EVM],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    let solana_highest: Option<i64> = connection
+        .query_row(
+            "SELECT MAX(account) FROM derivation_allocations
+              WHERE wallet_id = ?1 AND profile = ?2",
+            rusqlite::params![wallet_id.as_str(), PROFILE_SOLANA],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    let next = evm_next
+        .unwrap_or(0)
+        .max(solana_highest.map_or(0, |highest| highest + 1));
+    u32::try_from(next)
+        .ok()
+        .filter(|next| *next < (1_u32 << 31))
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::LimitExceededOperations,
+                "account number space is exhausted",
+            )
+        })
+}
+
+/// [`prepare_allocation`] with an explicit EVM address index. Used only by
+/// Signer's own multi-family allocation so both children of one account
+/// share a number; callers outside the engine cannot reach it. A target on
+/// an index that any allocation or tombstone already occupies is a typed
+/// conflict, a BIP-32-invalid target is tombstoned and reported as invalid
+/// without consuming a counter step, and a successful target moves the
+/// counter to `MAX(next_index, index + 1)` so the ordinary next-index path
+/// can never return an index the target already claimed.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_allocation_at(
+    connection: &mut Connection,
+    wallet_id: &Token,
+    profile: &str,
+    role: &str,
+    account: impl Into<Option<u32>>,
+    target_index: Option<u32>,
+    operation_id: &str,
+    invalid_child: impl Fn(u32, u32) -> bool,
+    now_ms: u64,
+    audit: AuditRecorder<'_>,
+) -> Result<Reservation, ProtocolError> {
     let requested_account = account.into();
     if requested_account.is_some_and(|account| account >= (1_u32 << 31)) {
         return Err(invalid(
             "derivation account must fit the non-hardened BIP-32 child-number range",
+        ));
+    }
+    if target_index.is_some_and(|index| index >= (1_u32 << 31)) {
+        return Err(invalid(
+            "derivation index must fit the non-hardened BIP-32 child-number range",
+        ));
+    }
+    if target_index.is_some() && profile != PROFILE_EVM {
+        return Err(invalid(
+            "an explicit address index applies only to the EVM profile",
         ));
     }
     if let Some(existing) = load_allocation(connection, wallet_id, operation_id)? {
@@ -405,6 +491,7 @@ pub fn prepare_allocation(
         if existing.profile == profile
             && existing.role == role
             && requested_account.is_none_or(|account| existing.account == i64::from(account))
+            && target_index.is_none_or(|index| existing.index == i64::from(index))
         {
             return Ok(Reservation {
                 operation_id: operation_id.to_owned(),
@@ -499,9 +586,44 @@ pub fn prepare_allocation(
         }
         set
     };
-    let (start, skipped) = bloom_signer_derive::next_valid_index(start, |candidate| {
-        tombstoned.contains(&i64::from(candidate)) || invalid_child(account, candidate)
-    });
+    let counter = start;
+    let (start, skipped) = match target_index {
+        None => bloom_signer_derive::next_valid_index(start, |candidate| {
+            tombstoned.contains(&i64::from(candidate)) || invalid_child(account, candidate)
+        }),
+        Some(index) => {
+            if tombstoned.contains(&i64::from(index)) {
+                return Err(conflict(format!(
+                    "address index {index} is tombstoned and can never be allocated"
+                )));
+            }
+            if invalid_child(account, index) {
+                // Record the invalid child so the next target skips it, then
+                // report it as invalid. Nothing else about the namespace moves.
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO derivation_tombstones
+                            (wallet_id, profile, role, account, \"index\", reason, created_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 'invalid-child', ?6)",
+                        rusqlite::params![
+                            wallet_id.as_str(),
+                            profile,
+                            role,
+                            i64::from(account),
+                            i64::from(index),
+                            now_ms as i64
+                        ],
+                    )
+                    .map_err(storage)?;
+                transaction.commit().map_err(storage)?;
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::BackendInvalidRequest,
+                    format!("address index {index} is a BIP-32 invalid child"),
+                ));
+            }
+            (index, Vec::new())
+        }
+    };
 
     let path = resolve_canonical_path(profile, account, start)?;
     let path_owner = transaction
@@ -535,21 +657,39 @@ pub fn prepare_allocation(
             )
             .map_err(storage)?;
     }
-    transaction
-        .execute(
-            "UPDATE derivation_namespaces SET next_index = ?5
-              WHERE wallet_id = ?1 AND profile = ?2 AND role = ?3 AND account = ?4
-                AND next_index = ?6",
-            rusqlite::params![
-                wallet_id.as_str(),
-                profile,
-                role,
-                i64::from(account),
-                i64::from(start) + 1,
-                i64::from(start) - skipped.len() as i64,
-            ],
-        )
-        .map_err(storage)?;
+    if target_index.is_some() {
+        // A target may sit at or beyond the counter; the counter only ever
+        // moves forward, so the ordinary path can never hand out this index.
+        transaction
+            .execute(
+                "UPDATE derivation_namespaces SET next_index = MAX(next_index, ?5)
+                  WHERE wallet_id = ?1 AND profile = ?2 AND role = ?3 AND account = ?4",
+                rusqlite::params![
+                    wallet_id.as_str(),
+                    profile,
+                    role,
+                    i64::from(account),
+                    i64::from(start) + 1,
+                ],
+            )
+            .map_err(storage)?;
+    } else {
+        transaction
+            .execute(
+                "UPDATE derivation_namespaces SET next_index = ?5
+                  WHERE wallet_id = ?1 AND profile = ?2 AND role = ?3 AND account = ?4
+                    AND next_index = ?6",
+                rusqlite::params![
+                    wallet_id.as_str(),
+                    profile,
+                    role,
+                    i64::from(account),
+                    i64::from(start) + 1,
+                    i64::from(counter),
+                ],
+            )
+            .map_err(storage)?;
+    }
     transaction
         .execute(
             "INSERT INTO derivation_allocations (

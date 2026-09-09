@@ -248,6 +248,56 @@ pub struct DerivationRegistryBackup {
 /// the enrolled `KeyRef` it resolves to. Carried so `restore_backup` can
 /// reconstruct the descriptor projection (SPKI / fingerprint / lifecycle) and
 /// re-enroll the child without re-deriving from a locked backend.
+/// One child produced by a multi-family account allocation, with the registry
+/// operation id its row is keyed by (the custody operation id for a
+/// single-family allocation, a [`family_operation_id`] otherwise).
+#[derive(Clone, Debug)]
+pub struct AllocatedAccountKey {
+    pub key_ref: KeyRef,
+    pub descriptor: DerivedAccountDescriptor,
+    pub operation_id: OperationId,
+}
+
+/// A derived child whose registry row is ACTIVATED but which is not yet
+/// registered with the backend or enrolled. Internal to the allocation path.
+struct ActivatedChild {
+    operation_id: OperationId,
+    profile: DerivationProfile,
+    public: crate::derivation_registry::PublicAccount,
+    spki_der: Vec<u8>,
+    key_spec: KeySpec,
+    encoding: PublicKeyEncoding,
+    fingerprint: Digest32,
+}
+
+/// Registry operation id for one family of a multi-family account allocation.
+/// Distinct per family so each child has its own registry and backend row,
+/// deterministic so a retried ceremony reaches the same rows.
+pub fn family_operation_id(
+    custody_operation_id: &OperationId,
+    profile: DerivationProfile,
+) -> OperationId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bloom-account-family-allocation/v1\0");
+    hasher.update(custody_operation_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(profile_id(profile).as_bytes());
+    OperationId::from_bytes(hasher.finalize().into())
+}
+
+/// Every registry operation id a custody operation may have written under:
+/// itself for a single-family allocation, plus one per family otherwise.
+pub fn allocation_operation_ids(custody_operation_id: &OperationId) -> [OperationId; 3] {
+    [
+        custody_operation_id.clone(),
+        family_operation_id(custody_operation_id, DerivationProfile::Bip44EvmSecp256k1V1),
+        family_operation_id(
+            custody_operation_id,
+            DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+        ),
+    ]
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DerivationAllocationBackup {
@@ -1559,6 +1609,27 @@ impl SignerEngine {
             .transpose()
     }
 
+    /// Whether a registry allocation under `operation_id` reached ACTIVATED and
+    /// was marked authority-committed by its ceremony's durable commit. Children
+    /// of a multi-family allocation carry per-family operation ids, so their
+    /// commit is recorded here rather than under a receipt of their own.
+    pub(crate) fn allocation_is_authority_committed(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<bool, ProtocolError> {
+        let connection = self.connection.lock();
+        let committed: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM derivation_allocations
+                  WHERE operation_id = ?1 AND state = 'ACTIVATED' AND authority_committed = 1",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        Ok(committed.is_some())
+    }
+
     pub(crate) fn custody_receipt(
         &self,
         operation_id: &OperationId,
@@ -1923,12 +1994,17 @@ impl SignerEngine {
                 ],
             )
             .map_err(storage)?;
+        let allocation_ids = allocation_operation_ids(&result.custody_operation_id);
         transaction
             .execute(
                 "UPDATE derivation_allocations
                  SET authority_committed = 1
-                 WHERE operation_id = ?1",
-                [result.custody_operation_id.as_str()],
+                 WHERE operation_id IN (?1, ?2, ?3)",
+                params![
+                    allocation_ids[0].as_str(),
+                    allocation_ids[1].as_str(),
+                    allocation_ids[2].as_str(),
+                ],
             )
             .map_err(storage)?;
         transaction
@@ -2331,26 +2407,224 @@ impl SignerEngine {
         unlocked: &UnlockedWallet,
         now_ms: u64,
     ) -> Result<(KeyRef, DerivedAccountDescriptor), ProtocolError> {
+        let seed = unlocked.bip39_seed()?;
+        let mut connection = self.connection.lock();
+        let child = self.activate_bip39_child(
+            &mut connection,
+            wallet_id,
+            operation_id,
+            request,
+            None,
+            &seed,
+            now_ms,
+        )?;
+        drop(connection);
+        self.enroll_activated_child(wallet_id, child, unlocked, now_ms)
+    }
+
+    /// Allocate every requested family under one account number in one
+    /// custody ceremony. Signer chooses the number: one more than every path
+    /// either family has ever used, so both children share it and neither
+    /// lands on a tombstoned path. A single request keeps the ordinary
+    /// next-path behavior of [`Self::allocate_bip39_account`], keyed by the
+    /// custody operation id itself; several requests get one registry row
+    /// each, keyed by [`family_operation_id`], so the ceremony commit can
+    /// mark all of them authority-committed together.
+    pub fn allocate_bip39_accounts(
+        &self,
+        wallet_id: &Token,
+        custody_operation_id: &OperationId,
+        requests: &[DerivedAccountRequest],
+        unlocked: &UnlockedWallet,
+        now_ms: u64,
+    ) -> Result<Vec<AllocatedAccountKey>, ProtocolError> {
+        match requests {
+            [] => Err(error(
+                ProtocolErrorCode::MalformedFrame,
+                "account allocation requires at least one derivation request",
+            )),
+            [request] => {
+                let (key_ref, descriptor) = self.allocate_bip39_account(
+                    wallet_id,
+                    custody_operation_id,
+                    request,
+                    unlocked,
+                    now_ms,
+                )?;
+                Ok(vec![AllocatedAccountKey {
+                    key_ref,
+                    descriptor,
+                    operation_id: custody_operation_id.clone(),
+                }])
+            }
+            requests => {
+                let seed = unlocked.bip39_seed()?;
+                // EVM first: it is the only family with an invalid-child case,
+                // and a Solana account at the chosen number cannot exist because
+                // the number is beyond every Solana account ever allocated.
+                let mut ordered: Vec<&DerivedAccountRequest> = requests.iter().collect();
+                ordered.sort_by_key(|request| match request.derivation_profile {
+                    DerivationProfile::Bip44EvmSecp256k1V1 => 0,
+                    DerivationProfile::Bip44SolanaSlip10Ed25519V1 => 1,
+                });
+
+                let mut connection = self.connection.lock();
+                let mut number =
+                    crate::derivation_registry::next_account_number(&connection, wallet_id)?;
+                // Skip BIP-32 invalid EVM children before touching the registry;
+                // the ordinary allocator tombstones them when it reaches them.
+                if ordered.iter().any(|request| {
+                    request.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1
+                }) {
+                    while matches!(
+                        bloom_signer_derive::derive_evm_account(&seed, 0, number),
+                        Err(bloom_signer_derive::Secp256k1DeriveError::InvalidChild)
+                    ) {
+                        number = number.checked_add(1).ok_or_else(|| {
+                            error(
+                                ProtocolErrorCode::LimitExceededOperations,
+                                "account number space is exhausted",
+                            )
+                        })?;
+                    }
+                }
+
+                let mut activated: Vec<ActivatedChild> = Vec::with_capacity(ordered.len());
+                for request in ordered {
+                    let operation_id =
+                        family_operation_id(custody_operation_id, request.derivation_profile);
+                    let target = match request.derivation_profile {
+                        DerivationProfile::Bip44EvmSecp256k1V1 => (None, Some(number)),
+                        DerivationProfile::Bip44SolanaSlip10Ed25519V1 => (Some(number), None),
+                    };
+                    let pinned = DerivedAccountRequest {
+                        derivation_profile: request.derivation_profile,
+                        requested_role: request.requested_role.clone(),
+                        account: target.0,
+                    };
+                    match self.activate_bip39_child(
+                        &mut connection,
+                        wallet_id,
+                        &operation_id,
+                        &pinned,
+                        target.1,
+                        &seed,
+                        now_ms,
+                    ) {
+                        Ok(child) => activated.push(child),
+                        Err(cause) => {
+                            // Nothing is enrolled yet; abandon the rows this
+                            // ceremony already activated so the number is not
+                            // half-used by a ceremony that reports failure.
+                            let audit =
+                                |tx: &Transaction, event: &str, payload: serde_json::Value| {
+                                    self.append_audit(tx, event, &payload)
+                                };
+                            for child in &activated {
+                                crate::derivation_registry::tombstone(
+                                    &mut connection,
+                                    wallet_id,
+                                    child.operation_id.as_str(),
+                                    now_ms,
+                                    &audit,
+                                )?;
+                            }
+                            return Err(cause);
+                        }
+                    }
+                }
+                drop(connection);
+
+                let mut enrolled: Vec<AllocatedAccountKey> = Vec::with_capacity(activated.len());
+                let mut pending = activated.into_iter();
+                while let Some(child) = pending.next() {
+                    let operation_id = child.operation_id.clone();
+                    match self.enroll_activated_child(wallet_id, child, unlocked, now_ms) {
+                        Ok((key_ref, descriptor)) => enrolled.push(AllocatedAccountKey {
+                            key_ref,
+                            descriptor,
+                            operation_id,
+                        }),
+                        Err(cause) => {
+                            // `enroll_activated_child` already rolled back the
+                            // child that failed. Roll back the ones before it and
+                            // abandon the ones after it so no key from this
+                            // ceremony survives its failure.
+                            let mut rollback: Result<(), ProtocolError> = Ok(());
+                            for done in &enrolled {
+                                rollback = rollback
+                                    .and(self.tombstone_failed_bip39_account(&done.key_ref, now_ms))
+                                    .and(
+                                        self.backend_registry
+                                            .rollback_local_derived_key(&done.key_ref),
+                                    );
+                            }
+                            {
+                                let mut connection = self.connection.lock();
+                                let audit =
+                                    |tx: &Transaction, event: &str, payload: serde_json::Value| {
+                                        self.append_audit(tx, event, &payload)
+                                    };
+                                for later in pending.by_ref() {
+                                    rollback = rollback.and(crate::derivation_registry::tombstone(
+                                        &mut connection,
+                                        wallet_id,
+                                        later.operation_id.as_str(),
+                                        now_ms,
+                                        &audit,
+                                    ));
+                                }
+                            }
+                            if let Err(rollback) = rollback {
+                                return Err(error(
+                                    ProtocolErrorCode::ServiceUnavailable,
+                                    format!(
+                                        "BIP-39 account allocation failed ({cause}); fail-closed rollback also failed ({rollback})"
+                                    ),
+                                ));
+                            }
+                            return Err(cause);
+                        }
+                    }
+                }
+                Ok(enrolled)
+            }
+        }
+    }
+
+    /// Registry phase of one allocation, run while the caller holds the
+    /// registry connection: reserve the path (at `target_index` for EVM when
+    /// given), derive the public key, and walk the row to ACTIVATED. Nothing
+    /// is enrolled or registered with the backend yet.
+    #[allow(clippy::too_many_arguments)]
+    fn activate_bip39_child(
+        &self,
+        connection: &mut Connection,
+        wallet_id: &Token,
+        operation_id: &OperationId,
+        request: &DerivedAccountRequest,
+        target_index: Option<u32>,
+        seed: &[u8; 64],
+        now_ms: u64,
+    ) -> Result<ActivatedChild, ProtocolError> {
         let profile = request.derivation_profile;
         let profile_str = profile_id(profile);
         let role = request.requested_role.as_str().to_owned();
-        let seed = unlocked.bip39_seed()?;
-
-        let mut connection = self.connection.lock();
         let audit = |tx: &Transaction, event: &str, payload: serde_json::Value| {
             self.append_audit(tx, event, &payload)
         };
-        let reservation = crate::derivation_registry::prepare_allocation(
-            &mut connection,
+        let reservation = crate::derivation_registry::prepare_allocation_at(
+            connection,
             wallet_id,
             profile_str,
             &role,
             request.account,
+            target_index,
             operation_id.as_str(),
             |candidate_account: u32, candidate_index: u32| match profile {
                 DerivationProfile::Bip44EvmSecp256k1V1 => matches!(
                     bloom_signer_derive::derive_evm_account(
-                        &seed,
+                        seed,
                         candidate_account,
                         candidate_index
                     ),
@@ -2366,7 +2640,7 @@ impl SignerEngine {
         let (spki_der, key_spec, encoding) = match profile {
             DerivationProfile::Bip44EvmSecp256k1V1 => {
                 let derived = bloom_signer_derive::derive_evm_account(
-                    &seed,
+                    seed,
                     reservation.account,
                     reservation.index,
                 )
@@ -2380,11 +2654,10 @@ impl SignerEngine {
                 )
             }
             DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
-                let derived =
-                    bloom_signer_derive::derive_solana_account(&seed, reservation.account)
-                        .map_err(|cause| {
-                            error(ProtocolErrorCode::BackendInvalidRequest, cause.to_string())
-                        })?;
+                let derived = bloom_signer_derive::derive_solana_account(seed, reservation.account)
+                    .map_err(|cause| {
+                        error(ProtocolErrorCode::BackendInvalidRequest, cause.to_string())
+                    })?;
                 (
                     derived.spki_der,
                     KeySpec::Ed25519,
@@ -2395,14 +2668,14 @@ impl SignerEngine {
         let fingerprint = Digest32::from_bytes(Sha256::digest(&spki_der).into());
 
         crate::derivation_registry::commit_index(
-            &mut connection,
+            connection,
             wallet_id,
             operation_id.as_str(),
             now_ms,
             &audit,
         )?;
         crate::derivation_registry::commit_account(
-            &mut connection,
+            connection,
             wallet_id,
             operation_id.as_str(),
             &hex::encode(&spki_der),
@@ -2411,13 +2684,44 @@ impl SignerEngine {
             &audit,
         )?;
         let public = crate::derivation_registry::activate(
-            &mut connection,
+            connection,
             wallet_id,
             operation_id.as_str(),
             now_ms,
             &audit,
         )?;
-        drop(connection);
+        Ok(ActivatedChild {
+            operation_id: operation_id.clone(),
+            profile,
+            public,
+            spki_der,
+            key_spec,
+            encoding,
+            fingerprint,
+        })
+    }
+
+    /// Enrollment phase of one allocation: register the child with the local
+    /// backend and enroll its `KeyRef`. On failure the registry row is
+    /// tombstoned and the backend child rolled back before the error returns.
+    fn enroll_activated_child(
+        &self,
+        wallet_id: &Token,
+        child: ActivatedChild,
+        unlocked: &UnlockedWallet,
+        now_ms: u64,
+    ) -> Result<(KeyRef, DerivedAccountDescriptor), ProtocolError> {
+        let ActivatedChild {
+            operation_id,
+            profile,
+            public,
+            spki_der,
+            key_spec,
+            encoding,
+            fingerprint,
+        } = child;
+        let profile_str = profile_id(profile);
+        let operation_id = &operation_id;
 
         let locator = hex::encode(Sha256::digest(
             [

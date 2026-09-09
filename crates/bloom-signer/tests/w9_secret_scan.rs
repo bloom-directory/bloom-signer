@@ -75,6 +75,7 @@ fn import_mnemonic(
                 legacy_passkey_migration: None,
                 wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
                 derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             now_ms,
         )
@@ -150,6 +151,7 @@ fn allocate(
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
                 derivation_request: Some(request),
+                derivation_requests: Vec::new(),
             },
             now_ms,
         )
@@ -344,6 +346,7 @@ fn bip39_secret_scan_is_empty_across_logs_audit_sqlite_and_responses() {
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
                 derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             40_200,
         )

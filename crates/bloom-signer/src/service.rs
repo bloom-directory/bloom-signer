@@ -1286,6 +1286,7 @@ mod tests {
                         bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1,
                     ),
                     derivation_request: None,
+                    derivation_requests: Vec::new(),
                 },
                 now_ms().unwrap(),
             )

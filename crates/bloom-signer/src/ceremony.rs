@@ -169,10 +169,18 @@ struct CustodyApplyContext {
 
 type SensitiveCustodyOutput = Zeroizing<Vec<u8>>;
 
+/// A derived key this ceremony produced, with the operation id its backend
+/// pending-derivation entry is keyed by. Rolled back together if the ceremony
+/// fails to commit, finalized together once it does.
+struct DerivedKeyCommit {
+    key_ref: bloom_signer_api::KeyRef,
+    operation_id: bloom_signer_api::OperationId,
+}
+
 struct CustodyApplyOutcome {
     sensitive_output: Option<SensitiveCustodyOutput>,
     database_effect: CeremonyDatabaseEffect,
-    rollback_derived_key: Option<bloom_signer_api::KeyRef>,
+    derived_keys: Vec<DerivedKeyCommit>,
     rollback_provisioned_backend: Option<bloom_signer_api::KeyRef>,
     public_key_refs: Vec<bloom_signer_api::KeyRef>,
     consume_legacy_migration: bool,
@@ -181,7 +189,7 @@ struct CustodyApplyOutcome {
 struct GenericCustodyOutcome {
     sensitive_output: Option<SensitiveCustodyOutput>,
     database_effect: CeremonyDatabaseEffect,
-    rollback_derived_key: Option<bloom_signer_api::KeyRef>,
+    derived_keys: Vec<DerivedKeyCommit>,
     public_key_refs: Vec<bloom_signer_api::KeyRef>,
 }
 
@@ -320,7 +328,12 @@ impl SignerCeremonyService {
         }
         #[cfg(feature = "local")]
         for (operation_id, key_ref) in engine.backend_registry().pending_local_derivations() {
-            if engine.custody_receipt(&operation_id)?.is_some() {
+            // A ceremony's own receipt commits its pending derivation; a child
+            // of a multi-family allocation is committed through its registry
+            // row instead, under a per-family operation id.
+            if engine.custody_receipt(&operation_id)?.is_some()
+                || engine.allocation_is_authority_committed(&operation_id)?
+            {
                 engine
                     .backend_registry()
                     .finalize_local_derived_key(&key_ref, &operation_id)?;
@@ -1275,7 +1288,7 @@ impl SignerCeremonyService {
         let encrypted_browser_result = match encrypted_browser_result {
             Ok(result) => result,
             Err(error) => {
-                self.rollback_derived_key(apply_outcome.rollback_derived_key.as_ref(), now_ms)?;
+                self.rollback_derived_keys(&apply_outcome.derived_keys, now_ms)?;
                 self.rollback_provisioned_backend(
                     apply_outcome.rollback_provisioned_backend.as_ref(),
                 );
@@ -1338,16 +1351,18 @@ impl SignerCeremonyService {
             &durable_status,
             apply_outcome.database_effect,
         ) {
-            self.rollback_derived_key(apply_outcome.rollback_derived_key.as_ref(), now_ms)?;
+            self.rollback_derived_keys(&apply_outcome.derived_keys, now_ms)?;
             self.rollback_provisioned_backend(apply_outcome.rollback_provisioned_backend.as_ref());
             self.restore_custody_snapshot(before)?;
             return Err(error);
         }
-        if let Some(key_ref) = apply_outcome.rollback_derived_key.as_ref() {
+        for derived in &apply_outcome.derived_keys {
             #[cfg(feature = "local")]
             self.engine
                 .backend_registry()
-                .finalize_local_derived_key(key_ref, &request.custody_operation_id)?;
+                .finalize_local_derived_key(&derived.key_ref, &derived.operation_id)?;
+            #[cfg(not(feature = "local"))]
+            let _ = derived;
         }
         if apply_outcome.consume_legacy_migration {
             self.legacy_migrations
@@ -1618,7 +1633,7 @@ impl SignerCeremonyService {
     ) -> Result<CustodyApplyOutcome, ProtocolError> {
         let mut sensitive_output = None;
         let mut database_effect = CeremonyDatabaseEffect::None;
-        let mut rollback_derived_key = None;
+        let mut derived_keys = Vec::new();
         let mut rollback_provisioned_backend = None;
         let mut public_key_refs = Vec::new();
         let mut consume_legacy_migration = false;
@@ -2098,7 +2113,7 @@ impl SignerCeremonyService {
                     GenericCustodyOutcome {
                         sensitive_output: None,
                         database_effect,
-                        rollback_derived_key: None,
+                        derived_keys: Vec::new(),
                         public_key_refs: Vec::new(),
                     }
                 } else {
@@ -2109,7 +2124,7 @@ impl SignerCeremonyService {
                 };
                 sensitive_output = generic.sensitive_output;
                 database_effect = generic.database_effect;
-                rollback_derived_key = generic.rollback_derived_key;
+                derived_keys = generic.derived_keys;
                 public_key_refs = generic.public_key_refs;
                 self.advance_counter(&verified.credential_id, verified.sign_count);
                 Ok(())
@@ -2120,7 +2135,7 @@ impl SignerCeremonyService {
         Ok(CustodyApplyOutcome {
             sensitive_output,
             database_effect,
-            rollback_derived_key,
+            derived_keys,
             rollback_provisioned_backend,
             public_key_refs,
             consume_legacy_migration,
@@ -2154,7 +2169,7 @@ impl SignerCeremonyService {
                                 serde_jcs::to_vec(&export).map_err(malformed)?,
                             )),
                             database_effect: CeremonyDatabaseEffect::None,
-                            rollback_derived_key: None,
+                            derived_keys: Vec::new(),
                             public_key_refs: Vec::new(),
                         })
                     }
@@ -2169,7 +2184,7 @@ impl SignerCeremonyService {
                         Ok(GenericCustodyOutcome {
                             sensitive_output: Some(Zeroizing::new(mnemonic.as_bytes().to_vec())),
                             database_effect: CeremonyDatabaseEffect::None,
-                            rollback_derived_key: None,
+                            derived_keys: Vec::new(),
                             public_key_refs: Vec::new(),
                         })
                     }
@@ -2183,7 +2198,7 @@ impl SignerCeremonyService {
                 Ok(GenericCustodyOutcome {
                     sensitive_output: None,
                     database_effect: CeremonyDatabaseEffect::None,
-                    rollback_derived_key: None,
+                    derived_keys: Vec::new(),
                     public_key_refs: Vec::new(),
                 })
             }
@@ -2201,7 +2216,7 @@ impl SignerCeremonyService {
                         key_ref: key_ref.clone(),
                         petal_scope: None,
                     },
-                    rollback_derived_key: None,
+                    derived_keys: Vec::new(),
                     public_key_refs: vec![key_ref.clone()],
                 })
             }
@@ -2279,7 +2294,10 @@ impl SignerCeremonyService {
                             key_ref: description.key_ref.clone(),
                             petal_scope: None,
                         },
-                        rollback_derived_key: Some(derived_key_ref),
+                        derived_keys: vec![DerivedKeyCommit {
+                            key_ref: derived_key_ref,
+                            operation_id: prepare.custody_operation_id.clone(),
+                        }],
                         public_key_refs: vec![description.key_ref],
                     })
                 }
@@ -2296,26 +2314,38 @@ impl SignerCeremonyService {
                 Err(kind_mismatch())
             }
             (CeremonyKind::AccountAllocate, GenericCustodyEffect::AccountAllocate) => {
-                let request = prepare
-                    .derivation_request
-                    .as_ref()
-                    .ok_or_else(kind_mismatch)?;
-                let (key_ref, _descriptor) = self.engine.allocate_bip39_account(
+                let requests: Vec<bloom_signer_api::DerivedAccountRequest> = prepare
+                    .effective_derivation_requests()
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                if requests.is_empty() {
+                    return Err(kind_mismatch());
+                }
+                let allocated = self.engine.allocate_bip39_accounts(
                     wallet_id,
                     &prepare.custody_operation_id,
-                    request,
+                    &requests,
                     unlocked,
                     now_ms,
                 )?;
-                self.engine
-                    .refresh_backend_enrollment(wallet_id, &key_ref)?;
-                // The child descriptor is public and projected on the read
-                // side from the registry entry; nothing secret leaves here.
+                for key in &allocated {
+                    self.engine
+                        .refresh_backend_enrollment(wallet_id, &key.key_ref)?;
+                }
+                // The child descriptors are public and projected on the read
+                // side from the registry entries; nothing secret leaves here.
                 Ok(GenericCustodyOutcome {
                     sensitive_output: None,
                     database_effect: CeremonyDatabaseEffect::None,
-                    rollback_derived_key: Some(key_ref.clone()),
-                    public_key_refs: vec![key_ref],
+                    derived_keys: allocated
+                        .iter()
+                        .map(|key| DerivedKeyCommit {
+                            key_ref: key.key_ref.clone(),
+                            operation_id: key.operation_id.clone(),
+                        })
+                        .collect(),
+                    public_key_refs: allocated.into_iter().map(|key| key.key_ref).collect(),
                 })
             }
             (CeremonyKind::AccountRetire, GenericCustodyEffect::AccountRetire) => {
@@ -2326,7 +2356,7 @@ impl SignerCeremonyService {
                 Ok(GenericCustodyOutcome {
                     sensitive_output: None,
                     database_effect: CeremonyDatabaseEffect::None,
-                    rollback_derived_key: None,
+                    derived_keys: Vec::new(),
                     public_key_refs: Vec::new(),
                 })
             }
@@ -2373,30 +2403,36 @@ impl SignerCeremonyService {
                 key_ref: description.key_ref.clone(),
                 petal_scope: Some(scope.clone()),
             },
-            rollback_derived_key: Some(derived_key_ref),
+            derived_keys: vec![DerivedKeyCommit {
+                key_ref: derived_key_ref,
+                operation_id: scope.custody_operation_id.clone(),
+            }],
             public_key_refs: vec![description.key_ref],
         })
     }
 
-    fn rollback_derived_key(
+    fn rollback_derived_keys(
         &self,
-        key_ref: Option<&bloom_signer_api::KeyRef>,
+        derived: &[DerivedKeyCommit],
         now_ms: u64,
     ) -> Result<(), ProtocolError> {
-        let Some(key_ref) = key_ref else {
+        if derived.is_empty() {
             return Ok(());
-        };
+        }
         #[cfg(feature = "local")]
         {
-            self.engine
-                .tombstone_failed_bip39_account(key_ref, now_ms)?;
-            self.engine
-                .backend_registry()
-                .rollback_local_derived_key(key_ref)
+            for derived in derived {
+                self.engine
+                    .tombstone_failed_bip39_account(&derived.key_ref, now_ms)?;
+                self.engine
+                    .backend_registry()
+                    .rollback_local_derived_key(&derived.key_ref)?;
+            }
+            Ok(())
         }
         #[cfg(not(feature = "local"))]
         {
-            let _ = key_ref;
+            let _ = now_ms;
             Err(protocol(
                 ProtocolErrorCode::ServiceUnavailable,
                 "derived-key rollback backend is unavailable",
@@ -2715,29 +2751,9 @@ impl SignerCeremonyService {
         // entropy under a different derivation tree than the migration receipt
         // authorized.
         reject_seed_profile_with_migration(request)?;
-        // derivation_request is legal only for AccountAllocate.
-        if request.derivation_request.is_some()
-            && request.ceremony_kind != CeremonyKind::AccountAllocate
-        {
-            return Err(protocol(
-                ProtocolErrorCode::CeremonyKindMismatch,
-                "derivation_request is valid only for account allocation",
-            ));
-        }
-        if request.ceremony_kind == CeremonyKind::AccountAllocate {
-            if request.derivation_request.is_none() {
-                return Err(protocol(
-                    ProtocolErrorCode::MalformedFrame,
-                    "AccountAllocate requires a derivation_request",
-                ));
-            }
-            if request.wallet_id.is_none() {
-                return Err(protocol(
-                    ProtocolErrorCode::MalformedFrame,
-                    "AccountAllocate requires an authoritative wallet ID",
-                ));
-            }
-        }
+        // Derivation requests are legal only for AccountAllocate, which needs
+        // exactly one shape of them plus an authoritative wallet ID.
+        request.validate_derivation_requests()?;
         if request.ceremony_kind == CeremonyKind::AccountRetire && request.key_ref.is_none() {
             return Err(protocol(
                 ProtocolErrorCode::MalformedFrame,
@@ -3173,6 +3189,7 @@ mod tests {
             petal_key_scope: None,
             legacy_passkey_migration: None,
             derivation_request: None,
+            derivation_requests: Vec::new(),
             wallet_seed_profile: None,
         }
     }

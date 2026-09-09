@@ -122,6 +122,7 @@ fn custody_prepare() -> CustodyPrepareRequest {
         petal_key_scope: None,
         legacy_passkey_migration: None,
         derivation_request: None,
+        derivation_requests: Vec::new(),
         wallet_seed_profile: None,
     }
 }
