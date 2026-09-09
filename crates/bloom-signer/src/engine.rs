@@ -5872,10 +5872,17 @@ fn validate_petal_key_approval(
             "approval suite exceeds the Petal derived-key scope",
         ));
     }
+    // The scope's expiry bounds automation: a reusable Petal approval may
+    // neither be used after it nor outlast it. An Exact approval is reviewed
+    // by the owner payload by payload, so it stays available after the scope
+    // expires (the funds behind a delegated key must remain recoverable); it
+    // is still bounded by the scope's maximum lifetime per approval.
+    let automation = matches!(terms.selector, ApprovalSelector::Petal { .. });
     if effective_now_ms < created_at_ms
-        || effective_now_ms >= scope_expires_at_ms
         || terms.not_before_ms.get() < created_at_ms
-        || terms.expires_at_ms.get() > scope_expires_at_ms
+        || (automation
+            && (effective_now_ms >= scope_expires_at_ms
+                || terms.expires_at_ms.get() > scope_expires_at_ms))
         || terms
             .expires_at_ms
             .get()

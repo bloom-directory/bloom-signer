@@ -1199,13 +1199,16 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         .unwrap();
 
     // Exercise expiry and revocation against the actual persisted Petal child,
-    // rather than relying on the generic approval tests.  The approval is
-    // necessarily bounded by the child scope, so once the scope window has
-    // elapsed no request using that child can remain valid.
+    // rather than relying on the generic approval tests. These terms use the
+    // Exact selector, which the child scope's expiry does not cap (an owner
+    // reviews each exact payload, so recovery stays possible after the scope
+    // lapses; see `petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not`).
+    // Past the scope window this request therefore fails on the approval's own
+    // expiry, which the scope bounded to the child's maximum lifetime.
     let mut expired_scoped_request = signed_petal_request(&scoped_terms, &broker, operation("d0"));
     // Keep the attempt itself live just beyond the child boundary so the
-    // failure is Signer's independent persisted-scope check, not the generic
-    // attempt-expiry guard.
+    // failure is the approval's validity, not the generic attempt-expiry
+    // guard.
     expired_scoped_request.unsigned.expires_at_ms = DecimalU64::new(30_400);
     expired_scoped_request.unsigned.attempt_digest = expired_scoped_request
         .unsigned
@@ -1231,7 +1234,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     assert_eq!(scope_expired.code, ProtocolErrorCode::ApprovalExpired);
     assert_eq!(
         scope_expired.message,
-        "approval validity exceeds the Petal derived-key scope"
+        "approval is expired or attempt outlives it"
     );
 
     let scoped_approval_id = scoped_terms.approval_id().unwrap();
@@ -3801,5 +3804,259 @@ fn bip39_solana_child_export_refuses_empty_pinned_keys() {
         err.code,
         ProtocolErrorCode::KeyrefMismatch,
         "empty pinned_keys with an allocated child must refuse to export"
+    );
+}
+
+fn healthy_clock(effective_now_ms: u64) -> ClockDecision {
+    ClockDecision {
+        effective_now_ms,
+        condition: ClockCondition::Healthy,
+        observed_utc_ms: Some(effective_now_ms),
+        monotonic_anchor_ns: 1_000_000,
+        boot_epoch: BootEpoch::from_bytes([1; 16]),
+    }
+}
+
+/// A Broker-signed exact sign request against `terms`, valid in the given
+/// window. Mirrors the shape the engine tests use.
+fn exact_sign_request(
+    broker: &SigningKey,
+    terms: &SealedApprovalTerms,
+    operation_byte: &str,
+    not_before_ms: u64,
+    expires_at_ms: u64,
+) -> SignRequest {
+    let ApprovalSelector::Exact {
+        ordered_payload_digests,
+        ordered_hashes,
+    } = &terms.selector
+    else {
+        panic!("exact_sign_request needs Exact terms");
+    };
+    let identity = SignOperationIdentity {
+        operation_id: OperationId::new(operation_byte.repeat(32)).unwrap(),
+        approval_id: terms.approval_id().unwrap(),
+        key_ref: terms.key_ref.clone(),
+        crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+        ordered_payload_digests: ordered_payload_digests.clone(),
+        ordered_hashes: ordered_hashes.clone(),
+        petal_use_claim_digest: None,
+        claim_assurance_digest: None,
+        policy_version: terms.policy_version.clone(),
+        policy_digest: terms.policy_digest.clone(),
+    };
+    let mut unsigned = UnsignedSignRequest {
+        schema: Token::new("bloom.sign-request/1").unwrap(),
+        attempt_id: digest(operation_byte),
+        operation_id: identity.operation_id.clone(),
+        operation_digest: identity.digest().unwrap(),
+        attempt_digest: digest("00"),
+        audience: Token::new("bloom-signer").unwrap(),
+        issuer_service_id: Token::new("bloom-broker").unwrap(),
+        issuer_boot_epoch: BootEpoch::new("99".repeat(16)).unwrap(),
+        broker_signing_key_id: Token::new("broker-app-1").unwrap(),
+        approval_id: identity.approval_id,
+        wallet_id: terms.wallet_id.clone(),
+        key_ref: identity.key_ref,
+        crypto_suite: identity.crypto_suite,
+        selector_kind: SelectorKind::Exact,
+        ordered_payload_digests: ordered_payload_digests.clone(),
+        ordered_hashes: ordered_hashes.clone(),
+        ordered_messages: Vec::new(),
+        signature_count: DecimalU64::new(ordered_hashes.len() as u64),
+        petal_use_claim_digest: None,
+        claim_assurance_digest: None,
+        policy_version: terms.policy_version.clone(),
+        policy_digest: terms.policy_digest.clone(),
+        validation_receipt_digest: digest("aa"),
+        issued_at_ms: DecimalU64::new(not_before_ms),
+        not_before_ms: DecimalU64::new(not_before_ms),
+        expires_at_ms: DecimalU64::new(expires_at_ms),
+    };
+    unsigned.attempt_digest = unsigned.computed_attempt_digest().unwrap();
+    SignRequest {
+        broker_signature: Base64UrlBytes::from_bytes(
+            &broker
+                .sign(&hex::decode(unsigned.attempt_digest.as_str()).unwrap())
+                .to_bytes(),
+        ),
+        unsigned,
+    }
+}
+
+/// The scope's expiry bounds automation, not the owner. A reusable Petal
+/// approval can neither be issued after the scope expires nor outlast it; an
+/// Exact approval, reviewed by the owner payload by payload, can be issued and
+/// used after expiry so the funds behind a delegated key stay recoverable.
+#[test]
+fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
+    let authenticator = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let (service, engine, _registry) = bip39_service(&authenticator);
+    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("c1"), 10_000);
+    let parent = engine.derived_account_descriptors(&wallet_id).unwrap()[0]
+        .key_ref
+        .clone();
+    let scope = PetalKeyScope {
+        wallet_id: wallet_id.clone(),
+        parent_key_ref: parent,
+        package_hash: digest("c2"),
+        route: "/petals/exchange/sign".into(),
+        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        key_slot: Token::new("desk-a").unwrap(),
+        allowed_routes: vec!["/petals/exchange/sign".into()],
+        allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+        maximum_lifetime_ms: DecimalU64::new(20_000),
+        custody_operation_id: operation("c3"),
+    };
+    // Derived at 10_200, committed at 10_300: the scope expires at 30_300.
+    let (derived, _) =
+        complete_petal_key_derivation(&service, &authenticator, scope.clone(), None, 10_200)
+            .unwrap();
+    let child = derived.public_key_refs[0].clone();
+    let policy = engine.policy_snapshot(&wallet_id).unwrap();
+    let epoch = engine
+        .revocation_state(&wallet_id, 10_400)
+        .unwrap()
+        .wallet_revocation_epoch;
+
+    let terms =
+        |selector: ApprovalSelector, nonce: &str, not_before_ms: u64, expires_at_ms: u64| {
+            // Exact terms authorize exactly their listed payloads; reusable
+            // terms carry a budget.
+            let (max_operations, max_signatures) = match &selector {
+                ApprovalSelector::Exact { ordered_hashes, .. } => (1, ordered_hashes.len() as u64),
+                ApprovalSelector::Petal { .. } => (4, 4),
+            };
+            SealedApprovalTerms {
+                subject: ApprovalSubject::Petal {
+                    package_hash: scope.package_hash.clone(),
+                    route: scope.route.clone(),
+                    agent_id: Some(scope.key_slot.as_str().into()),
+                },
+                wallet_id: wallet_id.clone(),
+                key_ref: child.clone(),
+                allowed_crypto_suites: scope.allowed_crypto_suites.clone(),
+                selector,
+                limits: ApprovalLimits {
+                    max_operations: DecimalU64::new(max_operations),
+                    max_signatures: DecimalU64::new(max_signatures),
+                    operation_rate_limits: vec![],
+                    signature_rate_limits: vec![],
+                    value_limits: vec![],
+                },
+                activation_mode: ActivationMode::BootBound,
+                wallet_revocation_epoch: epoch.clone(),
+                policy_version: policy.version.clone(),
+                policy_digest: policy.policy_digest.clone(),
+                provenance_digest: digest("c7"),
+                request_nonce: RequestNonce::new(nonce.repeat(16)).unwrap(),
+                issued_at_ms: DecimalU64::new(not_before_ms),
+                not_before_ms: DecimalU64::new(not_before_ms),
+                expires_at_ms: DecimalU64::new(expires_at_ms),
+                renewal_of: None,
+            }
+        };
+    let reusable = || ApprovalSelector::Petal {
+        package_hash: scope.package_hash.clone(),
+        route: scope.route.clone(),
+        allowed_operation_classes: scope.allowed_operation_classes.clone(),
+        route_grants: Vec::new(),
+        required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+    };
+    let exact = |byte: &str| ApprovalSelector::Exact {
+        ordered_payload_digests: vec![digest(byte)],
+        ordered_hashes: vec![digest(byte)],
+    };
+
+    // Before expiry both selectors are accepted, and neither may outlast the
+    // scope or its maximum lifetime.
+    let live_reusable = terms(reusable(), "d1", 15_000, 25_000);
+    engine.install_approval_for_test(&live_reusable).unwrap();
+    engine
+        .install_approval_for_test(&terms(exact("e1"), "d2", 15_000, 25_000))
+        .unwrap();
+    assert_eq!(
+        engine
+            .install_approval_for_test(&terms(reusable(), "d3", 15_000, 31_000))
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ApprovalExpired
+    );
+    assert_eq!(
+        engine
+            .install_approval_for_test(&terms(exact("e2"), "d4", 15_000, 36_000))
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ApprovalExpired
+    );
+
+    // After expiry a reusable approval is refused; an Exact one is accepted
+    // within the scope's per-approval lifetime bound and refused beyond it.
+    assert_eq!(
+        engine
+            .install_approval_for_test(&terms(reusable(), "d5", 40_000, 50_000))
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ApprovalExpired
+    );
+    let recovery = terms(exact("e3"), "d6", 40_000, 50_000);
+    engine.install_approval_for_test(&recovery).unwrap();
+    assert_eq!(
+        engine
+            .install_approval_for_test(&terms(exact("e4"), "d7", 40_000, 70_000))
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ApprovalExpired
+    );
+
+    // Signing follows the same rule: the fresh Exact approval authorizes a
+    // sign attempt after the scope expired; the reusable approval installed
+    // while the scope was live does not.
+    engine
+        .authorize_sign(
+            &exact_sign_request(&broker, &recovery, "f1", 45_000, 46_000),
+            &healthy_clock(45_000),
+        )
+        .unwrap();
+    // The reusable approval is still within its own validity here (it runs to
+    // 25_000 only, so move the attempt to 24_000 to isolate the scope rule) and
+    // the attempt window sits inside it; what refuses it is the scope check
+    // that `Petal` selectors still carry: at 24_000 the scope is live, so this
+    // attempt passes, and at 45_000 the same approval is dead twice over.
+    let mut reusable_attempt = signed_petal_request(&live_reusable, &broker, operation("f2"));
+    reusable_attempt.unsigned.issued_at_ms = DecimalU64::new(24_000);
+    reusable_attempt.unsigned.not_before_ms = DecimalU64::new(24_000);
+    reusable_attempt.unsigned.expires_at_ms = DecimalU64::new(24_500);
+    reusable_attempt.unsigned.attempt_digest =
+        reusable_attempt.unsigned.computed_attempt_digest().unwrap();
+    reusable_attempt.broker_signature = Base64UrlBytes::from_bytes(
+        &broker
+            .sign(&reusable_attempt.unsigned.attempt_digest.to_bytes())
+            .to_bytes(),
+    );
+    engine
+        .authorize_sign(&reusable_attempt, &healthy_clock(24_000))
+        .unwrap();
+    let mut late_attempt = signed_petal_request(&live_reusable, &broker, operation("f3"));
+    // A fresh attempt id: the helper's fixed one was consumed above, and a
+    // replayed attempt id is refused before any expiry rule runs.
+    late_attempt.unsigned.attempt_id = digest("f3");
+    late_attempt.unsigned.issued_at_ms = DecimalU64::new(45_000);
+    late_attempt.unsigned.not_before_ms = DecimalU64::new(45_000);
+    late_attempt.unsigned.expires_at_ms = DecimalU64::new(46_000);
+    late_attempt.unsigned.attempt_digest = late_attempt.unsigned.computed_attempt_digest().unwrap();
+    late_attempt.broker_signature = Base64UrlBytes::from_bytes(
+        &broker
+            .sign(&late_attempt.unsigned.attempt_digest.to_bytes())
+            .to_bytes(),
+    );
+    assert_eq!(
+        engine
+            .authorize_sign(&late_attempt, &healthy_clock(45_000))
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ApprovalExpired
     );
 }
