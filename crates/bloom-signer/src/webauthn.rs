@@ -212,7 +212,10 @@ fn verify_client_data(
     let decoded = encoded.decode();
     let data: ClientData = serde_json::from_slice(&decoded)
         .map_err(|_| proof_error("WebAuthn clientDataJSON is malformed"))?;
+    #[cfg(feature = "triad-dev-harness")]
     let expected_origin = configured_ceremony_origin()?;
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let expected_origin = CEREMONY_ORIGIN;
     if data.ceremony_type != expected_type
         || data.origin != expected_origin
         || data.cross_origin
