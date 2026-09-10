@@ -3818,7 +3818,9 @@ fn healthy_clock(effective_now_ms: u64) -> ClockDecision {
 }
 
 /// A Broker-signed exact sign request against `terms`, valid in the given
-/// window. Mirrors the shape the engine tests use.
+/// window. Mirrors the shape the engine tests use; w3_engine.rs's
+/// `unsigned_request` is the selector-agnostic builder to consolidate on if a
+/// third copy of this shape ever appears.
 fn exact_sign_request(
     broker: &SigningKey,
     terms: &SealedApprovalTerms,
@@ -3970,8 +3972,10 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
         ordered_hashes: vec![digest(byte)],
     };
 
-    // Before expiry both selectors are accepted, and neither may outlast the
-    // scope or its maximum lifetime.
+    // Before expiry both selectors are accepted within the scope's
+    // per-approval lifetime. A reusable approval may still not outlast the
+    // scope, and neither selector may exceed the lifetime; an Exact approval
+    // may cross the scope's end as long as its own lifetime fits.
     let live_reusable = terms(reusable(), "d1", 15_000, 25_000);
     engine.install_approval_for_test(&live_reusable).unwrap();
     engine
@@ -3991,6 +3995,10 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
             .code,
         ProtocolErrorCode::ApprovalExpired
     );
+    // Installed while the scope is live but expiring past it, with a lifetime
+    // exactly at the scope's bound: the recovery bridge is accepted.
+    let bridge = terms(exact("e5"), "d8", 15_000, 35_000);
+    engine.install_approval_for_test(&bridge).unwrap();
 
     // After expiry a reusable approval is refused; an Exact one is accepted
     // within the scope's per-approval lifetime bound and refused beyond it.
@@ -4020,11 +4028,18 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
             &healthy_clock(45_000),
         )
         .unwrap();
+    // The Exact approval installed before the scope lapsed, expiring past it,
+    // still authorizes once the scope window has closed.
+    engine
+        .authorize_sign(
+            &exact_sign_request(&broker, &bridge, "f4", 32_000, 33_000),
+            &healthy_clock(32_000),
+        )
+        .unwrap();
     // The reusable approval is still within its own validity here (it runs to
     // 25_000 only, so move the attempt to 24_000 to isolate the scope rule) and
-    // the attempt window sits inside it; what refuses it is the scope check
-    // that `Petal` selectors still carry: at 24_000 the scope is live, so this
-    // attempt passes, and at 45_000 the same approval is dead twice over.
+    // the attempt window sits inside it: at 24_000 the scope is live, so this
+    // attempt passes.
     let mut reusable_attempt = signed_petal_request(&live_reusable, &broker, operation("f2"));
     reusable_attempt.unsigned.issued_at_ms = DecimalU64::new(24_000);
     reusable_attempt.unsigned.not_before_ms = DecimalU64::new(24_000);
@@ -4039,6 +4054,10 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
     engine
         .authorize_sign(&reusable_attempt, &healthy_clock(24_000))
         .unwrap();
+    // At 45_000 the scope has lapsed, and the asserted message is the
+    // persisted-scope check that `Petal` selectors still carry at sign time -
+    // not the generic approval-window refusal - so this pins the sign-time
+    // automation bound itself.
     let mut late_attempt = signed_petal_request(&live_reusable, &broker, operation("f3"));
     // A fresh attempt id: the helper's fixed one was consumed above, and a
     // replayed attempt id is refused before any expiry rule runs.
@@ -4052,11 +4071,47 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
             .sign(&late_attempt.unsigned.attempt_digest.to_bytes())
             .to_bytes(),
     );
+    let scope_refusal = engine
+        .authorize_sign(&late_attempt, &healthy_clock(45_000))
+        .unwrap_err();
+    assert_eq!(scope_refusal.code, ProtocolErrorCode::ApprovalExpired);
     assert_eq!(
-        engine
-            .authorize_sign(&late_attempt, &healthy_clock(45_000))
+        scope_refusal.message,
+        "approval validity exceeds the Petal derived-key scope"
+    );
+
+    // The production activation path is the ceremony, which validates with the
+    // server's clock: preparing a reusable approval for the lapsed scope is
+    // refused there too, while an Exact recovery approval prepares.
+    assert_eq!(
+        service
+            .prepare_approval(
+                CeremonyPrepareRequest {
+                    activation_operation_id: operation("c4"),
+                    terms: terms(reusable(), "d9", 40_000, 50_000),
+                    review_manifest_digest: digest("c5"),
+                    exact_ordered_payload_digests: vec![],
+                    exact_ordered_hashes: vec![],
+                    replacement_approval_id: None,
+                },
+                45_000,
+            )
             .unwrap_err()
             .code,
         ProtocolErrorCode::ApprovalExpired
     );
+    let prepared = service
+        .prepare_approval(
+            CeremonyPrepareRequest {
+                activation_operation_id: operation("c5"),
+                terms: terms(exact("e6"), "da", 40_000, 50_000),
+                review_manifest_digest: digest("c5"),
+                exact_ordered_payload_digests: vec![digest("e6")],
+                exact_ordered_hashes: vec![digest("e6")],
+                replacement_approval_id: None,
+            },
+            45_000,
+        )
+        .unwrap();
+    assert!(!prepared.challenges.is_empty());
 }
