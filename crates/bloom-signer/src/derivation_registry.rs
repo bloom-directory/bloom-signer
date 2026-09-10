@@ -427,6 +427,14 @@ pub fn next_account_number(
             |row| row.get(0),
         )
         .map_err(storage)?;
+    let evm_tombstone_next: Option<i64> = connection
+        .query_row(
+            "SELECT MAX(\"index\") + 1 FROM derivation_tombstones
+              WHERE wallet_id = ?1 AND profile = ?2 AND account = 0",
+            rusqlite::params![wallet_id.as_str(), PROFILE_EVM],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
     let solana_highest: Option<i64> = connection
         .query_row(
             "SELECT MAX(account) FROM derivation_allocations
@@ -437,6 +445,7 @@ pub fn next_account_number(
         .map_err(storage)?;
     let next = evm_next
         .unwrap_or(0)
+        .max(evm_tombstone_next.unwrap_or(0))
         .max(solana_highest.map_or(0, |highest| highest + 1));
     u32::try_from(next)
         .ok()

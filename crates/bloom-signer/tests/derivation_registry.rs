@@ -1028,10 +1028,11 @@ fn recorded_invalid_children_are_never_targeted() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("tombstoned"), "{error}");
-    // The ordinary counter is untouched by a tombstone-only record.
+    // The ordinary namespace counter is untouched, but shared numbering skips
+    // every EVM tombstone so a paired allocation cannot land below a dead path.
     assert_eq!(
         registry::next_account_number(&connection, &wallet).unwrap(),
-        0
+        4
     );
 }
 

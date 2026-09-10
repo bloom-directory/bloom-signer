@@ -3,10 +3,10 @@ use bloom_signer_api::{
     CeremonyPhase, CeremonyPrepareRequest, CeremonyPublicStatus, CeremonyState,
     CeremonyWebAuthnOptions, CredentialPrfInput, CredentialSummary, CryptoSuite,
     CustodyCompleteRequest, CustodyHpkeAad, CustodyOutputHpkeAad, CustodyPrepareRequest,
-    CustodyResult, CustodySignerContribution, DecimalU64, Digest32, LocalPrfHpkeAad, OperationId,
-    PetalKeyScope, PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest,
-    ProtocolError, ProtocolErrorCode, SignerActivationReceipt, SignerCeremonyContribution, Token,
-    WebAuthnCeremonyProof, WebAuthnCredential,
+    CustodyResult, CustodySignerContribution, DecimalU64, DerivationRef, Digest32, LocalPrfHpkeAad,
+    OperationId, PetalKeyScope, PolicyUpdateCeremonyCompleteRequest,
+    PolicyUpdateCeremonyPrepareRequest, ProtocolError, ProtocolErrorCode, SignerActivationReceipt,
+    SignerCeremonyContribution, Token, WebAuthnCeremonyProof, WebAuthnCredential,
 };
 use bloom_signer_backend_api::SecretBytes;
 use ed25519_dalek::{Signer as _, SigningKey};
@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 use crate::registry::BackendRegistry;
 use crate::{
     custody::{UnlockedWallet, WalletCustody, WalletCustodyBackup},
-    engine::{CeremonyDatabaseEffect, SignerEngine},
+    engine::{CeremonyDatabaseEffect, CustodySnapshotCommit, SignerEngine},
     hpke::{
         CUSTODY_INPUT_INFO, CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO, seal_to_recipient,
     },
@@ -168,6 +168,10 @@ struct CustodyApplyContext {
 }
 
 type SensitiveCustodyOutput = Zeroizing<Vec<u8>>;
+type CustodySnapshot = (
+    Vec<crate::custody::WalletCustodyBackup>,
+    Vec<(Token, WebAuthnCredential)>,
+);
 
 /// A derived key this ceremony produced, with the operation id its backend
 /// pending-derivation entry is keyed by. Rolled back together if the ceremony
@@ -328,12 +332,12 @@ impl SignerCeremonyService {
         }
         #[cfg(feature = "local")]
         for (operation_id, key_ref) in engine.backend_registry().pending_local_derivations() {
-            // A ceremony's own receipt commits its pending derivation; a child
-            // of a multi-family allocation is committed through its registry
-            // row instead, under a per-family operation id.
-            if engine.custody_receipt(&operation_id)?.is_some()
-                || engine.allocation_is_authority_committed(&operation_id)?
-            {
+            // BIP-39 allocation children are committed only by the exact rows
+            // named by their ceremony apply outcome. A custody receipt under
+            // an aliased child operation ID is not sufficient. Other derived
+            // keys use their ceremony operation ID directly and retain the
+            // receipt-based recovery path.
+            if engine.pending_derivation_is_committed(&operation_id, &key_ref)? {
                 engine
                     .backend_registry()
                     .finalize_local_derived_key(&key_ref, &operation_id)?;
@@ -1288,12 +1292,13 @@ impl SignerCeremonyService {
         let encrypted_browser_result = match encrypted_browser_result {
             Ok(result) => result,
             Err(error) => {
-                self.rollback_derived_keys(&apply_outcome.derived_keys, now_ms)?;
-                self.rollback_provisioned_backend(
+                return Err(self.rollback_failed_custody_apply(
+                    &apply_outcome.derived_keys,
                     apply_outcome.rollback_provisioned_backend.as_ref(),
-                );
-                self.restore_custody_snapshot(before)?;
-                return Err(error);
+                    before,
+                    now_ms,
+                    error,
+                ));
             }
         };
         let wallet_id = contribution.wallet_id.clone();
@@ -1343,18 +1348,38 @@ impl SignerCeremonyService {
             ceremony_url: None,
             receipt_digest: Some(result.receipt_digest.clone()),
         };
-        if let Err(error) = self.engine.commit_custody_snapshot_with_effect(
-            &result,
-            &after.0,
-            &after.1,
-            now_ms,
-            &durable_status,
-            apply_outcome.database_effect,
-        ) {
-            self.rollback_derived_keys(&apply_outcome.derived_keys, now_ms)?;
-            self.rollback_provisioned_backend(apply_outcome.rollback_provisioned_backend.as_ref());
-            self.restore_custody_snapshot(before)?;
-            return Err(error);
+        // Commit only BIP-39 allocation rows actually produced by this apply.
+        // Deriving candidate child IDs from the receipt ID would let an
+        // unrelated custody operation alias an incomplete child's ID.
+        let committed_allocations: Vec<_> = apply_outcome
+            .derived_keys
+            .iter()
+            .filter_map(|derived| match &derived.key_ref.derivation {
+                Some(DerivationRef::Bip39Multicurve {
+                    wallet_seed_ref, ..
+                }) => Some((wallet_seed_ref.clone(), derived.operation_id.clone())),
+                _ => None,
+            })
+            .collect();
+        if let Err(error) = self
+            .engine
+            .commit_custody_snapshot_with_effect(CustodySnapshotCommit {
+                result: &result,
+                wallets: &after.0,
+                credentials: &after.1,
+                committed_at_ms: now_ms,
+                status: &durable_status,
+                committed_allocations: &committed_allocations,
+                effect: apply_outcome.database_effect,
+            })
+        {
+            return Err(self.rollback_failed_custody_apply(
+                &apply_outcome.derived_keys,
+                apply_outcome.rollback_provisioned_backend.as_ref(),
+                before,
+                now_ms,
+                error,
+            ));
         }
         for derived in &apply_outcome.derived_keys {
             #[cfg(feature = "local")]
@@ -2343,22 +2368,35 @@ impl SignerCeremonyService {
                     unlocked,
                     now_ms,
                 )?;
+                let derived_keys: Vec<_> = allocated
+                    .iter()
+                    .map(|key| DerivedKeyCommit {
+                        key_ref: key.key_ref.clone(),
+                        operation_id: key.operation_id.clone(),
+                    })
+                    .collect();
                 for key in &allocated {
-                    self.engine
-                        .refresh_backend_enrollment(wallet_id, &key.key_ref)?;
+                    if let Err(cause) = self
+                        .engine
+                        .refresh_backend_enrollment(wallet_id, &key.key_ref)
+                    {
+                        return match self.rollback_derived_keys(&derived_keys, now_ms) {
+                            Ok(()) => Err(cause),
+                            Err(rollback) => Err(protocol(
+                                ProtocolErrorCode::ServiceUnavailable,
+                                format!(
+                                    "BIP-39 account enrollment refresh failed ({cause}); fail-closed rollback also failed ({rollback})"
+                                ),
+                            )),
+                        };
+                    }
                 }
                 // The child descriptors are public and projected on the read
                 // side from the registry entries; nothing secret leaves here.
                 Ok(GenericCustodyOutcome {
                     sensitive_output: None,
                     database_effect: CeremonyDatabaseEffect::None,
-                    derived_keys: allocated
-                        .iter()
-                        .map(|key| DerivedKeyCommit {
-                            key_ref: key.key_ref.clone(),
-                            operation_id: key.operation_id.clone(),
-                        })
-                        .collect(),
+                    derived_keys,
                     public_key_refs: allocated.into_iter().map(|key| key.key_ref).collect(),
                 })
             }
@@ -2435,14 +2473,26 @@ impl SignerCeremonyService {
         }
         #[cfg(feature = "local")]
         {
+            let mut first_error = None;
             for derived in derived {
-                self.engine
-                    .tombstone_failed_bip39_account(&derived.key_ref, now_ms)?;
-                self.engine
+                if let Err(error) = self
+                    .engine
+                    .tombstone_failed_bip39_account(&derived.key_ref, now_ms)
+                {
+                    first_error.get_or_insert(error);
+                }
+                if let Err(error) = self
+                    .engine
                     .backend_registry()
-                    .rollback_local_derived_key(&derived.key_ref)?;
+                    .rollback_local_derived_key(&derived.key_ref)
+                {
+                    first_error.get_or_insert(error);
+                }
             }
-            Ok(())
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
         #[cfg(not(feature = "local"))]
         {
@@ -2462,6 +2512,42 @@ impl SignerCeremonyService {
         self.engine
             .backend_registry()
             .remove_local_wallet_backend(key_ref);
+    }
+
+    fn rollback_failed_custody_apply(
+        &self,
+        derived: &[DerivedKeyCommit],
+        provisioned_backend: Option<&bloom_signer_api::KeyRef>,
+        before: CustodySnapshot,
+        now_ms: u64,
+        cause: ProtocolError,
+    ) -> ProtocolError {
+        let rollback = self.rollback_derived_keys(derived, now_ms);
+        self.rollback_provisioned_backend(provisioned_backend);
+        let restore = self.restore_custody_snapshot(before);
+        match (rollback, restore) {
+            (Ok(()), Ok(())) => cause,
+            (rollback, restore) => {
+                let failures = [
+                    rollback
+                        .err()
+                        .map(|error| format!("derived-key rollback: {error}")),
+                    restore
+                        .err()
+                        .map(|error| format!("custody snapshot restore: {error}")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; ");
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!(
+                        "custody apply failed ({cause}); fail-closed cleanup failed ({failures})"
+                    ),
+                )
+            }
+        }
     }
 
     fn decrypt_custody_input(
@@ -2528,12 +2614,7 @@ impl SignerCeremonyService {
         })
     }
 
-    fn custody_snapshot(
-        &self,
-    ) -> (
-        Vec<crate::custody::WalletCustodyBackup>,
-        Vec<(Token, WebAuthnCredential)>,
-    ) {
+    fn custody_snapshot(&self) -> CustodySnapshot {
         let wallets = self
             .wallets
             .lock()
@@ -2549,13 +2630,7 @@ impl SignerCeremonyService {
         (wallets, credentials)
     }
 
-    fn restore_custody_snapshot(
-        &self,
-        snapshot: (
-            Vec<crate::custody::WalletCustodyBackup>,
-            Vec<(Token, WebAuthnCredential)>,
-        ),
-    ) -> Result<(), ProtocolError> {
+    fn restore_custody_snapshot(&self, snapshot: CustodySnapshot) -> Result<(), ProtocolError> {
         let wallets = snapshot
             .0
             .into_iter()

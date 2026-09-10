@@ -75,6 +75,16 @@ pub(crate) struct CeremonyPolicyUpdate {
     receipt: PolicyCommitReceipt,
 }
 
+pub(crate) struct CustodySnapshotCommit<'a> {
+    pub result: &'a CustodyResult,
+    pub wallets: &'a [WalletCustodyBackup],
+    pub credentials: &'a [(Token, WebAuthnCredential)],
+    pub committed_at_ms: u64,
+    pub status: &'a CeremonyPublicStatus,
+    pub committed_allocations: &'a [(Token, OperationId)],
+    pub effect: CeremonyDatabaseEffect,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PendingPolicyAuthorization {
@@ -283,19 +293,6 @@ pub fn family_operation_id(
     hasher.update(b"\0");
     hasher.update(profile_id(profile).as_bytes());
     OperationId::from_bytes(hasher.finalize().into())
-}
-
-/// Every registry operation id a custody operation may have written under:
-/// itself for a single-family allocation, plus one per family otherwise.
-pub fn allocation_operation_ids(custody_operation_id: &OperationId) -> [OperationId; 3] {
-    [
-        custody_operation_id.clone(),
-        family_operation_id(custody_operation_id, DerivationProfile::Bip44EvmSecp256k1V1),
-        family_operation_id(
-            custody_operation_id,
-            DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-        ),
-    ]
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1648,6 +1645,25 @@ impl SignerEngine {
             .transpose()
     }
 
+    /// Whether a pending backend derivation has a durable authority commit.
+    /// BIP-39 account children are committed through their exact allocation
+    /// row; accepting an arbitrary custody receipt with the same operation ID
+    /// would let an unrelated ceremony finalize an orphaned child.
+    pub(crate) fn pending_derivation_is_committed(
+        &self,
+        operation_id: &OperationId,
+        key_ref: &KeyRef,
+    ) -> Result<bool, ProtocolError> {
+        if matches!(
+            key_ref.derivation.as_ref(),
+            Some(DerivationRef::Bip39Multicurve { .. })
+        ) {
+            self.allocation_is_authority_committed(operation_id)
+        } else {
+            Ok(self.custody_receipt(operation_id)?.is_some())
+        }
+    }
+
     pub(crate) fn load_ceremony_custody(&self) -> Result<PersistedCeremonyCustody, ProtocolError> {
         let connection = self.connection.lock();
         let mut wallets_statement = connection
@@ -1709,13 +1725,17 @@ impl SignerEngine {
 
     pub(crate) fn commit_custody_snapshot_with_effect(
         &self,
-        result: &CustodyResult,
-        wallets: &[WalletCustodyBackup],
-        credentials: &[(Token, WebAuthnCredential)],
-        committed_at_ms: u64,
-        status: &CeremonyPublicStatus,
-        effect: CeremonyDatabaseEffect,
+        commit: CustodySnapshotCommit<'_>,
     ) -> Result<(), ProtocolError> {
+        let CustodySnapshotCommit {
+            result,
+            wallets,
+            credentials,
+            committed_at_ms,
+            status,
+            committed_allocations,
+            effect,
+        } = commit;
         let mut connection = self.connection.lock();
         let transaction = self.mutation_transaction(&mut connection)?;
         let wallet_snapshot_digest = Digest32::from_bytes(
@@ -1994,19 +2014,23 @@ impl SignerEngine {
                 ],
             )
             .map_err(storage)?;
-        let allocation_ids = allocation_operation_ids(&result.custody_operation_id);
-        transaction
-            .execute(
-                "UPDATE derivation_allocations
-                 SET authority_committed = 1
-                 WHERE operation_id IN (?1, ?2, ?3)",
-                params![
-                    allocation_ids[0].as_str(),
-                    allocation_ids[1].as_str(),
-                    allocation_ids[2].as_str(),
-                ],
-            )
-            .map_err(storage)?;
+        for (wallet_id, operation_id) in committed_allocations {
+            let updated = transaction
+                .execute(
+                    "UPDATE derivation_allocations
+                     SET authority_committed = 1
+                     WHERE wallet_id = ?1 AND operation_id = ?2
+                       AND state = 'ACTIVATED' AND authority_committed = 0",
+                    params![wallet_id.as_str(), operation_id.as_str()],
+                )
+                .map_err(storage)?;
+            if updated != 1 {
+                return Err(error(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "custody commit does not own the claimed derivation allocation",
+                ));
+            }
+        }
         transaction
             .execute(
                 "INSERT INTO ceremony_statuses(operation_id, status_jcs)
@@ -2398,11 +2422,9 @@ impl SignerEngine {
     /// Allocate every requested family under one account number in one
     /// custody ceremony. Signer chooses the number: one more than every path
     /// either family has ever used, so both children share it and neither
-    /// lands on a tombstoned path. A single request behaves like multi-family
-    /// allocation with one request; that request is keyed by the custody operation
-    /// id itself. Several requests get one registry row each, keyed by
-    /// [`family_operation_id`], so the ceremony commit can
-    /// mark all of them authority-committed together.
+    /// lands on a tombstoned path. Every family gets one registry row keyed by
+    /// [`family_operation_id`], so the ceremony commit can mark exactly the
+    /// rows produced by its apply outcome as authority-committed.
     pub fn allocate_bip39_accounts(
         &self,
         wallet_id: &Token,
@@ -8277,6 +8299,7 @@ mod clock_tests {
 #[cfg(test)]
 mod require_key_tests {
     use super::*;
+    use bloom_signer_api::{CeremonyKind, CeremonyState};
     use bloom_signer_backend_api::SecretBytes;
 
     fn retired_bip39_child_engine() -> (SignerEngine, KeyRef, Arc<BackendRegistry>) {
@@ -8430,6 +8453,80 @@ mod require_key_tests {
                 )
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn unrelated_custody_receipt_cannot_commit_an_aliased_allocation_id() {
+        let (engine, child, _registry) = retired_bip39_child_engine();
+        let wallet_id = Token::new("bip39-wallet").unwrap();
+        let original_parent = OperationId::from_bytes([41; 32]);
+        let orphan_child =
+            family_operation_id(&original_parent, DerivationProfile::Bip44EvmSecp256k1V1);
+        engine
+            .connection
+            .lock()
+            .execute(
+                "UPDATE derivation_allocations
+                 SET operation_id = ?1, state = 'ACTIVATED', authority_committed = 0
+                 WHERE operation_id = 'op-retired'",
+                [orphan_child.as_str()],
+            )
+            .unwrap();
+
+        // A different custody ceremony is allowed to choose the orphan's
+        // deterministic child ID as its own operation ID. Its receipt must not
+        // authorize registry rows that its apply outcome did not produce.
+        let result = CustodyResult {
+            ceremony_kind: CeremonyKind::WalletExport,
+            custody_operation_id: orphan_child.clone(),
+            public_status: CeremonyState::Succeeded,
+            wallet_id: Some(wallet_id),
+            public_key_refs: Vec::new(),
+            credential_summaries: Vec::new(),
+            initial_policy: None,
+            receipt_digest: Digest32::from_bytes([42; 32]),
+            encrypted_browser_result: None,
+            signer_key_id: Token::new("signer-key").unwrap(),
+            signer_signature: Base64UrlBytes::from_bytes(&[]),
+        };
+        let status = CeremonyPublicStatus {
+            ceremony_id: Digest32::from_bytes([43; 32]),
+            ceremony_kind: CeremonyKind::WalletExport,
+            operation_id: orphan_child.clone(),
+            state: CeremonyState::Succeeded,
+            expires_at_ms: DecimalU64::new(1_000),
+            ceremony_url: None,
+            receipt_digest: Some(result.receipt_digest.clone()),
+        };
+        engine
+            .commit_custody_snapshot_with_effect(CustodySnapshotCommit {
+                result: &result,
+                wallets: &[],
+                credentials: &[],
+                committed_at_ms: 100,
+                status: &status,
+                committed_allocations: &[],
+                effect: CeremonyDatabaseEffect::None,
+            })
+            .unwrap();
+
+        let committed: i64 = engine
+            .connection
+            .lock()
+            .query_row(
+                "SELECT authority_committed FROM derivation_allocations
+                 WHERE operation_id = ?1",
+                [orphan_child.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed, 0);
+        assert!(
+            !engine
+                .pending_derivation_is_committed(&orphan_child, &child)
+                .unwrap(),
+            "an aliased custody receipt must not commit a pending BIP-39 child"
         );
     }
 }
