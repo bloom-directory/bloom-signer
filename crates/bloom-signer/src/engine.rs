@@ -6172,10 +6172,16 @@ fn validate_petal_key_approval(
     // by the owner payload by payload, so it stays available after the scope
     // expires (the funds behind a delegated key must remain recoverable); it
     // is still bounded by the scope's maximum lifetime per approval.
-    let automation = matches!(terms.selector, ApprovalSelector::Petal { .. });
+    //
+    // Exhaustive on purpose: only Exact is exempt, so a selector added later
+    // stays scope-bound until this validator is changed to say otherwise.
+    let scope_bound = match terms.selector {
+        ApprovalSelector::Exact { .. } => false,
+        ApprovalSelector::Petal { .. } => true,
+    };
     if effective_now_ms < created_at_ms
         || terms.not_before_ms.get() < created_at_ms
-        || (automation
+        || (scope_bound
             && (effective_now_ms >= scope_expires_at_ms
                 || terms.expires_at_ms.get() > scope_expires_at_ms))
         || terms

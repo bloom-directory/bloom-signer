@@ -4177,7 +4177,14 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
     let broker = SigningKey::from_bytes(&[7; 32]);
     let (service, engine, _registry) = bip39_service(&authenticator);
     let (wallet_id, _) = register_wallet(&service, &authenticator, operation("c1"), 10_000);
-    let parent = engine.derived_account_descriptors(&wallet_id).unwrap()[0]
+    // Registration allocates both families; the EVM child is the parent whose
+    // suites this scope can carry.
+    let parent = engine
+        .derived_account_descriptors(&wallet_id)
+        .unwrap()
+        .iter()
+        .find(|account| account.key_ref.key_spec == KeySpec::Secp256k1)
+        .unwrap()
         .key_ref
         .clone();
     let scope = PetalKeyScope {
