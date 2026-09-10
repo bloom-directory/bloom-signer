@@ -2395,40 +2395,13 @@ impl SignerEngine {
         Ok(())
     }
 
-    /// Drive the full allocation lifecycle for one BIP-39 derived child, in
-    /// separate IMMEDIATE transactions keyed by the ceremony operation id,
-    /// and enroll the resulting `KeyRef`. Returns the child `KeyRef` and its
-    /// `DerivedAccountDescriptor`.
-    pub fn allocate_bip39_account(
-        &self,
-        wallet_id: &Token,
-        operation_id: &OperationId,
-        request: &DerivedAccountRequest,
-        unlocked: &UnlockedWallet,
-        now_ms: u64,
-    ) -> Result<(KeyRef, DerivedAccountDescriptor), ProtocolError> {
-        let seed = unlocked.bip39_seed()?;
-        let mut connection = self.connection.lock();
-        let child = self.activate_bip39_child(
-            &mut connection,
-            wallet_id,
-            operation_id,
-            request,
-            None,
-            &seed,
-            now_ms,
-        )?;
-        drop(connection);
-        self.enroll_activated_child(wallet_id, child, unlocked, now_ms)
-    }
-
     /// Allocate every requested family under one account number in one
     /// custody ceremony. Signer chooses the number: one more than every path
     /// either family has ever used, so both children share it and neither
-    /// lands on a tombstoned path. A single request keeps the ordinary
-    /// next-path behavior of [`Self::allocate_bip39_account`], keyed by the
-    /// custody operation id itself; several requests get one registry row
-    /// each, keyed by [`family_operation_id`], so the ceremony commit can
+    /// lands on a tombstoned path. A single request behaves like multi-family
+    /// allocation with one request; that request is keyed by the custody operation
+    /// id itself. Several requests get one registry row each, keyed by
+    /// [`family_operation_id`], so the ceremony commit can
     /// mark all of them authority-committed together.
     pub fn allocate_bip39_accounts(
         &self,
@@ -2443,20 +2416,6 @@ impl SignerEngine {
                 ProtocolErrorCode::MalformedFrame,
                 "account allocation requires at least one derivation request",
             )),
-            [request] => {
-                let (key_ref, descriptor) = self.allocate_bip39_account(
-                    wallet_id,
-                    custody_operation_id,
-                    request,
-                    unlocked,
-                    now_ms,
-                )?;
-                Ok(vec![AllocatedAccountKey {
-                    key_ref,
-                    descriptor,
-                    operation_id: custody_operation_id.clone(),
-                }])
-            }
             requests => {
                 let seed = unlocked.bip39_seed()?;
                 // EVM first: it is the only family with an invalid-child case,
