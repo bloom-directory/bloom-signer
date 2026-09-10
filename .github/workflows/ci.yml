@@ -28,6 +28,18 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Run tests
         run: cargo test --workspace --all-features --locked
+      - name: Exercise isolated developer ceremony origin
+        env:
+          BLOOM_TRIAD_DEV_CEREMONY_PORT: "28735"
+        run: |
+          cargo test -p bloom-signer --locked \
+            webauthn::tests::developer_ceremony_origin_is_build_scoped_and_exact -- --exact --ignored
+          cargo test -p bloom-signer --features triad-dev-harness --locked \
+            webauthn::tests::developer_ceremony_origin_is_build_scoped_and_exact -- --exact --ignored
+          # Fixtures derive the effective origin, so the full crate suite is
+          # runnable with the developer port selected — the same environment
+          # the eval harness exports.
+          cargo test -p bloom-signer --features triad-dev-harness --locked
       # `--all-features` turns on `triad-dev-harness`, so every step above
       # builds the harness arm of each `#[cfg(feature = ...)]` and never the
       # one that ships. Release behaviour was going unlinted and untested.

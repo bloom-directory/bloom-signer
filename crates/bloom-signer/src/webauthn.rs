@@ -15,6 +15,43 @@ use bloom_signer_api::{
 pub const CEREMONY_ORIGIN: &str = "http://localhost:18734";
 pub const CEREMONY_RP_ID: &str = "localhost";
 
+/// The origin every WebAuthn clientDataJSON must carry.
+///
+/// Default builds accept only the fixed production origin and ignore
+/// `BLOOM_TRIAD_DEV_CEREMONY_PORT` entirely — including values a harness
+/// build would reject. A `triad-dev-harness` build honours the variable when
+/// it names an explicit localhost port from 1 to 65535; anything else is a
+/// configuration error returned to the caller, so a malformed value fails
+/// the verification with a diagnosable protocol error instead of a panic.
+pub fn configured_ceremony_origin() -> Result<String, ProtocolError> {
+    ceremony_origin_for(std::env::var_os("BLOOM_TRIAD_DEV_CEREMONY_PORT").as_deref())
+}
+
+fn ceremony_origin_for(_env_value: Option<&std::ffi::OsStr>) -> Result<String, ProtocolError> {
+    // The underscore name keeps default builds (which never read the
+    // override) warning-free while the harness arm uses the value below.
+    #[cfg(feature = "triad-dev-harness")]
+    if let Some(value) = _env_value {
+        let port = parse_developer_ceremony_port(value)?;
+        return Ok(format!("http://localhost:{port}"));
+    }
+    Ok(CEREMONY_ORIGIN.to_owned())
+}
+
+#[cfg(feature = "triad-dev-harness")]
+fn parse_developer_ceremony_port(value: &std::ffi::OsStr) -> Result<u16, ProtocolError> {
+    value
+        .to_str()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "BLOOM_TRIAD_DEV_CEREMONY_PORT must be UTF-8 naming an integer from 1 to 65535",
+            )
+        })
+}
+
 const FLAG_USER_PRESENT: u8 = 0x01;
 const FLAG_USER_VERIFIED: u8 = 0x04;
 const FLAG_ATTESTED_CREDENTIAL: u8 = 0x40;
@@ -175,8 +212,9 @@ fn verify_client_data(
     let decoded = encoded.decode();
     let data: ClientData = serde_json::from_slice(&decoded)
         .map_err(|_| proof_error("WebAuthn clientDataJSON is malformed"))?;
+    let expected_origin = configured_ceremony_origin()?;
     if data.ceremony_type != expected_type
-        || data.origin != CEREMONY_ORIGIN
+        || data.origin != expected_origin
         || data.cross_origin
         || Base64UrlBytes::parse(data.challenge)? != Base64UrlBytes::from_bytes(expected_challenge)
     {
@@ -332,10 +370,11 @@ mod tests {
     #[test]
     fn client_data_tolerates_future_unknown_members() {
         let challenge = b"future-compatible-challenge";
+        let origin = configured_ceremony_origin().unwrap();
         let encoded = client_data(serde_json::json!({
             "type": "webauthn.get",
             "challenge": Base64UrlBytes::from_bytes(challenge),
-            "origin": CEREMONY_ORIGIN,
+            "origin": origin,
             "crossOrigin": false,
             "futureBrowserField": {"version": 1}
         }));
@@ -346,15 +385,107 @@ mod tests {
     #[test]
     fn client_data_still_rejects_cross_origin_with_top_origin() {
         let challenge = b"cross-origin-challenge";
+        let origin = configured_ceremony_origin().unwrap();
         let encoded = client_data(serde_json::json!({
             "type": "webauthn.get",
             "challenge": Base64UrlBytes::from_bytes(challenge),
-            "origin": CEREMONY_ORIGIN,
+            "origin": origin,
             "crossOrigin": true,
             "topOrigin": "https://example.invalid"
         }));
 
         let error = verify_client_data(&encoded, "webauthn.get", challenge).unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
+    }
+
+    #[test]
+    #[ignore = "requires BLOOM_TRIAD_DEV_CEREMONY_PORT from the focused CI invocation"]
+    fn developer_ceremony_origin_is_build_scoped_and_exact() {
+        let port = std::env::var("BLOOM_TRIAD_DEV_CEREMONY_PORT")
+            .expect("focused CI must select a developer ceremony port");
+        let selected = format!("http://localhost:{port}");
+        let expected = if cfg!(feature = "triad-dev-harness") {
+            selected.as_str()
+        } else {
+            CEREMONY_ORIGIN
+        };
+        assert_ne!(
+            selected, CEREMONY_ORIGIN,
+            "focused CI must select a non-default port"
+        );
+        assert_eq!(configured_ceremony_origin().unwrap(), expected);
+
+        let challenge = b"developer-origin-challenge";
+        let accepted = client_data(serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": Base64UrlBytes::from_bytes(challenge),
+            "origin": expected,
+            "crossOrigin": false
+        }));
+        verify_client_data(&accepted, "webauthn.get", challenge).unwrap();
+
+        let rejected_origin = if expected == CEREMONY_ORIGIN {
+            selected.as_str()
+        } else {
+            CEREMONY_ORIGIN
+        };
+        let rejected = client_data(serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": Base64UrlBytes::from_bytes(challenge),
+            "origin": rejected_origin,
+            "crossOrigin": false
+        }));
+        assert!(verify_client_data(&rejected, "webauthn.get", challenge).is_err());
+    }
+
+    /// Invalid developer port configuration must surface as a protocol
+    /// error from verification, never a panic; default builds must ignore
+    /// the variable entirely, including invalid values.
+    #[test]
+    fn ceremony_origin_for_is_exact_about_developer_port_values() {
+        use std::ffi::OsStr;
+        #[cfg(not(feature = "triad-dev-harness"))]
+        {
+            assert_eq!(ceremony_origin_for(None).unwrap(), CEREMONY_ORIGIN);
+            assert_eq!(
+                ceremony_origin_for(Some(OsStr::new("28735"))).unwrap(),
+                CEREMONY_ORIGIN
+            );
+            assert_eq!(
+                ceremony_origin_for(Some(OsStr::new("0"))).unwrap(),
+                CEREMONY_ORIGIN
+            );
+            assert_eq!(
+                ceremony_origin_for(Some(OsStr::new("not-a-port"))).unwrap(),
+                CEREMONY_ORIGIN
+            );
+        }
+        #[cfg(feature = "triad-dev-harness")]
+        {
+            assert_eq!(ceremony_origin_for(None).unwrap(), CEREMONY_ORIGIN);
+            assert_eq!(
+                ceremony_origin_for(Some(OsStr::new("28735"))).unwrap(),
+                "http://localhost:28735"
+            );
+            assert_eq!(
+                ceremony_origin_for(Some(OsStr::new("65535"))).unwrap(),
+                "http://localhost:65535"
+            );
+            for invalid in ["0", "65536", "not-a-port", " 28735", ""] {
+                let error = ceremony_origin_for(Some(OsStr::new(invalid))).unwrap_err();
+                assert_eq!(
+                    error.code,
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "value {invalid:?} must be rejected, not panic"
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt as _;
+                let error =
+                    ceremony_origin_for(Some(OsStr::from_bytes(b"\xff\xfeinvalid"))).unwrap_err();
+                assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+            }
+        }
     }
 }
