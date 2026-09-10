@@ -2356,6 +2356,19 @@ impl SignerEngine {
         let Some(operation_id) = operation_id else {
             return Ok(());
         };
+        // The child's `enrolled_keys` row must not outlive its allocation:
+        // the account listing resolves every enrolled derived key against
+        // its derivation row, so a live enrollment over a tombstoned
+        // allocation would fail the whole listing closed. Tolerates the
+        // not-yet-enrolled case — the same abandon path runs when backend
+        // registration itself failed and nothing was enrolled.
+        connection
+            .execute(
+                "UPDATE enrolled_keys SET available = 0
+                  WHERE key_fingerprint = ?1 AND authority_class = 'derived'",
+                [key_ref.public_key_fingerprint.as_str()],
+            )
+            .map_err(storage)?;
         let audit = |tx: &Transaction, event: &str, payload: serde_json::Value| {
             self.append_audit(tx, event, &payload)
         };
