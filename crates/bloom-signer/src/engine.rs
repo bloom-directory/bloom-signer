@@ -6232,10 +6232,12 @@ fn validate_petal_key_approval(
     let scope_bound = match terms.selector {
         ApprovalSelector::Exact { .. } => false,
         ApprovalSelector::Petal { .. } => true,
-        // A System approval is reviewed once against a single intent, but the
-        // payload it finally signs is refreshed, so it is not the
-        // payload-by-payload review that earns Exact its exemption. It takes
-        // the default this match asks a new selector to take.
+        // Unreachable, and fail-closed if that ever changes: `validate` pairs
+        // a System selector only with a System subject, and this validator
+        // has already refused anything but a Petal subject above. A System
+        // approval on a Petal sub-key never reaches this value. Broker's
+        // mirror of this check is dead for the same reason; the reachable
+        // System rule is the stopped-key one.
         ApprovalSelector::System { .. } => true,
     };
     if effective_now_ms < created_at_ms
