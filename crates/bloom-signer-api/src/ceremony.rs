@@ -336,12 +336,57 @@ pub struct CustodyPrepareRequest {
     /// BIP-39 root. Broker selects; Signer validates against capabilities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wallet_seed_profile: Option<crate::WalletSeedProfile>,
-    /// Derived-account allocation request (AccountAllocate custody only).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub derivation_request: Option<crate::DerivedAccountRequest>,
+    /// Families allocated under one account number in one ceremony
+    /// (AccountAllocate custody only). Signer chooses the number; the request
+    /// carries none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derivation_requests: Vec<crate::DerivedAccountRequest>,
 }
 
 impl CustodyPrepareRequest {
+    /// Validate the derivation requests against the ceremony kind. Broker and
+    /// Signer both call this before accepting an allocation.
+    pub fn validate_derivation_requests(&self) -> Result<(), ProtocolError> {
+        if self.ceremony_kind != CeremonyKind::AccountAllocate {
+            if !self.derivation_requests.is_empty() {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::CeremonyKindMismatch,
+                    "derivation requests are valid only for account allocation",
+                ));
+            }
+            return Ok(());
+        }
+        if self.derivation_requests.is_empty() || self.derivation_requests.len() > 2 {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "AccountAllocate requires one or two derivation requests",
+            ));
+        }
+        if self.wallet_id.is_none() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "AccountAllocate requires an authoritative wallet ID",
+            ));
+        }
+        let requests = &self.derivation_requests;
+        let mut profiles = std::collections::HashSet::new();
+        for request in requests {
+            if !profiles.insert(request.derivation_profile) {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::MalformedFrame,
+                    "one allocation names each derivation profile at most once",
+                ));
+            }
+            if request.account.is_some() {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::MalformedFrame,
+                    "allocation requests cannot pin derivation account numbers",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_wallet_creation_binding(&self) -> Result<(), ProtocolError> {
         if !matches!(
             self.ceremony_kind,
@@ -842,7 +887,7 @@ mod tests {
             petal_key_scope: Some(scope),
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
-            derivation_request: None,
+            derivation_requests: Vec::new(),
         }
     }
 
@@ -858,7 +903,7 @@ mod tests {
             petal_key_scope: None,
             legacy_passkey_migration: None,
             wallet_seed_profile: None,
-            derivation_request: None,
+            derivation_requests: Vec::new(),
         }
     }
 

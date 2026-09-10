@@ -992,11 +992,12 @@ impl LocalSignerBackend {
         };
         for key_ref in registered {
             match key_ref.derivation.as_ref() {
-                Some(DerivationRef::Bip32Secp256k1 { path, .. }) => {
-                    if self.describe_path(path)?.key_ref != key_ref {
-                        return Err(BackendError::DefinitiveRejected);
-                    }
+                Some(DerivationRef::Bip32Secp256k1 { path, .. })
+                    if self.describe_path(path)?.key_ref != key_ref =>
+                {
+                    return Err(BackendError::DefinitiveRejected);
                 }
+                Some(DerivationRef::Bip32Secp256k1 { .. }) => {}
                 Some(DerivationRef::Bip39Multicurve { .. }) => {
                     let seed = bip39_seed.as_ref().ok_or(BackendError::InvalidRequest)?;
                     if self.describe_bip39_child_with_seed(&key_ref, seed)?.key_ref != key_ref {
