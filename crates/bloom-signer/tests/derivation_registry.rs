@@ -777,3 +777,369 @@ fn automatic_solana_accounts_advance_across_tombstones_and_roles() {
     .unwrap();
     assert_eq!(retry, second);
 }
+
+fn code(error: &bloom_signer_api::ProtocolError) -> ProtocolErrorCode {
+    error.code
+}
+
+#[test]
+fn explicit_index_targets_the_path_and_only_moves_the_counter_forward() {
+    let mut connection = connection();
+    let wallet = primary();
+    allocate_activated(&mut connection, "op-0", 0);
+
+    // A target beyond the counter lands exactly there and moves the counter
+    // past it, so the ordinary allocator can never hand that index out again.
+    let targeted = registry::prepare_allocation_at(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        None,
+        Some(3),
+        "op-3",
+        |_, _| false,
+        2_000,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(targeted.index, 3);
+    assert_eq!(targeted.path, "m/44'/60'/0'/0/3");
+    let ordinary = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        None,
+        "op-next",
+        |_, _| false,
+        2_100,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(ordinary.index, 4);
+
+    // A target below the counter fills a hole without moving the counter back.
+    let hole = registry::prepare_allocation_at(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        None,
+        Some(1),
+        "op-1",
+        |_, _| false,
+        2_200,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(hole.index, 1);
+    let after_hole = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        None,
+        "op-after-hole",
+        |_, _| false,
+        2_300,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(after_hole.index, 5);
+
+    // Retrying the same operation with the same target is idempotent; a
+    // different target under a used operation id is a conflict.
+    let retry = registry::prepare_allocation_at(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        None,
+        Some(3),
+        "op-3",
+        |_, _| false,
+        2_400,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(retry, targeted);
+    let conflict = registry::prepare_allocation_at(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        None,
+        Some(2),
+        "op-3",
+        |_, _| false,
+        2_500,
+        &noop,
+    )
+    .unwrap_err();
+    assert_eq!(code(&conflict), ProtocolErrorCode::OperationIdConflict);
+
+    // Targets are an EVM-only concept: the Solana path carries no index.
+    let solana = registry::prepare_allocation_at(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_SOLANA,
+        registry::ROLE_SOLANA_ACCOUNT,
+        None,
+        Some(0),
+        "op-solana-target",
+        |_, _| false,
+        2_600,
+        &noop,
+    )
+    .unwrap_err();
+    assert_eq!(code(&solana), ProtocolErrorCode::MalformedFrame);
+    registry::verify_event_chain(&connection).unwrap();
+}
+
+#[test]
+fn explicit_index_on_an_occupied_tombstoned_or_invalid_index_fails_typed() {
+    let mut connection = connection();
+    let wallet = primary();
+    allocate_activated(&mut connection, "op-0", 0);
+
+    // Occupied by a live allocation.
+    let occupied = registry::prepare_allocation_at(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        None,
+        Some(0),
+        "op-dup",
+        |_, _| false,
+        2_000,
+        &noop,
+    )
+    .unwrap_err();
+    assert_eq!(code(&occupied), ProtocolErrorCode::OperationIdConflict);
+
+    // Occupied by a tombstone: retiring index 0 never frees it.
+    registry::tombstone(&mut connection, &wallet, "op-0", 2_100, &noop).unwrap();
+    let dead = registry::prepare_allocation_at(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        None,
+        Some(0),
+        "op-dead",
+        |_, _| false,
+        2_200,
+        &noop,
+    )
+    .unwrap_err();
+    assert_eq!(code(&dead), ProtocolErrorCode::OperationIdConflict);
+
+    // A BIP-32-invalid target is recorded as a tombstone and reported as
+    // invalid; the counter does not move, so the next ordinary allocation is
+    // still index 1, and the same target afterwards is a plain conflict.
+    let invalid = registry::prepare_allocation_at(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        None,
+        Some(7),
+        "op-invalid",
+        |_, index| index == 7,
+        2_300,
+        &noop,
+    )
+    .unwrap_err();
+    assert_eq!(code(&invalid), ProtocolErrorCode::BackendInvalidRequest);
+    assert!(
+        registry::public_accounts(&connection, &wallet)
+            .unwrap()
+            .iter()
+            .all(|account| account.operation_id != "op-invalid")
+    );
+    let ordinary = registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        None,
+        "op-1",
+        |_, _| false,
+        2_400,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(ordinary.index, 1);
+    let again = registry::prepare_allocation_at(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        None,
+        Some(7),
+        "op-invalid-again",
+        |_, _| false,
+        2_500,
+        &noop,
+    )
+    .unwrap_err();
+    assert_eq!(code(&again), ProtocolErrorCode::OperationIdConflict);
+    registry::verify_event_chain(&connection).unwrap();
+}
+
+#[test]
+fn recorded_invalid_children_are_never_targeted() {
+    let mut connection = connection();
+    let wallet = primary();
+    registry::record_invalid_child_tombstone(
+        &connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        0,
+        3,
+        1_000,
+    )
+    .unwrap();
+    // Retrying the same conclusion is a no-op, not a duplicate row.
+    registry::record_invalid_child_tombstone(
+        &connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        0,
+        3,
+        1_100,
+    )
+    .unwrap();
+    let error = registry::prepare_allocation_at(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        None,
+        Some(3),
+        "op-target-invalid",
+        |_, _| false,
+        1_200,
+        &noop,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("tombstoned"), "{error}");
+    // The ordinary namespace counter is untouched, but shared numbering skips
+    // every EVM tombstone so a paired allocation cannot land below a dead path.
+    assert_eq!(
+        registry::next_account_number(&connection, &wallet).unwrap(),
+        4
+    );
+}
+
+#[test]
+fn next_account_number_spans_both_families_and_counts_dead_paths() {
+    let mut connection = connection();
+    let wallet = primary();
+    assert_eq!(
+        registry::next_account_number(&connection, &wallet).unwrap(),
+        0
+    );
+
+    allocate_activated(&mut connection, "op-evm-0", 0);
+    assert_eq!(
+        registry::next_account_number(&connection, &wallet).unwrap(),
+        1
+    );
+
+    // Solana accounts 0 and 1; tombstoning 1 leaves it counted.
+    for (operation, expected_account) in [("op-sol-0", 0), ("op-sol-1", 1)] {
+        let reservation = registry::prepare_allocation(
+            &mut connection,
+            &wallet,
+            registry::PROFILE_SOLANA,
+            registry::ROLE_SOLANA_ACCOUNT,
+            None,
+            operation,
+            |_, _| false,
+            3_000,
+            &noop,
+        )
+        .unwrap();
+        assert_eq!(reservation.account, expected_account);
+    }
+    assert_eq!(
+        registry::next_account_number(&connection, &wallet).unwrap(),
+        2
+    );
+    registry::tombstone(&mut connection, &wallet, "op-sol-1", 3_100, &noop).unwrap();
+    assert_eq!(
+        registry::next_account_number(&connection, &wallet).unwrap(),
+        2
+    );
+
+    // An EVM target at 4 pushes the number past every Solana account; a
+    // Solana account at 7 pushes it past every EVM index.
+    registry::prepare_allocation_at(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_EVM,
+        registry::ROLE_EVM_ACCOUNT,
+        None,
+        Some(4),
+        "op-evm-4",
+        |_, _| false,
+        3_200,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(
+        registry::next_account_number(&connection, &wallet).unwrap(),
+        5
+    );
+    registry::prepare_allocation(
+        &mut connection,
+        &wallet,
+        registry::PROFILE_SOLANA,
+        registry::ROLE_SOLANA_ACCOUNT,
+        Some(7),
+        "op-sol-7",
+        |_, _| false,
+        3_300,
+        &noop,
+    )
+    .unwrap();
+    assert_eq!(
+        registry::next_account_number(&connection, &wallet).unwrap(),
+        8
+    );
+
+    // A retired row keeps its account and its index, so retirement never
+    // frees its number.
+    registry::commit_index(&mut connection, &wallet, "op-sol-7", 3_350, &noop).unwrap();
+    let (spki, fingerprint) = spki_fixture(3);
+    registry::commit_account(
+        &mut connection,
+        &wallet,
+        "op-sol-7",
+        &spki,
+        &fingerprint,
+        3_360,
+        &noop,
+    )
+    .unwrap();
+    registry::activate(&mut connection, &wallet, "op-sol-7", 3_370, &noop).unwrap();
+    registry::retire(&mut connection, &wallet, "op-sol-7", 3_400, &noop).unwrap();
+    assert_eq!(
+        registry::next_account_number(&connection, &wallet).unwrap(),
+        8
+    );
+    let retired: (String, i64) = connection
+        .query_row(
+            "SELECT state, account FROM derivation_allocations
+              WHERE wallet_id = ?1 AND operation_id = 'op-sol-7'",
+            rusqlite::params![wallet.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(retired, ("RETIRED".to_owned(), 7));
+}
