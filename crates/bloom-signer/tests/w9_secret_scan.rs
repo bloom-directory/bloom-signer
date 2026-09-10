@@ -74,7 +74,7 @@ fn import_mnemonic(
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
-                derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             now_ms,
         )
@@ -123,80 +123,6 @@ fn import_mnemonic(
             now_ms + 100,
         )
         .unwrap()
-}
-
-fn allocate(
-    service: &SignerCeremonyService,
-    authenticator: &VirtualAuthenticator,
-    wallet_id: &Token,
-    operation_id: &OperationId,
-    request: DerivedAccountRequest,
-    now_ms: u64,
-) -> KeyRef {
-    let effect = serde_json::json!({ "kind": "account_allocate" });
-    let exact_terms_digest =
-        Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&effect).unwrap()).into());
-    let prepared = service
-        .prepare_custody(
-            CustodyPrepareRequest {
-                ceremony_kind: CeremonyKind::AccountAllocate,
-                custody_operation_id: operation_id.clone(),
-                wallet_id: Some(wallet_id.clone()),
-                key_ref: None,
-                exact_terms_digest: exact_terms_digest.clone(),
-                expected_input_class: Token::new("generic-custody-v1").unwrap(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-                wallet_seed_profile: None,
-                derivation_request: Some(request),
-            },
-            now_ms,
-        )
-        .unwrap();
-    let assertion = authenticator.assertion(
-        &prepared.challenges[0].canonical_bytes().unwrap(),
-        now_ms as u32,
-    );
-    let aad = CustodyHpkeAad {
-        ceremony_id: prepared.contribution.ceremony_id.clone(),
-        ceremony_kind: CeremonyKind::AccountAllocate,
-        custody_operation_id: operation_id.clone(),
-        signer_nonce: prepared.contribution.signer_nonce.clone(),
-        signer_contribution_digest: prepared.contribution.digest().unwrap(),
-        wallet_id: Some(wallet_id.clone()),
-        key_ref: None,
-        credential_id: Some(assertion.credential_id.clone()),
-        expected_input_class: Token::new("generic-custody-v1").unwrap(),
-    }
-    .canonical_bytes()
-    .unwrap();
-    let plaintext = serde_jcs::to_vec(&serde_json::json!({
-        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-        "effect": effect,
-    }))
-    .unwrap();
-    let encrypted_input = seal_hpke(
-        &prepared.contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
-        &plaintext,
-    )
-    .unwrap();
-    let result = service
-        .complete_custody(
-            CustodyCompleteRequest {
-                ceremony_kind: CeremonyKind::AccountAllocate,
-                custody_operation_id: operation_id.clone(),
-                ceremony_id: prepared.contribution.ceremony_id,
-                proof: WebAuthnCeremonyProof::Assertion { assertion },
-                encrypted_input: Some(encrypted_input),
-                public_binding_digest: exact_terms_digest,
-            },
-            now_ms + 100,
-        )
-        .unwrap();
-    result.public_key_refs[0].clone()
 }
 
 /// A tracing `MakeWriter` that appends every line to a shared buffer.
@@ -288,18 +214,7 @@ fn bip39_secret_scan_is_empty_across_logs_audit_sqlite_and_responses() {
         40_000,
     );
     let evm_child = import_result.public_key_refs[0].clone();
-    let solana_child = allocate(
-        &service,
-        &authenticator,
-        &wallet_id,
-        &OperationId::new("41".repeat(32)).unwrap(),
-        DerivedAccountRequest {
-            derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-            requested_role: Token::new("solana-account").unwrap(),
-            account: Some(0),
-        },
-        40_100,
-    );
+    let solana_child = import_result.public_key_refs[1].clone();
 
     let backend = registry
         .get(&Token::new("local").unwrap(), &wallet_id)
@@ -343,7 +258,7 @@ fn bip39_secret_scan_is_empty_across_logs_audit_sqlite_and_responses() {
                 petal_key_scope: None,
                 legacy_passkey_migration: None,
                 wallet_seed_profile: None,
-                derivation_request: None,
+                derivation_requests: Vec::new(),
             },
             40_200,
         )

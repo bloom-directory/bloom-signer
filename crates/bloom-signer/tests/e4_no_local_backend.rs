@@ -60,7 +60,7 @@ fn bip39_registration_prepare_is_backend_unsupported_without_local() {
             petal_key_scope: None,
             legacy_passkey_migration: None,
             wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
-            derivation_request: None,
+            derivation_requests: Vec::new(),
         },
         10_000,
     );
