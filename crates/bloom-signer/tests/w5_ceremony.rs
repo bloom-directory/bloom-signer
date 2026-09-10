@@ -3864,3 +3864,111 @@ fn an_approval_ceremony_is_bounded_by_its_terms_not_by_the_ceremony_ttl() {
         "an approval ceremony must expire with the authority it activates"
     );
 }
+
+#[test]
+fn petal_subkey_reuses_a_fingerprint_whose_scope_expired_on_a_same_seed_wallet() {
+    // A wallet recovered from the mnemonic of an older wallet takes over its
+    // parent keys and derives byte-identical Petal children. The older
+    // wallet's scopes must not poison the recovered wallet forever: an
+    // expired scope yields, a live one stays exclusive.
+    let authenticator_a = VirtualAuthenticator::generate();
+    let authenticator_b = VirtualAuthenticator::generate();
+    let (service, _engine, _registry) = bip39_service(&authenticator_a);
+    let wallet_a = Token::new("seed-original").unwrap();
+    let wallet_b = Token::new("seed-recovered").unwrap();
+    let scope = |wallet: &Token, parent: &bloom_signer_api::KeyRef, op: &str, lifetime_ms: u64| {
+        PetalKeyScope {
+            wallet_id: wallet.clone(),
+            parent_key_ref: parent.clone(),
+            package_hash: digest("c3"),
+            route: "/petals/exchange/sign".into(),
+            lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            key_slot: Token::new("account-a").unwrap(),
+            allowed_routes: vec!["/petals/exchange/sign".into()],
+            allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
+            allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+            maximum_lifetime_ms: DecimalU64::new(lifetime_ms),
+            custody_operation_id: operation(op),
+        }
+    };
+
+    let parent_a = complete_bip39_mnemonic_import(
+        &service,
+        &authenticator_a,
+        &wallet_a,
+        &operation("c1"),
+        bloom_signer_vectors::BIP39_MNEMONIC,
+        10_000,
+    )
+    .public_key_refs[0]
+        .clone();
+    // Wallet A takes child index 0 (scope expires at 30_200) and child
+    // index 1 (scope still live at 50_000).
+    let (first_a, _) = complete_petal_key_derivation(
+        &service,
+        &authenticator_a,
+        scope(&wallet_a, &parent_a, "c4", 20_000),
+        None,
+        10_200,
+    )
+    .unwrap();
+    let (second_a, _) = complete_petal_key_derivation(
+        &service,
+        &authenticator_a,
+        scope(&wallet_a, &parent_a, "c6", 100_000),
+        None,
+        10_400,
+    )
+    .unwrap();
+    assert_ne!(
+        second_a.public_key_refs[0].public_key_fingerprint,
+        first_a.public_key_refs[0].public_key_fingerprint
+    );
+
+    // Wallet B recovers the same mnemonic and becomes the parent's owner.
+    let parent_b = complete_bip39_mnemonic_import(
+        &service,
+        &authenticator_b,
+        &wallet_b,
+        &operation("c2"),
+        bloom_signer_vectors::BIP39_MNEMONIC,
+        50_000,
+    )
+    .public_key_refs[0]
+        .clone();
+    assert_eq!(
+        parent_a.public_key_fingerprint,
+        parent_b.public_key_fingerprint
+    );
+
+    // Child index 0 again: A's scope has expired, so B takes the key over.
+    let (first_b, _) = complete_petal_key_derivation(
+        &service,
+        &authenticator_b,
+        scope(&wallet_b, &parent_b, "c5", 20_000),
+        None,
+        50_100,
+    )
+    .expect("an expired scope on a same-seed wallet must not block derivation");
+    assert_eq!(
+        first_a.public_key_refs[0].public_key_fingerprint,
+        first_b.public_key_refs[0].public_key_fingerprint
+    );
+
+    // Child index 1 again: A's scope is live, so B is refused with a clear
+    // code, not a storage failure.
+    let collision = complete_petal_key_derivation(
+        &service,
+        &authenticator_b,
+        scope(&wallet_b, &parent_b, "c7", 20_000),
+        None,
+        50_200,
+    )
+    .unwrap_err();
+    assert_eq!(collision.code, ProtocolErrorCode::KeyrefMismatch);
+    assert!(
+        collision.message.contains("seed-original"),
+        "{}",
+        collision.message
+    );
+}
