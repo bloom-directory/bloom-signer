@@ -226,7 +226,9 @@ fn try_complete_local_approval(
             ordered_payload_digests,
             ordered_hashes,
         } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
-        ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
+        ApprovalSelector::Petal { .. } | ApprovalSelector::System { .. } => {
+            (Vec::new(), Vec::new())
+        }
     };
     let prepared = service.prepare_approval(
         CeremonyPrepareRequest {
@@ -4873,6 +4875,9 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
             let (max_operations, max_signatures) = match &selector {
                 ApprovalSelector::Exact { ordered_hashes, .. } => (1, ordered_hashes.len() as u64),
                 ApprovalSelector::Petal { .. } => (4, 4),
+                ApprovalSelector::System { .. } => {
+                    unreachable!("this test builds only Exact and Petal terms")
+                }
             };
             SealedApprovalTerms {
                 subject: ApprovalSubject::Petal {

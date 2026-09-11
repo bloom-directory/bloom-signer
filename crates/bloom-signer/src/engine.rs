@@ -6133,6 +6133,12 @@ fn validate_against_approval(
         (ApprovalSelector::Petal { .. }, SelectorKind::Petal)
             if request.unsigned.petal_use_claim_digest.is_some()
                 && request.unsigned.claim_assurance_digest.is_some() => {}
+        // Broker verifies the System claim against `intent_digest`. Signer is
+        // deliberately parser-free and requires both Broker-authenticated
+        // opaque commitments before applying its own counters and key checks.
+        (ApprovalSelector::System { .. }, SelectorKind::System)
+            if request.unsigned.petal_use_claim_digest.is_some()
+                && request.unsigned.claim_assurance_digest.is_some() => {}
         _ => {
             return Err(error(
                 ProtocolErrorCode::SelectorMismatch,
@@ -6271,6 +6277,13 @@ fn validate_petal_key_approval(
     let scope_bound = match terms.selector {
         ApprovalSelector::Exact { .. } => false,
         ApprovalSelector::Petal { .. } => true,
+        // Unreachable, and fail-closed if that ever changes: `validate` pairs
+        // a System selector only with a System subject, and this validator
+        // has already refused anything but a Petal subject above. A System
+        // approval on a Petal sub-key never reaches this value. Broker's
+        // mirror of this check is dead for the same reason; the reachable
+        // System rule is the stopped-key one.
+        ApprovalSelector::System { .. } => true,
     };
     if effective_now_ms < created_at_ms
         || terms.not_before_ms.get() < created_at_ms

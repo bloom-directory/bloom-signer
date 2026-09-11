@@ -54,6 +54,13 @@ pub enum ApprovalSelector {
         route_grants: Vec<PetalRouteGrant>,
         required_claim_assurance: ClaimAssuranceLevel,
     },
+    System {
+        component_id: Token,
+        action_class: Token,
+        allowed_operation_classes: Vec<Token>,
+        required_claim_assurance: ClaimAssuranceLevel,
+        intent_digest: Digest32,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -151,6 +158,22 @@ impl SealedApprovalTerms {
         }
 
         match (&self.subject, &self.selector) {
+            (
+                ApprovalSubject::System {
+                    component_id,
+                    operation_class,
+                },
+                ApprovalSelector::System {
+                    component_id: selector_component,
+                    action_class,
+                    allowed_operation_classes,
+                    ..
+                },
+            ) if component_id == selector_component
+                && operation_class == action_class
+                && classes_are_canonical(allowed_operation_classes)
+                && self.limits.max_operations.get() == 1
+                && self.limits.max_signatures.get() == 1 => {}
             (
                 ApprovalSubject::Petal {
                     package_hash,
@@ -352,6 +375,85 @@ mod tests {
             terms.validate().unwrap_err().code,
             ProtocolErrorCode::SelectorMismatch
         );
+    }
+
+    #[test]
+    fn system_selector_identity_classes_and_single_use_are_fail_closed() {
+        let mut terms = exact_terms("03".repeat(16).as_str());
+        terms.subject = ApprovalSubject::System {
+            component_id: Token::new("bloom-broker").unwrap(),
+            operation_class: Token::new("wallet.fund-derived").unwrap(),
+        };
+        terms.selector = ApprovalSelector::System {
+            component_id: Token::new("bloom-broker").unwrap(),
+            action_class: Token::new("wallet.fund-derived").unwrap(),
+            allowed_operation_classes: vec![Token::new("solana.transfer").unwrap()],
+            required_claim_assurance: ClaimAssuranceLevel::ProofVerified,
+            intent_digest: Digest32::new("66".repeat(32)).unwrap(),
+        };
+        terms.validate().unwrap();
+
+        let mut wrong_subject = terms.clone();
+        wrong_subject.subject = ApprovalSubject::Cli {
+            client_id: Token::new("bloom-cli").unwrap(),
+            command_class: Token::new("wallet.sign").unwrap(),
+        };
+        assert_eq!(
+            wrong_subject.validate().unwrap_err().code,
+            ProtocolErrorCode::SelectorMismatch
+        );
+
+        let mut wrong_component = terms.clone();
+        if let ApprovalSelector::System { component_id, .. } = &mut wrong_component.selector {
+            *component_id = Token::new("other-component").unwrap();
+        }
+        assert_eq!(
+            wrong_component.validate().unwrap_err().code,
+            ProtocolErrorCode::SelectorMismatch
+        );
+
+        let mut wrong_action = terms.clone();
+        if let ApprovalSelector::System { action_class, .. } = &mut wrong_action.selector {
+            *action_class = Token::new("wallet.other-action").unwrap();
+        }
+        assert_eq!(
+            wrong_action.validate().unwrap_err().code,
+            ProtocolErrorCode::SelectorMismatch
+        );
+
+        let mut noncanonical_classes = terms.clone();
+        if let ApprovalSelector::System {
+            allowed_operation_classes,
+            ..
+        } = &mut noncanonical_classes.selector
+        {
+            *allowed_operation_classes = vec![
+                Token::new("solana.transfer").unwrap(),
+                Token::new("solana.transfer").unwrap(),
+            ];
+        }
+        assert_eq!(
+            noncanonical_classes.validate().unwrap_err().code,
+            ProtocolErrorCode::SelectorMismatch
+        );
+
+        for limits in [
+            ApprovalLimits {
+                max_operations: DecimalU64::new(2),
+                ..terms.limits.clone()
+            },
+            ApprovalLimits {
+                max_signatures: DecimalU64::new(2),
+                ..terms.limits.clone()
+            },
+        ] {
+            let mut widened = terms.clone();
+            widened.limits = limits;
+            assert_eq!(
+                widened.validate().unwrap_err().code,
+                ProtocolErrorCode::SelectorMismatch
+            );
+        }
     }
 
     #[test]

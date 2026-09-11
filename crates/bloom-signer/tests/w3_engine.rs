@@ -101,6 +101,22 @@ fn petal_terms() -> SealedApprovalTerms {
     terms
 }
 
+fn system_terms() -> SealedApprovalTerms {
+    let mut terms = exact_terms();
+    terms.subject = ApprovalSubject::System {
+        component_id: Token::new("bloom-broker").unwrap(),
+        operation_class: Token::new("wallet.fund-derived").unwrap(),
+    };
+    terms.selector = ApprovalSelector::System {
+        component_id: Token::new("bloom-broker").unwrap(),
+        action_class: Token::new("wallet.fund-derived").unwrap(),
+        allowed_operation_classes: vec![Token::new("solana.transfer").unwrap()],
+        required_claim_assurance: ClaimAssuranceLevel::ProofVerified,
+        intent_digest: digest("78"),
+    };
+    terms
+}
+
 fn new_engine(broker: &SigningKey) -> SignerEngine {
     let registry = Arc::new(
         BackendRegistry::from_compiled(vec![CompiledBackend::Local(local_backend())]).unwrap(),
@@ -132,11 +148,16 @@ fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> Unsign
         ApprovalSelector::Petal { .. } => {
             (vec![digest("22")], vec![digest("33")], SelectorKind::Petal)
         }
+        ApprovalSelector::System { .. } => {
+            (vec![digest("22")], vec![digest("33")], SelectorKind::System)
+        }
     };
-    let claim_digest =
-        matches!(&terms.selector, ApprovalSelector::Petal { .. }).then(|| digest("ab"));
-    let assurance_digest =
-        matches!(&terms.selector, ApprovalSelector::Petal { .. }).then(|| digest("ac"));
+    let reusable = matches!(
+        &terms.selector,
+        ApprovalSelector::Petal { .. } | ApprovalSelector::System { .. }
+    );
+    let claim_digest = reusable.then(|| digest("ab"));
+    let assurance_digest = reusable.then(|| digest("ac"));
     let identity = SignOperationIdentity {
         operation_id: OperationId::new(operation_byte.repeat(32)).unwrap(),
         approval_id: terms.approval_id().unwrap(),
@@ -461,6 +482,61 @@ fn ac11_approval_ceiling_selector_issuer_key_state_retry_and_release_are_closed(
     assert_eq!(
         engine.authorize_sign(&replacement, &clock(2_500)).unwrap(),
         SignAuthorization::NewOperation
+    );
+}
+
+#[test]
+fn system_selector_requires_both_claim_commitments_and_is_single_use() {
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let terms = system_terms();
+
+    for missing_claim in [true, false] {
+        let engine = new_engine(&broker);
+        engine.install_approval_for_test(&terms).unwrap();
+        let mut request = signed(&broker, unsigned_request(&terms, "20"));
+        if missing_claim {
+            request.unsigned.petal_use_claim_digest = None;
+        } else {
+            request.unsigned.claim_assurance_digest = None;
+        }
+        resign(&broker, &mut request);
+        assert_eq!(
+            engine
+                .authorize_sign(&request, &clock(2_500))
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::SelectorMismatch
+        );
+    }
+
+    let engine = new_engine(&broker);
+    engine.install_approval_for_test(&terms).unwrap();
+    let mut wrong_kind = signed(&broker, unsigned_request(&terms, "21"));
+    wrong_kind.unsigned.selector_kind = SelectorKind::Petal;
+    resign(&broker, &mut wrong_kind);
+    assert_eq!(
+        engine
+            .authorize_sign(&wrong_kind, &clock(2_500))
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+
+    let accepted = signed(&broker, unsigned_request(&terms, "22"));
+    assert_eq!(
+        engine.authorize_sign(&accepted, &clock(2_500)).unwrap(),
+        SignAuthorization::NewOperation
+    );
+
+    let mut second = signed(&broker, unsigned_request(&terms, "23"));
+    second.unsigned.attempt_id = digest("89");
+    resign(&broker, &mut second);
+    assert_eq!(
+        engine
+            .authorize_sign(&second, &clock(2_500))
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::LimitExceededOperations
     );
 }
 

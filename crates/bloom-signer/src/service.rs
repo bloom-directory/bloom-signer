@@ -1303,7 +1303,9 @@ mod tests {
                 ordered_payload_digests,
                 ordered_hashes,
             } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
-            ApprovalSelector::Petal { .. } => unreachable!("fixture is exact"),
+            ApprovalSelector::Petal { .. } | ApprovalSelector::System { .. } => {
+                unreachable!("fixture is exact")
+            }
         };
         service
             .ceremony
