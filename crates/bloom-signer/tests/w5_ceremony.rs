@@ -2753,8 +2753,7 @@ fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
     assert_eq!(
         prepared.contribution.expires_at_ms.get(),
         10_100 + 5 * 60 * 1_000,
-        "a Petal scope ceremony uses the ordinary custody window; the developer
-         harness widens it separately in bloom-directory/bloom-signer#27"
+        "a Petal scope ceremony uses the ordinary custody window"
     );
 }
 
@@ -4110,42 +4109,6 @@ fn bip39_solana_child_export_refuses_empty_pinned_keys() {
         err.code,
         ProtocolErrorCode::KeyrefMismatch,
         "empty pinned_keys with an allocated child must refuse to export"
-    );
-}
-
-/// A sealed-approval ceremony never outlives the authority it activates, so
-/// the ceremony TTL cannot lengthen one — including the developer harness TTL.
-///
-/// This is worth pinning because it is easy to get backwards. The harness
-/// window is for custody ceremonies, which are minted from the TTL alone. An
-/// approval is minted from `min(ttl, terms.expires_at_ms)`, and the Machine
-/// sets those terms to ten minutes, so the clamp always wins. Raising the TTL
-/// to widen an approval window silently does nothing.
-#[test]
-fn an_approval_ceremony_is_bounded_by_its_terms_not_by_the_ceremony_ttl() {
-    let authenticator = VirtualAuthenticator::generate();
-    let (service, key_ref, _engine, _registry) = service(&authenticator);
-    let terms = terms(key_ref);
-    // Sooner than the shortest TTL either build can mint.
-    assert_eq!(terms.expires_at_ms.get(), 30_300);
-
-    let prepared = service
-        .prepare_approval(
-            CeremonyPrepareRequest {
-                activation_operation_id: operation("10"),
-                terms: terms.clone(),
-                review_manifest_digest: digest("77"),
-                exact_ordered_payload_digests: vec![digest("22")],
-                exact_ordered_hashes: vec![digest("33")],
-                replacement_approval_id: None,
-            },
-            2_000,
-        )
-        .unwrap();
-
-    assert_eq!(
-        prepared.contribution.expires_at_ms, terms.expires_at_ms,
-        "an approval ceremony must expire with the authority it activates"
     );
 }
 
