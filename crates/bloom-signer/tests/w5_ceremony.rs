@@ -3225,6 +3225,61 @@ fn account_allocate_prepare(
 }
 
 /// One ceremony allocating several families under one Signer-chosen number.
+/// The multi-family allocation ceremony, keeping the completion error
+/// instead of unwrapping it.
+fn try_complete_account_allocate_many(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    wallet_id: &Token,
+    operation_id: &OperationId,
+    requests: Vec<DerivedAccountRequest>,
+    now_ms: u64,
+) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
+    let (request, exact_terms_digest, effect) =
+        account_allocate_prepare(wallet_id, operation_id, requests);
+    let prepared = service.prepare_custody(request, now_ms).unwrap();
+    let assertion = authenticator.assertion(
+        &prepared.challenges[0].canonical_bytes().unwrap(),
+        now_ms as u32,
+    );
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::AccountAllocate,
+        custody_operation_id: operation_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest().unwrap(),
+        wallet_id: Some(wallet_id.clone()),
+        key_ref: None,
+        credential_id: Some(assertion.credential_id.clone()),
+        expected_input_class: Token::new("generic-custody-v1").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "effect": effect,
+    }))
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    service.complete_custody(
+        CustodyCompleteRequest {
+            ceremony_kind: CeremonyKind::AccountAllocate,
+            custody_operation_id: operation_id.clone(),
+            ceremony_id: prepared.contribution.ceremony_id.clone(),
+            proof: WebAuthnCeremonyProof::Assertion { assertion },
+            encrypted_input: Some(encrypted_input),
+            public_binding_digest: exact_terms_digest,
+        },
+        now_ms + 100,
+    )
+}
+
 fn complete_account_allocate_many(
     service: &SignerCeremonyService,
     authenticator: &VirtualAuthenticator,
@@ -3400,6 +3455,237 @@ fn bip39_two_family_allocation_shares_one_number_chosen_by_signer() {
     assert_eq!(listed.len(), 9);
     let paths: std::collections::BTreeSet<_> = listed.iter().map(|d| d.path.clone()).collect();
     assert_eq!(paths.len(), 9);
+}
+
+#[test]
+fn bip39_enrollment_refresh_failure_after_allocation_rolls_back_every_sibling() {
+    // Allocation is durable before the post-allocation enrollment refresh,
+    // so its failure is the rollback path every allocated sibling must
+    // survive. Removing the durable enrollment row is the public way to
+    // make that refresh fail after both children were allocated: the
+    // refresh UPDATE then hits no row and refuses with KEYREF_MISMATCH.
+    // File-backed so the row can be removed and restored between
+    // ceremonies without restarting the Signer.
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let authenticator = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
+    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+    let engine = Arc::new(
+        SignerEngine::open(
+            &database,
+            Token::new("broker-app-1").unwrap(),
+            broker.verifying_key(),
+            ceremony_key.verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
+            registry.clone(),
+        )
+        .unwrap(),
+    );
+    let service = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        ceremony_key.clone(),
+    )
+    .unwrap();
+    let wallet_id = Token::new("bip39-wallet-refresh-failure").unwrap();
+    let registration = complete_bip39_registration(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("f0"),
+        10_000,
+    );
+    assert_eq!(registration.public_key_refs.len(), 2);
+    assert_eq!(
+        engine
+            .derived_account_descriptors(&wallet_id)
+            .unwrap()
+            .len(),
+        2,
+        "fixture: registration left exactly the two account-0 children"
+    );
+
+    let enrollment: Vec<(String, String)> = {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let mut statement = connection
+            .prepare("SELECT backend_instance, enrollment_jcs FROM ceremony_backend_enrollments")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(statement);
+        connection
+            .execute("DELETE FROM ceremony_backend_enrollments", [])
+            .unwrap();
+        rows
+    };
+    assert_eq!(enrollment.len(), 1, "fixture: one enrollment row to remove");
+
+    let error = try_complete_account_allocate_many(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("f1"),
+        vec![evm_request(None), solana_request(None)],
+        10_100,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+    assert!(
+        error
+            .message
+            .contains("bip39 backend lacks durable enrollment"),
+        "the ceremony reports the enrollment-refresh failure: {error}"
+    );
+
+    // Both siblings are rolled back even though the refresh failed on the
+    // first: the shared account number is durably tombstoned for both
+    // families, so no half-allocated number survives.
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT profile, account, state FROM derivation_allocations
+                 WHERE wallet_id = ?1 ORDER BY state, profile",
+            )
+            .unwrap();
+        let rows: Vec<(String, i64, String)> = statement
+            .query_map([wallet_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        // The EVM row records its unpinned request account, the Solana row
+        // the chosen shared number; what matters is that exactly one row
+        // per family from the failed ceremony is tombstoned and the two
+        // registration rows stay live.
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "bip44-evm-secp256k1-v1".to_owned(),
+                    0,
+                    "ACTIVATED".to_owned()
+                ),
+                (
+                    "bip44-solana-slip10-ed25519-v1".to_owned(),
+                    0,
+                    "ACTIVATED".to_owned()
+                ),
+                (
+                    "bip44-evm-secp256k1-v1".to_owned(),
+                    0,
+                    "TOMBSTONED".to_owned()
+                ),
+                (
+                    "bip44-solana-slip10-ed25519-v1".to_owned(),
+                    1,
+                    "TOMBSTONED".to_owned()
+                ),
+            ],
+            "both family rows of the failed ceremony are tombstoned; the              registration pair stays activated"
+        );
+        let mut statement = connection
+            .prepare("SELECT COUNT(*) FROM ceremony_backend_enrollments")
+            .unwrap();
+        let remaining: i64 = statement.query_row([], |row| row.get(0)).unwrap();
+        assert_eq!(remaining, 0, "the rollback adds no enrollment row");
+    }
+
+    // Neither child is visible as a wallet account...
+    assert_eq!(
+        engine
+            .derived_account_descriptors(&wallet_id)
+            .unwrap()
+            .len(),
+        2,
+        "the failed ceremony adds no visible account"
+    );
+    // ...and neither can sign: the backend registrations the allocation
+    // made are rolled back with the children, while the registration
+    // children at account 0 stay available.
+    let registered: Vec<KeyRef> = {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT key_ref_jcs FROM enrolled_keys
+                 WHERE wallet_id = ?1 AND authority_class = 'derived'",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([wallet_id.as_str()], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(statement);
+        rows.into_iter()
+            .map(|row| serde_json::from_str(&row).unwrap())
+            .collect()
+    };
+    assert_eq!(registered.len(), 4, "two registration children, two failed");
+    for child in &registered {
+        let path = match &child.derivation {
+            Some(DerivationRef::Bip39Multicurve { path, .. }) => path.clone(),
+            other => panic!("derived child carries a BIP-39 derivation: {other:?}"),
+        };
+        if path.ends_with("/1") || path.contains("/1'/0'") {
+            // The rollback tears the allocation's backend registration
+            // down: the child is either gone from the backend outright or
+            // locked out of it, and never signable.
+            assert!(
+                !matches!(registry.key_is_available(child), Ok(true)),
+                "a child from the failed ceremony must not be signable ({path})"
+            );
+        } else {
+            assert!(
+                registry.key_is_available(child).unwrap(),
+                "a registration child must stay signable ({path})"
+            );
+        }
+    }
+
+    // The enrollment row is the durable enrollment source, so restore it
+    // exactly; a later pair must then succeed on the next number, never
+    // reusing the tombstoned one.
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        for (backend_instance, enrollment_jcs) in &enrollment {
+            connection
+                .execute(
+                    "INSERT INTO ceremony_backend_enrollments(backend_instance, enrollment_jcs)
+                     VALUES (?1, ?2)",
+                    rusqlite::params![backend_instance, enrollment_jcs],
+                )
+                .unwrap();
+        }
+    }
+    let pair = complete_account_allocate_many(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("f2"),
+        vec![evm_request(None), solana_request(None)],
+        10_200,
+    );
+    assert_eq!(pair.public_key_refs.len(), 2);
+    assert_eq!(
+        paths_by_family(&engine, &pair),
+        ("m/44'/60'/0'/0/2".to_owned(), "m/44'/501'/2'/0'".to_owned()),
+        "the next allocation jumps the tombstoned pair"
+    );
 }
 
 #[test]
@@ -4111,6 +4397,351 @@ fn bip39_solana_child_export_refuses_empty_pinned_keys() {
         err.code,
         ProtocolErrorCode::KeyrefMismatch,
         "empty pinned_keys with an allocated child must refuse to export"
+    );
+}
+
+/// A sealed-approval ceremony never outlives the authority it activates: with
+/// terms expiring sooner than the window, the terms decide.
+#[test]
+fn an_approval_ceremony_is_bounded_by_its_terms_not_by_the_ceremony_ttl() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, key_ref, _engine, _registry) = service(&authenticator);
+    let terms = terms(key_ref);
+    // Sooner than the default window.
+    assert_eq!(terms.expires_at_ms.get(), 30_300);
+
+    let prepared = service
+        .prepare_approval(
+            CeremonyPrepareRequest {
+                activation_operation_id: operation("10"),
+                terms: terms.clone(),
+                review_manifest_digest: digest("77"),
+                exact_ordered_payload_digests: vec![digest("22")],
+                exact_ordered_hashes: vec![digest("33")],
+                replacement_approval_id: None,
+            },
+            2_000,
+        )
+        .unwrap();
+
+    assert_eq!(
+        prepared.contribution.expires_at_ms, terms.expires_at_ms,
+        "an approval ceremony must expire with the authority it activates"
+    );
+}
+
+/// Mints a custody ceremony through the real service API so window tests
+/// assert the minted contribution, not a duplicate calculation.
+fn prepared_wallet_registration(
+    service: &SignerCeremonyService,
+    now_ms: u64,
+) -> PreparedCustodyCeremony {
+    let prepare = CustodyPrepareRequest {
+        ceremony_kind: CeremonyKind::WalletRegistration,
+        custody_operation_id: operation("2e"),
+        wallet_id: Some(Token::new("ttl-gates").unwrap()),
+        key_ref: None,
+        exact_terms_digest: digest("2f"),
+        expected_input_class: Token::new("passkey-prf").unwrap(),
+        browser_output_recipient_key: None,
+        petal_key_scope: None,
+        legacy_passkey_migration: None,
+        derivation_requests: Vec::new(),
+        wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
+    };
+    service.prepare_custody(prepare, now_ms).unwrap()
+}
+
+#[test]
+fn custody_ceremony_uses_the_five_minute_window_by_default() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _key_ref, _engine, _registry) = service(&authenticator);
+    let prepared = prepared_wallet_registration(&service, 3_000);
+    assert_eq!(prepared.contribution.expires_at_ms.get(), 3_000 + 300_000);
+}
+
+#[test]
+fn custody_ceremony_uses_the_configured_window() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _key_ref, _engine, _registry) = service(&authenticator);
+    let service = service.with_ceremony_ttl_ms(1_800_000).unwrap();
+    let prepared = prepared_wallet_registration(&service, 3_000);
+    assert_eq!(prepared.contribution.expires_at_ms.get(), 3_000 + 1_800_000);
+}
+
+#[test]
+fn a_ceremony_window_outside_its_bounds_is_refused() {
+    for ttl_ms in [0, 1_800_001] {
+        let authenticator = VirtualAuthenticator::generate();
+        let (service, _key_ref, _engine, _registry) = service(&authenticator);
+        let Err(error) = service.with_ceremony_ttl_ms(ttl_ms) else {
+            panic!("{ttl_ms} ms must be refused");
+        };
+        assert!(
+            error.message.contains("ceremony_ttl_ms"),
+            "{}",
+            error.message
+        );
+    }
+}
+
+/// With terms that outlast the default window, the mint is
+/// `min(now + window, terms expiry)`: a longer window extends an approval
+/// ceremony up to — never past — its terms. The Machine's exact approvals carry
+/// ten-minute terms, so under the developer window they run ten minutes.
+#[test]
+fn a_longer_window_extends_an_approval_ceremony_only_to_its_terms() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, key_ref, _engine, _registry) = service(&authenticator);
+    let service = service.with_ceremony_ttl_ms(1_800_000).unwrap();
+    let mut long_terms = terms(key_ref);
+    long_terms.expires_at_ms = DecimalU64::new(602_000);
+    let prepared = service
+        .prepare_approval(
+            CeremonyPrepareRequest {
+                activation_operation_id: operation("11"),
+                terms: long_terms,
+                review_manifest_digest: digest("77"),
+                exact_ordered_payload_digests: vec![digest("22")],
+                exact_ordered_hashes: vec![digest("33")],
+                replacement_approval_id: None,
+            },
+            2_000,
+        )
+        .unwrap();
+    assert_eq!(prepared.contribution.expires_at_ms.get(), 602_000);
+}
+
+#[test]
+fn petal_subkey_reuses_a_fingerprint_whose_scope_expired_on_a_same_seed_wallet() {
+    // A wallet recovered from the mnemonic of an older wallet takes over its
+    // parent keys and derives byte-identical Petal children. The older
+    // wallet's scopes must not poison the recovered wallet forever: an
+    // expired scope yields, a live one stays exclusive.
+    let authenticator_a = VirtualAuthenticator::generate();
+    let authenticator_b = VirtualAuthenticator::generate();
+    let (service, _engine, _registry) = bip39_service(&authenticator_a);
+    let wallet_a = Token::new("seed-original").unwrap();
+    let wallet_b = Token::new("seed-recovered").unwrap();
+    let scope = |wallet: &Token, parent: &bloom_signer_api::KeyRef, op: &str, lifetime_ms: u64| {
+        PetalKeyScope {
+            wallet_id: wallet.clone(),
+            parent_key_ref: parent.clone(),
+            package_hash: digest("c3"),
+            route: "/petals/exchange/sign".into(),
+            lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            key_slot: Token::new("account-a").unwrap(),
+            allowed_routes: vec!["/petals/exchange/sign".into()],
+            allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
+            allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+            maximum_lifetime_ms: DecimalU64::new(lifetime_ms),
+            custody_operation_id: operation(op),
+        }
+    };
+
+    let parent_a = complete_bip39_mnemonic_import(
+        &service,
+        &authenticator_a,
+        &wallet_a,
+        &operation("c1"),
+        bloom_signer_vectors::BIP39_MNEMONIC,
+        10_000,
+    )
+    .public_key_refs[0]
+        .clone();
+    // Wallet A takes child index 0 (scope expires at 30_200) and child
+    // index 1 (scope still live at 50_000).
+    let (first_a, _) = complete_petal_key_derivation(
+        &service,
+        &authenticator_a,
+        scope(&wallet_a, &parent_a, "c4", 20_000),
+        None,
+        10_200,
+    )
+    .unwrap();
+    let (second_a, _) = complete_petal_key_derivation(
+        &service,
+        &authenticator_a,
+        scope(&wallet_a, &parent_a, "c6", 100_000),
+        None,
+        10_400,
+    )
+    .unwrap();
+    assert_ne!(
+        second_a.public_key_refs[0].public_key_fingerprint,
+        first_a.public_key_refs[0].public_key_fingerprint
+    );
+
+    // Wallet B recovers the same mnemonic and becomes the parent's owner.
+    let parent_b = complete_bip39_mnemonic_import(
+        &service,
+        &authenticator_b,
+        &wallet_b,
+        &operation("c2"),
+        bloom_signer_vectors::BIP39_MNEMONIC,
+        50_000,
+    )
+    .public_key_refs[0]
+        .clone();
+    assert_eq!(
+        parent_a.public_key_fingerprint,
+        parent_b.public_key_fingerprint
+    );
+
+    // Child index 0 again: A's scope has expired, so B takes the key over.
+    let (first_b, _) = complete_petal_key_derivation(
+        &service,
+        &authenticator_b,
+        scope(&wallet_b, &parent_b, "c5", 20_000),
+        None,
+        50_100,
+    )
+    .expect("an expired scope on a same-seed wallet must not block derivation");
+    assert_eq!(
+        first_a.public_key_refs[0].public_key_fingerprint,
+        first_b.public_key_refs[0].public_key_fingerprint
+    );
+
+    // Child index 1 again: A's scope is live, so B is refused with a clear
+    // code, not a storage failure.
+    let collision = complete_petal_key_derivation(
+        &service,
+        &authenticator_b,
+        scope(&wallet_b, &parent_b, "c7", 20_000),
+        None,
+        50_200,
+    )
+    .unwrap_err();
+    assert_eq!(collision.code, ProtocolErrorCode::KeyrefMismatch);
+    assert!(
+        collision.message.contains("seed-original"),
+        "{}",
+        collision.message
+    );
+}
+
+/// An Exact approval may outlive its Petal key scope (bloom-signer#40), but
+/// once a same-seed wallet takes over the expired scope, the key belongs to
+/// that wallet. The previous wallet's recovery approval is then refused,
+/// fail-closed, rather than signing for a key another wallet now holds; that
+/// wallet has to sweep before its scope lapses.
+#[test]
+fn a_taken_over_scope_refuses_the_previous_wallets_exact_approval() {
+    let authenticator_a = VirtualAuthenticator::generate();
+    let authenticator_b = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let (service, engine, _registry) = bip39_service(&authenticator_a);
+    let wallet_a = Token::new("seed-original").unwrap();
+    let wallet_b = Token::new("seed-recovered").unwrap();
+    let scope = |wallet: &Token, parent: &bloom_signer_api::KeyRef, op: &str| PetalKeyScope {
+        wallet_id: wallet.clone(),
+        parent_key_ref: parent.clone(),
+        package_hash: digest("c3"),
+        route: "/petals/exchange/sign".into(),
+        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        key_slot: Token::new("account-a").unwrap(),
+        allowed_routes: vec!["/petals/exchange/sign".into()],
+        allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+        maximum_lifetime_ms: DecimalU64::new(20_000),
+        custody_operation_id: operation(op),
+    };
+    let parent_a = complete_bip39_mnemonic_import(
+        &service,
+        &authenticator_a,
+        &wallet_a,
+        &operation("c1"),
+        bloom_signer_vectors::BIP39_MNEMONIC,
+        10_000,
+    )
+    .public_key_refs[0]
+        .clone();
+    // A's scope on child 0 expires at 30_200.
+    let (derived_a, _) = complete_petal_key_derivation(
+        &service,
+        &authenticator_a,
+        scope(&wallet_a, &parent_a, "c4"),
+        None,
+        10_200,
+    )
+    .unwrap();
+    let child = derived_a.public_key_refs[0].clone();
+
+    // After the scope lapses, A's owner approves an Exact recovery sweep.
+    let policy = engine.policy_snapshot(&wallet_a).unwrap();
+    let epoch = engine
+        .revocation_state(&wallet_a, 40_000)
+        .unwrap()
+        .wallet_revocation_epoch;
+    let recovery = SealedApprovalTerms {
+        subject: ApprovalSubject::Petal {
+            package_hash: digest("c3"),
+            route: "/petals/exchange/sign".into(),
+            agent_id: Some("account-a".into()),
+        },
+        wallet_id: wallet_a.clone(),
+        key_ref: child.clone(),
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+        selector: ApprovalSelector::Exact {
+            ordered_payload_digests: vec![digest("e1")],
+            ordered_hashes: vec![digest("e1")],
+        },
+        limits: ApprovalLimits {
+            max_operations: DecimalU64::new(1),
+            max_signatures: DecimalU64::new(1),
+            operation_rate_limits: vec![],
+            signature_rate_limits: vec![],
+            value_limits: vec![],
+        },
+        activation_mode: ActivationMode::BootBound,
+        wallet_revocation_epoch: epoch,
+        policy_version: policy.version.clone(),
+        policy_digest: policy.policy_digest.clone(),
+        provenance_digest: digest("c7"),
+        request_nonce: RequestNonce::new("d1".repeat(16)).unwrap(),
+        issued_at_ms: DecimalU64::new(40_000),
+        not_before_ms: DecimalU64::new(40_000),
+        expires_at_ms: DecimalU64::new(58_000),
+        renewal_of: None,
+    };
+    engine.install_approval_for_test(&recovery).unwrap();
+
+    // B recovers the same mnemonic and takes the expired scope over.
+    let parent_b = complete_bip39_mnemonic_import(
+        &service,
+        &authenticator_b,
+        &wallet_b,
+        &operation("c2"),
+        bloom_signer_vectors::BIP39_MNEMONIC,
+        50_000,
+    )
+    .public_key_refs[0]
+        .clone();
+    let (derived_b, _) = complete_petal_key_derivation(
+        &service,
+        &authenticator_b,
+        scope(&wallet_b, &parent_b, "c5"),
+        None,
+        50_100,
+    )
+    .unwrap();
+    assert_eq!(
+        derived_b.public_key_refs[0].public_key_fingerprint,
+        child.public_key_fingerprint
+    );
+
+    let refusal = engine
+        .authorize_sign(
+            &exact_sign_request(&broker, &recovery, "f1", 52_000, 53_000),
+            &healthy_clock(52_000),
+        )
+        .unwrap_err();
+    // B's enrollment replaced the key's enrolled KeyRef, which names B's
+    // backend, so A's approval no longer matches the enrolled key at all.
+    assert_eq!(refusal.code, ProtocolErrorCode::KeyrefMismatch);
+    assert_eq!(
+        refusal.message,
+        "approval key is absent, inactive, or differs from compiled backend enrollment"
     );
 }
 
