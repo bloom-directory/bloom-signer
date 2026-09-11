@@ -4112,6 +4112,118 @@ fn bip39_solana_child_export_refuses_empty_pinned_keys() {
     );
 }
 
+/// A sealed-approval ceremony never outlives the authority it activates: with
+/// terms expiring sooner than the window, the terms decide.
+#[test]
+fn an_approval_ceremony_is_bounded_by_its_terms_not_by_the_ceremony_ttl() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, key_ref, _engine, _registry) = service(&authenticator);
+    let terms = terms(key_ref);
+    // Sooner than the default window.
+    assert_eq!(terms.expires_at_ms.get(), 30_300);
+
+    let prepared = service
+        .prepare_approval(
+            CeremonyPrepareRequest {
+                activation_operation_id: operation("10"),
+                terms: terms.clone(),
+                review_manifest_digest: digest("77"),
+                exact_ordered_payload_digests: vec![digest("22")],
+                exact_ordered_hashes: vec![digest("33")],
+                replacement_approval_id: None,
+            },
+            2_000,
+        )
+        .unwrap();
+
+    assert_eq!(
+        prepared.contribution.expires_at_ms, terms.expires_at_ms,
+        "an approval ceremony must expire with the authority it activates"
+    );
+}
+
+/// Mints a custody ceremony through the real service API so window tests
+/// assert the minted contribution, not a duplicate calculation.
+fn prepared_wallet_registration(
+    service: &SignerCeremonyService,
+    now_ms: u64,
+) -> PreparedCustodyCeremony {
+    let prepare = CustodyPrepareRequest {
+        ceremony_kind: CeremonyKind::WalletRegistration,
+        custody_operation_id: operation("2e"),
+        wallet_id: Some(Token::new("ttl-gates").unwrap()),
+        key_ref: None,
+        exact_terms_digest: digest("2f"),
+        expected_input_class: Token::new("passkey-prf").unwrap(),
+        browser_output_recipient_key: None,
+        petal_key_scope: None,
+        legacy_passkey_migration: None,
+        derivation_requests: Vec::new(),
+        wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
+    };
+    service.prepare_custody(prepare, now_ms).unwrap()
+}
+
+#[test]
+fn custody_ceremony_uses_the_five_minute_window_by_default() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _key_ref, _engine, _registry) = service(&authenticator);
+    let prepared = prepared_wallet_registration(&service, 3_000);
+    assert_eq!(prepared.contribution.expires_at_ms.get(), 3_000 + 300_000);
+}
+
+#[test]
+fn custody_ceremony_uses_the_configured_window() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _key_ref, _engine, _registry) = service(&authenticator);
+    let service = service.with_ceremony_ttl_ms(1_800_000).unwrap();
+    let prepared = prepared_wallet_registration(&service, 3_000);
+    assert_eq!(prepared.contribution.expires_at_ms.get(), 3_000 + 1_800_000);
+}
+
+#[test]
+fn a_ceremony_window_outside_its_bounds_is_refused() {
+    for ttl_ms in [0, 1_800_001] {
+        let authenticator = VirtualAuthenticator::generate();
+        let (service, _key_ref, _engine, _registry) = service(&authenticator);
+        let Err(error) = service.with_ceremony_ttl_ms(ttl_ms) else {
+            panic!("{ttl_ms} ms must be refused");
+        };
+        assert!(
+            error.message.contains("ceremony_ttl_ms"),
+            "{}",
+            error.message
+        );
+    }
+}
+
+/// With terms that outlast the default window, the mint is
+/// `min(now + window, terms expiry)`: a longer window extends an approval
+/// ceremony up to — never past — its terms. The Machine's exact approvals carry
+/// ten-minute terms, so under the developer window they run ten minutes.
+#[test]
+fn a_longer_window_extends_an_approval_ceremony_only_to_its_terms() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, key_ref, _engine, _registry) = service(&authenticator);
+    let service = service.with_ceremony_ttl_ms(1_800_000).unwrap();
+    let mut long_terms = terms(key_ref);
+    long_terms.expires_at_ms = DecimalU64::new(602_000);
+    let prepared = service
+        .prepare_approval(
+            CeremonyPrepareRequest {
+                activation_operation_id: operation("11"),
+                terms: long_terms,
+                review_manifest_digest: digest("77"),
+                exact_ordered_payload_digests: vec![digest("22")],
+                exact_ordered_hashes: vec![digest("33")],
+                replacement_approval_id: None,
+            },
+            2_000,
+        )
+        .unwrap();
+    assert_eq!(prepared.contribution.expires_at_ms.get(), 602_000);
+}
+
 #[test]
 fn petal_subkey_reuses_a_fingerprint_whose_scope_expired_on_a_same_seed_wallet() {
     // A wallet recovered from the mnemonic of an older wallet takes over its
