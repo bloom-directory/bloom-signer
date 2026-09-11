@@ -4088,21 +4088,14 @@ fn bip39_solana_child_export_refuses_empty_pinned_keys() {
     );
 }
 
-/// A sealed-approval ceremony never outlives the authority it activates:
-/// with terms expiring sooner than every TTL any build can mint, the terms
-/// clamp decides in every configuration.
-///
-/// The ignored sibling test
-/// `approval_ceremony_extends_to_but_never_past_its_terms_under_the_developer_ttl`
-/// pins the other side of the `min(now + TTL, terms expiry)` mint: terms that
-/// outlast the production TTL expose the difference between the builds, so
-/// the developer window extends an approval ceremony up to the terms cap.
+/// A sealed-approval ceremony never outlives the authority it activates: with
+/// terms expiring sooner than the window, the terms decide.
 #[test]
 fn an_approval_ceremony_is_bounded_by_its_terms_not_by_the_ceremony_ttl() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, key_ref, _engine, _registry) = service(&authenticator);
     let terms = terms(key_ref);
-    // Sooner than the shortest TTL either build can mint.
+    // Sooner than the default window.
     assert_eq!(terms.expires_at_ms.get(), 30_300);
 
     let prepared = service
@@ -4125,8 +4118,8 @@ fn an_approval_ceremony_is_bounded_by_its_terms_not_by_the_ceremony_ttl() {
     );
 }
 
-/// Mints a custody ceremony through the real service API so TTL tests assert
-/// the minted contribution, not a duplicate calculation.
+/// Mints a custody ceremony through the real service API so window tests
+/// assert the minted contribution, not a duplicate calculation.
 fn prepared_wallet_registration(
     service: &SignerCeremonyService,
     now_ms: u64,
@@ -4147,78 +4140,49 @@ fn prepared_wallet_registration(
     service.prepare_custody(prepare, now_ms).unwrap()
 }
 
-/// Without a developer root, every build — harness-featured or not — must
-/// mint the five-minute production window.
-///
-/// CI runs this with `BLOOM_TRIAD_DEVELOPER_ROOT` explicitly removed in both
-/// feature arms. The precondition assert keeps a dirty developer shell from
-/// silently testing the wrong configuration.
 #[test]
-#[ignore = "run by CI with BLOOM_TRIAD_DEVELOPER_ROOT removed; both feature arms"]
-fn custody_ceremony_keeps_the_five_minute_window_without_a_developer_root() {
-    assert!(
-        std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_none(),
-        "run with the variable removed, e.g. \
-         `env -u BLOOM_TRIAD_DEVELOPER_ROOT cargo test ... -- --exact --ignored`"
-    );
+fn custody_ceremony_uses_the_five_minute_window_by_default() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, _key_ref, _engine, _registry) = service(&authenticator);
     let prepared = prepared_wallet_registration(&service, 3_000);
-    assert_eq!(
-        prepared.contribution.expires_at_ms.get(),
-        3_000 + 300_000,
-        "without a developer root every build must mint the five-minute window"
-    );
+    assert_eq!(prepared.contribution.expires_at_ms.get(), 3_000 + 300_000);
 }
 
-/// The thirty-minute window needs the harness build *and* the developer root;
-/// either gate alone keeps the five-minute production window.
-///
-/// CI runs this with `BLOOM_TRIAD_DEVELOPER_ROOT` set in both feature arms;
-/// the expected lifetime is an independent literal per arm, not a value
-/// derived from `ceremony_ttl_ms()`.
 #[test]
-#[ignore = "run by CI with BLOOM_TRIAD_DEVELOPER_ROOT set; both feature arms"]
-fn custody_ceremony_window_requires_both_the_harness_build_and_a_developer_root() {
-    assert!(
-        std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some(),
-        "run with the variable set, e.g. \
-         `BLOOM_TRIAD_DEVELOPER_ROOT=/tmp/bloom-triad-developer-root \
-         cargo test ... -- --exact --ignored`"
-    );
+fn custody_ceremony_uses_the_configured_window() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, _key_ref, _engine, _registry) = service(&authenticator);
+    let service = service.with_ceremony_ttl_ms(1_800_000).unwrap();
     let prepared = prepared_wallet_registration(&service, 3_000);
-    let expected_ttl_ms = if cfg!(feature = "triad-dev-harness") {
-        1_800_000
-    } else {
-        300_000
-    };
-    assert_eq!(
-        prepared.contribution.expires_at_ms.get(),
-        3_000 + expected_ttl_ms,
-        "only the harness build with a developer root may mint thirty minutes"
-    );
+    assert_eq!(prepared.contribution.expires_at_ms.get(), 3_000 + 1_800_000);
 }
 
-/// With terms that outlast the production TTL, the mint is
-/// `min(now + TTL, terms expiry)`: a default build still gets five minutes
-/// even with a developer root set, and the harness build extends the ceremony
-/// up to — never past — the terms expiry.
 #[test]
-#[ignore = "run by CI with BLOOM_TRIAD_DEVELOPER_ROOT set; both feature arms"]
-fn approval_ceremony_extends_to_but_never_past_its_terms_under_the_developer_ttl() {
-    assert!(
-        std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some(),
-        "run with the variable set, e.g. \
-         `BLOOM_TRIAD_DEVELOPER_ROOT=/tmp/bloom-triad-developer-root \
-         cargo test ... -- --exact --ignored`"
-    );
+fn a_ceremony_window_outside_its_bounds_is_refused() {
+    for ttl_ms in [0, 1_800_001] {
+        let authenticator = VirtualAuthenticator::generate();
+        let (service, _key_ref, _engine, _registry) = service(&authenticator);
+        let Err(error) = service.with_ceremony_ttl_ms(ttl_ms) else {
+            panic!("{ttl_ms} ms must be refused");
+        };
+        assert!(
+            error.message.contains("ceremony_ttl_ms"),
+            "{}",
+            error.message
+        );
+    }
+}
+
+/// With terms that outlast the default window, the mint is
+/// `min(now + window, terms expiry)`: a longer window extends an approval
+/// ceremony up to — never past — its terms. The Machine's exact approvals carry
+/// ten-minute terms, so under the developer window they run ten minutes.
+#[test]
+fn a_longer_window_extends_an_approval_ceremony_only_to_its_terms() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, key_ref, _engine, _registry) = service(&authenticator);
+    let service = service.with_ceremony_ttl_ms(1_800_000).unwrap();
     let mut long_terms = terms(key_ref);
-    // Ten minutes after the supplied now_ms of 2_000 — past the production
-    // TTL, matching what the Machine's exact-approval terms allow.
     long_terms.expires_at_ms = DecimalU64::new(602_000);
     let prepared = service
         .prepare_approval(
@@ -4233,16 +4197,7 @@ fn approval_ceremony_extends_to_but_never_past_its_terms_under_the_developer_ttl
             2_000,
         )
         .unwrap();
-    let expected_expiry_ms = if cfg!(feature = "triad-dev-harness") {
-        602_000
-    } else {
-        302_000
-    };
-    assert_eq!(
-        prepared.contribution.expires_at_ms.get(),
-        expected_expiry_ms,
-        "an approval ceremony is capped by min(now + TTL, terms expiry)"
-    );
+    assert_eq!(prepared.contribution.expires_at_ms.get(), 602_000);
 }
 
 fn healthy_clock(effective_now_ms: u64) -> ClockDecision {

@@ -47,26 +47,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run tests on the shipped feature set
         run: cargo test --workspace --locked
-      # The TTL gates are mint-time behaviour that depends on both the build
-      # and the environment, so each configuration needs its own test process.
-      # The ignored tests assert their own BLOOM_TRIAD_DEVELOPER_ROOT
-      # precondition; `env -u` keeps a runner-provided value from quietly
-      # changing which configuration runs, and the dummy root path never needs
-      # to exist because the library gate checks presence only.
-      - name: Exercise the ceremony TTL gates in every build and environment
-        run: |
-          env -u BLOOM_TRIAD_DEVELOPER_ROOT cargo test -p bloom-signer --locked \
-            --test w5_ceremony custody_ceremony_keeps_the_five_minute_window_without_a_developer_root -- --exact --ignored
-          env -u BLOOM_TRIAD_DEVELOPER_ROOT cargo test -p bloom-signer --features triad-dev-harness --locked \
-            --test w5_ceremony custody_ceremony_keeps_the_five_minute_window_without_a_developer_root -- --exact --ignored
-          BLOOM_TRIAD_DEVELOPER_ROOT=/tmp/bloom-triad-developer-root cargo test -p bloom-signer --locked \
-            --test w5_ceremony custody_ceremony_window_requires_both_the_harness_build_and_a_developer_root -- --exact --ignored
-          BLOOM_TRIAD_DEVELOPER_ROOT=/tmp/bloom-triad-developer-root cargo test -p bloom-signer --features triad-dev-harness --locked \
-            --test w5_ceremony custody_ceremony_window_requires_both_the_harness_build_and_a_developer_root -- --exact --ignored
-          BLOOM_TRIAD_DEVELOPER_ROOT=/tmp/bloom-triad-developer-root cargo test -p bloom-signer --locked \
-            --test w5_ceremony approval_ceremony_extends_to_but_never_past_its_terms_under_the_developer_ttl -- --exact --ignored
-          BLOOM_TRIAD_DEVELOPER_ROOT=/tmp/bloom-triad-developer-root cargo test -p bloom-signer --features triad-dev-harness --locked \
-            --test w5_ceremony approval_ceremony_extends_to_but_never_past_its_terms_under_the_developer_ttl -- --exact --ignored
       - name: Keep the accepted time advisory out of the default artifact
         run: |
           if cargo tree --locked -p bloom-signer -e normal --prefix none | grep -Eq '^time v'; then

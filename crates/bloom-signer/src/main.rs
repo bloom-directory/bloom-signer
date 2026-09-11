@@ -86,6 +86,10 @@ struct SignerConfig {
     control_maximum_journal_admissions_per_window: usize,
     control_journal_window_ms: u64,
     aws_kms_backends: Vec<AwsKmsBackendConfig>,
+    /// Ceremony window override; production templates omit it and keep the
+    /// five-minute default. The developer harness sets thirty minutes.
+    #[serde(default)]
+    ceremony_ttl_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -385,14 +389,20 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
         migration_root,
         signer_effective_uid,
     )?);
-    let ceremony = Arc::new(
-        SignerCeremonyService::new(
-            engine.clone(),
-            Token::new(config.ceremony_key_id.clone())?,
-            ceremony_signing_key,
-        )?
-        .with_legacy_migrations(migration_store),
-    );
+    let mut ceremony = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new(config.ceremony_key_id.clone())?,
+        ceremony_signing_key,
+    )?
+    .with_legacy_migrations(migration_store);
+    if let Some(ttl_ms) = config.ceremony_ttl_ms {
+        ceremony = ceremony.with_ceremony_ttl_ms(ttl_ms)?;
+        tracing::warn!(
+            ceremony_ttl_ms = ttl_ms,
+            "Signer config overrides the ceremony window"
+        );
+    }
+    let ceremony = Arc::new(ceremony);
     let clock = Arc::new(SignerClock::new(
         engine.clone(),
         &trusted_time_source,

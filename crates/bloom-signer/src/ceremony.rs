@@ -71,37 +71,12 @@ fn ceremony_kind_name(kind: CeremonyKind) -> &'static str {
     }
 }
 
-const CEREMONY_TTL_MS: u64 = 5 * 60 * 1_000;
-/// The developer harness drives ceremonies by hand: a person has to read the
-/// review, switch to a browser, and touch a security key. Five minutes bounds
-/// an attended production flow; it does not bound how long someone takes to
-/// notice a prompt during a test session, where lapsing just forces a re-issue
-/// and teaches nothing.
-#[cfg(feature = "triad-dev-harness")]
-const DEVELOPER_HARNESS_CEREMONY_TTL_MS: u64 = 30 * 60 * 1_000;
-
-/// How long a freshly minted ceremony stays open.
-///
-/// The harness window needs the feature *and* a developer root at run time.
-/// `main.rs` gates identity loading and history ownership the same way, so a
-/// harness-featured binary pointed at production identity paths keeps
-/// production behaviour; the feature alone is not enough to relax anything.
-///
-/// Custody ceremonies are minted from the TTL alone. A sealed approval is
-/// minted from `min(now + TTL, terms expiry)` in
-/// [`SignerCeremonyService::prepare_approval`], so it can never outlive the
-/// authority it activates — but when those terms outlast the five-minute
-/// production TTL, this developer window does lengthen the approval ceremony,
-/// up to the terms cap. The Machine mints exact approvals with ten-minute
-/// terms, so under the developer window those ceremonies run ten minutes
-/// instead of five.
-fn ceremony_ttl_ms() -> u64 {
-    #[cfg(feature = "triad-dev-harness")]
-    if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
-        return DEVELOPER_HARNESS_CEREMONY_TTL_MS;
-    }
-    CEREMONY_TTL_MS
-}
+/// How long a freshly minted ceremony stays open unless the Signer config sets
+/// `ceremony_ttl_ms`.
+pub const CEREMONY_TTL_MS: u64 = 5 * 60 * 1_000;
+/// The longest ceremony window a Signer config may set. The developer harness
+/// uses it because a person drives each ceremony by hand.
+pub const MAXIMUM_CEREMONY_TTL_MS: u64 = 30 * 60 * 1_000;
 const CONTRIBUTION_DOMAIN: &[u8] = b"bloom-signer-ceremony-contribution/v1";
 const RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1";
 const WRAP_INFO: &[u8] = b"bloom-passkey-wallet-wrap/v1";
@@ -273,6 +248,7 @@ pub struct SignerCeremonyService {
     credentials: Mutex<BTreeMap<String, BoundCredential>>,
     wallets: Mutex<BTreeMap<Token, Arc<WalletCustody>>>,
     legacy_migrations: Option<Arc<LegacyMigrationStore>>,
+    ceremony_ttl_ms: u64,
     approval_completion_barrier: AsyncMutex<()>,
     custody_completion_barrier: Mutex<()>,
 }
@@ -408,6 +384,7 @@ impl SignerCeremonyService {
             credentials: Mutex::new(credentials),
             wallets: Mutex::new(wallets),
             legacy_migrations: None,
+            ceremony_ttl_ms: CEREMONY_TTL_MS,
             approval_completion_barrier: AsyncMutex::new(()),
             custody_completion_barrier: Mutex::new(()),
         })
@@ -416,6 +393,27 @@ impl SignerCeremonyService {
     pub fn with_legacy_migrations(mut self, store: Arc<LegacyMigrationStore>) -> Self {
         self.legacy_migrations = Some(store);
         self
+    }
+
+    /// Sets how long newly minted ceremonies stay open, up to
+    /// [`MAXIMUM_CEREMONY_TTL_MS`].
+    ///
+    /// Custody ceremonies are minted from this window alone. An approval
+    /// ceremony is minted from `min(now + window, terms expiry)`, so it never
+    /// outlives the authority it activates — but a window longer than the
+    /// default does lengthen approval ceremonies whose terms outlast the
+    /// default, up to those terms.
+    pub fn with_ceremony_ttl_ms(mut self, ttl_ms: u64) -> Result<Self, ProtocolError> {
+        if ttl_ms == 0 || ttl_ms > MAXIMUM_CEREMONY_TTL_MS {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                format!(
+                    "ceremony_ttl_ms must be between 1 and {MAXIMUM_CEREMONY_TTL_MS} milliseconds"
+                ),
+            ));
+        }
+        self.ceremony_ttl_ms = ttl_ms;
+        Ok(self)
     }
 
     pub fn register_existing_credential(
@@ -538,10 +536,10 @@ impl SignerCeremonyService {
             // A browser ceremony cannot outlive the authority it activates.
             // In particular, Solana exact-message approvals are bounded by the
             // recent blockhash lifetime, which is normally much shorter than
-            // the generic five-minute browser TTL.
+            // the configured browser ceremony window.
             expires_at_ms: DecimalU64::new(
                 now_ms
-                    .saturating_add(ceremony_ttl_ms())
+                    .saturating_add(self.ceremony_ttl_ms)
                     .min(request.terms.expires_at_ms.get()),
             ),
             signer_key_id: self.signer_key_id.clone(),
@@ -748,7 +746,7 @@ impl SignerCeremonyService {
             browser_output_recipient_key: request.browser_output_recipient_key.clone(),
             petal_key_scope: request.petal_key_scope.clone(),
             wallet_seed_profile: request.wallet_seed_profile,
-            expires_at_ms: DecimalU64::new(now_ms.saturating_add(ceremony_ttl_ms())),
+            expires_at_ms: DecimalU64::new(now_ms.saturating_add(self.ceremony_ttl_ms)),
             signer_key_id: self.signer_key_id.clone(),
             signer_signature: Base64UrlBytes::from_bytes(&[]),
         };
