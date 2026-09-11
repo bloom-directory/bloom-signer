@@ -78,6 +78,7 @@ const WRAP_INFO: &[u8] = b"bloom-passkey-wallet-wrap/v1";
 const DERIVATION_AUTHORITY_DOMAIN: &[u8] = b"bloom-key-derive-authority/v1";
 const PETAL_SUBKEY_NAMESPACE: &str = "petal-subkeys-v1";
 const PETAL_SUBKEY_PREFIX: &str = "m/44'/60'/0'/18735";
+const PETAL_ED25519_BRANCH: u32 = 18_735;
 
 #[derive(Clone, Debug)]
 pub struct PreparedApprovalCeremony {
@@ -2422,11 +2423,53 @@ impl SignerCeremonyService {
         root: &bloom_signer_api::KeyRef,
         scope: &PetalKeyScope,
     ) -> Result<GenericCustodyOutcome, ProtocolError> {
-        let namespace_id = Token::new(PETAL_SUBKEY_NAMESPACE).expect("static token");
+        let (namespace_id, canonical_prefix) = match root.key_spec {
+            bloom_signer_api::KeySpec::Secp256k1 => (
+                Token::new(PETAL_SUBKEY_NAMESPACE).expect("static token"),
+                PETAL_SUBKEY_PREFIX.to_owned(),
+            ),
+            bloom_signer_api::KeySpec::Ed25519 => {
+                let Some(bloom_signer_api::DerivationRef::Bip39Multicurve {
+                    profile: bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                    path,
+                    ..
+                }) = &root.derivation
+                else {
+                    return Err(protocol(
+                        ProtocolErrorCode::BackendInvalidRequest,
+                        "Ed25519 Petal keys require a registered Solana account parent",
+                    ));
+                };
+                let components = path.split('/').collect::<Vec<_>>();
+                if components.len() != 5
+                    || components[0] != "m"
+                    || components[1] != "44'"
+                    || components[2] != "501'"
+                    || components[3]
+                        .strip_suffix('\'')
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .is_none()
+                    || components[4] != "0'"
+                {
+                    return Err(protocol(
+                        ProtocolErrorCode::BackendInvalidRequest,
+                        "Ed25519 Petal parent has a noncanonical Solana account path",
+                    ));
+                }
+                (
+                    Token::new(format!(
+                        "petal-ed25519-{}",
+                        &root.public_key_fingerprint.as_str()[..32]
+                    ))
+                    .map_err(malformed)?,
+                    format!("{path}/{PETAL_ED25519_BRANCH}'"),
+                )
+            }
+        };
         let grant = bloom_signer_backend_local::DerivationGrant {
             authority_kind: Token::new("ceremony").expect("static token"),
             namespace_id: namespace_id.clone(),
-            canonical_prefix: PETAL_SUBKEY_PREFIX.to_owned(),
+            canonical_prefix,
             starting_index: DecimalU64::new(0),
             maximum_children: DecimalU64::new(0x8000_0000),
         };

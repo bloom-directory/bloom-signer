@@ -6,8 +6,10 @@ use bloom_signer_backend_api::{
     ActivationStatus, BackendError, BackendInput, BackendSignRequest, SecretBytes, SignerBackend,
     SignerBackendActivation, SignerBackendDerivation,
 };
-use bloom_signer_backend_local::{EncryptedLocalBackup, LocalSignerBackend};
-use ed25519_dalek::SigningKey as Ed25519SigningKey;
+use bloom_signer_backend_local::{
+    DerivationAuthority, DerivationGrant, EncryptedLocalBackup, LocalSignerBackend,
+};
+use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
 use k256::pkcs8::EncodePublicKey as _;
 use sha2::Digest as _;
 use std::str::FromStr as _;
@@ -122,6 +124,74 @@ fn bip39_public_descriptions_survive_a_locked_restart() {
         .is_err(),
         "public projection must not unlock signing"
     );
+}
+
+#[test]
+fn bip39_solana_parent_allocates_and_signs_a_hardened_petal_child() {
+    const AUTHORITY_DOMAIN: &[u8] = b"bloom-key-derive-authority/v1";
+    let (backend, entropy) = bip39_backend();
+    let parent = bip39_child(&entropy, DerivationProfile::Bip44SolanaSlip10Ed25519V1).0;
+    backend.register_bip39_child(parent.clone(), None).unwrap();
+
+    let namespace_id = Token::new(format!(
+        "petal-ed25519-{}",
+        &parent.public_key_fingerprint.as_str()[..32]
+    ))
+    .unwrap();
+    let grant = DerivationGrant {
+        authority_kind: Token::new("ceremony").unwrap(),
+        namespace_id: namespace_id.clone(),
+        canonical_prefix: "m/44'/501'/0'/0'/18735'".into(),
+        starting_index: DecimalU64::new(0),
+        maximum_children: DecimalU64::new(8),
+    };
+    let mut message = AUTHORITY_DOMAIN.to_vec();
+    message.extend_from_slice(&serde_jcs::to_vec(&grant).unwrap());
+    let authority = DerivationAuthority::from_signed(
+        grant,
+        Base64UrlBytes::from_bytes(
+            &Ed25519SigningKey::from_bytes(&[5; 32])
+                .sign(&message)
+                .to_bytes(),
+        ),
+    );
+    backend.configure_namespace(&authority).unwrap();
+    let child = backend
+        .allocate_derived_key(&parent, &namespace_id, &authority)
+        .unwrap();
+    assert_eq!(child.key_ref.key_spec, KeySpec::Ed25519);
+    assert!(matches!(
+        child.key_ref.derivation,
+        Some(DerivationRef::Bip39Multicurve {
+            profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            ref path,
+            ..
+        }) if path == "m/44'/501'/0'/0'/18735'/0'"
+    ));
+
+    let payload = b"pumpfun-petal-session";
+    let signature = futures::executor::block_on(backend.sign(BackendSignRequest {
+        provider_attempt_id: Digest32::new("33".repeat(32)).unwrap(),
+        key_ref: child.key_ref.clone(),
+        crypto_suite: CryptoSuite::Ed25519Message,
+        input: BackendInput::Message {
+            message: Base64UrlBytes::from_bytes(payload),
+        },
+        deadline_ms: DecimalU64::new(100),
+    }))
+    .unwrap();
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(
+        &child.canonical_spki_der.decode()[12..44]
+            .try_into()
+            .unwrap(),
+    )
+    .unwrap();
+    verifying
+        .verify_strict(
+            payload,
+            &ed25519_dalek::Signature::from_slice(&signature.bytes.decode()).unwrap(),
+        )
+        .unwrap();
 }
 
 #[test]

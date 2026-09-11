@@ -42,4 +42,6 @@ pub use mnemonic::{
 };
 pub use policy::{GENERATE_WORDS, IMPORT_WORDS, entropy_bytes_for_words};
 pub use seed::SEED_BYTES;
-pub use slip10::{DerivedEd25519, Ed25519DeriveError, derive_solana_account};
+pub use slip10::{
+    DerivedEd25519, Ed25519DeriveError, derive_solana_account, derive_solana_petal_key,
+};

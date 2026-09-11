@@ -761,6 +761,7 @@ dependencies = [
  "bloom-signer-vectors",
  "bloom-triad-local-transport",
  "bloom-trusted-time",
+ "bs58",
  "chacha20poly1305 0.10.1",
  "ciborium",
  "ed25519-dalek",
