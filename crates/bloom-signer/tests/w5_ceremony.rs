@@ -4112,6 +4112,95 @@ fn bip39_solana_child_export_refuses_empty_pinned_keys() {
     );
 }
 
+#[test]
+fn petal_subkey_reuses_an_expired_same_seed_scope_and_refuses_a_live_one() {
+    let authenticator_a = VirtualAuthenticator::generate();
+    let authenticator_b = VirtualAuthenticator::generate();
+    let (service, _engine, _registry) = bip39_service(&authenticator_a);
+    let wallet_a = Token::new("seed-original").unwrap();
+    let wallet_b = Token::new("seed-recovered").unwrap();
+    let scope = |wallet: &Token, parent: &bloom_signer_api::KeyRef, op: &str, lifetime_ms: u64| {
+        PetalKeyScope {
+            wallet_id: wallet.clone(),
+            parent_key_ref: parent.clone(),
+            package_hash: digest("c3"),
+            route: "/petals/exchange/sign".into(),
+            lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            key_slot: Token::new("account-a").unwrap(),
+            allowed_routes: vec!["/petals/exchange/sign".into()],
+            allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
+            allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+            maximum_lifetime_ms: DecimalU64::new(lifetime_ms),
+            custody_operation_id: operation(op),
+        }
+    };
+
+    let parent_a = complete_bip39_mnemonic_import(
+        &service,
+        &authenticator_a,
+        &wallet_a,
+        &operation("c1"),
+        bloom_signer_vectors::BIP39_MNEMONIC,
+        10_000,
+    )
+    .public_key_refs[0]
+        .clone();
+    let (expired_a, _) = complete_petal_key_derivation(
+        &service,
+        &authenticator_a,
+        scope(&wallet_a, &parent_a, "c4", 20_000),
+        None,
+        10_200,
+    )
+    .unwrap();
+    let (live_a, _) = complete_petal_key_derivation(
+        &service,
+        &authenticator_a,
+        scope(&wallet_a, &parent_a, "c6", 100_000),
+        None,
+        10_400,
+    )
+    .unwrap();
+
+    let parent_b = complete_bip39_mnemonic_import(
+        &service,
+        &authenticator_b,
+        &wallet_b,
+        &operation("c2"),
+        bloom_signer_vectors::BIP39_MNEMONIC,
+        50_000,
+    )
+    .public_key_refs[0]
+        .clone();
+    let (expired_b, _) = complete_petal_key_derivation(
+        &service,
+        &authenticator_b,
+        scope(&wallet_b, &parent_b, "c5", 20_000),
+        None,
+        50_100,
+    )
+    .expect("an expired scope must yield to the recovered same-seed wallet");
+    assert_eq!(
+        expired_a.public_key_refs[0].public_key_fingerprint,
+        expired_b.public_key_refs[0].public_key_fingerprint
+    );
+
+    let collision = complete_petal_key_derivation(
+        &service,
+        &authenticator_b,
+        scope(&wallet_b, &parent_b, "c7", 20_000),
+        None,
+        50_200,
+    )
+    .unwrap_err();
+    assert_eq!(collision.code, ProtocolErrorCode::KeyrefMismatch);
+    assert!(collision.message.contains(wallet_a.as_str()));
+    assert_ne!(
+        live_a.public_key_refs[0].public_key_fingerprint,
+        expired_a.public_key_refs[0].public_key_fingerprint
+    );
+}
+
 fn healthy_clock(effective_now_ms: u64) -> ClockDecision {
     ClockDecision {
         effective_now_ms,

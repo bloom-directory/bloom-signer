@@ -1956,6 +1956,33 @@ impl SignerEngine {
                                 "Petal key scope lifetime overflows the protocol clock",
                             )
                         })?;
+                    let holder = transaction
+                        .query_row(
+                            "SELECT wallet_id, expires_at_ms FROM petal_key_scopes
+                             WHERE key_fingerprint = ?1",
+                            [key_ref.public_key_fingerprint.as_str()],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .optional()
+                        .map_err(storage)?;
+                    if let Some((holder_wallet, holder_expires_at_ms)) = holder {
+                        let holder_expires_at_ms =
+                            holder_expires_at_ms.parse::<u64>().map_err(malformed)?;
+                        if holder_expires_at_ms > committed_at_ms {
+                            return Err(error(
+                                ProtocolErrorCode::KeyrefMismatch,
+                                format!(
+                                    "Petal sub-key is already scoped to wallet '{holder_wallet}' until {holder_expires_at_ms}"
+                                ),
+                            ));
+                        }
+                        transaction
+                            .execute(
+                                "DELETE FROM petal_key_scopes WHERE key_fingerprint = ?1",
+                                [key_ref.public_key_fingerprint.as_str()],
+                            )
+                            .map_err(storage)?;
+                    }
                     transaction
                         .execute(
                             "INSERT INTO petal_key_scopes(
