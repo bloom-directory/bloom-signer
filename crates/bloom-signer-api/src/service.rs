@@ -238,6 +238,9 @@ pub struct KeyPublic {
     /// roots/children so 1.3 peers see an unchanged shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived_account: Option<crate::DerivedAccountDescriptor>,
+    /// Absolute expiry recorded by Signer for a Petal-scoped key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub petal_scope_expires_at_ms: Option<DecimalU64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

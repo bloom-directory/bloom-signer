@@ -1956,6 +1956,38 @@ impl SignerEngine {
                                 "Petal key scope lifetime overflows the protocol clock",
                             )
                         })?;
+                    // Two wallets restored from one seed derive identical
+                    // children, so a fingerprint can already carry a scope
+                    // from another wallet. A live scope stays exclusive; an
+                    // expired one is dead and yields to the wallet deriving
+                    // the key now.
+                    let holder = transaction
+                        .query_row(
+                            "SELECT wallet_id, expires_at_ms FROM petal_key_scopes
+                             WHERE key_fingerprint = ?1",
+                            [key_ref.public_key_fingerprint.as_str()],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .optional()
+                        .map_err(storage)?;
+                    if let Some((holder_wallet, holder_expires_at_ms)) = holder {
+                        let holder_expires_at_ms =
+                            holder_expires_at_ms.parse::<u64>().map_err(malformed)?;
+                        if holder_expires_at_ms > committed_at_ms {
+                            return Err(error(
+                                ProtocolErrorCode::KeyrefMismatch,
+                                format!(
+                                    "Petal sub-key is already scoped to wallet '{holder_wallet}' until {holder_expires_at_ms}"
+                                ),
+                            ));
+                        }
+                        transaction
+                            .execute(
+                                "DELETE FROM petal_key_scopes WHERE key_fingerprint = ?1",
+                                [key_ref.public_key_fingerprint.as_str()],
+                            )
+                            .map_err(storage)?;
+                    }
                     transaction
                         .execute(
                             "INSERT INTO petal_key_scopes(
@@ -1975,13 +2007,24 @@ impl SignerEngine {
                         .map_err(storage)?;
                     #[cfg(feature = "local")]
                     {
+                        let encrypted_record = self
+                            .backend_registry
+                            .local_encrypted_backup(&scope.parent_key_ref)?;
+                        let backup: bloom_signer_backend_local::EncryptedLocalBackup =
+                            serde_json::from_slice(&encrypted_record.decode())
+                                .map_err(malformed)?;
+                        let pinned_keys = if backup.root_material_kind
+                            == bloom_signer_backend_local::LocalRootMaterialKind::Bip39Entropy
+                        {
+                            backup.derivation_registry
+                        } else {
+                            vec![scope.parent_key_ref.clone()]
+                        };
                         let enrollment = BackendEnrollmentBackup {
                             backend: scope.parent_key_ref.backend.clone(),
                             backend_instance: scope.parent_key_ref.backend_instance.clone(),
-                            encrypted_record: self
-                                .backend_registry
-                                .local_encrypted_backup(&scope.parent_key_ref)?,
-                            pinned_keys: vec![scope.parent_key_ref.clone()],
+                            encrypted_record,
+                            pinned_keys,
                         };
                         let updated = transaction
                             .execute(
@@ -2813,6 +2856,21 @@ impl SignerEngine {
             return Ok(None);
         };
         let connection = self.connection.lock();
+        let authority_class: Option<String> = connection
+            .query_row(
+                "SELECT authority_class FROM enrolled_keys WHERE key_fingerprint = ?1",
+                [key_ref.public_key_fingerprint.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        // Petal-scoped children carry their deterministic derivation path so
+        // the local backend can restore them, but they are not wallet accounts
+        // and therefore have no derivation_allocations row. Their public key
+        // remains describable; only the account-specific projection is absent.
+        if authority_class.as_deref() == Some("petal") {
+            return Ok(None);
+        }
         let row = connection
             .query_row(
                 "SELECT key_spec, public_key_spki_der, public_key_fingerprint, state
@@ -3560,6 +3618,28 @@ impl SignerEngine {
                 "key is not an enrolled wallet root or Signer-derived key",
             )),
         }
+    }
+
+    pub fn petal_key_scope_expires_at_ms(
+        &self,
+        key_ref: &KeyRef,
+    ) -> Result<Option<DecimalU64>, ProtocolError> {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT expires_at_ms FROM petal_key_scopes WHERE key_fingerprint = ?1",
+                [key_ref.public_key_fingerprint.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?
+            .map(|expires_at_ms| {
+                expires_at_ms
+                    .parse::<u64>()
+                    .map(DecimalU64::new)
+                    .map_err(malformed)
+            })
+            .transpose()
     }
 
     /// Durable enrollment of a Petal sub-key parent.
@@ -6203,15 +6283,16 @@ fn require_key_available(
     backend_registry: &BackendRegistry,
     key_ref: &KeyRef,
 ) -> Result<(), ProtocolError> {
-    let enrolled: Option<(String, bool)> = transaction
+    let enrolled: Option<(String, bool, String)> = transaction
         .query_row(
-            "SELECT key_ref_jcs, available FROM enrolled_keys WHERE key_fingerprint = ?1",
+            "SELECT key_ref_jcs, available, authority_class
+             FROM enrolled_keys WHERE key_fingerprint = ?1",
             [key_ref.public_key_fingerprint.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(storage)?;
-    if enrolled.as_ref().map(|(stored, _)| stored)
+    if enrolled.as_ref().map(|(stored, _, _)| stored)
         != Some(&serde_jcs::to_string(key_ref).map_err(malformed)?)
         || !backend_registry.key_is_available(key_ref)?
     {
@@ -6223,10 +6304,15 @@ fn require_key_available(
     // A BIP-39 derived child must still be ACTIVATED in the durable registry.
     // Retirement commits that transition before it deactivates enrolled_keys,
     // so a sign request that slips into that gap must fail closed here rather
-    // than authorize a retired account.
-    if let Some(DerivationRef::Bip39Multicurve {
-        wallet_seed_ref, ..
-    }) = &key_ref.derivation
+    // than authorize a retired account. Scoped Petal keys are the one BIP-39
+    // class without an allocation row; every other class keeps the check, so
+    // a relabelled or re-enrolled child cannot shed it.
+    if enrolled
+        .as_ref()
+        .is_none_or(|(_, _, authority_class)| authority_class != "petal")
+        && let Some(DerivationRef::Bip39Multicurve {
+            wallet_seed_ref, ..
+        }) = &key_ref.derivation
     {
         let state: Option<String> = transaction
             .query_row(
@@ -8395,6 +8481,52 @@ mod require_key_tests {
         let error = require_key_available(&transaction, &registry, &child).unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
         assert!(error.message.contains("not an active derived account"));
+        drop(transaction);
+        drop(connection);
+    }
+
+    #[test]
+    fn require_key_available_checks_a_retired_child_whatever_its_class_label() {
+        let (engine, child, registry) = retired_bip39_child_engine();
+        let mut connection = engine.connection.lock();
+        for class in ["unscoped", "wallet_root"] {
+            connection
+                .execute(
+                    "UPDATE enrolled_keys SET authority_class = ?1 WHERE key_fingerprint = ?2",
+                    rusqlite::params![class, child.public_key_fingerprint.as_str()],
+                )
+                .unwrap();
+            let transaction = engine.mutation_transaction(&mut connection).unwrap();
+            let error = require_key_available(&transaction, &registry, &child).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch, "{class}");
+            assert!(
+                error.message.contains("not an active derived account"),
+                "a {class}-labelled BIP-39 child must not skip the allocation check"
+            );
+            drop(transaction);
+        }
+        drop(connection);
+    }
+
+    #[test]
+    fn require_key_available_accepts_a_petal_bip39_child_without_account_allocation() {
+        let (engine, child, registry) = retired_bip39_child_engine();
+        let mut connection = engine.connection.lock();
+        connection
+            .execute(
+                "UPDATE enrolled_keys SET authority_class = 'petal'
+                 WHERE key_fingerprint = ?1",
+                [child.public_key_fingerprint.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM derivation_allocations WHERE public_key_fingerprint = ?1",
+                [child.public_key_fingerprint.as_str()],
+            )
+            .unwrap();
+        let transaction = engine.mutation_transaction(&mut connection).unwrap();
+        require_key_available(&transaction, &registry, &child).unwrap();
         drop(transaction);
         drop(connection);
     }

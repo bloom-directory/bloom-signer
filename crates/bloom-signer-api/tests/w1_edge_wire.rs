@@ -415,6 +415,7 @@ fn key_public() -> KeyPublic {
         addresses: vec!["0x1".into()],
         supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
         derived_account: None,
+        petal_scope_expires_at_ms: None,
     }
 }
 
