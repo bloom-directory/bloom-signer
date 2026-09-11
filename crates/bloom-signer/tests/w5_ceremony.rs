@@ -3223,6 +3223,61 @@ fn account_allocate_prepare(
 }
 
 /// One ceremony allocating several families under one Signer-chosen number.
+/// The multi-family allocation ceremony, keeping the completion error
+/// instead of unwrapping it.
+fn try_complete_account_allocate_many(
+    service: &SignerCeremonyService,
+    authenticator: &VirtualAuthenticator,
+    wallet_id: &Token,
+    operation_id: &OperationId,
+    requests: Vec<DerivedAccountRequest>,
+    now_ms: u64,
+) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
+    let (request, exact_terms_digest, effect) =
+        account_allocate_prepare(wallet_id, operation_id, requests);
+    let prepared = service.prepare_custody(request, now_ms).unwrap();
+    let assertion = authenticator.assertion(
+        &prepared.challenges[0].canonical_bytes().unwrap(),
+        now_ms as u32,
+    );
+    let aad = CustodyHpkeAad {
+        ceremony_id: prepared.contribution.ceremony_id.clone(),
+        ceremony_kind: CeremonyKind::AccountAllocate,
+        custody_operation_id: operation_id.clone(),
+        signer_nonce: prepared.contribution.signer_nonce.clone(),
+        signer_contribution_digest: prepared.contribution.digest().unwrap(),
+        wallet_id: Some(wallet_id.clone()),
+        key_ref: None,
+        credential_id: Some(assertion.credential_id.clone()),
+        expected_input_class: Token::new("generic-custody-v1").unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap();
+    let plaintext = serde_jcs::to_vec(&serde_json::json!({
+        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
+        "effect": effect,
+    }))
+    .unwrap();
+    let encrypted_input = seal_hpke(
+        &prepared.contribution.hpke_recipient_key,
+        b"bloom-custody-input/v1",
+        &aad,
+        &plaintext,
+    )
+    .unwrap();
+    service.complete_custody(
+        CustodyCompleteRequest {
+            ceremony_kind: CeremonyKind::AccountAllocate,
+            custody_operation_id: operation_id.clone(),
+            ceremony_id: prepared.contribution.ceremony_id.clone(),
+            proof: WebAuthnCeremonyProof::Assertion { assertion },
+            encrypted_input: Some(encrypted_input),
+            public_binding_digest: exact_terms_digest,
+        },
+        now_ms + 100,
+    )
+}
+
 fn complete_account_allocate_many(
     service: &SignerCeremonyService,
     authenticator: &VirtualAuthenticator,
@@ -3398,6 +3453,237 @@ fn bip39_two_family_allocation_shares_one_number_chosen_by_signer() {
     assert_eq!(listed.len(), 9);
     let paths: std::collections::BTreeSet<_> = listed.iter().map(|d| d.path.clone()).collect();
     assert_eq!(paths.len(), 9);
+}
+
+#[test]
+fn bip39_enrollment_refresh_failure_after_allocation_rolls_back_every_sibling() {
+    // Allocation is durable before the post-allocation enrollment refresh,
+    // so its failure is the rollback path every allocated sibling must
+    // survive. Removing the durable enrollment row is the public way to
+    // make that refresh fail after both children were allocated: the
+    // refresh UPDATE then hits no row and refuses with KEYREF_MISMATCH.
+    // File-backed so the row can be removed and restored between
+    // ceremonies without restarting the Signer.
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let authenticator = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
+    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+    let engine = Arc::new(
+        SignerEngine::open(
+            &database,
+            Token::new("broker-app-1").unwrap(),
+            broker.verifying_key(),
+            ceremony_key.verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
+            registry.clone(),
+        )
+        .unwrap(),
+    );
+    let service = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        ceremony_key.clone(),
+    )
+    .unwrap();
+    let wallet_id = Token::new("bip39-wallet-refresh-failure").unwrap();
+    let registration = complete_bip39_registration(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("f0"),
+        10_000,
+    );
+    assert_eq!(registration.public_key_refs.len(), 2);
+    assert_eq!(
+        engine
+            .derived_account_descriptors(&wallet_id)
+            .unwrap()
+            .len(),
+        2,
+        "fixture: registration left exactly the two account-0 children"
+    );
+
+    let enrollment: Vec<(String, String)> = {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let mut statement = connection
+            .prepare("SELECT backend_instance, enrollment_jcs FROM ceremony_backend_enrollments")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(statement);
+        connection
+            .execute("DELETE FROM ceremony_backend_enrollments", [])
+            .unwrap();
+        rows
+    };
+    assert_eq!(enrollment.len(), 1, "fixture: one enrollment row to remove");
+
+    let error = try_complete_account_allocate_many(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("f1"),
+        vec![evm_request(None), solana_request(None)],
+        10_100,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+    assert!(
+        error
+            .message
+            .contains("bip39 backend lacks durable enrollment"),
+        "the ceremony reports the enrollment-refresh failure: {error}"
+    );
+
+    // Both siblings are rolled back even though the refresh failed on the
+    // first: the shared account number is durably tombstoned for both
+    // families, so no half-allocated number survives.
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT profile, account, state FROM derivation_allocations
+                 WHERE wallet_id = ?1 ORDER BY state, profile",
+            )
+            .unwrap();
+        let rows: Vec<(String, i64, String)> = statement
+            .query_map([wallet_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        // The EVM row records its unpinned request account, the Solana row
+        // the chosen shared number; what matters is that exactly one row
+        // per family from the failed ceremony is tombstoned and the two
+        // registration rows stay live.
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "bip44-evm-secp256k1-v1".to_owned(),
+                    0,
+                    "ACTIVATED".to_owned()
+                ),
+                (
+                    "bip44-solana-slip10-ed25519-v1".to_owned(),
+                    0,
+                    "ACTIVATED".to_owned()
+                ),
+                (
+                    "bip44-evm-secp256k1-v1".to_owned(),
+                    0,
+                    "TOMBSTONED".to_owned()
+                ),
+                (
+                    "bip44-solana-slip10-ed25519-v1".to_owned(),
+                    1,
+                    "TOMBSTONED".to_owned()
+                ),
+            ],
+            "both family rows of the failed ceremony are tombstoned; the              registration pair stays activated"
+        );
+        let mut statement = connection
+            .prepare("SELECT COUNT(*) FROM ceremony_backend_enrollments")
+            .unwrap();
+        let remaining: i64 = statement.query_row([], |row| row.get(0)).unwrap();
+        assert_eq!(remaining, 0, "the rollback adds no enrollment row");
+    }
+
+    // Neither child is visible as a wallet account...
+    assert_eq!(
+        engine
+            .derived_account_descriptors(&wallet_id)
+            .unwrap()
+            .len(),
+        2,
+        "the failed ceremony adds no visible account"
+    );
+    // ...and neither can sign: the backend registrations the allocation
+    // made are rolled back with the children, while the registration
+    // children at account 0 stay available.
+    let registered: Vec<KeyRef> = {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT key_ref_jcs FROM enrolled_keys
+                 WHERE wallet_id = ?1 AND authority_class = 'derived'",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([wallet_id.as_str()], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(statement);
+        rows.into_iter()
+            .map(|row| serde_json::from_str(&row).unwrap())
+            .collect()
+    };
+    assert_eq!(registered.len(), 4, "two registration children, two failed");
+    for child in &registered {
+        let path = match &child.derivation {
+            Some(DerivationRef::Bip39Multicurve { path, .. }) => path.clone(),
+            other => panic!("derived child carries a BIP-39 derivation: {other:?}"),
+        };
+        if path.ends_with("/1") || path.contains("/1'/0'") {
+            // The rollback tears the allocation's backend registration
+            // down: the child is either gone from the backend outright or
+            // locked out of it, and never signable.
+            assert!(
+                !matches!(registry.key_is_available(child), Ok(true)),
+                "a child from the failed ceremony must not be signable ({path})"
+            );
+        } else {
+            assert!(
+                registry.key_is_available(child).unwrap(),
+                "a registration child must stay signable ({path})"
+            );
+        }
+    }
+
+    // The enrollment row is the durable enrollment source, so restore it
+    // exactly; a later pair must then succeed on the next number, never
+    // reusing the tombstoned one.
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        for (backend_instance, enrollment_jcs) in &enrollment {
+            connection
+                .execute(
+                    "INSERT INTO ceremony_backend_enrollments(backend_instance, enrollment_jcs)
+                     VALUES (?1, ?2)",
+                    rusqlite::params![backend_instance, enrollment_jcs],
+                )
+                .unwrap();
+        }
+    }
+    let pair = complete_account_allocate_many(
+        &service,
+        &authenticator,
+        &wallet_id,
+        &operation("f2"),
+        vec![evm_request(None), solana_request(None)],
+        10_200,
+    );
+    assert_eq!(pair.public_key_refs.len(), 2);
+    assert_eq!(
+        paths_by_family(&engine, &pair),
+        ("m/44'/60'/0'/0/2".to_owned(), "m/44'/501'/2'/0'".to_owned()),
+        "the next allocation jumps the tombstoned pair"
+    );
 }
 
 #[test]
