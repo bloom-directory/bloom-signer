@@ -6272,10 +6272,12 @@ fn require_key_available(
     // A BIP-39 derived child must still be ACTIVATED in the durable registry.
     // Retirement commits that transition before it deactivates enrolled_keys,
     // so a sign request that slips into that gap must fail closed here rather
-    // than authorize a retired account.
+    // than authorize a retired account. Scoped Petal keys are the one BIP-39
+    // class without an allocation row; every other class keeps the check, so
+    // a relabelled or re-enrolled child cannot shed it.
     if enrolled
         .as_ref()
-        .is_some_and(|(_, _, authority_class)| authority_class == "derived")
+        .is_none_or(|(_, _, authority_class)| authority_class != "petal")
         && let Some(DerivationRef::Bip39Multicurve {
             wallet_seed_ref, ..
         }) = &key_ref.derivation
@@ -8448,6 +8450,29 @@ mod require_key_tests {
         assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
         assert!(error.message.contains("not an active derived account"));
         drop(transaction);
+        drop(connection);
+    }
+
+    #[test]
+    fn require_key_available_checks_a_retired_child_whatever_its_class_label() {
+        let (engine, child, registry) = retired_bip39_child_engine();
+        let mut connection = engine.connection.lock();
+        for class in ["unscoped", "wallet_root"] {
+            connection
+                .execute(
+                    "UPDATE enrolled_keys SET authority_class = ?1 WHERE key_fingerprint = ?2",
+                    rusqlite::params![class, child.public_key_fingerprint.as_str()],
+                )
+                .unwrap();
+            let transaction = engine.mutation_transaction(&mut connection).unwrap();
+            let error = require_key_available(&transaction, &registry, &child).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch, "{class}");
+            assert!(
+                error.message.contains("not an active derived account"),
+                "a {class}-labelled BIP-39 child must not skip the allocation check"
+            );
+            drop(transaction);
+        }
         drop(connection);
     }
 
