@@ -4220,6 +4220,131 @@ fn petal_subkey_reuses_a_fingerprint_whose_scope_expired_on_a_same_seed_wallet()
     );
 }
 
+/// An Exact approval may outlive its Petal key scope (bloom-signer#40), but
+/// once a same-seed wallet takes over the expired scope, the key belongs to
+/// that wallet. The previous wallet's recovery approval is then refused,
+/// fail-closed, rather than signing for a key another wallet now holds; that
+/// wallet has to sweep before its scope lapses.
+#[test]
+fn a_taken_over_scope_refuses_the_previous_wallets_exact_approval() {
+    let authenticator_a = VirtualAuthenticator::generate();
+    let authenticator_b = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let (service, engine, _registry) = bip39_service(&authenticator_a);
+    let wallet_a = Token::new("seed-original").unwrap();
+    let wallet_b = Token::new("seed-recovered").unwrap();
+    let scope = |wallet: &Token, parent: &bloom_signer_api::KeyRef, op: &str| PetalKeyScope {
+        wallet_id: wallet.clone(),
+        parent_key_ref: parent.clone(),
+        package_hash: digest("c3"),
+        route: "/petals/exchange/sign".into(),
+        lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        key_slot: Token::new("account-a").unwrap(),
+        allowed_routes: vec!["/petals/exchange/sign".into()],
+        allowed_operation_classes: vec![Token::new("exchange-agent").unwrap()],
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+        maximum_lifetime_ms: DecimalU64::new(20_000),
+        custody_operation_id: operation(op),
+    };
+    let parent_a = complete_bip39_mnemonic_import(
+        &service,
+        &authenticator_a,
+        &wallet_a,
+        &operation("c1"),
+        bloom_signer_vectors::BIP39_MNEMONIC,
+        10_000,
+    )
+    .public_key_refs[0]
+        .clone();
+    // A's scope on child 0 expires at 30_200.
+    let (derived_a, _) = complete_petal_key_derivation(
+        &service,
+        &authenticator_a,
+        scope(&wallet_a, &parent_a, "c4"),
+        None,
+        10_200,
+    )
+    .unwrap();
+    let child = derived_a.public_key_refs[0].clone();
+
+    // After the scope lapses, A's owner approves an Exact recovery sweep.
+    let policy = engine.policy_snapshot(&wallet_a).unwrap();
+    let epoch = engine
+        .revocation_state(&wallet_a, 40_000)
+        .unwrap()
+        .wallet_revocation_epoch;
+    let recovery = SealedApprovalTerms {
+        subject: ApprovalSubject::Petal {
+            package_hash: digest("c3"),
+            route: "/petals/exchange/sign".into(),
+            agent_id: Some("account-a".into()),
+        },
+        wallet_id: wallet_a.clone(),
+        key_ref: child.clone(),
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Sha256Recoverable],
+        selector: ApprovalSelector::Exact {
+            ordered_payload_digests: vec![digest("e1")],
+            ordered_hashes: vec![digest("e1")],
+        },
+        limits: ApprovalLimits {
+            max_operations: DecimalU64::new(1),
+            max_signatures: DecimalU64::new(1),
+            operation_rate_limits: vec![],
+            signature_rate_limits: vec![],
+            value_limits: vec![],
+        },
+        activation_mode: ActivationMode::BootBound,
+        wallet_revocation_epoch: epoch,
+        policy_version: policy.version.clone(),
+        policy_digest: policy.policy_digest.clone(),
+        provenance_digest: digest("c7"),
+        request_nonce: RequestNonce::new("d1".repeat(16)).unwrap(),
+        issued_at_ms: DecimalU64::new(40_000),
+        not_before_ms: DecimalU64::new(40_000),
+        expires_at_ms: DecimalU64::new(58_000),
+        renewal_of: None,
+    };
+    engine.install_approval_for_test(&recovery).unwrap();
+
+    // B recovers the same mnemonic and takes the expired scope over.
+    let parent_b = complete_bip39_mnemonic_import(
+        &service,
+        &authenticator_b,
+        &wallet_b,
+        &operation("c2"),
+        bloom_signer_vectors::BIP39_MNEMONIC,
+        50_000,
+    )
+    .public_key_refs[0]
+        .clone();
+    let (derived_b, _) = complete_petal_key_derivation(
+        &service,
+        &authenticator_b,
+        scope(&wallet_b, &parent_b, "c5"),
+        None,
+        50_100,
+    )
+    .unwrap();
+    assert_eq!(
+        derived_b.public_key_refs[0].public_key_fingerprint,
+        child.public_key_fingerprint
+    );
+
+    let refusal = engine
+        .authorize_sign(
+            &exact_sign_request(&broker, &recovery, "f1", 52_000, 53_000),
+            &healthy_clock(52_000),
+        )
+        .unwrap_err();
+    // B's enrollment replaced the key's enrolled KeyRef, which names B's
+    // backend, so A's approval no longer matches the enrolled key at all.
+    assert_eq!(refusal.code, ProtocolErrorCode::KeyrefMismatch);
+    assert_eq!(
+        refusal.message,
+        "approval key is absent, inactive, or differs from compiled backend enrollment"
+    );
+}
+
 fn healthy_clock(effective_now_ms: u64) -> ClockDecision {
     ClockDecision {
         effective_now_ms,
