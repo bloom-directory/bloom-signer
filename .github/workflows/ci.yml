@@ -57,7 +57,7 @@ jobs:
   supply-chain:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # Advisories, licences, sources, and wildcard pins, configured in
       # deny.toml. Runs as its own job so a dependency advisory is
       # distinguishable from a code failure, and so it still reports when
