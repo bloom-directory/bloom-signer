@@ -9,6 +9,7 @@ use bloom_signer_api::*;
 use bloom_signer_backend_api::{SecretBytes, SignerBackendActivation};
 use bloom_signer_backend_local::LocalSignerBackend;
 use ed25519_dalek::{Signer as _, SigningKey};
+use hkdf::Hkdf;
 use sha2::{Digest as _, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -101,20 +102,90 @@ fn petal_terms() -> SealedApprovalTerms {
     terms
 }
 
-fn system_terms() -> SealedApprovalTerms {
+fn system_terms(key_ref: KeyRef) -> SealedApprovalTerms {
     let mut terms = exact_terms();
+    terms.wallet_id = Token::new("bip39-wallet").unwrap();
+    terms.key_ref = key_ref;
+    terms.allowed_crypto_suites = vec![CryptoSuite::Ed25519Message];
     terms.subject = ApprovalSubject::System {
-        component_id: Token::new("bloom-broker").unwrap(),
-        operation_class: Token::new("wallet.fund-derived").unwrap(),
+        component_id: Token::new("bloom-machine").unwrap(),
+        operation_class: Token::new("solana.transfer.confirm").unwrap(),
     };
     terms.selector = ApprovalSelector::System {
-        component_id: Token::new("bloom-broker").unwrap(),
-        action_class: Token::new("wallet.fund-derived").unwrap(),
-        allowed_operation_classes: vec![Token::new("solana.transfer").unwrap()],
+        component_id: Token::new("bloom-machine").unwrap(),
+        action_class: Token::new("solana.transfer.confirm").unwrap(),
+        allowed_operation_classes: vec![Token::new("solana.native-transfer").unwrap()],
         required_claim_assurance: ClaimAssuranceLevel::ProofVerified,
         intent_digest: digest("78"),
     };
+    terms.limits.value_limits = vec![ValueLimit {
+        asset: AssetId {
+            chain: Token::new("solana").unwrap(),
+            asset: "native".into(),
+        },
+        lifetime: DecimalU256::parse("1000001").unwrap(),
+        rolling_windows: vec![],
+    }];
     terms
+}
+
+fn new_system_engine(broker: &SigningKey) -> (SignerEngine, KeyRef) {
+    let wallet_id = Token::new("bip39-wallet").unwrap();
+    let entropy = hex::decode(bloom_signer_vectors::BIP39_ENTROPY_HEX).unwrap();
+    let wkek = vec![2; 32];
+    let credential_id = Base64UrlBytes::from_bytes(b"credential-1");
+    let credential_key = vec![3; 32];
+    let custody = WalletCustody::register_bip39(
+        wallet_id.clone(),
+        SecretBytes::new(entropy.clone()),
+        SecretBytes::new(vec![8; 32]),
+        SecretBytes::new(wkek.clone()),
+        credential_id.clone(),
+        SecretBytes::new(credential_key.clone()),
+    )
+    .unwrap();
+    let unlocked = custody
+        .unlock_with_credential(&credential_id, &SecretBytes::new(credential_key))
+        .unwrap();
+    let salt: [u8; 32] = Sha256::digest(wallet_id.as_str().as_bytes()).into();
+    let mut activation_secret = vec![0_u8; 32];
+    Hkdf::<Sha256>::new(Some(&salt), &wkek)
+        .expand(b"bloom-local-backend-wrap/v1", &mut activation_secret)
+        .unwrap();
+    let backend = Arc::new(
+        LocalSignerBackend::provision_bip39(
+            wallet_id.clone(),
+            wallet_id.clone(),
+            SecretBytes::new(entropy),
+            SecretBytes::new(activation_secret),
+            SigningKey::from_bytes(&[5; 32]).verifying_key(),
+        )
+        .unwrap(),
+    );
+    let engine = SignerEngine::open_in_memory(
+        Token::new("broker-app-1").unwrap(),
+        broker.verifying_key(),
+        SigningKey::from_bytes(&[6; 32]).verifying_key(),
+        Token::new("signer-revocation-key").unwrap(),
+        SigningKey::from_bytes(&[4; 32]),
+        audit_keys(),
+        Arc::new(BackendRegistry::from_compiled(vec![CompiledBackend::Local(backend)]).unwrap()),
+    )
+    .unwrap();
+    let allocated = engine
+        .allocate_bip39_accounts(
+            &wallet_id,
+            &OperationId::new("19".repeat(32)).unwrap(),
+            &[DerivedAccountRequest {
+                derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                requested_role: Token::new("solana-account").unwrap(),
+                account: None,
+            }],
+            &unlocked,
+            1_500,
+        )
+        .unwrap();
+    (engine, allocated[0].key_ref.clone())
 }
 
 fn new_engine(broker: &SigningKey) -> SignerEngine {
@@ -136,20 +207,31 @@ fn new_engine(broker: &SigningKey) -> SignerEngine {
 }
 
 fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> UnsignedSignRequest {
-    let (payloads, hashes, selector_kind) = match &terms.selector {
+    let (payloads, hashes, messages, selector_kind) = match &terms.selector {
         ApprovalSelector::Exact {
             ordered_payload_digests,
             ordered_hashes,
         } => (
             ordered_payload_digests.clone(),
             ordered_hashes.clone(),
+            Vec::new(),
             SelectorKind::Exact,
         ),
-        ApprovalSelector::Petal { .. } => {
-            (vec![digest("22")], vec![digest("33")], SelectorKind::Petal)
-        }
+        ApprovalSelector::Petal { .. } => (
+            vec![digest("22")],
+            vec![digest("33")],
+            Vec::new(),
+            SelectorKind::Petal,
+        ),
         ApprovalSelector::System { .. } => {
-            (vec![digest("22")], vec![digest("33")], SelectorKind::System)
+            let message = Base64UrlBytes::from_bytes(b"solana-native-transfer");
+            let digest = Digest32::from_bytes(Sha256::digest(message.decode()).into());
+            (
+                vec![digest.clone()],
+                vec![digest],
+                vec![message],
+                SelectorKind::System,
+            )
         }
     };
     let reusable = matches!(
@@ -162,7 +244,7 @@ fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> Unsign
         operation_id: OperationId::new(operation_byte.repeat(32)).unwrap(),
         approval_id: terms.approval_id().unwrap(),
         key_ref: terms.key_ref.clone(),
-        crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+        crypto_suite: terms.allowed_crypto_suites[0],
         ordered_payload_digests: payloads.clone(),
         ordered_hashes: hashes.clone(),
         petal_use_claim_digest: claim_digest.clone(),
@@ -187,7 +269,7 @@ fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> Unsign
         selector_kind,
         ordered_payload_digests: payloads,
         ordered_hashes: hashes.clone(),
-        ordered_messages: Vec::new(),
+        ordered_messages: messages,
         signature_count: DecimalU64::new(hashes.len() as u64),
         petal_use_claim_digest: claim_digest,
         claim_assurance_digest: assurance_digest,
@@ -488,10 +570,10 @@ fn ac11_approval_ceiling_selector_issuer_key_state_retry_and_release_are_closed(
 #[test]
 fn system_selector_requires_both_claim_commitments_and_is_single_use() {
     let broker = SigningKey::from_bytes(&[7; 32]);
-    let terms = system_terms();
 
     for missing_claim in [true, false] {
-        let engine = new_engine(&broker);
+        let (engine, key_ref) = new_system_engine(&broker);
+        let terms = system_terms(key_ref);
         engine.install_approval_for_test(&terms).unwrap();
         let mut request = signed(&broker, unsigned_request(&terms, "20"));
         if missing_claim {
@@ -500,16 +582,12 @@ fn system_selector_requires_both_claim_commitments_and_is_single_use() {
             request.unsigned.claim_assurance_digest = None;
         }
         resign(&broker, &mut request);
-        assert_eq!(
-            engine
-                .authorize_sign(&request, &clock(2_500))
-                .unwrap_err()
-                .code,
-            ProtocolErrorCode::SelectorMismatch
-        );
+        let error = engine.authorize_sign(&request, &clock(2_500)).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch, "{error:?}");
     }
 
-    let engine = new_engine(&broker);
+    let (engine, key_ref) = new_system_engine(&broker);
+    let terms = system_terms(key_ref);
     engine.install_approval_for_test(&terms).unwrap();
     let mut wrong_kind = signed(&broker, unsigned_request(&terms, "21"));
     wrong_kind.unsigned.selector_kind = SelectorKind::Petal;
