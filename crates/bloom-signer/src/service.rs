@@ -13,10 +13,10 @@ use bloom_signer_api::{
     SignerPreparedApproval, SignerPreparedCustody, SigningResult, Token,
 };
 use bloom_signer_backend_api::{BackendError, BackendInput, BackendSignRequest};
-use k256::elliptic_curve::sec1::ToEncodedPoint as _;
+use k256::elliptic_curve::sec1::ToSec1Point as _;
 use k256::pkcs8::DecodePublicKey;
 use sha2::{Digest as _, Sha256};
-use sha3::{Digest as _, Keccak256};
+use sha3::Keccak256;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -771,7 +771,7 @@ fn chain_addresses(
                             "secp256k1 backend returned invalid canonical SPKI",
                         )
                     })?;
-            let point = public_key.to_encoded_point(false);
+            let point = public_key.to_sec1_point(false);
             let digest = Keccak256::digest(&point.as_bytes()[1..]);
             Ok(vec![format!("0x{}", hex::encode(&digest[12..]))])
         }

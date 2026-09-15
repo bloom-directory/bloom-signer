@@ -213,9 +213,7 @@ pub fn sign_evm_digest(
     verify_descriptor(&derived.spki_der, account)?;
     let signing = SigningKey::from_bytes((&*derived.private_key).into())
         .map_err(|_| SigningEdgeError::DescriptorMismatch)?;
-    let (signature, recovery_id) = signing
-        .sign_prehash_recoverable(digest)
-        .map_err(|_| SigningEdgeError::SelfVerificationFailed)?;
+    let (signature, recovery_id) = signing.sign_prehash_recoverable(digest);
     let verifying: VerifyingKey = *signing.verifying_key();
     let recovered = VerifyingKey::recover_from_prehash(digest, &signature, recovery_id)
         .map_err(|_| SigningEdgeError::SelfVerificationFailed)?;

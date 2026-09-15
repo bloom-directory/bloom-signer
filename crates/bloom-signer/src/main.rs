@@ -331,7 +331,8 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
     let audit_signing_key = take_signing_key(&mut config.audit_signing_seed_hex)?;
     if config.audit_key_id == config.revocation_key_id
         || audit_signing_key.verifying_key() == revocation_signing_key.verifying_key()
-        || audit_signing_key.verifying_key() == identity.signing_key.verifying_key()
+        || audit_signing_key.verifying_key().to_bytes()
+            == identity.signing_key.verifying_key().to_bytes()
     {
         return Err(
             "Signer audit key must be distinct from revocation and application keys".into(),
@@ -2009,7 +2010,10 @@ mod tests {
                     PinnedAuditKey {
                         service_id: Token::new("bloom-broker").unwrap(),
                         key_id: Token::new("broker-app").unwrap(),
-                        verifying_key: broker_key.verifying_key(),
+                        verifying_key: VerifyingKey::from_bytes(
+                            &broker_key.verifying_key().to_bytes(),
+                        )
+                        .unwrap(),
                     },
                 ],
             )
@@ -2074,7 +2078,10 @@ mod tests {
                     PinnedAuditKey {
                         service_id: Token::new("bloom-broker").unwrap(),
                         key_id: Token::new("broker-app").unwrap(),
-                        verifying_key: broker_key.verifying_key(),
+                        verifying_key: VerifyingKey::from_bytes(
+                            &broker_key.verifying_key().to_bytes(),
+                        )
+                        .unwrap(),
                     },
                 ],
             )

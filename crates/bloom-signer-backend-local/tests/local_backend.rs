@@ -16,10 +16,14 @@ use std::str::FromStr as _;
 
 fn spki_fingerprint(verifying: &k256::ecdsa::VerifyingKey) -> (Vec<u8>, Digest32) {
     let public =
-        k256::PublicKey::from_sec1_bytes(verifying.to_encoded_point(false).as_bytes()).unwrap();
+        k256::PublicKey::from_sec1_bytes(verifying.to_sec1_point(false).as_bytes()).unwrap();
     let spki = public.to_public_key_der().unwrap().as_bytes().to_vec();
     let fingerprint = Digest32::from_bytes(sha2::Sha256::digest(&spki).into());
     (spki, fingerprint)
+}
+
+fn signing_key_from_xprv(derived: bip32::XPrv) -> k256::ecdsa::SigningKey {
+    derived.private_key().clone()
 }
 
 fn backend(private_key: [u8; 32]) -> LocalSignerBackend {
@@ -326,9 +330,11 @@ fn bip32_seed_backend(seed: &[u8], kek: &[u8]) -> LocalSignerBackend {
     ]
     .concat();
     let nonce = [0_u8; 24];
-    let ciphertext = XChaCha20Poly1305::new(CKey::from_slice(kek))
+    let key: &CKey = kek.try_into().unwrap();
+    let nonce_ref: &XNonce = nonce.as_slice().try_into().unwrap();
+    let ciphertext = XChaCha20Poly1305::new(key)
         .encrypt(
-            XNonce::from_slice(&nonce),
+            nonce_ref,
             Payload {
                 msg: seed,
                 aad: &aad,
@@ -337,10 +343,9 @@ fn bip32_seed_backend(seed: &[u8], kek: &[u8]) -> LocalSignerBackend {
         .unwrap();
 
     // Master key at "m" and its SPKI fingerprint, mirroring describe_path.
-    let master: K256SigningKey =
-        XPrv::derive_from_path(seed, &DerivationPath::from_str("m").unwrap())
-            .unwrap()
-            .into();
+    let master: K256SigningKey = signing_key_from_xprv(
+        XPrv::derive_from_path(seed, &DerivationPath::from_str("m").unwrap()).unwrap(),
+    );
     let (spki, fingerprint) = spki_fingerprint(master.verifying_key());
 
     let root = KeyRef {
@@ -426,12 +431,13 @@ fn bip32_seed_wallet_unlocks_derives_signs_and_round_trips() {
 
     // Derive two children and confirm they differ and are both signable.
     let child_path = "m/0";
-    let child_sk: k256::ecdsa::SigningKey = XPrv::derive_from_path(
-        seed.as_slice(),
-        &DerivationPath::from_str(child_path).unwrap(),
-    )
-    .unwrap()
-    .into();
+    let child_sk = signing_key_from_xprv(
+        XPrv::derive_from_path(
+            seed.as_slice(),
+            &DerivationPath::from_str(child_path).unwrap(),
+        )
+        .unwrap(),
+    );
     let (_child_spki, child_fingerprint) = spki_fingerprint(child_sk.verifying_key());
     let child = KeyRef {
         backend: Token::new("local").unwrap(),

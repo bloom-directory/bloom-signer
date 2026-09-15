@@ -818,9 +818,14 @@ pub(crate) fn encrypt(
     SysRng
         .try_fill_bytes(&mut nonce)
         .expect("OS randomness unavailable");
-    let ciphertext = XChaCha20Poly1305::new(Key::from_slice(key.expose_to_backend()))
+    let key: &Key = key
+        .expose_to_backend()
+        .try_into()
+        .expect("validated 32-byte key");
+    let nonce_ref: &XNonce = nonce.as_slice().try_into().expect("24-byte nonce");
+    let ciphertext = XChaCha20Poly1305::new(key)
         .encrypt(
-            XNonce::from_slice(&nonce),
+            nonce_ref,
             Payload {
                 msg: plaintext,
                 aad,
@@ -850,9 +855,14 @@ pub(crate) fn decrypt(
             "custody nonce must contain 24 bytes",
         )
     })?;
-    XChaCha20Poly1305::new(Key::from_slice(key.expose_to_backend()))
+    let key: &Key = key
+        .expose_to_backend()
+        .try_into()
+        .expect("validated 32-byte key");
+    let nonce_ref: &XNonce = nonce.as_slice().try_into().expect("24-byte nonce");
+    XChaCha20Poly1305::new(key)
         .decrypt(
-            XNonce::from_slice(&nonce),
+            nonce_ref,
             Payload {
                 msg: &blob.ciphertext.decode(),
                 aad,

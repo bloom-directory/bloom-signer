@@ -54,14 +54,15 @@ fn normalized_recoverable_signature_matches_reviewed_artifact() {
     let normalized = hex::decode(vector.normalized_signature_hex).unwrap();
     assert_eq!(normalized.len(), 65);
     let signature = Signature::from_slice(&normalized[..64]).unwrap();
-    assert!(
-        signature.normalize_s().is_none(),
+    assert_eq!(
+        signature.normalize_s(),
+        signature,
         "golden signature must already use low s"
     );
     let recovery_id = RecoveryId::from_byte(normalized[64]).unwrap();
     let recovered = VerifyingKey::recover_from_prehash(&digest, &signature, recovery_id).unwrap();
     assert_eq!(
-        hex::encode(recovered.to_encoded_point(true).as_bytes()),
+        hex::encode(recovered.to_sec1_point(true).as_bytes()),
         vector.compressed_public_key_hex
     );
 }
@@ -84,11 +85,11 @@ fn normalized_keccak_recoverable_signature_matches_reviewed_artifact() {
     assert_eq!(hex::encode(digest), vector.digest_hex);
     let normalized = hex::decode(vector.normalized_signature_hex).unwrap();
     let signature = Signature::from_slice(&normalized[..64]).unwrap();
-    assert!(signature.normalize_s().is_none());
+    assert_eq!(signature.normalize_s(), signature);
     let recovery_id = RecoveryId::from_byte(normalized[64]).unwrap();
     let recovered = VerifyingKey::recover_from_prehash(&digest, &signature, recovery_id).unwrap();
     assert_eq!(
-        hex::encode(recovered.to_encoded_point(true).as_bytes()),
+        hex::encode(recovered.to_sec1_point(true).as_bytes()),
         vector.compressed_public_key_hex
     );
 }

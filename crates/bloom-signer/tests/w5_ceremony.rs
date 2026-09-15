@@ -18,9 +18,8 @@ use chacha20poly1305::{
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use k256::pkcs8::EncodePublicKey as _;
-use k256::{SecretKey as Secp256k1Secret, elliptic_curve::sec1::ToEncodedPoint as _};
+use k256::{SecretKey as Secp256k1Secret, elliptic_curve::sec1::ToSec1Point as _};
 use sha2::Digest as _;
-use sha3::Digest as _;
 use std::{collections::BTreeMap, os::unix::fs::MetadataExt as _, sync::Arc};
 use support::{VirtualAuthenticator, seal_hpke};
 
@@ -1993,15 +1992,17 @@ fn legacy_passkey_import_converts_existing_credential_into_current_custody() {
     let metadata = std::fs::metadata(&source).unwrap();
     let private = [11_u8; 32];
     let secret = Secp256k1Secret::from_slice(&private).unwrap();
-    let public = secret.public_key().to_encoded_point(false);
+    let public = secret.public_key().to_sec1_point(false);
     let address_hash = sha3::Keccak256::digest(&public.as_bytes()[1..]);
     let address = format!("0x{}", hex::encode(&address_hash[12..]));
     let prf = authenticator.deterministic_prf();
     let nonce = [12_u8; 12];
     let wrap = blake3::derive_key("bloom passkey wrap key", &prf);
-    let ciphertext = ChaCha20Poly1305::new(Key::from_slice(&wrap))
+    let key: &Key = wrap.as_slice().try_into().unwrap();
+    let nonce_ref: &Nonce = nonce.as_slice().try_into().unwrap();
+    let ciphertext = ChaCha20Poly1305::new(key)
         .encrypt(
-            Nonce::from_slice(&nonce),
+            nonce_ref,
             Payload {
                 msg: &private,
                 aad: b"bloom-keystore-passkey",
@@ -2315,7 +2316,7 @@ fn raw_private_key_import_creates_a_new_wallet_and_first_passkey() {
     let imported_public_key = k256::PublicKey::from_sec1_bytes(
         imported_signing_key
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes(),
     )
     .unwrap();

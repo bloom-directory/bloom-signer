@@ -24,13 +24,13 @@ publish = false
 bloom-signer-api = { path = "crates/bloom-signer-api" }
 bloom-signer-derive = { path = "crates/bloom-signer-derive" }
 bloom-signer-process-hardening = { path = "crates/bloom-signer-process-hardening" }
-bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
-bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
-bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
-bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
-bloom-service-observability = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
-bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
-bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
+bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "90cb0882e44608dfb8c804946ab509b186dfb0f8" }
+bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "90cb0882e44608dfb8c804946ab509b186dfb0f8" }
+bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "90cb0882e44608dfb8c804946ab509b186dfb0f8" }
+bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "90cb0882e44608dfb8c804946ab509b186dfb0f8" }
+bloom-service-observability = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "90cb0882e44608dfb8c804946ab509b186dfb0f8" }
+bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "90cb0882e44608dfb8c804946ab509b186dfb0f8" }
+bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "90cb0882e44608dfb8c804946ab509b186dfb0f8" }
 aws-config = { version = "=1.8.1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-credential-types = "1"
 # Exact AWS service pins preserve the workspace's declared Rust 1.85 floor.
@@ -52,17 +52,17 @@ tracing = "0.1"
 unicode-normalization = "0.1"
 zeroize = { version = "1", features = ["serde", "zeroize_derive"] }
 futures = "0.3"
-bip32 = { version = "0.5", features = ["secp256k1"] }
+bip32 = { version = "0.6.0-rc.0", features = ["alloc", "secp256k1"] }
 blake3 = "1"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 ciborium = "0.2"
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 hex = "0.4"
 libc = "0.2"
 hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
 hkdf = "0.13"
 hmac = "0.13"
-k256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+k256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 parking_lot = "0.12"
 p256 = { version = "0.14", features = ["ecdsa"] }
 rand = "0.10"
@@ -70,5 +70,5 @@ rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 serde_jcs = "0.2"
 serde_json = "1"
 sha2 = "0.11"
-sha3 = "0.10"
+sha3 = "0.12"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }

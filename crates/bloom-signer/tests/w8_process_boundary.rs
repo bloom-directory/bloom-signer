@@ -809,7 +809,7 @@ fn bip39_restored_wallet_signs_from_its_restored_derived_account() {
         .unwrap();
     // The recovered key's SPKI must byte-match the restored descriptor.
     use k256::pkcs8::EncodePublicKey as _;
-    let spki = k256::PublicKey::from_sec1_bytes(recovered.to_encoded_point(false).as_bytes())
+    let spki = k256::PublicKey::from_sec1_bytes(recovered.to_sec1_point(false).as_bytes())
         .unwrap()
         .to_public_key_der()
         .unwrap();

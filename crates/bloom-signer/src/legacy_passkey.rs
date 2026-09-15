@@ -22,11 +22,11 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead as _, KeyInit as _, Payload},
 };
-use k256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint as _};
+use k256::{SecretKey, elliptic_curve::sec1::ToSec1Point as _};
 use rand::{TryRng as _, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use sha3::{Digest as _, Keccak256};
+use sha3::Keccak256;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::webauthn::es256_cose_public_key;
@@ -356,11 +356,13 @@ impl StagedLegacyPasskey {
         let wrap_key = Zeroizing::new(blake3::derive_key("bloom passkey wrap key", prf));
         let nonce = hex::decode(&self.encrypted.nonce_hex).map_err(malformed)?;
         let ciphertext = hex::decode(&self.encrypted.ciphertext_hex).map_err(malformed)?;
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(wrap_key.as_slice()));
+        let key: &Key = wrap_key.as_slice().try_into().expect("32-byte wrap key");
+        let nonce: &Nonce = nonce.as_slice().try_into().map_err(malformed)?;
+        let cipher = ChaCha20Poly1305::new(key);
         let mut plaintext = Zeroizing::new(
             cipher
                 .decrypt(
-                    Nonce::from_slice(&nonce),
+                    nonce,
                     Payload {
                         msg: &ciphertext,
                         aad: PASSKEY_AAD,
@@ -537,7 +539,7 @@ fn validate_private_projection(
     public_key_hex: &str,
 ) -> Result<(), ProtocolError> {
     let secret = SecretKey::from_slice(private_key).map_err(|_| authentication_failed())?;
-    let public = secret.public_key().to_encoded_point(false);
+    let public = secret.public_key().to_sec1_point(false);
     if !public
         .as_bytes()
         .eq_ignore_ascii_case(&hex::decode(public_key_hex).map_err(malformed)?)
@@ -778,15 +780,17 @@ mod tests {
 
         let private = [1_u8; 32];
         let secret = SecretKey::from_slice(&private).unwrap();
-        let public = secret.public_key().to_encoded_point(false);
+        let public = secret.public_key().to_sec1_point(false);
         let address_hash = Keccak256::digest(&public.as_bytes()[1..]);
         let address = format!("0x{}", hex::encode(&address_hash[12..]));
         let prf = [9_u8; 32];
         let nonce = [2_u8; 12];
         let wrap = blake3::derive_key("bloom passkey wrap key", &prf);
-        let encrypted = ChaCha20Poly1305::new(Key::from_slice(&wrap))
+        let key: &Key = wrap.as_slice().try_into().unwrap();
+        let nonce_ref: &Nonce = nonce.as_slice().try_into().unwrap();
+        let encrypted = ChaCha20Poly1305::new(key)
             .encrypt(
-                Nonce::from_slice(&nonce),
+                nonce_ref,
                 Payload {
                     msg: &private,
                     aad: PASSKEY_AAD,

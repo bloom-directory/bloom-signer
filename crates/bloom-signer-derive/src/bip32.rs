@@ -73,8 +73,9 @@ fn hmac_sha512(key: &[u8], message: &[u8]) -> [u8; 64] {
 /// values at or above n; canonicality is checked by reduction round-trip,
 /// independent of any single constructor's failure mode.
 fn scalar_from_canonical(bytes: &[u8; 32]) -> Option<Scalar> {
-    let reduced =
-        <Scalar as Reduce<k256::elliptic_curve::bigint::U256>>::reduce_bytes(&(*bytes).into());
+    let reduced = <Scalar as Reduce<k256::elliptic_curve::bigint::U256>>::reduce(
+        &k256::elliptic_curve::bigint::U256::from_be_slice(bytes),
+    );
     if reduced.to_bytes().as_slice() == bytes.as_slice() {
         Some(reduced)
     } else {
@@ -176,8 +177,8 @@ pub fn describe_secp256k1(private_key: &[u8; 32]) -> DerivedSecp256k1 {
     let signing = SigningKey::from_bytes(private_key.into()).expect("validated private key");
     let verifying = signing.verifying_key();
     let mut compressed_public_key = [0u8; 33];
-    compressed_public_key.copy_from_slice(verifying.to_encoded_point(true).as_bytes());
-    let public_key = k256::PublicKey::from_sec1_bytes(verifying.to_encoded_point(false).as_bytes())
+    compressed_public_key.copy_from_slice(verifying.to_sec1_point(true).as_bytes());
+    let public_key = k256::PublicKey::from_sec1_bytes(verifying.to_sec1_point(false).as_bytes())
         .expect("valid SEC1 point");
     let spki_der = public_key
         .to_public_key_der()

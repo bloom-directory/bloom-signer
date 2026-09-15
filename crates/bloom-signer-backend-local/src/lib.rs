@@ -34,6 +34,10 @@ const ROOT_AAD_DOMAIN: &[u8] = b"bloom-local-root-wrap/v1";
 const WRAP_FORMAT_VERSION: u32 = 1;
 const DERIVATION_AUTHORITY_DOMAIN: &[u8] = b"bloom-key-derive-authority/v1";
 
+fn signing_key_from_xprv(derived: XPrv) -> SigningKey {
+    derived.private_key().clone()
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EncryptedLocalBackup {
@@ -196,10 +200,15 @@ impl LocalSignerBackend {
             .try_fill_bytes(&mut nonce)
             .expect("OS randomness unavailable");
         let aad = root_aad(&backend_instance_id, &root_key_id);
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(kek.expose_to_backend()));
+        let key: &Key = kek
+            .expose_to_backend()
+            .try_into()
+            .map_err(|_| BackendError::InvalidRequest)?;
+        let nonce_ref: &XNonce = nonce.as_slice().try_into().expect("24-byte nonce");
+        let cipher = XChaCha20Poly1305::new(key);
         let encrypted_seed = cipher
             .encrypt(
-                XNonce::from_slice(&nonce),
+                nonce_ref,
                 Payload {
                     msg: material.expose_to_backend(),
                     aad: &aad,
@@ -850,9 +859,14 @@ impl LocalSignerBackend {
             .try_into()
             .map_err(|_| BackendError::InvalidRequest)?;
         let aad = root_aad(&self.backend_instance_id, &backup.root_key_id);
-        XChaCha20Poly1305::new(Key::from_slice(kek.expose_to_backend()))
+        let key: &Key = kek
+            .expose_to_backend()
+            .try_into()
+            .map_err(|_| BackendError::InvalidRequest)?;
+        let nonce_ref: &XNonce = nonce.as_slice().try_into().expect("24-byte nonce");
+        XChaCha20Poly1305::new(key)
             .decrypt(
-                XNonce::from_slice(&nonce),
+                nonce_ref,
                 Payload {
                     msg: &backup.encrypted_seed.decode(),
                     aad: &aad,
@@ -875,9 +889,9 @@ impl LocalSignerBackend {
             LocalRootMaterialKind::Bip32Seed => {
                 let path =
                     DerivationPath::from_str("m").map_err(|_| BackendError::InvalidRequest)?;
-                XPrv::derive_from_path(material.as_slice(), &path)
-                    .map(SigningKey::from)
-                    .map_err(|_| BackendError::DefinitiveRejected)
+                let derived = XPrv::derive_from_path(material.as_slice(), &path)
+                    .map_err(|_| BackendError::DefinitiveRejected)?;
+                Ok(signing_key_from_xprv(derived))
             }
             LocalRootMaterialKind::ImportedSecp256k1Scalar => {
                 SigningKey::from_slice(material.as_slice())
@@ -915,9 +929,9 @@ impl LocalSignerBackend {
                 let path =
                     DerivationPath::from_str(&path).map_err(|_| BackendError::InvalidRequest)?;
                 let seed = self.active_seed()?;
-                XPrv::derive_from_path(seed.as_slice(), &path)
-                    .map(SigningKey::from)
-                    .map_err(|_| BackendError::DefinitiveRejected)
+                let derived = XPrv::derive_from_path(seed.as_slice(), &path)
+                    .map_err(|_| BackendError::DefinitiveRejected)?;
+                Ok(signing_key_from_xprv(derived))
             }
             DerivationRef::Bip39Multicurve { profile, path, .. } => {
                 let (account, index) = parse_bip39_path(profile, &path)?;
@@ -1029,15 +1043,12 @@ impl LocalSignerBackend {
                 return Err(BackendError::Unsupported);
             }
             let seed = self.active_seed()?;
-            XPrv::derive_from_path(seed.as_slice(), &path)
-                .map(SigningKey::from)
-                .map_err(|_| BackendError::DefinitiveRejected)?
+            let derived = XPrv::derive_from_path(seed.as_slice(), &path)
+                .map_err(|_| BackendError::DefinitiveRejected)?;
+            signing_key_from_xprv(derived)
         };
         let public_key = k256::PublicKey::from_sec1_bytes(
-            signing_key
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes(),
+            signing_key.verifying_key().to_sec1_point(false).as_bytes(),
         )
         .map_err(|_| BackendError::DefinitiveRejected)?;
         let spki = public_key
@@ -1281,9 +1292,7 @@ impl SignerBackend for LocalSignerBackend {
                         .try_into()
                         .map_err(|_| BackendError::InvalidRequest)?;
                     let key = self.derive_secp_signing_key(&request.key_ref)?;
-                    let (signature, recovery_id) = key
-                        .sign_prehash_recoverable(&digest)
-                        .map_err(|_| BackendError::DefinitiveRejected)?;
+                    let (signature, recovery_id) = key.sign_prehash_recoverable(&digest);
                     let mut normalized = signature.to_bytes().to_vec();
                     normalized.push(recovery_id.to_byte());
                     Ok(BackendSignature {
