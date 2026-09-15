@@ -31,7 +31,7 @@ use k256::{
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use sha3::{Digest as _, Keccak256};
+use sha3::Keccak256;
 use std::{
     collections::{BTreeMap, VecDeque},
     fs,
@@ -778,7 +778,7 @@ fn normalize_recoverable_signature(
     expected_key: &VerifyingKey,
 ) -> Result<[u8; 65], BackendError> {
     let signature = Signature::from_der(der).map_err(|_| BackendError::DefinitiveRejected)?;
-    let signature = signature.normalize_s().unwrap_or(signature);
+    let signature = signature.normalize_s();
     let recovery_id = (0_u8..=3)
         .filter_map(RecoveryId::from_byte)
         .find(|recovery_id| {
@@ -793,7 +793,7 @@ fn normalize_recoverable_signature(
 }
 
 fn ethereum_address(verifying_key: &VerifyingKey) -> String {
-    let encoded = verifying_key.to_encoded_point(false);
+    let encoded = verifying_key.to_sec1_point(false);
     let digest = Keccak256::digest(&encoded.as_bytes()[1..]);
     format!("0x{}", hex::encode(&digest[12..]))
 }

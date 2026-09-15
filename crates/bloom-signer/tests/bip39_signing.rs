@@ -122,9 +122,11 @@ fn entropy_to_seed_validates_length_against_metadata() {
             bloom_signer::custody::RootMaterialProfile::Bip39MulticurveV1,
             None,
         );
-        let ciphertext = XChaCha20Poly1305::new(Key::from_slice(&wkek))
+        let key: &Key = wkek.as_slice().try_into().unwrap();
+        let nonce_ref: &XNonce = nonce.as_slice().try_into().unwrap();
+        let ciphertext = XChaCha20Poly1305::new(key)
             .encrypt(
-                XNonce::from_slice(&nonce),
+                nonce_ref,
                 Payload {
                     msg: &entropy,
                     aad: &aad,

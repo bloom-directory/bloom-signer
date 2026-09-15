@@ -34,10 +34,7 @@ impl MockProvider {
     fn new() -> Self {
         let signing_key = SigningKey::from_slice(&[7; 32]).unwrap();
         let public_key = k256::PublicKey::from_sec1_bytes(
-            signing_key
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes(),
+            signing_key.verifying_key().to_sec1_point(false).as_bytes(),
         )
         .unwrap();
         Self {
@@ -279,7 +276,7 @@ fn durable_enrollment_restores_without_provider_reenrollment() {
     let substitute = SigningKey::from_slice(&[9; 32]).unwrap();
     let substitute_public = substitute.verifying_key();
     let substitute_spki =
-        k256::PublicKey::from_sec1_bytes(substitute_public.to_encoded_point(false).as_bytes())
+        k256::PublicKey::from_sec1_bytes(substitute_public.to_sec1_point(false).as_bytes())
             .unwrap()
             .to_public_key_der()
             .unwrap();
@@ -440,13 +437,13 @@ fn high_s_provider_signature_is_normalized_to_low_s() {
         low.s().to_bytes().into(),
     );
     let high = Signature::from_scalars(low.r().to_bytes(), high_s).unwrap();
-    assert!(high.normalize_s().is_some());
+    assert_ne!(high.normalize_s(), high);
     *provider.signature_override.write() = Some(high.to_der().as_bytes().to_vec());
 
     let output = futures::executor::block_on(backend.sign(request(key))).unwrap();
     let bytes = output.bytes.decode();
     let normalized = Signature::from_slice(&bytes[..64]).unwrap();
-    assert!(normalized.normalize_s().is_none());
+    assert_eq!(normalized.normalize_s(), normalized);
 }
 
 fn subtract_be(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
