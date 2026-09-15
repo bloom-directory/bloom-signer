@@ -62,7 +62,7 @@ libc = "0.2"
 hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
 hkdf = "0.13"
 hmac = "0.13"
-k256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+k256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 parking_lot = "0.12"
 p256 = { version = "0.14", features = ["ecdsa"] }
 rand = "0.10"

@@ -538,7 +538,7 @@ checksum = "db40d3dfbeab4e031d78c844642fa0caa0b0db11ce1607ac9d2986dff1405c69"
 dependencies = [
  "bs58",
  "hmac 0.12.1",
- "k256",
+ "k256 0.13.4",
  "once_cell",
  "pbkdf2",
  "rand_core 0.6.4",
@@ -769,7 +769,7 @@ dependencies = [
  "hex",
  "hkdf 0.13.0",
  "hpke",
- "k256",
+ "k256 0.14.0",
  "libc",
  "p256",
  "parking_lot",
@@ -811,7 +811,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "hex",
- "k256",
+ "k256 0.14.0",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -838,7 +838,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "http 1.5.0",
- "k256",
+ "k256 0.14.0",
  "parking_lot",
  "serde",
  "serde_jcs",
@@ -862,7 +862,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "hex",
- "k256",
+ "k256 0.14.0",
  "parking_lot",
  "rand 0.10.2",
  "serde",
@@ -883,7 +883,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hmac 0.13.0",
- "k256",
+ "k256 0.14.0",
  "ows-signer",
  "rand 0.10.2",
  "sha2 0.11.0",
@@ -1142,7 +1142,7 @@ dependencies = [
  "coins-core",
  "digest 0.10.7",
  "hmac 0.12.1",
- "k256",
+ "k256 0.13.4",
  "serde",
  "sha2 0.10.9",
  "thiserror 1.0.69",
@@ -2510,6 +2510,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "k256"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93f50113171a713f4a4231ef82eb26703607139b35dcb56241f0ceab2ae1f7d8"
+dependencies = [
+ "cpubits",
+ "ecdsa 0.17.0",
+ "elliptic-curve 0.14.1",
+ "primeorder",
+ "sha2 0.11.0",
+ "signature 3.0.0",
+ "wnaf",
+]
+
+[[package]]
 name = "keccak"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2726,7 +2741,7 @@ dependencies = [
  "hex",
  "hkdf 0.12.4",
  "hmac 0.12.1",
- "k256",
+ "k256 0.13.4",
  "libc",
  "ows-core",
  "rand 0.8.7",
@@ -3850,7 +3865,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
