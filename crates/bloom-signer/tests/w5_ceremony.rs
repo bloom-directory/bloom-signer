@@ -5069,11 +5069,18 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
 // ---------------------------------------------------------------------------
 // Blockhash-normalized Exact approvals
 //
-// A native SOL transfer's recent blockhash expires in about a minute, well
-// inside a normal passkey ceremony. These cases prove the owner may finish
-// that ceremony late and still obtain one signature over a freshly stamped
-// message, while every other approved byte, and the one-signature ceiling,
-// stay exactly where they were.
+// Under this mode the approval commits to the message with its 32
+// recent-blockhash bytes zeroed. These cases establish what Signer is
+// responsible for: a message whose only difference is those bytes still
+// matches the approval, any other difference does not, the approval still
+// yields one signature, and the five-minute approval window still bounds it.
+//
+// Signer has no notion of blockhash freshness, and none of these cases model
+// a cluster. The messages here differ by byte substitution, and the elapsed
+// times are virtual and measured against the approval window, not against any
+// real blockhash lifetime. Detecting an expired blockhash, refreshing it and
+// re-quoting the fee is Machine behaviour, and settlement needs the validator
+// workflow in that slice.
 // ---------------------------------------------------------------------------
 
 /// The public golden native-transfer message, mirrored from
@@ -5238,12 +5245,16 @@ fn native_transfer_sign_request(
     }
 }
 
-/// The failure this change exists to fix: the owner approves, the staged
-/// blockhash lapses, the Machine restamps the same transfer, and the approval
-/// still authorizes exactly that message. The signature is produced by the
-/// real local backend over the refreshed raw bytes.
+/// An approval sealed over the normalized digest still authorizes the same
+/// transfer restamped with different blockhash bytes, four minutes into its
+/// five-minute window, and the real local backend signs those raw bytes.
+///
+/// Four minutes is measured against the approval's own validity on a virtual
+/// clock. It is longer than a cluster would honour a blockhash for, which is
+/// why the mode exists, but this test does not model a cluster and does not
+/// establish that a real expiry is survived.
 #[test]
-fn a_late_ceremony_still_signs_the_refreshed_native_transfer() {
+fn a_late_ceremony_still_signs_a_restamped_native_transfer() {
     let authenticator = VirtualAuthenticator::generate();
     let broker = SigningKey::from_bytes(&[7; 32]);
     let (service, engine, registry) = bip39_service(&authenticator);
@@ -5276,8 +5287,9 @@ fn a_late_ceremony_still_signs_the_refreshed_native_transfer() {
         10_100,
     );
 
-    // Four minutes later the staged blockhash is long dead. The Machine keeps
-    // the same entry and the same approval, and restamps the transfer.
+    // Four minutes into the approval window the Machine restamps the transfer.
+    // The restamp is a byte substitution here; on the wire it would follow a
+    // real blockhash expiry that neither service can observe.
     let final_message = native_transfer_message(&payer, 0x5a);
     assert_ne!(final_message, staged);
     let request =
@@ -5346,24 +5358,24 @@ fn only_the_blockhash_may_move_under_a_normalized_approval() {
     );
     engine.install_approval_for_test(&terms).unwrap();
 
-    let refreshed = native_transfer_message(&payer, 0x5a);
+    let restamped = native_transfer_message(&payer, 0x5a);
     let mutate = |offset: usize, value: u8| {
-        let mut message = refreshed.clone();
+        let mut message = restamped.clone();
         message[offset] = value;
         message
     };
-    let mut trailing = refreshed.clone();
+    let mut trailing = restamped.clone();
     trailing.push(0);
 
     for (label, message) in [
-        ("amount", mutate(142, refreshed[142].wrapping_add(1))),
-        ("recipient", mutate(36, refreshed[36].wrapping_add(1))),
-        ("payer", mutate(4, refreshed[4].wrapping_add(1))),
+        ("amount", mutate(142, restamped[142].wrapping_add(1))),
+        ("recipient", mutate(36, restamped[36].wrapping_add(1))),
+        ("payer", mutate(4, restamped[4].wrapping_add(1))),
         ("program ID", mutate(68, 1)),
         ("instruction data length", mutate(137, 13)),
         ("account count", mutate(3, 4)),
         ("version prefix", mutate(0, 0x80)),
-        ("truncated", refreshed[..149].to_vec()),
+        ("truncated", restamped[..149].to_vec()),
         ("trailing byte", trailing),
     ] {
         let request = native_transfer_sign_request(&broker, &terms, &message, "d5", "e5", 250_000);
@@ -5382,7 +5394,7 @@ fn only_the_blockhash_may_move_under_a_normalized_approval() {
 /// gets raw bytes, which is the pre-existing behaviour and the reason a second
 /// ceremony was needed.
 #[test]
-fn an_unmarked_exact_approval_still_refuses_a_refreshed_blockhash() {
+fn an_unmarked_exact_approval_still_refuses_a_restamped_blockhash() {
     let authenticator = VirtualAuthenticator::generate();
     let broker = SigningKey::from_bytes(&[7; 32]);
     let (service, engine, _registry) = bip39_service(&authenticator);
