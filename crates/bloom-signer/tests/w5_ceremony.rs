@@ -4,7 +4,7 @@ use bloom_signer::webauthn::{verify_webauthn_assertion, verify_webauthn_attestat
 use bloom_signer::{
     ceremony::{PreparedCustodyCeremony, SignerCeremonyService},
     clock::{ClockCondition, ClockDecision},
-    engine::{BackendEnrollmentBackup, SignerAuditKeys, SignerEngine},
+    engine::{BackendEnrollmentBackup, SignAuthorization, SignerAuditKeys, SignerEngine},
     hpke::{CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO},
     legacy_passkey::{LEGACY_PASSKEY_INPUT_CLASS, LegacyMigrationStore, stage_legacy_wallet},
     registry::{BackendRegistry, CompiledBackend},
@@ -169,6 +169,7 @@ fn terms(key_ref: KeyRef) -> SealedApprovalTerms {
         selector: ApprovalSelector::Exact {
             ordered_payload_digests: vec![digest("22")],
             ordered_hashes: vec![digest("33")],
+            message_normalization: None,
         },
         limits: ApprovalLimits {
             max_operations: DecimalU64::new(1),
@@ -224,6 +225,7 @@ fn try_complete_local_approval(
         ApprovalSelector::Exact {
             ordered_payload_digests,
             ordered_hashes,
+            ..
         } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
         ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
     };
@@ -947,6 +949,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         selector: ApprovalSelector::Exact {
             ordered_payload_digests: vec![digest("b5")],
             ordered_hashes: vec![digest("b6")],
+            message_normalization: None,
         },
         limits: ApprovalLimits {
             max_operations: DecimalU64::new(1),
@@ -4684,6 +4687,7 @@ fn a_taken_over_scope_refuses_the_previous_wallets_exact_approval() {
         selector: ApprovalSelector::Exact {
             ordered_payload_digests: vec![digest("e1")],
             ordered_hashes: vec![digest("e1")],
+            message_normalization: None,
         },
         limits: ApprovalLimits {
             max_operations: DecimalU64::new(1),
@@ -4768,6 +4772,7 @@ fn exact_sign_request(
     let ApprovalSelector::Exact {
         ordered_payload_digests,
         ordered_hashes,
+        ..
     } = &terms.selector
     else {
         panic!("exact_sign_request needs Exact terms");
@@ -4914,6 +4919,7 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
     let exact = |byte: &str| ApprovalSelector::Exact {
         ordered_payload_digests: vec![digest(byte)],
         ordered_hashes: vec![digest(byte)],
+        message_normalization: None,
     };
 
     // Before expiry both selectors are accepted within the scope's
@@ -5058,4 +5064,487 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
         )
         .unwrap();
     assert!(!prepared.challenges.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Blockhash-normalized Exact approvals
+//
+// A native SOL transfer's recent blockhash expires in about a minute, well
+// inside a normal passkey ceremony. These cases prove the owner may finish
+// that ceremony late and still obtain one signature over a freshly stamped
+// message, while every other approved byte, and the one-signature ceiling,
+// stay exactly where they were.
+// ---------------------------------------------------------------------------
+
+/// The public golden native-transfer message, mirrored from
+/// `bloom_broker_api::solana_vectors`. Signer normalizes exactly these bytes
+/// and deliberately depends on no Solana SDK to do it.
+const NATIVE_TRANSFER_GOLDEN_HEX: &str = "0100010303a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8abababababababababababababababababababababababababababababababab0000000000000000000000000000000000000000000000000000000000000000424242424242424242424242424242424242424242424242424242424242424201020200010c0200000000ca9a3b00000000";
+const NATIVE_TRANSFER_BLOCKHASH: std::ops::Range<usize> = 100..132;
+
+/// The golden layout, paying from `payer` and stamped with one blockhash, so
+/// the approved bytes describe a real transfer out of the approved account.
+fn native_transfer_message(payer: &[u8], blockhash_byte: u8) -> Vec<u8> {
+    let mut message = hex::decode(NATIVE_TRANSFER_GOLDEN_HEX).unwrap();
+    message[4..36].copy_from_slice(payer);
+    message[NATIVE_TRANSFER_BLOCKHASH].fill(blockhash_byte);
+    message
+}
+
+/// The raw Ed25519 public key behind a derived account's SPKI DER.
+fn ed25519_public_key(engine: &SignerEngine, key_ref: &KeyRef) -> Vec<u8> {
+    let spki = engine
+        .derived_account_descriptor(key_ref)
+        .unwrap()
+        .unwrap()
+        .canonical_public_key
+        .decode();
+    assert_eq!(spki.len(), 44, "Ed25519 SPKI DER is 44 bytes");
+    spki[12..].to_vec()
+}
+
+fn solana_child_key_ref(engine: &SignerEngine, wallet_id: &Token) -> KeyRef {
+    engine
+        .derived_account_descriptors(wallet_id)
+        .unwrap()
+        .iter()
+        .find(|account| account.key_ref.key_spec == KeySpec::Ed25519)
+        .expect("registration allocates a Solana account")
+        .key_ref
+        .clone()
+}
+
+/// Terms an owner approves for one native transfer. `normalization` selects
+/// the new blockhash-normalized matching mode; `None` is ordinary raw Exact
+/// over the same staged message.
+fn native_transfer_terms(
+    engine: &SignerEngine,
+    wallet_id: &Token,
+    key_ref: KeyRef,
+    staged_message: &[u8],
+    normalization: Option<ExactMessageNormalization>,
+    issued_at_ms: u64,
+) -> SealedApprovalTerms {
+    let committed = match normalization {
+        Some(_) => solana_native_transfer_approval_digest(staged_message).unwrap(),
+        None => Digest32::from_bytes(sha2::Sha256::digest(staged_message).into()),
+    };
+    let policy = engine.policy_snapshot(wallet_id).unwrap();
+    let epoch = engine
+        .revocation_state(wallet_id, issued_at_ms)
+        .unwrap()
+        .wallet_revocation_epoch;
+    SealedApprovalTerms {
+        subject: ApprovalSubject::System {
+            component_id: Token::new("bloom-machine").unwrap(),
+            operation_class: Token::new("solana.transfer.confirm").unwrap(),
+        },
+        wallet_id: wallet_id.clone(),
+        key_ref,
+        allowed_crypto_suites: vec![CryptoSuite::Ed25519Message],
+        selector: ApprovalSelector::Exact {
+            ordered_payload_digests: vec![committed.clone()],
+            ordered_hashes: vec![committed],
+            message_normalization: normalization,
+        },
+        limits: ApprovalLimits {
+            max_operations: DecimalU64::new(1),
+            max_signatures: DecimalU64::new(1),
+            operation_rate_limits: vec![],
+            signature_rate_limits: vec![],
+            value_limits: vec![ValueLimit {
+                asset: AssetId {
+                    chain: Token::new("solana").unwrap(),
+                    asset: "native".into(),
+                },
+                lifetime: DecimalU256::parse("1000005000").unwrap(),
+                rolling_windows: vec![],
+            }],
+        },
+        activation_mode: ActivationMode::BootBound,
+        wallet_revocation_epoch: epoch,
+        policy_version: policy.version.clone(),
+        policy_digest: policy.policy_digest.clone(),
+        provenance_digest: digest("55"),
+        request_nonce: RequestNonce::new("d5".repeat(16)).unwrap(),
+        issued_at_ms: DecimalU64::new(issued_at_ms),
+        not_before_ms: DecimalU64::new(issued_at_ms),
+        // Five minutes, which is the whole point: long enough to finish a
+        // ceremony, and the only temporal authority this mode adds.
+        expires_at_ms: DecimalU64::new(issued_at_ms + 300_000),
+        renewal_of: None,
+    }
+}
+
+/// A Broker-signed sign request carrying the raw message. Every digest here is
+/// raw: normalization applies to approval matching and nothing else.
+fn native_transfer_sign_request(
+    broker: &SigningKey,
+    terms: &SealedApprovalTerms,
+    message: &[u8],
+    operation_byte: &str,
+    attempt_byte: &str,
+    not_before_ms: u64,
+) -> SignRequest {
+    let raw = Digest32::from_bytes(sha2::Sha256::digest(message).into());
+    let identity = SignOperationIdentity {
+        operation_id: OperationId::new(operation_byte.repeat(32)).unwrap(),
+        approval_id: terms.approval_id().unwrap(),
+        key_ref: terms.key_ref.clone(),
+        crypto_suite: CryptoSuite::Ed25519Message,
+        ordered_payload_digests: vec![raw.clone()],
+        ordered_hashes: vec![raw.clone()],
+        petal_use_claim_digest: None,
+        claim_assurance_digest: None,
+        policy_version: terms.policy_version.clone(),
+        policy_digest: terms.policy_digest.clone(),
+    };
+    let mut unsigned = UnsignedSignRequest {
+        schema: Token::new("bloom.sign-request/1").unwrap(),
+        attempt_id: digest(attempt_byte),
+        operation_id: identity.operation_id.clone(),
+        operation_digest: identity.digest().unwrap(),
+        attempt_digest: digest("00"),
+        audience: Token::new("bloom-signer").unwrap(),
+        issuer_service_id: Token::new("bloom-broker").unwrap(),
+        issuer_boot_epoch: BootEpoch::new("99".repeat(16)).unwrap(),
+        broker_signing_key_id: Token::new("broker-app-1").unwrap(),
+        approval_id: identity.approval_id,
+        wallet_id: terms.wallet_id.clone(),
+        key_ref: identity.key_ref,
+        crypto_suite: identity.crypto_suite,
+        selector_kind: SelectorKind::Exact,
+        ordered_payload_digests: vec![raw.clone()],
+        ordered_hashes: vec![raw],
+        ordered_messages: vec![Base64UrlBytes::from_bytes(message)],
+        signature_count: DecimalU64::new(1),
+        petal_use_claim_digest: None,
+        claim_assurance_digest: None,
+        policy_version: terms.policy_version.clone(),
+        policy_digest: terms.policy_digest.clone(),
+        validation_receipt_digest: digest("aa"),
+        issued_at_ms: DecimalU64::new(not_before_ms),
+        not_before_ms: DecimalU64::new(not_before_ms),
+        expires_at_ms: DecimalU64::new(not_before_ms + 20_000),
+    };
+    unsigned.attempt_digest = unsigned.computed_attempt_digest().unwrap();
+    SignRequest {
+        broker_signature: Base64UrlBytes::from_bytes(
+            &broker
+                .sign(&hex::decode(unsigned.attempt_digest.as_str()).unwrap())
+                .to_bytes(),
+        ),
+        unsigned,
+    }
+}
+
+/// The failure this change exists to fix: the owner approves, the staged
+/// blockhash lapses, the Machine restamps the same transfer, and the approval
+/// still authorizes exactly that message. The signature is produced by the
+/// real local backend over the refreshed raw bytes.
+#[test]
+fn a_late_ceremony_still_signs_the_refreshed_native_transfer() {
+    let authenticator = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let (service, engine, registry) = bip39_service(&authenticator);
+    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("d1"), 10_000);
+    let child = solana_child_key_ref(&engine, &wallet_id);
+    let payer = ed25519_public_key(&engine, &child);
+
+    let staged = native_transfer_message(&payer, 0x42);
+    let terms = native_transfer_terms(
+        &engine,
+        &wallet_id,
+        child.clone(),
+        &staged,
+        Some(ExactMessageNormalization::SolanaNativeTransferBlockhashV1),
+        10_100,
+    );
+    // The marker is sealed into the terms the owner's passkey actually
+    // approves, so it cannot be added to or removed from a live approval.
+    assert!(
+        String::from_utf8(terms.canonical_bytes().unwrap())
+            .unwrap()
+            .contains("solana_native_transfer_blockhash_v1")
+    );
+    complete_local_approval(
+        &service,
+        &authenticator,
+        terms.clone(),
+        operation("d2"),
+        2,
+        10_100,
+    );
+
+    // Four minutes later the staged blockhash is long dead. The Machine keeps
+    // the same entry and the same approval, and restamps the transfer.
+    let final_message = native_transfer_message(&payer, 0x5a);
+    assert_ne!(final_message, staged);
+    let request =
+        native_transfer_sign_request(&broker, &terms, &final_message, "d3", "e3", 250_000);
+    assert_eq!(
+        engine
+            .authorize_sign(&request, &healthy_clock(250_500))
+            .unwrap(),
+        SignAuthorization::NewOperation
+    );
+
+    // The backend signs the refreshed bytes themselves. Nothing normalized
+    // reaches it, and the signature does not verify over the normalized form.
+    let backend = registry
+        .get(&Token::new("local").unwrap(), &wallet_id)
+        .unwrap();
+    let produced = futures::executor::block_on(backend.sign(BackendSignRequest {
+        provider_attempt_id: digest("e4"),
+        key_ref: child,
+        crypto_suite: CryptoSuite::Ed25519Message,
+        input: BackendInput::Message {
+            message: Base64UrlBytes::from_bytes(&final_message),
+        },
+        deadline_ms: DecimalU64::new(1_000_000),
+    }))
+    .unwrap();
+    assert_eq!(produced.encoding, SignatureEncoding::Ed25519Raw64);
+    let verifying =
+        ed25519_dalek::VerifyingKey::from_bytes(&payer.clone().try_into().unwrap()).unwrap();
+    let signature =
+        ed25519_dalek::Signature::from_bytes(&produced.bytes.decode().try_into().unwrap());
+    verifying.verify_strict(&final_message, &signature).unwrap();
+
+    let mut zeroed = final_message.clone();
+    zeroed[NATIVE_TRANSFER_BLOCKHASH].fill(0);
+    assert!(verifying.verify_strict(&zeroed, &signature).is_err());
+    assert!(
+        verifying
+            .verify_strict(&sha2::Sha256::digest(&final_message), &signature)
+            .is_err()
+    );
+    assert!(verifying.verify_strict(&staged, &signature).is_err());
+}
+
+/// Normalization covers 32 bytes and no others. A structurally valid change to
+/// the amount, the recipient or the program ID still normalizes, but produces
+/// a different commitment and is refused; a layout Signer does not support is
+/// refused outright.
+#[test]
+fn only_the_blockhash_may_move_under_a_normalized_approval() {
+    let authenticator = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let (service, engine, _registry) = bip39_service(&authenticator);
+    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("d4"), 10_000);
+    let child = solana_child_key_ref(&engine, &wallet_id);
+    let payer = ed25519_public_key(&engine, &child);
+
+    let staged = native_transfer_message(&payer, 0x42);
+    let terms = native_transfer_terms(
+        &engine,
+        &wallet_id,
+        child,
+        &staged,
+        Some(ExactMessageNormalization::SolanaNativeTransferBlockhashV1),
+        10_100,
+    );
+    engine.install_approval_for_test(&terms).unwrap();
+
+    let refreshed = native_transfer_message(&payer, 0x5a);
+    let mutate = |offset: usize, value: u8| {
+        let mut message = refreshed.clone();
+        message[offset] = value;
+        message
+    };
+    let mut trailing = refreshed.clone();
+    trailing.push(0);
+
+    for (label, message) in [
+        ("amount", mutate(142, refreshed[142].wrapping_add(1))),
+        ("recipient", mutate(36, refreshed[36].wrapping_add(1))),
+        ("payer", mutate(4, refreshed[4].wrapping_add(1))),
+        ("program ID", mutate(68, 1)),
+        ("instruction data length", mutate(137, 13)),
+        ("account count", mutate(3, 4)),
+        ("version prefix", mutate(0, 0x80)),
+        ("truncated", refreshed[..149].to_vec()),
+        ("trailing byte", trailing),
+    ] {
+        let request = native_transfer_sign_request(&broker, &terms, &message, "d5", "e5", 250_000);
+        assert_eq!(
+            engine
+                .authorize_sign(&request, &healthy_clock(250_500))
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::SelectorMismatch,
+            "a changed {label} must not be signable under the approval"
+        );
+    }
+}
+
+/// The new mode is opt-in per approval. An owner who approved raw bytes still
+/// gets raw bytes, which is the pre-existing behaviour and the reason a second
+/// ceremony was needed.
+#[test]
+fn an_unmarked_exact_approval_still_refuses_a_refreshed_blockhash() {
+    let authenticator = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let (service, engine, _registry) = bip39_service(&authenticator);
+    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("d6"), 10_000);
+    let child = solana_child_key_ref(&engine, &wallet_id);
+    let payer = ed25519_public_key(&engine, &child);
+
+    let staged = native_transfer_message(&payer, 0x42);
+    let terms = native_transfer_terms(&engine, &wallet_id, child, &staged, None, 10_100);
+    engine.install_approval_for_test(&terms).unwrap();
+
+    assert_eq!(
+        engine
+            .authorize_sign(
+                &native_transfer_sign_request(&broker, &terms, &staged, "d7", "e7", 11_000),
+                &healthy_clock(11_500)
+            )
+            .unwrap(),
+        SignAuthorization::NewOperation
+    );
+    assert_eq!(
+        engine
+            .authorize_sign(
+                &native_transfer_sign_request(
+                    &broker,
+                    &terms,
+                    &native_transfer_message(&payer, 0x5a),
+                    "d8",
+                    "e8",
+                    11_000
+                ),
+                &healthy_clock(11_500)
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::SelectorMismatch
+    );
+}
+
+/// Widening the window must not widen the authority. Signer enforces one
+/// signature per normalized approval on its own, without trusting the
+/// Machine's entry lock, and refuses to let one operation swap its bytes.
+#[test]
+fn a_normalized_approval_yields_at_most_one_message_signature() {
+    let authenticator = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let (service, engine, _registry) = bip39_service(&authenticator);
+    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("d9"), 10_000);
+    let child = solana_child_key_ref(&engine, &wallet_id);
+    let payer = ed25519_public_key(&engine, &child);
+
+    let staged = native_transfer_message(&payer, 0x42);
+    let terms = native_transfer_terms(
+        &engine,
+        &wallet_id,
+        child,
+        &staged,
+        Some(ExactMessageNormalization::SolanaNativeTransferBlockhashV1),
+        10_100,
+    );
+    engine.install_approval_for_test(&terms).unwrap();
+
+    let first = native_transfer_message(&payer, 0x5a);
+    let request = native_transfer_sign_request(&broker, &terms, &first, "da", "ea", 60_000);
+    assert_eq!(
+        engine
+            .authorize_sign(&request, &healthy_clock(60_500))
+            .unwrap(),
+        SignAuthorization::NewOperation
+    );
+    assert_eq!(
+        engine
+            .authorize_sign(&request, &healthy_clock(60_500))
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyReplay
+    );
+
+    // A second blockhash under a second operation is a second operation, and
+    // the approval permits one.
+    let second = native_transfer_message(&payer, 0x6b);
+    assert_eq!(
+        engine
+            .authorize_sign(
+                &native_transfer_sign_request(&broker, &terms, &second, "db", "eb", 60_000),
+                &healthy_clock(60_500)
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::LimitExceededOperations
+    );
+
+    // The reserved operation cannot quietly acquire different raw bytes.
+    assert_eq!(
+        engine
+            .authorize_sign(
+                &native_transfer_sign_request(&broker, &terms, &second, "da", "ec", 60_000),
+                &healthy_clock(60_500)
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::OperationIdConflict
+    );
+}
+
+/// The expansion is bounded. Five minutes is a ceiling on obtaining a
+/// signature, enforced by the same approval-validity checks as before.
+#[test]
+fn a_normalized_approval_still_dies_at_five_minutes() {
+    let authenticator = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let (service, engine, _registry) = bip39_service(&authenticator);
+    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("dc"), 10_000);
+    let child = solana_child_key_ref(&engine, &wallet_id);
+    let payer = ed25519_public_key(&engine, &child);
+
+    let staged = native_transfer_message(&payer, 0x42);
+    let terms = native_transfer_terms(
+        &engine,
+        &wallet_id,
+        child,
+        &staged,
+        Some(ExactMessageNormalization::SolanaNativeTransferBlockhashV1),
+        10_100,
+    );
+    engine.install_approval_for_test(&terms).unwrap();
+    let message = native_transfer_message(&payer, 0x5a);
+
+    // An attempt that would outlive the approval, and an attempt made after it
+    // expires, both fail.
+    for (label, not_before_ms, now_ms) in [
+        ("attempt outlives the approval", 300_000_u64, 300_500_u64),
+        ("attempt after expiry", 310_200, 310_500),
+    ] {
+        assert_eq!(
+            engine
+                .authorize_sign(
+                    &native_transfer_sign_request(
+                        &broker,
+                        &terms,
+                        &message,
+                        "dd",
+                        "ed",
+                        not_before_ms
+                    ),
+                    &healthy_clock(now_ms)
+                )
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::ApprovalExpired,
+            "{label}"
+        );
+    }
+
+    // And a five-minute-plus-one approval cannot be sealed at all.
+    let mut too_long = terms;
+    too_long.expires_at_ms = DecimalU64::new(too_long.not_before_ms.get() + 300_001);
+    assert_eq!(
+        engine
+            .install_approval_for_test(&too_long)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ApprovalExpired
+    );
 }

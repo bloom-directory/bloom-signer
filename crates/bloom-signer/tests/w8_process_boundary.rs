@@ -142,6 +142,7 @@ fn bip39_terms(key_ref: KeyRef, wallet_id: &Token) -> SealedApprovalTerms {
         selector: ApprovalSelector::Exact {
             ordered_payload_digests: vec![digest("22")],
             ordered_hashes: vec![digest("33")],
+            message_normalization: None,
         },
         limits: ApprovalLimits {
             max_operations: DecimalU64::new(1),
@@ -178,6 +179,7 @@ fn complete_local_approval(
         ApprovalSelector::Exact {
             ordered_payload_digests,
             ordered_hashes,
+            ..
         } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
         ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
     };

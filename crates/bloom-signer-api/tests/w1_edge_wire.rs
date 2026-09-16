@@ -38,6 +38,7 @@ fn approval_terms() -> SealedApprovalTerms {
         selector: ApprovalSelector::Exact {
             ordered_payload_digests: vec![digest(2)],
             ordered_hashes: vec![digest(3)],
+            message_normalization: None,
         },
         limits: ApprovalLimits {
             max_operations: DecimalU64::new(1),

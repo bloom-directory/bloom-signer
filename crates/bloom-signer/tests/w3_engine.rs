@@ -63,6 +63,7 @@ fn exact_terms() -> SealedApprovalTerms {
         selector: ApprovalSelector::Exact {
             ordered_payload_digests: vec![digest("22")],
             ordered_hashes: vec![digest("33")],
+            message_normalization: None,
         },
         limits: ApprovalLimits {
             max_operations: DecimalU64::new(1),
@@ -124,6 +125,7 @@ fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> Unsign
         ApprovalSelector::Exact {
             ordered_payload_digests,
             ordered_hashes,
+            ..
         } => (
             ordered_payload_digests.clone(),
             ordered_hashes.clone(),

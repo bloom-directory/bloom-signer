@@ -960,6 +960,7 @@ mod tests {
             selector: ApprovalSelector::Exact {
                 ordered_payload_digests: vec![Digest32::from_bytes([22; 32])],
                 ordered_hashes: vec![Digest32::from_bytes([33; 32])],
+                message_normalization: None,
             },
             limits: ApprovalLimits {
                 max_operations: DecimalU64::new(1),
@@ -1302,6 +1303,7 @@ mod tests {
             ApprovalSelector::Exact {
                 ordered_payload_digests,
                 ordered_hashes,
+                ..
             } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
             ApprovalSelector::Petal { .. } => unreachable!("fixture is exact"),
         };

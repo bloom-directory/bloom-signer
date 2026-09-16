@@ -2,12 +2,13 @@ use bloom_signer_api::{
     AccountLifecycleState, ApprovalLifecycleState, ApprovalPublicStatus, ApprovalSelector,
     ApprovalSubject, ApprovalTombstone, Base64UrlBytes, CeremonyPublicStatus, CredentialPublic,
     CredentialState, CustodyResult, DecimalU64, DerivationProfile, DerivationRef,
-    DerivedAccountDescriptor, DerivedAccountRequest, Digest32, KeyRef, KeySpec, OperationId,
-    OperationPublicStatus, OperationState, PetalKeyScope, PolicyCommitReceipt,
-    PolicyCompareAndSwapRequest, PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest,
-    PolicyValidationReceipt, ProtocolError, ProtocolErrorCode, PublicKeyEncoding, RevocationState,
-    SealedApprovalTerms, SelectorKind, SignRequest, SignedPolicySnapshot, SignerActivationReceipt,
-    SigningResult, Token, WalletSeedProfile, WalletSeedRef, WalletTombstone, WebAuthnCredential,
+    DerivedAccountDescriptor, DerivedAccountRequest, Digest32, ExactMessageNormalization, KeyRef,
+    KeySpec, OperationId, OperationPublicStatus, OperationState, PetalKeyScope,
+    PolicyCommitReceipt, PolicyCompareAndSwapRequest, PolicyUpdateCeremonyPrepareRequest,
+    PolicyUpdateRequest, PolicyValidationReceipt, ProtocolError, ProtocolErrorCode,
+    PublicKeyEncoding, RevocationState, SealedApprovalTerms, SelectorKind, SignRequest,
+    SignedPolicySnapshot, SignerActivationReceipt, SigningResult, Token, WalletSeedProfile,
+    WalletSeedRef, WalletTombstone, WebAuthnCredential, solana_native_transfer_approval_digest,
 };
 use bloom_trusted_time::{DurableClockCondition, PersistedClockState, evaluate_durable_clock};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
@@ -6125,6 +6126,39 @@ fn validate_against_approval(
             ApprovalSelector::Exact {
                 ordered_payload_digests,
                 ordered_hashes,
+                message_normalization:
+                    Some(ExactMessageNormalization::SolanaNativeTransferBlockhashV1),
+            },
+            SelectorKind::Exact,
+        ) => {
+            // The approval commits to the message with its recent blockhash
+            // zeroed, so recompute that digest here from the one message the
+            // Broker actually submitted. A normalized digest offered in the
+            // request is never accepted as a substitute: `validate_shape` has
+            // already bound `ordered_messages` to the raw digests, and those
+            // raw values continue to drive the operation and retry identities.
+            let [message] = request.unsigned.ordered_messages.as_slice() else {
+                return Err(error(
+                    ProtocolErrorCode::SelectorMismatch,
+                    "blockhash-normalized approval covers exactly one message",
+                ));
+            };
+            let normalized = solana_native_transfer_approval_digest(&message.decode())?;
+            if ordered_payload_digests.as_slice() != [normalized.clone()]
+                || ordered_hashes.as_slice() != [normalized]
+                || request.unsigned.signature_count.get() != 1
+            {
+                return Err(error(
+                    ProtocolErrorCode::SelectorMismatch,
+                    "normalized message digest or signature count differs from approval",
+                ));
+            }
+        }
+        (
+            ApprovalSelector::Exact {
+                ordered_payload_digests,
+                ordered_hashes,
+                message_normalization: None,
             },
             SelectorKind::Exact,
         ) if ordered_payload_digests == &request.unsigned.ordered_payload_digests

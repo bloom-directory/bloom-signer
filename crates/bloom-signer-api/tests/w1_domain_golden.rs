@@ -138,6 +138,7 @@ fn every_immutable_authority_field_changes_the_approval_digest() {
     changed.selector = ApprovalSelector::Exact {
         ordered_payload_digests: vec![Digest32::new("66".repeat(32)).unwrap()],
         ordered_hashes: vec![Digest32::new("33".repeat(32)).unwrap()],
+        message_normalization: None,
     };
     mutations.push(("selector", changed));
 
