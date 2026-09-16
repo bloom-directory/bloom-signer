@@ -773,6 +773,59 @@ fn complete_policy_update(
 }
 
 #[test]
+fn ed25519_petal_key_derivation_commits_against_a_solana_account_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let authenticator = VirtualAuthenticator::generate();
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
+    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+    let engine = Arc::new(
+        SignerEngine::open(
+            &database,
+            Token::new("broker-app-1").unwrap(),
+            broker.verifying_key(),
+            ceremony_key.verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
+            registry,
+        )
+        .unwrap(),
+    );
+    let service = SignerCeremonyService::new(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        ceremony_key,
+    )
+    .unwrap();
+    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("e1"), 10_000);
+    let accounts = engine.derived_account_descriptors(&wallet_id).unwrap();
+    let parent = accounts
+        .iter()
+        .find(|account| account.key_ref.key_spec == KeySpec::Ed25519)
+        .unwrap()
+        .key_ref
+        .clone();
+    let scope = PetalKeyScope {
+        wallet_id: wallet_id.clone(),
+        parent_key_ref: parent,
+        package_hash: digest("e2"),
+        route: "/petals/pumpfun/sign".into(),
+        lineage_id: "pln1_abcdefghjkmnpqrstuvwxyz234567abcdefghjkmnpqrstuvw234".into(),
+        key_slot: Token::new("session-a").unwrap(),
+        allowed_routes: vec!["/petals/pumpfun/sign".into()],
+        allowed_operation_classes: vec![Token::new("pumpfun.sweep").unwrap()],
+        allowed_crypto_suites: vec![CryptoSuite::Ed25519Message],
+        maximum_lifetime_ms: DecimalU64::new(20_000),
+        custody_operation_id: operation("e3"),
+    };
+    let (result, _) =
+        complete_petal_key_derivation(&service, &authenticator, scope, None, 10_200).unwrap();
+    assert_eq!(result.public_key_refs.len(), 1);
+}
+
+#[test]
 fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals() {
     let temp = tempfile::tempdir().unwrap();
     let database = temp.path().join("signer.sqlite");

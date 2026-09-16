@@ -1380,16 +1380,28 @@ impl SignerCeremonyService {
         // Commit only BIP-39 allocation rows actually produced by this apply.
         // Deriving candidate child IDs from the receipt ID would let an
         // unrelated custody operation alias an incomplete child's ID.
-        let committed_allocations: Vec<_> = apply_outcome
-            .derived_keys
-            .iter()
-            .filter_map(|derived| match &derived.key_ref.derivation {
-                Some(DerivationRef::Bip39Multicurve {
-                    wallet_seed_ref, ..
-                }) => Some((wallet_seed_ref.clone(), derived.operation_id.clone())),
-                _ => None,
-            })
-            .collect();
+        //
+        // A Petal KeyDerive mints a scoped sub-key, never a registry
+        // allocation row: its EnrollKey effect records enrolled_keys and
+        // petal_key_scopes only. An Ed25519 Petal child still carries a
+        // Bip39Multicurve ref (it branches off the Solana account path),
+        // so without this gate the commit below demands a
+        // derivation_allocations row no apply ever produces and every such
+        // ceremony fails with OperationIdConflict.
+        let committed_allocations: Vec<_> = if contribution.petal_key_scope.is_some() {
+            Vec::new()
+        } else {
+            apply_outcome
+                .derived_keys
+                .iter()
+                .filter_map(|derived| match &derived.key_ref.derivation {
+                    Some(DerivationRef::Bip39Multicurve {
+                        wallet_seed_ref, ..
+                    }) => Some((wallet_seed_ref.clone(), derived.operation_id.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
         if let Err(error) = self
             .engine
             .commit_custody_snapshot_with_effect(CustodySnapshotCommit {
