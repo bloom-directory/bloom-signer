@@ -301,6 +301,17 @@ async fn provision(
     let broker_gid: u32 = std::env::var("BLOOM_SIGNER_BROKER_GID")
         .map_err(|_| "BLOOM_SIGNER_BROKER_GID is required")?
         .parse()?;
+    let tunnel_path = std::env::var_os("BLOOM_SIGNER_TUNNEL_CREDENTIAL_PATH")
+        .map(PathBuf::from)
+        .ok_or("BLOOM_SIGNER_TUNNEL_CREDENTIAL_PATH is required")?;
+    let broker_parent = require_private_broker_parent(&tunnel_path, broker_uid, broker_gid)?;
+    install_broker_file(
+        &root,
+        &broker_parent.join("relay-control-ca.pem"),
+        &ca_pem,
+        broker_uid,
+        broker_gid,
+    )?;
     for (scope, variable, label) in [
         (
             Scope::Tunnel,
@@ -313,9 +324,13 @@ async fn provision(
             "dns",
         ),
     ] {
-        let destination = std::env::var_os(variable)
-            .map(PathBuf::from)
-            .ok_or_else(|| format!("{variable} is required"))?;
+        let destination = if scope == Scope::Tunnel {
+            tunnel_path.clone()
+        } else {
+            std::env::var_os(variable)
+                .map(PathBuf::from)
+                .ok_or_else(|| format!("{variable} is required"))?
+        };
         ensure_scoped_credential(
             &root,
             &destination,
@@ -331,10 +346,7 @@ async fn provision(
     let account_path = std::env::var_os("BLOOM_SIGNER_ACME_ACCOUNT_URI_PATH")
         .map(PathBuf::from)
         .ok_or("BLOOM_SIGNER_ACME_ACCOUNT_URI_PATH is required")?;
-    let expected_parent = std::env::var_os("BLOOM_SIGNER_TUNNEL_CREDENTIAL_PATH")
-        .map(PathBuf::from)
-        .ok_or("BLOOM_SIGNER_TUNNEL_CREDENTIAL_PATH is required")?;
-    if account_path.parent() != expected_parent.parent()
+    if account_path.parent() != tunnel_path.parent()
         || account_path.file_name().and_then(|name| name.to_str()) != Some("acme-account-uri")
     {
         return Err("ACME account URI must use Broker's enrolled credential directory".into());
@@ -463,19 +475,7 @@ fn ensure_scoped_credential(
     ca_pem: &[u8],
     key: &SigningKey,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let parent = destination
-        .parent()
-        .ok_or("credential destination has no parent")?;
-    let metadata = fs::symlink_metadata(parent)?;
-    if !metadata.file_type().is_dir()
-        || metadata.uid() != broker_uid
-        || metadata.gid() != broker_gid
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(
-            "Broker credential directory must be Broker-owned, private, and not a symlink".into(),
-        );
-    }
+    require_private_broker_parent(destination, broker_uid, broker_gid)?;
     let state_path = root.join(format!("{label}-credential-state.json"));
     let metadata_path = destination.with_file_name(format!("relay-{label}.metadata.json"));
     let installed = if state_path.exists() && destination.exists() && metadata_path.exists() {
@@ -575,6 +575,27 @@ fn ensure_scoped_credential(
     write_root_state(root, &state_path, &state)?;
     fs::remove_file(pending_path)?;
     Ok(())
+}
+
+fn require_private_broker_parent(
+    destination: &Path,
+    broker_uid: u32,
+    broker_gid: u32,
+) -> Result<&Path, Box<dyn std::error::Error>> {
+    let parent = destination
+        .parent()
+        .ok_or("Broker destination has no parent")?;
+    let metadata = fs::symlink_metadata(parent)?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != broker_uid
+        || metadata.gid() != broker_gid
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(
+            "Broker credential directory must be Broker-owned, private, and not a symlink".into(),
+        );
+    }
+    Ok(parent)
 }
 
 fn write_root_state<T: Serialize>(root: &Path, destination: &Path, value: &T) -> io::Result<()> {
@@ -754,5 +775,31 @@ mod tests {
         )
         .unwrap();
         assert!(read_broker_acme_uri(&path, uid, gid).is_err());
+    }
+
+    #[test]
+    fn broker_public_ca_handoff_is_atomic_private_and_owner_checked() {
+        let root = tempfile::tempdir().unwrap();
+        let broker = tempfile::tempdir().unwrap();
+        fs::set_permissions(broker.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = fs::metadata(broker.path()).unwrap();
+        let destination = broker.path().join("relay-control-ca.pem");
+        require_private_broker_parent(&destination, owner.uid(), owner.gid()).unwrap();
+        install_broker_file(
+            root.path(),
+            &destination,
+            b"public pinned CA",
+            owner.uid(),
+            owner.gid(),
+        )
+        .unwrap();
+        let published = fs::symlink_metadata(&destination).unwrap();
+        assert!(published.file_type().is_file());
+        assert_eq!(published.uid(), owner.uid());
+        assert_eq!(published.gid(), owner.gid());
+        assert_eq!(published.mode() & 0o777, 0o600);
+        assert_eq!(fs::read(&destination).unwrap(), b"public pinned CA");
+        fs::set_permissions(broker.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(require_private_broker_parent(&destination, owner.uid(), owner.gid()).is_err());
     }
 }

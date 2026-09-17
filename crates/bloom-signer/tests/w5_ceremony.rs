@@ -2650,6 +2650,26 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
             6_001,
         )
         .unwrap();
+    let stale_operation = operation("af");
+    let stale_recovery = service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
+                ceremony_kind: CeremonyKind::WalletRecovery,
+                custody_operation_id: stale_operation.clone(),
+                wallet_id: Some(wallet_id.clone()),
+                key_ref: None,
+                exact_terms_digest: digest("d3"),
+                expected_input_class: Token::new("recovery-factor-v1").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                derivation_requests: Vec::new(),
+                wallet_seed_profile: None,
+            },
+            6_002,
+        )
+        .unwrap();
     let attestation =
         replacement.attestation(&recovery_prepared.challenges[0].canonical_bytes().unwrap());
     let prf_assertion = replacement.assertion(
@@ -2707,6 +2727,28 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
         1
     );
     assert_eq!(recovery_result.credential_summaries.len(), 1);
+    assert_eq!(
+        service
+            .complete_custody(
+                CustodyCompleteRequest {
+                    ceremony_kind: CeremonyKind::WalletRecovery,
+                    custody_operation_id: stale_operation,
+                    ceremony_id: stale_recovery.contribution.ceremony_id,
+                    proof: WebAuthnCeremonyProof::RecoveryCredentialChange {
+                        new_credential_attestation: replacement
+                            .attestation(&stale_recovery.challenges[0].canonical_bytes().unwrap()),
+                        new_credential_prf_assertion: None,
+                    },
+                    encrypted_input: None,
+                    public_binding_digest: digest("d3"),
+                },
+                6_102
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyKindMismatch
+    );
+
     assert!(matches!(
         service
             .status_at(&recovery_operation, 6_100 + 15 * 60_000)
@@ -2786,6 +2828,70 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
         )
         .unwrap_err();
     assert_eq!(forged_registration.code, ProtocolErrorCode::KeyrefMismatch);
+    let recovery_probe = |wallet_id: Token, operation_id: OperationId| {
+        service
+            .prepare_custody(
+                CustodyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
+                    ceremony_kind: CeremonyKind::WalletRecovery,
+                    custody_operation_id: operation_id,
+                    wallet_id: Some(wallet_id),
+                    key_ref: None,
+                    exact_terms_digest: digest("d4"),
+                    expected_input_class: Token::new("recovery-factor-v1").unwrap(),
+                    browser_output_recipient_key: None,
+                    petal_key_scope: None,
+                    legacy_passkey_migration: None,
+                    derivation_requests: Vec::new(),
+                    wallet_seed_profile: None,
+                },
+                6_200,
+            )
+            .unwrap()
+    };
+    let known = recovery_probe(wallet_id.clone(), operation("b7"));
+    let unknown = recovery_probe(Token::new("nonexistent-wallet").unwrap(), operation("b8"));
+    for prepared in [&known, &unknown] {
+        assert!(prepared.webauthn_options.allowed_credentials.is_empty());
+        assert!(prepared.verification_credentials.is_empty());
+        assert_eq!(
+            prepared.contribution.credential_authority_generation.get(),
+            0
+        );
+        assert_eq!(
+            prepared
+                .webauthn_options
+                .registration_user_handle
+                .as_ref()
+                .unwrap()
+                .decode()
+                .len(),
+            32
+        );
+        assert_eq!(
+            prepared
+                .webauthn_options
+                .registration_prf_salt
+                .as_ref()
+                .unwrap()
+                .decode()
+                .len(),
+            32
+        );
+    }
+    assert_ne!(
+        known.webauthn_options.registration_user_handle,
+        Some(replacement.credential(0).user_handle.clone())
+    );
+    let browser = HpkeRecipient::generate();
+    for operation_id in [operation("b7"), operation("b8")] {
+        let bound = service
+            .bind_custody_output_recipient(&operation_id, browser.public_key().clone(), 6_201)
+            .unwrap();
+        assert!(bound.webauthn_options.allowed_credentials.is_empty());
+        assert!(bound.verification_credentials.is_empty());
+        assert_eq!(bound.contribution.credential_authority_generation.get(), 0);
+    }
 }
 
 #[test]

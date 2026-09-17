@@ -103,6 +103,17 @@ fn default_surface_status() -> SurfaceStatus {
         remote_routing_ready: false,
     }
 }
+
+fn verification_origin(surface: &SurfaceDescriptor) -> Result<String, ProtocolError> {
+    // The developer-only harness already serves localhost on a selected port.
+    // Keep the persisted local surface identity fixed at the shipping origin,
+    // and scope this clientDataJSON override to that harness build only.
+    #[cfg(feature = "triad-dev-harness")]
+    if surface.identity.surface_id.as_str() == "local" {
+        return crate::webauthn::configured_ceremony_origin();
+    }
+    Ok(surface.identity.origin.clone())
+}
 const CONTRIBUTION_DOMAIN: &[u8] = b"bloom-signer-ceremony-contribution/v1";
 const RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1";
 const WRAP_INFO: &[u8] = b"bloom-passkey-wallet-wrap/v1";
@@ -163,6 +174,9 @@ struct PendingCeremony {
     registration: Option<RegistrationSecrets>,
     credential_creation: Option<CredentialCreation>,
     legacy_migration: Option<PreparedLegacyMigration>,
+    /// Recovery publishes a fixed generation to unauthenticated browsers;
+    /// the actual epoch remains private until its factor is proven.
+    private_recovery_generation: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -756,7 +770,7 @@ impl SignerCeremonyService {
             credential,
             &prepared.source_challenge.canonical_bytes()?,
             true,
-            &source.identity.origin,
+            &verification_origin(&source)?,
             source.identity.rp_id.as_str(),
         )?;
         let aad = cross_surface_aad(prepared, "source_prf")?.canonical_bytes()?;
@@ -881,7 +895,7 @@ impl SignerCeremonyService {
             &challenges[0].canonical_bytes()?,
             prepared.destination_user_handle.clone(),
             prepared.destination_prf_salt.clone(),
-            &destination.identity.origin,
+            &verification_origin(&destination)?,
             destination.identity.rp_id.as_str(),
         )?;
         credential.surface = pair.pairing.destination_surface.clone();
@@ -890,7 +904,7 @@ impl SignerCeremonyService {
             &credential,
             &challenges[1].canonical_bytes()?,
             true,
-            &destination.identity.origin,
+            &verification_origin(&destination)?,
             destination.identity.rp_id.as_str(),
         )?;
         credential.sign_count = DecimalU64::new(u64::from(verified.sign_count));
@@ -1363,6 +1377,7 @@ impl SignerCeremonyService {
                 registration: None,
                 credential_creation: None,
                 legacy_migration: None,
+                private_recovery_generation: None,
             },
         );
         tracing::info!(
@@ -1526,7 +1541,14 @@ impl SignerCeremonyService {
                 | CeremonyKind::CredentialReplace
                 | CeremonyKind::WalletRecovery
         ) {
-            Some(self.new_credential_creation(request.wallet_id.as_ref(), &request.surface))
+            Some(self.new_credential_creation(
+                if request.ceremony_kind == CeremonyKind::WalletRecovery {
+                    None
+                } else {
+                    request.wallet_id.as_ref()
+                },
+                &request.surface,
+            ))
         } else {
             None
         };
@@ -1534,10 +1556,15 @@ impl SignerCeremonyService {
             .as_ref()
             .map(|registration| registration.wallet_id.clone())
             .or_else(|| request.wallet_id.clone());
+        let private_generation = self.authority_generation(effective_wallet_id.as_ref());
         let mut contribution = CustodySignerContribution {
             surface: request.surface.clone(),
             credential_authority_generation: DecimalU64::new(
-                self.authority_generation(effective_wallet_id.as_ref()),
+                if request.ceremony_kind == CeremonyKind::WalletRecovery {
+                    0
+                } else {
+                    private_generation
+                },
             ),
             ceremony_id: ceremony_id.clone(),
             ceremony_kind: request.ceremony_kind,
@@ -1597,8 +1624,15 @@ impl SignerCeremonyService {
             })
             .or_else(|| {
                 credential_creation.as_ref().map(|creation| {
-                    let mut options =
-                        self.options_for_wallet(request.wallet_id.as_ref(), &request.surface);
+                    let mut options = if request.ceremony_kind == CeremonyKind::WalletRecovery {
+                        CeremonyWebAuthnOptions {
+                            allowed_credentials: Vec::new(),
+                            registration_user_handle: None,
+                            registration_prf_salt: None,
+                        }
+                    } else {
+                        self.options_for_wallet(request.wallet_id.as_ref(), &request.surface)
+                    };
                     options.registration_user_handle = Some(creation.user_handle.clone());
                     options.registration_prf_salt = Some(creation.prf_salt.clone());
                     options
@@ -1642,6 +1676,9 @@ impl SignerCeremonyService {
                 registration,
                 credential_creation,
                 legacy_migration,
+                private_recovery_generation: (prepared.contribution.ceremony_kind
+                    == CeremonyKind::WalletRecovery)
+                    .then_some(private_generation),
             },
         );
         tracing::info!(
@@ -1889,7 +1926,7 @@ impl SignerCeremonyService {
                 credential,
                 challenge,
                 uv,
-                &surface.identity.origin,
+                &verification_origin(&surface)?,
                 surface.identity.rp_id.as_str(),
             )
         };
@@ -2115,8 +2152,11 @@ impl SignerCeremonyService {
             || request.ceremony_id != contribution.ceremony_id
             || contribution.expires_at_ms.get() <= now_ms
             || request.public_binding_digest != prepare.exact_terms_digest
-            || contribution.credential_authority_generation.get()
-                != self.authority_generation(contribution.wallet_id.as_ref())
+            || (if prepare.ceremony_kind == CeremonyKind::WalletRecovery {
+                pending.private_recovery_generation.ok_or_else(replay)?
+            } else {
+                contribution.credential_authority_generation.get()
+            }) != self.authority_generation(contribution.wallet_id.as_ref())
             || !self.verify_contribution(
                 &contribution.unsigned_canonical_bytes()?,
                 &contribution.signer_signature,
@@ -2595,7 +2635,7 @@ impl SignerCeremonyService {
                 credential,
                 challenge,
                 uv,
-                &surface.identity.origin,
+                &verification_origin(&surface)?,
                 surface.identity.rp_id.as_str(),
             )
         };
@@ -2609,7 +2649,7 @@ impl SignerCeremonyService {
                     challenge,
                     user_handle,
                     prf_salt,
-                    &surface.identity.origin,
+                    &verification_origin(&surface)?,
                     surface.identity.rp_id.as_str(),
                 )
             };
@@ -3751,6 +3791,21 @@ impl SignerCeremonyService {
     }
 
     fn options_for_pending(&self, pending: &PendingCeremony) -> CeremonyWebAuthnOptions {
+        if matches!(&pending.request, PendingRequest::Custody(request)
+            if request.ceremony_kind == CeremonyKind::WalletRecovery)
+        {
+            return CeremonyWebAuthnOptions {
+                allowed_credentials: Vec::new(),
+                registration_user_handle: pending
+                    .credential_creation
+                    .as_ref()
+                    .map(|creation| creation.user_handle.clone()),
+                registration_prf_salt: pending
+                    .credential_creation
+                    .as_ref()
+                    .map(|creation| creation.prf_salt.clone()),
+            };
+        }
         pending
             .legacy_migration
             .as_ref()
@@ -3806,6 +3861,11 @@ impl SignerCeremonyService {
         &self,
         pending: &PendingCeremony,
     ) -> Vec<WebAuthnCredential> {
+        if matches!(&pending.request, PendingRequest::Custody(request)
+            if request.ceremony_kind == CeremonyKind::WalletRecovery)
+        {
+            return Vec::new();
+        }
         if let Some(legacy) = &pending.legacy_migration {
             return vec![legacy.credential.clone()];
         }

@@ -17,8 +17,8 @@ blake3.workspace = true
 bloom-signer-api.workspace = true
 bloom-signer-derive.workspace = true
 bloom-signer-process-hardening.workspace = true
-bloom-relay-admin-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "ed5c3c85d247c01fac7fe6d548515d17c7c7f915" }
-bloom-relay-protocol = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "ed5c3c85d247c01fac7fe6d548515d17c7c7f915" }
+bloom-relay-admin-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "329b955454db23813e24b0947142c0398bed4b00" }
+bloom-relay-protocol = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "329b955454db23813e24b0947142c0398bed4b00" }
 bloom-triad-local-transport.workspace = true
 bloom-platform-containment.workspace = true
 bloom-audit-checkpoint.workspace = true
