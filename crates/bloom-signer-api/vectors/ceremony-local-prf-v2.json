@@ -1,0 +1,50 @@
+{
+  "name": "sealed-approval-local-prf-v2",
+  "challenge": {
+    "ceremony_id": "0101010101010101010101010101010101010101010101010101010101010101",
+    "ceremony_kind": "sealed_approval",
+    "exact_terms_digest": "0606060606060606060606060606060606060606060606060606060606060606",
+    "operation_id": "0202020202020202020202020202020202020202020202020202020202020202",
+    "phase": "approve",
+    "review_manifest_digest": "0404040404040404040404040404040404040404040404040404040404040404",
+    "schema": "bloom.ceremony.challenge.v1",
+    "signer_contribution_digest": "0505050505050505050505050505050505050505050505050505050505050505",
+    "signer_nonce": "0303030303030303030303030303030303030303030303030303030303030303",
+    "surface": {
+      "surface_id": "local",
+      "identity_digest": "d9e4edce4defccf9a6ee3f267f21c3fc6384cb9ef3de4b3c6dbf0250ebc549b8"
+    }
+  },
+  "challenge_canonical_jcs": "{\"ceremony_id\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"ceremony_kind\":\"sealed_approval\",\"exact_terms_digest\":\"0606060606060606060606060606060606060606060606060606060606060606\",\"operation_id\":\"0202020202020202020202020202020202020202020202020202020202020202\",\"phase\":\"approve\",\"review_manifest_digest\":\"0404040404040404040404040404040404040404040404040404040404040404\",\"schema\":\"bloom.ceremony.challenge.v1\",\"signer_contribution_digest\":\"0505050505050505050505050505050505050505050505050505050505050505\",\"signer_nonce\":\"0303030303030303030303030303030303030303030303030303030303030303\",\"surface\":{\"identity_digest\":\"d9e4edce4defccf9a6ee3f267f21c3fc6384cb9ef3de4b3c6dbf0250ebc549b8\",\"surface_id\":\"local\"}}",
+  "challenge_base64url": "eyJjZXJlbW9ueV9pZCI6IjAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEiLCJjZXJlbW9ueV9raW5kIjoic2VhbGVkX2FwcHJvdmFsIiwiZXhhY3RfdGVybXNfZGlnZXN0IjoiMDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNiIsIm9wZXJhdGlvbl9pZCI6IjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIwMjAyMDIiLCJwaGFzZSI6ImFwcHJvdmUiLCJyZXZpZXdfbWFuaWZlc3RfZGlnZXN0IjoiMDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNDA0MDQwNCIsInNjaGVtYSI6ImJsb29tLmNlcmVtb255LmNoYWxsZW5nZS52MSIsInNpZ25lcl9jb250cmlidXRpb25fZGlnZXN0IjoiMDUwNTA1MDUwNTA1MDUwNTA1MDUwNTA1MDUwNTA1MDUwNTA1MDUwNTA1MDUwNTA1MDUwNTA1MDUwNTA1MDUwNSIsInNpZ25lcl9ub25jZSI6IjAzMDMwMzAzMDMwMzAzMDMwMzAzMDMwMzAzMDMwMzAzMDMwMzAzMDMwMzAzMDMwMzAzMDMwMzAzMDMwMzAzMDMiLCJzdXJmYWNlIjp7ImlkZW50aXR5X2RpZ2VzdCI6ImQ5ZTRlZGNlNGRlZmNjZjlhNmVlM2YyNjdmMjFjM2ZjNjM4NGNiOWVmM2RlNGIzYzZkYmYwMjUwZWJjNTQ5YjgiLCJzdXJmYWNlX2lkIjoibG9jYWwifX0",
+  "challenge_digest": "856260888b9d34fa389f461be29e92a5a5b4804b042b9d324182ab36d2af3e9a",
+  "local_prf_aad": {
+    "activation_mode": {
+      "kind": "boot_bound"
+    },
+    "allowed_crypto_suites": [
+      "secp256k1-sha256-recoverable",
+      "secp256k1-keccak256-recoverable"
+    ],
+    "approval_digest": "0606060606060606060606060606060606060606060606060606060606060606",
+    "approval_id": "0606060606060606060606060606060606060606060606060606060606060606",
+    "ceremony_id": "0101010101010101010101010101010101010101010101010101010101010101",
+    "credential_id": "Y3JlZGVudGlhbC1vbmU",
+    "key_ref": {
+      "backend": "local",
+      "backend_instance": "local-default",
+      "derivation": null,
+      "key_spec": "secp256k1",
+      "locator": "root:root-1",
+      "public_key_fingerprint": "1212121212121212121212121212121212121212121212121212121212121212"
+    },
+    "review_manifest_digest": "0404040404040404040404040404040404040404040404040404040404040404",
+    "signer_nonce": "0303030303030303030303030303030303030303030303030303030303030303",
+    "wallet_revocation_epoch": "7",
+    "surface": {
+      "surface_id": "local",
+      "identity_digest": "d9e4edce4defccf9a6ee3f267f21c3fc6384cb9ef3de4b3c6dbf0250ebc549b8"
+    }
+  },
+  "local_prf_aad_canonical_jcs": "{\"activation_mode\":{\"kind\":\"boot_bound\"},\"allowed_crypto_suites\":[\"secp256k1-sha256-recoverable\",\"secp256k1-keccak256-recoverable\"],\"approval_digest\":\"0606060606060606060606060606060606060606060606060606060606060606\",\"approval_id\":\"0606060606060606060606060606060606060606060606060606060606060606\",\"ceremony_id\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"credential_id\":\"Y3JlZGVudGlhbC1vbmU\",\"key_ref\":{\"backend\":\"local\",\"backend_instance\":\"local-default\",\"derivation\":null,\"key_spec\":\"secp256k1\",\"locator\":\"root:root-1\",\"public_key_fingerprint\":\"1212121212121212121212121212121212121212121212121212121212121212\"},\"review_manifest_digest\":\"0404040404040404040404040404040404040404040404040404040404040404\",\"signer_nonce\":\"0303030303030303030303030303030303030303030303030303030303030303\",\"surface\":{\"identity_digest\":\"d9e4edce4defccf9a6ee3f267f21c3fc6384cb9ef3de4b3c6dbf0250ebc549b8\",\"surface_id\":\"local\"},\"wallet_revocation_epoch\":\"7\"}"
+}

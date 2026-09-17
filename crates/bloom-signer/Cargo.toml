@@ -17,6 +17,8 @@ blake3.workspace = true
 bloom-signer-api.workspace = true
 bloom-signer-derive.workspace = true
 bloom-signer-process-hardening.workspace = true
+bloom-relay-admin-client = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "ed5c3c85d247c01fac7fe6d548515d17c7c7f915" }
+bloom-relay-protocol = { git = "https://github.com/bloom-directory/bloom-relay.git", rev = "ed5c3c85d247c01fac7fe6d548515d17c7c7f915" }
 bloom-triad-local-transport.workspace = true
 bloom-platform-containment.workspace = true
 bloom-audit-checkpoint.workspace = true
@@ -45,10 +47,12 @@ serde_jcs.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sha3.workspace = true
+subtle = "2"
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 tracing.workspace = true
 zeroize.workspace = true
 thiserror.workspace = true
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 bloom-signer-vectors = { path = "../bloom-signer-vectors" }

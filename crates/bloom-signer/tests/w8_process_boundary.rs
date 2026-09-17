@@ -59,6 +59,10 @@ fn production_signer_dependency_graph_has_no_machine_broker_or_debug_driver() {
         [
             "bloom-audit-checkpoint",
             "bloom-platform-containment",
+            // Privileged allocation enrollment only; the Broker-owned tunnel
+            // client is deliberately excluded from Signer custody.
+            "bloom-relay-admin-client",
+            "bloom-relay-protocol",
             "bloom-rpc-wire",
             "bloom-service-activation",
             "bloom-service-observability",
@@ -184,6 +188,7 @@ fn complete_local_approval(
     let prepared = service
         .prepare_approval(
             CeremonyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 activation_operation_id: activation_operation_id.clone(),
                 terms: terms.clone(),
                 review_manifest_digest: review_manifest_digest.clone(),
@@ -199,6 +204,7 @@ fn complete_local_approval(
         sign_count,
     );
     let aad = LocalPrfHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         signer_nonce: prepared.contribution.signer_nonce.clone(),
         approval_id: terms.approval_id().unwrap(),
@@ -275,6 +281,7 @@ fn bip39_register(
     let prepared = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletRegistration,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(wallet_id.clone()),
@@ -294,6 +301,7 @@ fn bip39_register(
     let prf_assertion =
         authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation_id.clone(),
@@ -345,6 +353,7 @@ fn bip39_retire(
     let prepared = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::AccountRetire,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(wallet_id.clone()),
@@ -365,6 +374,7 @@ fn bip39_retire(
         now_ms as u32,
     );
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::AccountRetire,
         custody_operation_id: operation_id.clone(),
@@ -879,6 +889,7 @@ fn bip39_allocate_pair(
     let prepared = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::AccountAllocate,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(wallet_id.clone()),
@@ -910,6 +921,7 @@ fn bip39_allocate_pair(
         now_ms as u32,
     );
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::AccountAllocate,
         custody_operation_id: operation_id.clone(),

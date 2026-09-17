@@ -75,6 +75,27 @@ pub fn verify_webauthn_assertion(
     expected_challenge: &[u8],
     require_user_verification: bool,
 ) -> Result<VerifiedAssertion, ProtocolError> {
+    verify_webauthn_assertion_for_origin(
+        assertion,
+        credential,
+        expected_challenge,
+        require_user_verification,
+        &configured_ceremony_origin()?,
+        CEREMONY_RP_ID,
+    )
+}
+
+/// Verify against the exact Signer-approved surface, never a Browser-provided
+/// RP or a host header. Callers must resolve this origin and RP from Signer
+/// state before accepting the proof.
+pub fn verify_webauthn_assertion_for_origin(
+    assertion: &WebAuthnAssertion,
+    credential: &WebAuthnCredential,
+    expected_challenge: &[u8],
+    require_user_verification: bool,
+    expected_origin: &str,
+    expected_rp_id: &str,
+) -> Result<VerifiedAssertion, ProtocolError> {
     if assertion.credential_id != credential.credential_id {
         return Err(proof_error(
             "credential ID does not match Signer enrollment",
@@ -84,11 +105,17 @@ pub fn verify_webauthn_assertion(
         &assertion.client_data_json,
         "webauthn.get",
         expected_challenge,
+        expected_origin,
     )?;
 
     let authenticator_data = assertion.authenticator_data.decode();
     let parsed = parse_authenticator_data(&authenticator_data, require_user_verification)?;
-    let rp_hash: [u8; 32] = Sha256::digest(credential.rp_id.as_str().as_bytes()).into();
+    if credential.rp_id.as_str() != expected_rp_id {
+        return Err(proof_error(
+            "credential belongs to a different ceremony surface",
+        ));
+    }
+    let rp_hash: [u8; 32] = Sha256::digest(expected_rp_id.as_bytes()).into();
     if parsed.rp_id_hash != rp_hash {
         return Err(proof_error("authenticator RP ID hash is invalid"));
     }
@@ -125,10 +152,29 @@ pub fn verify_webauthn_attestation(
     expected_user_handle: Base64UrlBytes,
     expected_prf_salt: Base64UrlBytes,
 ) -> Result<WebAuthnCredential, ProtocolError> {
+    verify_webauthn_attestation_for_origin(
+        attestation,
+        expected_challenge,
+        expected_user_handle,
+        expected_prf_salt,
+        &configured_ceremony_origin()?,
+        CEREMONY_RP_ID,
+    )
+}
+
+pub fn verify_webauthn_attestation_for_origin(
+    attestation: &WebAuthnAttestation,
+    expected_challenge: &[u8],
+    expected_user_handle: Base64UrlBytes,
+    expected_prf_salt: Base64UrlBytes,
+    expected_origin: &str,
+    expected_rp_id: &str,
+) -> Result<WebAuthnCredential, ProtocolError> {
     verify_client_data(
         &attestation.client_data_json,
         "webauthn.create",
         expected_challenge,
+        expected_origin,
     )?;
     let object: Value =
         ciborium::from_reader(attestation.attestation_object.decode().as_slice())
@@ -151,7 +197,7 @@ pub fn verify_webauthn_attestation(
     if parsed.flags & FLAG_ATTESTED_CREDENTIAL == 0 {
         return Err(proof_error("attested credential data flag is absent"));
     }
-    let rp_hash: [u8; 32] = Sha256::digest(CEREMONY_RP_ID.as_bytes()).into();
+    let rp_hash: [u8; 32] = Sha256::digest(expected_rp_id.as_bytes()).into();
     if parsed.rp_id_hash != rp_hash {
         return Err(proof_error("attestation RP ID hash is invalid"));
     }
@@ -185,10 +231,11 @@ pub fn verify_webauthn_attestation(
     let cose_public_key = canonical_cbor(&cose)?;
 
     Ok(WebAuthnCredential {
+        surface: bloom_signer_api::legacy_local_surface(),
         credential_id: attestation.credential_id.clone(),
         cose_public_key: Base64UrlBytes::from_bytes(&cose_public_key),
         user_handle: expected_user_handle,
-        rp_id: Token::new(CEREMONY_RP_ID)?,
+        rp_id: Token::new(expected_rp_id)?,
         prf_salt: expected_prf_salt,
         sign_count: DecimalU64::new(u64::from(parsed.sign_count)),
     })
@@ -208,11 +255,11 @@ fn verify_client_data(
     encoded: &Base64UrlBytes,
     expected_type: &str,
     expected_challenge: &[u8],
+    expected_origin: &str,
 ) -> Result<(), ProtocolError> {
     let decoded = encoded.decode();
     let data: ClientData = serde_json::from_slice(&decoded)
         .map_err(|_| proof_error("WebAuthn clientDataJSON is malformed"))?;
-    let expected_origin = configured_ceremony_origin()?;
     if data.ceremony_type != expected_type
         || data.origin != expected_origin
         || data.cross_origin
@@ -379,7 +426,7 @@ mod tests {
             "futureBrowserField": {"version": 1}
         }));
 
-        verify_client_data(&encoded, "webauthn.get", challenge).unwrap();
+        verify_client_data(&encoded, "webauthn.get", challenge, &origin).unwrap();
     }
 
     #[test]
@@ -394,7 +441,7 @@ mod tests {
             "topOrigin": "https://example.invalid"
         }));
 
-        let error = verify_client_data(&encoded, "webauthn.get", challenge).unwrap_err();
+        let error = verify_client_data(&encoded, "webauthn.get", challenge, &origin).unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
     }
 
@@ -422,7 +469,7 @@ mod tests {
             "origin": expected,
             "crossOrigin": false
         }));
-        verify_client_data(&accepted, "webauthn.get", challenge).unwrap();
+        verify_client_data(&accepted, "webauthn.get", challenge, expected).unwrap();
 
         let rejected_origin = if expected == CEREMONY_ORIGIN {
             selected.as_str()
@@ -435,7 +482,7 @@ mod tests {
             "origin": rejected_origin,
             "crossOrigin": false
         }));
-        assert!(verify_client_data(&rejected, "webauthn.get", challenge).is_err());
+        assert!(verify_client_data(&rejected, "webauthn.get", challenge, expected).is_err());
     }
 
     /// Invalid developer port configuration must surface as a protocol

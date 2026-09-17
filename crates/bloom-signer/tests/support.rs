@@ -27,6 +27,8 @@ pub struct VirtualAuthenticator {
     signing_key: SigningKey,
     credential_id: Base64UrlBytes,
     user_handle: Base64UrlBytes,
+    origin: String,
+    rp_id: String,
 }
 
 impl VirtualAuthenticator {
@@ -43,12 +45,21 @@ impl VirtualAuthenticator {
             signing_key: SigningKey::generate(),
             credential_id: Base64UrlBytes::from_bytes(&credential_id),
             user_handle: Base64UrlBytes::from_bytes(&user_handle),
+            origin: bloom_signer::webauthn::configured_ceremony_origin().expect("test origin"),
+            rp_id: "localhost".into(),
         }
     }
 
     pub fn generate_with_user_handle(user_handle: &[u8]) -> Self {
         let mut authenticator = Self::generate();
         authenticator.user_handle = Base64UrlBytes::from_bytes(user_handle);
+        authenticator
+    }
+
+    pub fn generate_for_surface(user_handle: &[u8], origin: &str, rp_id: &str) -> Self {
+        let mut authenticator = Self::generate_with_user_handle(user_handle);
+        authenticator.origin = origin.to_owned();
+        authenticator.rp_id = rp_id.to_owned();
         authenticator
     }
 
@@ -77,12 +88,13 @@ impl VirtualAuthenticator {
 
     pub fn credential(&self, sign_count: u32) -> WebAuthnCredential {
         WebAuthnCredential {
+            surface: bloom_signer_api::legacy_local_surface(),
             credential_id: self.credential_id.clone(),
             cose_public_key: Base64UrlBytes::from_bytes(
                 &self.cose_public_key().expect("generated key encodes"),
             ),
             user_handle: self.user_handle.clone(),
-            rp_id: Token::new("localhost").expect("static RP token"),
+            rp_id: Token::new(self.rp_id.clone()).expect("test RP token"),
             prf_salt: Base64UrlBytes::from_bytes(&Sha256::digest(
                 [
                     b"bloom-debug-driver-salt/v1".as_slice(),
@@ -95,8 +107,8 @@ impl VirtualAuthenticator {
     }
 
     pub fn assertion(&self, challenge: &[u8], sign_count: u32) -> WebAuthnAssertion {
-        let client_data = client_data("webauthn.get", challenge);
-        let authenticator_data = authenticator_data(0x05, sign_count);
+        let client_data = client_data("webauthn.get", challenge, &self.origin);
+        let authenticator_data = authenticator_data(0x05, sign_count, &self.rp_id);
         let mut message = authenticator_data.clone();
         message.extend_from_slice(&Sha256::digest(&client_data));
         let signature: p256::ecdsa::Signature = self.signing_key.sign(&message);
@@ -110,7 +122,7 @@ impl VirtualAuthenticator {
     }
 
     pub fn attestation(&self, challenge: &[u8]) -> WebAuthnAttestation {
-        let mut auth_data = authenticator_data(0x45, 0);
+        let mut auth_data = authenticator_data(0x45, 0, &self.rp_id);
         auth_data.extend_from_slice(&[0_u8; 16]);
         let credential_id = self.credential_id.decode();
         auth_data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
@@ -128,6 +140,7 @@ impl VirtualAuthenticator {
             client_data_json: Base64UrlBytes::from_bytes(&client_data(
                 "webauthn.create",
                 challenge,
+                &self.origin,
             )),
             attestation_object: Base64UrlBytes::from_bytes(&encoded),
             transports: vec![Token::new("internal").expect("static transport token")],
@@ -180,19 +193,18 @@ pub fn seal_hpke(
     })
 }
 
-fn client_data(kind: &str, challenge: &[u8]) -> Vec<u8> {
+fn client_data(kind: &str, challenge: &[u8], origin: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "type": kind,
         "challenge": Base64UrlBytes::from_bytes(challenge),
-        "origin": bloom_signer::webauthn::configured_ceremony_origin()
-            .expect("the test environment selects a valid ceremony origin"),
+        "origin": origin,
         "crossOrigin": false
     }))
     .expect("client data serializes")
 }
 
-fn authenticator_data(flags: u8, sign_count: u32) -> Vec<u8> {
-    let mut data = Sha256::digest(b"localhost").to_vec();
+fn authenticator_data(flags: u8, sign_count: u32, rp_id: &str) -> Vec<u8> {
+    let mut data = Sha256::digest(rp_id.as_bytes()).to_vec();
     data.push(flags);
     data.extend_from_slice(&sign_count.to_be_bytes());
     data
