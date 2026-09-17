@@ -1,4 +1,5 @@
 use bloom_signer_api::*;
+use ed25519_dalek::{Signer as _, SigningKey, Verifier as _};
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 use std::fmt::Debug;
@@ -112,6 +113,7 @@ fn capabilities() -> ServiceCapabilities {
 
 fn custody_prepare() -> CustodyPrepareRequest {
     CustodyPrepareRequest {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation(14),
         wallet_id: Some(token("wallet")),
@@ -169,12 +171,15 @@ fn policy_snapshot() -> SignedPolicySnapshot {
 
 fn custody_result() -> CustodyResult {
     CustodyResult {
+        surface: Some(bloom_signer_api::legacy_local_surface()),
+        credential_authority_generation: Some(DecimalU64::new(0)),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation(14),
         public_status: CeremonyState::Completed,
         wallet_id: Some(token("wallet")),
         public_key_refs: vec![key_ref()],
         credential_summaries: vec![CredentialSummary {
+            surface: Some(bloom_signer_api::legacy_local_surface()),
             credential_id: Base64UrlBytes::from_bytes(&[19]),
             rp_id: token("localhost"),
             active: true,
@@ -315,6 +320,15 @@ fn webauthn_assertion() -> WebAuthnAssertion {
     }
 }
 
+fn webauthn_attestation() -> WebAuthnAttestation {
+    WebAuthnAttestation {
+        credential_id: Base64UrlBytes::from_bytes(&[47]),
+        client_data_json: Base64UrlBytes::from_bytes(b"{}"),
+        attestation_object: Base64UrlBytes::from_bytes(&[48; 32]),
+        transports: vec![token("internal")],
+    }
+}
+
 fn custody_complete() -> CustodyCompleteRequest {
     CustodyCompleteRequest {
         ceremony_kind: CeremonyKind::WalletRegistration,
@@ -330,6 +344,8 @@ fn custody_complete() -> CustodyCompleteRequest {
 
 fn signer_contribution() -> SignerCeremonyContribution {
     SignerCeremonyContribution {
+        surface: bloom_signer_api::legacy_local_surface(),
+        credential_authority_generation: DecimalU64::new(0),
         ceremony_id: digest(46),
         signer_nonce: digest(51),
         approval_digest: digest(52),
@@ -348,6 +364,7 @@ fn signer_contribution() -> SignerCeremonyContribution {
 
 fn ceremony_challenge() -> CeremonyChallenge {
     CeremonyChallenge {
+        surface: bloom_signer_api::legacy_local_surface(),
         schema: token("bloom.ceremony-challenge/1"),
         ceremony_id: digest(46),
         ceremony_kind: CeremonyKind::SealedApproval,
@@ -375,6 +392,8 @@ fn prepared_approval() -> SignerPreparedApproval {
 
 fn custody_contribution() -> CustodySignerContribution {
     CustodySignerContribution {
+        surface: bloom_signer_api::legacy_local_surface(),
+        credential_authority_generation: DecimalU64::new(0),
         ceremony_id: digest(46),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation(14),
@@ -423,8 +442,83 @@ fn credential_public() -> CredentialPublic {
     CredentialPublic {
         credential_id: Base64UrlBytes::from_bytes(&[64]),
         wallet_id: token("wallet"),
+        surface: bloom_signer_api::legacy_local_surface(),
         created_at_ms: DecimalU64::new(10),
         state: CredentialState::Active,
+    }
+}
+
+fn remote_surface() -> SurfaceRef {
+    SurfaceIdentity::remote("abcdefghijklmnopqrstuv2345.relay.bloom.directory", 10)
+        .unwrap()
+        .reference()
+        .unwrap()
+}
+
+fn surface_status() -> SurfaceStatus {
+    let local = SurfaceIdentity::local(0);
+    let remote =
+        SurfaceIdentity::remote("abcdefghijklmnopqrstuv2345.relay.bloom.directory", 10).unwrap();
+    SurfaceStatus {
+        surfaces: vec![
+            SurfaceDescriptor {
+                identity_digest: local.reference().unwrap().identity_digest,
+                identity: local,
+                lifecycle: SurfaceLifecycle::Active,
+                lifecycle_revision: DecimalU64::new(0),
+            },
+            SurfaceDescriptor {
+                identity_digest: remote.reference().unwrap().identity_digest,
+                identity: remote,
+                lifecycle: SurfaceLifecycle::Disabled,
+                lifecycle_revision: DecimalU64::new(0),
+            },
+        ],
+        installation_id: Some("00000000-0000-4000-8000-000000000001".into()),
+        installation_admin_key_sha256: Some(digest(89)),
+        desired_mode: ExposureMode::RemoteEnabled,
+        desired_revision: DecimalU64::new(2),
+        effective_mode: ExposureMode::LocalhostOnly,
+        effective_revision: DecimalU64::new(1),
+        remote_tls_ready: false,
+        remote_routing_ready: false,
+    }
+}
+
+fn cross_pairing() -> CrossSurfacePairing {
+    CrossSurfacePairing {
+        pairing_id: digest(90),
+        destination_surface: remote_surface(),
+        operation_id: operation(91),
+        exact_terms_digest: digest(92),
+        destination_hpke_public_key: Base64UrlBytes::from_bytes(&[93; 32]),
+        destination_challenge: digest(94),
+        confirmation_code: "123456".into(),
+        expires_at_ms: DecimalU64::new(600_000),
+    }
+}
+
+fn cross_prepared() -> CrossSurfaceSourcePrepared {
+    let mut source_challenge = ceremony_challenge();
+    source_challenge.ceremony_kind = CeremonyKind::CredentialAdd;
+    source_challenge.operation_id = operation(91);
+    let mut destination_challenge = source_challenge.clone();
+    destination_challenge.surface = remote_surface();
+    destination_challenge.phase = CeremonyPhase::RegisterCredential;
+    CrossSurfaceSourcePrepared {
+        pairing: cross_pairing(),
+        source_surface: legacy_local_surface(),
+        wallet_id: token("wallet"),
+        source_challenge,
+        destination_challenges: vec![destination_challenge],
+        source_credentials: Vec::new(),
+        source_prf_inputs: Vec::new(),
+        destination_user_handle: Base64UrlBytes::from_bytes(&[95; 32]),
+        destination_prf_salt: Base64UrlBytes::from_bytes(&[96; 32]),
+        source_hpke_recipient_key: Base64UrlBytes::from_bytes(&[97; 32]),
+        destination_hpke_recipient_key: Base64UrlBytes::from_bytes(&[98; 32]),
+        credential_authority_generation: DecimalU64::new(0),
+        signer_signature: Base64UrlBytes::from_bytes(&[99; 64]),
     }
 }
 
@@ -441,6 +535,48 @@ fn signer_requests() -> Vec<BrokerSignerRequest> {
         BrokerSignerRequest::SystemHello(hello()),
         BrokerSignerRequest::SignerReadiness(Empty {}),
         BrokerSignerRequest::SignerCapabilities(Empty {}),
+        BrokerSignerRequest::SurfaceStatus(Empty {}),
+        BrokerSignerRequest::SurfaceReportEffective(SurfaceEffectiveReport {
+            desired_revision: DecimalU64::new(2),
+            remote_tls_ready: true,
+            remote_routing_ready: true,
+            remote_closed: false,
+        }),
+        BrokerSignerRequest::CrossSurfacePairStart(CrossSurfacePairStartRequest {
+            destination_surface: remote_surface(),
+            operation_id: operation(91),
+            exact_terms_digest: digest(92),
+            destination_hpke_public_key: Base64UrlBytes::from_bytes(&[93; 32]),
+        }),
+        BrokerSignerRequest::CrossSurfacePrepareSource(CrossSurfacePrepareSourceRequest {
+            pairing_id: digest(90),
+            operation_id: operation(91),
+            source_surface: legacy_local_surface(),
+            wallet_id: token("wallet"),
+            exact_terms_digest: digest(92),
+        }),
+        BrokerSignerRequest::CrossSurfaceCompleteSource(CrossSurfaceCompleteSourceRequest {
+            pairing_id: digest(90),
+            operation_id: operation(91),
+            authority_assertion: webauthn_assertion(),
+            encrypted_authority_prf: HpkeEnvelope {
+                kem_output: Base64UrlBytes::from_bytes(&[100; 32]),
+                ciphertext: Base64UrlBytes::from_bytes(&[101; 48]),
+            },
+        }),
+        BrokerSignerRequest::CrossSurfaceCompleteDestination(
+            CrossSurfaceCompleteDestinationRequest {
+                pairing_id: digest(90),
+                operation_id: operation(91),
+                capability: Base64UrlBytes::from_bytes(&[102; 32]),
+                attestation: webauthn_attestation(),
+                prf_assertion: webauthn_assertion(),
+                encrypted_new_prf: HpkeEnvelope {
+                    kem_output: Base64UrlBytes::from_bytes(&[103; 32]),
+                    ciphertext: Base64UrlBytes::from_bytes(&[104; 48]),
+                },
+            },
+        ),
         BrokerSignerRequest::KeyGetPublic(key.clone()),
         BrokerSignerRequest::KeyListPublic(wallet.clone()),
         BrokerSignerRequest::KeyDerivationCapabilities(key.clone()),
@@ -451,6 +587,7 @@ fn signer_requests() -> Vec<BrokerSignerRequest> {
         BrokerSignerRequest::KeyEnrollStatus(operation_request.clone()),
         BrokerSignerRequest::CeremonyPrepare(SignerCeremonyPrepareRequest::SealedApproval(
             Box::new(CeremonyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 activation_operation_id: operation(54),
                 terms: approval_terms(),
                 review_manifest_digest: digest(27),
@@ -526,6 +663,19 @@ fn signer_responses() -> Vec<BrokerSignerResponse> {
         BrokerSignerResponse::SystemHello(hello()),
         BrokerSignerResponse::SignerReadiness(readiness()),
         BrokerSignerResponse::SignerCapabilities(capabilities()),
+        BrokerSignerResponse::SurfaceStatus(surface_status()),
+        BrokerSignerResponse::SurfaceReportEffective(surface_status()),
+        BrokerSignerResponse::CrossSurfacePairStart(cross_pairing()),
+        BrokerSignerResponse::CrossSurfacePrepareSource(cross_prepared()),
+        BrokerSignerResponse::CrossSurfaceCompleteSource(CrossSurfaceHandoff {
+            pairing_id: digest(90),
+            encrypted_capability: HpkeEnvelope {
+                kem_output: Base64UrlBytes::from_bytes(&[105; 32]),
+                ciphertext: Base64UrlBytes::from_bytes(&[106; 48]),
+            },
+            expires_at_ms: DecimalU64::new(600_000),
+        }),
+        BrokerSignerResponse::CrossSurfaceCompleteDestination(custody_result()),
         BrokerSignerResponse::KeyGetPublic(key_public()),
         BrokerSignerResponse::KeyListPublic(vec![key_public()]),
         BrokerSignerResponse::KeyDerivationCapabilities(vec![token("bip32")]),
@@ -539,6 +689,8 @@ fn signer_responses() -> Vec<BrokerSignerResponse> {
         )),
         BrokerSignerResponse::CeremonyComplete(SignerCeremonyCompleteResponse::SealedApproval(
             Box::new(SignerActivationReceipt {
+                surface: Some(bloom_signer_api::legacy_local_surface()),
+                credential_authority_generation: Some(DecimalU64::new(0)),
                 activation_operation_id: operation(54),
                 ceremony_id: digest(46),
                 approval_id: digest(35),
@@ -629,22 +781,18 @@ where
 
 #[test]
 fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
-    // The signer-responses frame set covers both unreleased additions that met
-    // here: `DerivedAccountList` from the bip39 surface and
-    // `SignerCeremonyStatus::Terminal` from the durable terminal
-    // ceremony-status contract. Its digest is therefore neither side's frozen
-    // value. The response digest also records the authority-range floor of
-    // 1.5, the first complete BIP-39 contract. The signer-requests set gained
-    // no variant and its digest tracks only the advertised current minor.
+    // The v1.6 signer frame sets include exact surface status and the four
+    // cross-surface operations. These digests freeze every authority variant
+    // together with the strict v1.6 protocol range.
     assert_wire_digest(
         "signer requests",
         signer_requests(),
-        "1571f26a22d505ebf9024258712e835efebfd9d0114592749291d72254b83f06",
+        "a64eb396809eb2eb7896c57efa3956a2c096ef9c8bedd5d3d89f38aa646ae3fe",
     );
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "880cb46fca9952d9a4916894ea4449ada66f00bd66ef45f21fa0518922a31017",
+        "53c5ff1b20e8d720bb9e702b8c551949bcdbd6f0c4337c4a63865b239218b3c2",
     );
     assert_wire_digest(
         "control requests",
@@ -656,4 +804,85 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
         control_responses(),
         "4645f9050601fa8d966346c30a01c0f6dd44f3777dd9c7b56585c4ed453665b7",
     );
+}
+
+#[test]
+fn pre_surface_signed_receipts_keep_their_original_canonical_bytes() {
+    let signer = SigningKey::from_bytes(&[47; 32]);
+    let mut custody = custody_result();
+    custody.surface = None;
+    custody.credential_authority_generation = None;
+    for summary in &mut custody.credential_summaries {
+        summary.surface = None;
+    }
+    let mut historical = serde_json::to_value(&custody).unwrap();
+    historical
+        .as_object_mut()
+        .unwrap()
+        .remove("signer_signature");
+    let old_unsigned = serde_jcs::to_vec(&historical).unwrap();
+    assert_eq!(custody.unsigned_canonical_bytes().unwrap(), old_unsigned);
+    let signature = signer.sign(
+        &[
+            b"bloom-signer-ceremony-receipt/v1".as_slice(),
+            &old_unsigned,
+        ]
+        .concat(),
+    );
+    custody.signer_signature = Base64UrlBytes::from_bytes(&signature.to_bytes());
+    let restored: CustodyResult =
+        serde_json::from_value(serde_json::to_value(&custody).unwrap()).unwrap();
+    signer
+        .verifying_key()
+        .verify(
+            &[
+                b"bloom-signer-ceremony-receipt/v1".as_slice(),
+                &restored.unsigned_canonical_bytes().unwrap(),
+            ]
+            .concat(),
+            &signature,
+        )
+        .unwrap();
+    assert_eq!(restored.surface, None);
+
+    let mut activation = signer_responses()
+        .into_iter()
+        .find_map(|response| match response {
+            BrokerSignerResponse::CeremonyComplete(
+                SignerCeremonyCompleteResponse::SealedApproval(receipt),
+            ) => Some(*receipt),
+            _ => None,
+        })
+        .unwrap();
+    activation.surface = None;
+    activation.credential_authority_generation = None;
+    let mut historical = serde_json::to_value(&activation).unwrap();
+    historical
+        .as_object_mut()
+        .unwrap()
+        .remove("signer_signature");
+    let old_unsigned = serde_jcs::to_vec(&historical).unwrap();
+    assert_eq!(activation.unsigned_canonical_bytes().unwrap(), old_unsigned);
+    let signature = signer.sign(
+        &[
+            b"bloom-signer-ceremony-receipt/v1".as_slice(),
+            &old_unsigned,
+        ]
+        .concat(),
+    );
+    activation.signer_signature = Base64UrlBytes::from_bytes(&signature.to_bytes());
+    let restored: SignerActivationReceipt =
+        serde_json::from_value(serde_json::to_value(&activation).unwrap()).unwrap();
+    signer
+        .verifying_key()
+        .verify(
+            &[
+                b"bloom-signer-ceremony-receipt/v1".as_slice(),
+                &restored.unsigned_canonical_bytes().unwrap(),
+            ]
+            .concat(),
+            &signature,
+        )
+        .unwrap();
+    assert_eq!(restored.surface, None);
 }

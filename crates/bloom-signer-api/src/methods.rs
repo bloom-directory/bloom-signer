@@ -42,6 +42,12 @@ method_enum!(BrokerSignerMethod {
     SystemHello => "system.hello",
     SignerReadiness => "signer.readiness",
     SignerCapabilities => "signer.capabilities",
+    SurfaceStatus => "surface.status",
+    SurfaceReportEffective => "surface.report_effective",
+    CrossSurfacePairStart => "cross_surface.pair_start",
+    CrossSurfacePrepareSource => "cross_surface.prepare_source",
+    CrossSurfaceCompleteSource => "cross_surface.complete_source",
+    CrossSurfaceCompleteDestination => "cross_surface.complete_destination",
     KeyGetPublic => "key.get_public",
     KeyListPublic => "key.list_public",
     KeyDerivationCapabilities => "key.derivation_capabilities",
@@ -96,6 +102,7 @@ impl BrokerSignerMethod {
             Self::SystemHello
             | Self::SignerReadiness
             | Self::SignerCapabilities
+            | Self::SurfaceStatus
             | Self::KeyGetPublic
             | Self::KeyListPublic
             | Self::KeyDerivationCapabilities
@@ -113,6 +120,11 @@ impl BrokerSignerMethod {
             | Self::CustodyStatus => true,
 
             Self::KeyDerivePrepare
+            | Self::SurfaceReportEffective
+            | Self::CrossSurfacePairStart
+            | Self::CrossSurfacePrepareSource
+            | Self::CrossSurfaceCompleteSource
+            | Self::CrossSurfaceCompleteDestination
             | Self::KeyEnrollPrepare
             | Self::CeremonyPrepare
             | Self::CeremonyComplete

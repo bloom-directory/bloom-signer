@@ -477,6 +477,7 @@ impl LegacyPasskeyFile {
             legacy.attestation_format,
         );
         Ok(WebAuthnCredential {
+            surface: bloom_signer_api::legacy_local_surface(),
             credential_id: legacy.cred_id,
             cose_public_key: es256_cose_public_key(&x, &y)?,
             user_handle: Base64UrlBytes::from_bytes(&legacy_user_handle(wallet_name.as_str())),

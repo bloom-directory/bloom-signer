@@ -51,6 +51,9 @@ allow = [
   "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",
   "BSD-3-Clause",
+  # Maintained ureq/rustls trust-anchor data used by the pinned relay admin
+  # client. This is permissive data licensing, not executable ceremony code.
+  "CDLA-Permissive-2.0",
   # rust-bip39 and its rust-bitcoin hash/hex dependencies are dedicated to
   # the public domain under CC0. They implement the imported mnemonic codec.
   "CC0-1.0",
@@ -71,6 +74,9 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# The triad's shared runtime crates. The workspace pins each to an exact
-# revision; this allows the host they come from.
-allow-git = ["https://github.com/bloom-directory/bloom-service-runtime"]
+# Runtime transport and the hosted relay's protocol/admin client. Workspace
+# manifests pin exact revisions; these entries only allow their source hosts.
+allow-git = [
+  "https://github.com/bloom-directory/bloom-service-runtime",
+  "https://github.com/bloom-directory/bloom-relay",
+]

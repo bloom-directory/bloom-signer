@@ -101,6 +101,412 @@ fn digest(byte: &str) -> Digest32 {
     Digest32::new(byte.repeat(32)).unwrap()
 }
 
+fn cross_aad(prepared: &CrossSurfaceSourcePrepared, phase: &str) -> Vec<u8> {
+    CrossSurfaceHpkeAad {
+        pairing_id: prepared.pairing.pairing_id.clone(),
+        operation_id: prepared.pairing.operation_id.clone(),
+        wallet_id: prepared.wallet_id.clone(),
+        source_surface: prepared.source_surface.clone(),
+        destination_surface: prepared.pairing.destination_surface.clone(),
+        exact_terms_digest: prepared.pairing.exact_terms_digest.clone(),
+        destination_challenge: prepared.pairing.destination_challenge.clone(),
+        phase: Token::new(phase).unwrap(),
+    }
+    .canonical_bytes()
+    .unwrap()
+}
+
+#[test]
+fn cross_surface_add_requires_source_authority_and_destination_pair_key() {
+    let local = VirtualAuthenticator::generate();
+    let (service, _, _, _) = service(&local);
+    let (registered, _) = complete_new_wallet(
+        &service,
+        &local,
+        CeremonyKind::WalletRegistration,
+        operation("91"),
+        None,
+        None,
+        1_000,
+    );
+    let wallet_id = registered.wallet_id.unwrap();
+    let hostname = "abcdefghijklmnopqrstuv2345.relay.bloom.directory";
+    service
+        .install_remote_surface(hostname, "installation-1", digest("ab"), 2_000)
+        .unwrap();
+    let current = service.surface_status().unwrap();
+    service
+        .report_effective(SurfaceEffectiveReport {
+            desired_revision: current.desired_revision,
+            remote_tls_ready: true,
+            remote_routing_ready: true,
+            remote_closed: false,
+        })
+        .unwrap();
+    let remote = service
+        .surface_status()
+        .unwrap()
+        .surfaces
+        .into_iter()
+        .find(|surface| surface.identity.surface_id.as_str() == "remote")
+        .unwrap();
+    let destination_recipient = HpkeRecipient::generate();
+    let pair = service
+        .cross_surface_pair_start(
+            CrossSurfacePairStartRequest {
+                destination_surface: remote.reference(),
+                operation_id: operation("92"),
+                exact_terms_digest: digest("93"),
+                destination_hpke_public_key: destination_recipient.public_key().clone(),
+            },
+            2_100,
+        )
+        .unwrap();
+    let prepared = service
+        .cross_surface_prepare_source(
+            CrossSurfacePrepareSourceRequest {
+                pairing_id: pair.pairing_id.clone(),
+                operation_id: pair.operation_id.clone(),
+                source_surface: legacy_local_surface(),
+                wallet_id: wallet_id.clone(),
+                exact_terms_digest: digest("93"),
+            },
+            2_200,
+        )
+        .unwrap();
+    assert_eq!(prepared.pairing.confirmation_code.len(), 6);
+    let destination = VirtualAuthenticator::generate_for_surface(
+        &prepared.destination_user_handle.decode(),
+        &remote.identity.origin,
+        remote.identity.rp_id.as_str(),
+    );
+    let source_envelope = seal_hpke(
+        &prepared.source_hpke_recipient_key,
+        b"bloom-cross-surface-source-prf/v1",
+        &cross_aad(&prepared, "source_prf"),
+        &local.deterministic_prf(),
+    )
+    .unwrap();
+    let source_completion = CrossSurfaceCompleteSourceRequest {
+        pairing_id: pair.pairing_id.clone(),
+        operation_id: pair.operation_id.clone(),
+        authority_assertion: local
+            .assertion(&prepared.source_challenge.canonical_bytes().unwrap(), 2),
+        encrypted_authority_prf: source_envelope,
+    };
+    let handoff = service
+        .cross_surface_complete_source(source_completion.clone(), 2_300)
+        .unwrap();
+    assert_eq!(
+        service
+            .cross_surface_complete_source(source_completion.clone(), 2_301)
+            .unwrap(),
+        handoff
+    );
+    let mut altered_retry = source_completion;
+    altered_retry.encrypted_authority_prf.ciphertext = Base64UrlBytes::from_bytes(&[1]);
+    assert_eq!(
+        service
+            .cross_surface_complete_source(altered_retry, 2_302)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::OperationIdConflict
+    );
+    let capability = destination_recipient
+        .open(
+            &handoff.encrypted_capability,
+            b"bloom-cross-surface-handoff/v1",
+            &cross_aad(&prepared, "handoff"),
+        )
+        .unwrap();
+    let destination_envelope = seal_hpke(
+        &prepared.destination_hpke_recipient_key,
+        b"bloom-cross-surface-destination-prf/v1",
+        &cross_aad(&prepared, "destination_prf"),
+        &destination.deterministic_prf(),
+    )
+    .unwrap();
+    let mut completion = CrossSurfaceCompleteDestinationRequest {
+        pairing_id: pair.pairing_id.clone(),
+        operation_id: pair.operation_id.clone(),
+        capability: Base64UrlBytes::from_bytes(&[0; 32]),
+        attestation: destination.attestation(
+            &prepared.destination_challenges[0]
+                .canonical_bytes()
+                .unwrap(),
+        ),
+        prf_assertion: destination.assertion(
+            &prepared.destination_challenges[1]
+                .canonical_bytes()
+                .unwrap(),
+            1,
+        ),
+        encrypted_new_prf: destination_envelope,
+    };
+    assert_eq!(
+        service
+            .cross_surface_complete_destination(completion.clone(), 2_400)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::UnauthenticatedPeer
+    );
+    completion.capability = Base64UrlBytes::from_bytes(capability.expose_to_backend());
+    let result = service
+        .cross_surface_complete_destination(completion.clone(), 2_500)
+        .unwrap();
+    assert_eq!(result.public_status, CeremonyState::Succeeded);
+    assert!(
+        result
+            .credential_summaries
+            .iter()
+            .any(|summary| summary.surface.as_ref() == Some(&remote.reference()))
+    );
+    assert!(
+        result
+            .credential_summaries
+            .iter()
+            .any(|summary| summary.surface.as_ref() == Some(&legacy_local_surface()))
+    );
+    assert_eq!(
+        service
+            .cross_surface_complete_destination(completion, 2_600)
+            .unwrap(),
+        result
+    );
+
+    // The same authority ordering works from a phone's remote credential to
+    // a host's localhost credential, without asking the host to prove remote
+    // origin possession or handing PRF material to Broker.
+    let host_recipient = HpkeRecipient::generate();
+    let reverse_pair = service
+        .cross_surface_pair_start(
+            CrossSurfacePairStartRequest {
+                destination_surface: legacy_local_surface(),
+                operation_id: operation("94"),
+                exact_terms_digest: digest("95"),
+                destination_hpke_public_key: host_recipient.public_key().clone(),
+            },
+            3_000,
+        )
+        .unwrap();
+    let reverse = service
+        .cross_surface_prepare_source(
+            CrossSurfacePrepareSourceRequest {
+                pairing_id: reverse_pair.pairing_id.clone(),
+                source_surface: remote.reference(),
+                operation_id: reverse_pair.operation_id.clone(),
+                wallet_id,
+                exact_terms_digest: digest("95"),
+            },
+            3_100,
+        )
+        .unwrap();
+    let new_local =
+        VirtualAuthenticator::generate_with_user_handle(&reverse.destination_user_handle.decode());
+    let source_envelope = seal_hpke(
+        &reverse.source_hpke_recipient_key,
+        b"bloom-cross-surface-source-prf/v1",
+        &cross_aad(&reverse, "source_prf"),
+        &destination.deterministic_prf(),
+    )
+    .unwrap();
+    let reverse_handoff = service
+        .cross_surface_complete_source(
+            CrossSurfaceCompleteSourceRequest {
+                pairing_id: reverse_pair.pairing_id.clone(),
+                operation_id: reverse_pair.operation_id.clone(),
+                authority_assertion: destination
+                    .assertion(&reverse.source_challenge.canonical_bytes().unwrap(), 2),
+                encrypted_authority_prf: source_envelope,
+            },
+            3_200,
+        )
+        .unwrap();
+    let reverse_capability = host_recipient
+        .open(
+            &reverse_handoff.encrypted_capability,
+            b"bloom-cross-surface-handoff/v1",
+            &cross_aad(&reverse, "handoff"),
+        )
+        .unwrap();
+    let destination_envelope = seal_hpke(
+        &reverse.destination_hpke_recipient_key,
+        b"bloom-cross-surface-destination-prf/v1",
+        &cross_aad(&reverse, "destination_prf"),
+        &new_local.deterministic_prf(),
+    )
+    .unwrap();
+    let reverse_result = service
+        .cross_surface_complete_destination(
+            CrossSurfaceCompleteDestinationRequest {
+                pairing_id: reverse_pair.pairing_id,
+                operation_id: reverse_pair.operation_id,
+                capability: Base64UrlBytes::from_bytes(reverse_capability.expose_to_backend()),
+                attestation: new_local
+                    .attestation(&reverse.destination_challenges[0].canonical_bytes().unwrap()),
+                prf_assertion: new_local.assertion(
+                    &reverse.destination_challenges[1].canonical_bytes().unwrap(),
+                    1,
+                ),
+                encrypted_new_prf: destination_envelope,
+            },
+            3_300,
+        )
+        .unwrap();
+    assert_eq!(reverse_result.credential_summaries.len(), 3);
+
+    let pending_recipient = HpkeRecipient::generate();
+    let pending_pair = service
+        .cross_surface_pair_start(
+            CrossSurfacePairStartRequest {
+                destination_surface: remote.reference(),
+                operation_id: operation("96"),
+                exact_terms_digest: digest("97"),
+                destination_hpke_public_key: pending_recipient.public_key().clone(),
+            },
+            4_000,
+        )
+        .unwrap();
+    let pending = service
+        .cross_surface_prepare_source(
+            CrossSurfacePrepareSourceRequest {
+                pairing_id: pending_pair.pairing_id.clone(),
+                operation_id: pending_pair.operation_id.clone(),
+                source_surface: legacy_local_surface(),
+                wallet_id: reverse_result.wallet_id.unwrap(),
+                exact_terms_digest: digest("97"),
+            },
+            4_100,
+        )
+        .unwrap();
+    let input = seal_hpke(
+        &pending.source_hpke_recipient_key,
+        b"bloom-cross-surface-source-prf/v1",
+        &cross_aad(&pending, "source_prf"),
+        &local.deterministic_prf(),
+    )
+    .unwrap();
+    let pending_handoff = service
+        .cross_surface_complete_source(
+            CrossSurfaceCompleteSourceRequest {
+                pairing_id: pending_pair.pairing_id.clone(),
+                operation_id: pending_pair.operation_id.clone(),
+                authority_assertion: local
+                    .assertion(&pending.source_challenge.canonical_bytes().unwrap(), 3),
+                encrypted_authority_prf: input,
+            },
+            4_200,
+        )
+        .unwrap();
+    let pending_capability = pending_recipient
+        .open(
+            &pending_handoff.encrypted_capability,
+            b"bloom-cross-surface-handoff/v1",
+            &cross_aad(&pending, "handoff"),
+        )
+        .unwrap();
+    let current = service.surface_status().unwrap();
+    let down = service
+        .report_effective(SurfaceEffectiveReport {
+            desired_revision: current.desired_revision.clone(),
+            remote_tls_ready: false,
+            remote_routing_ready: false,
+            remote_closed: true,
+        })
+        .unwrap();
+    assert_eq!(down.effective_mode, ExposureMode::LocalhostOnly);
+    let pending_destination = VirtualAuthenticator::generate_for_surface(
+        &pending.destination_user_handle.decode(),
+        &remote.identity.origin,
+        remote.identity.rp_id.as_str(),
+    );
+    let destination_input = seal_hpke(
+        &pending.destination_hpke_recipient_key,
+        b"bloom-cross-surface-destination-prf/v1",
+        &cross_aad(&pending, "destination_prf"),
+        &pending_destination.deterministic_prf(),
+    )
+    .unwrap();
+    let completion = CrossSurfaceCompleteDestinationRequest {
+        pairing_id: pending_pair.pairing_id.clone(),
+        operation_id: pending_pair.operation_id,
+        capability: Base64UrlBytes::from_bytes(pending_capability.expose_to_backend()),
+        attestation: pending_destination
+            .attestation(&pending.destination_challenges[0].canonical_bytes().unwrap()),
+        prf_assertion: pending_destination.assertion(
+            &pending.destination_challenges[1].canonical_bytes().unwrap(),
+            1,
+        ),
+        encrypted_new_prf: destination_input,
+    };
+    assert!(
+        service
+            .cross_surface_complete_destination(completion.clone(), 4_300)
+            .is_err()
+    );
+    service
+        .report_effective(SurfaceEffectiveReport {
+            desired_revision: current.desired_revision,
+            remote_tls_ready: true,
+            remote_routing_ready: true,
+            remote_closed: false,
+        })
+        .unwrap();
+    assert_eq!(
+        service
+            .cross_surface_complete_destination(completion, 4_400)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyReplay
+    );
+}
+
+#[test]
+fn signer_restart_fences_stale_remote_readiness_until_broker_reconciles() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, engine, _) = service(&authenticator);
+    service
+        .install_remote_surface(
+            "abcdefghijklmnopqrstuv2345.relay.bloom.directory",
+            "installation-1",
+            digest("ab"),
+            2_000,
+        )
+        .unwrap();
+    let status = service.surface_status().unwrap();
+    service
+        .report_effective(SurfaceEffectiveReport {
+            desired_revision: status.desired_revision,
+            remote_tls_ready: true,
+            remote_routing_ready: true,
+            remote_closed: false,
+        })
+        .unwrap();
+    assert_eq!(
+        service.surface_status().unwrap().effective_mode,
+        ExposureMode::RemoteEnabled
+    );
+    drop(service);
+
+    let restarted = SignerCeremonyService::new(
+        engine,
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    let fenced = restarted.surface_status().unwrap();
+    assert_eq!(fenced.desired_mode, ExposureMode::RemoteEnabled);
+    assert_eq!(fenced.effective_mode, ExposureMode::LocalhostOnly);
+    assert!(!fenced.remote_tls_ready && !fenced.remote_routing_ready);
+    assert!(
+        fenced
+            .surfaces
+            .iter()
+            .any(|surface| surface.identity.surface_id.as_str() == "remote"
+                && surface.lifecycle == SurfaceLifecycle::Disabled)
+    );
+}
+
 fn operation(byte: &str) -> OperationId {
     OperationId::new(byte.repeat(32)).unwrap()
 }
@@ -229,6 +635,7 @@ fn try_complete_local_approval(
     };
     let prepared = service.prepare_approval(
         CeremonyPrepareRequest {
+            surface: bloom_signer_api::legacy_local_surface(),
             activation_operation_id: activation_operation_id.clone(),
             terms: terms.clone(),
             review_manifest_digest: review_manifest_digest.clone(),
@@ -243,6 +650,7 @@ fn try_complete_local_approval(
         sign_count,
     );
     let aad = LocalPrfHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         signer_nonce: prepared.contribution.signer_nonce.clone(),
         approval_id: terms.approval_id().unwrap(),
@@ -286,6 +694,7 @@ fn register_wallet(
 ) -> (Token, WebAuthnCredential) {
     let wallet_id = Token::new(format!("wallet-{}", &operation_id.as_str()[..12])).unwrap();
     let prepare = CustodyPrepareRequest {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation_id.clone(),
         wallet_id: Some(wallet_id.clone()),
@@ -304,6 +713,7 @@ fn register_wallet(
     let prf_assertion =
         authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation_id.clone(),
@@ -366,6 +776,7 @@ fn complete_new_wallet(
     let mut prepared = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: kind,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(wallet_id.clone()),
@@ -405,6 +816,7 @@ fn complete_new_wallet(
         authenticator.deterministic_prf().to_vec()
     };
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: kind,
         custody_operation_id: operation_id.clone(),
@@ -457,6 +869,7 @@ fn complete_generic(
         Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&effect).unwrap()).into());
     let mut prepared = service.prepare_custody(
         CustodyPrepareRequest {
+            surface: bloom_signer_api::legacy_local_surface(),
             ceremony_kind: kind,
             custody_operation_id: operation_id.clone(),
             wallet_id: Some(wallet_id.clone()),
@@ -481,6 +894,7 @@ fn complete_generic(
     let assertion =
         authenticator.assertion(&prepared.challenges[0].canonical_bytes()?, now_ms as u32);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: kind,
         custody_operation_id: operation_id.clone(),
@@ -536,6 +950,7 @@ fn complete_credential_change(
     let prepared = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: kind,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(wallet_id.clone()),
@@ -560,6 +975,7 @@ fn complete_credential_change(
     let new_credential_prf_assertion =
         replacement.assertion(&prepared.challenges[2].canonical_bytes().unwrap(), 1);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: kind,
         custody_operation_id: operation_id.clone(),
@@ -626,6 +1042,7 @@ fn complete_petal_key_derivation(
     let scope_digest = scope.request_digest()?;
     let prepared = service.prepare_custody(
         CustodyPrepareRequest {
+            surface: bloom_signer_api::legacy_local_surface(),
             ceremony_kind: CeremonyKind::KeyDerive,
             custody_operation_id: scope.custody_operation_id.clone(),
             wallet_id: Some(scope.wallet_id.clone()),
@@ -644,6 +1061,7 @@ fn complete_petal_key_derivation(
     let assertion =
         authenticator.assertion(&prepared.challenges[0].canonical_bytes()?, now_ms as u32);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::KeyDerive,
         custody_operation_id: scope.custody_operation_id.clone(),
@@ -701,6 +1119,7 @@ fn complete_policy_update(
     );
     let request = PolicyUpdateCeremonyPrepareRequest {
         custody: CustodyPrepareRequest {
+            surface: bloom_signer_api::legacy_local_surface(),
             ceremony_kind: CeremonyKind::PolicyUpdate,
             custody_operation_id: update.operation_id.clone(),
             wallet_id: Some(wallet_id.clone()),
@@ -733,6 +1152,7 @@ fn complete_policy_update(
     let assertion =
         authenticator.assertion(&prepared.challenges[0].canonical_bytes()?, now_ms as u32);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::PolicyUpdate,
         custody_operation_id: request.update.operation_id.clone(),
@@ -830,6 +1250,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         service
             .prepare_custody(
                 CustodyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
                     ceremony_kind: CeremonyKind::KeyDerive,
                     custody_operation_id: cross_wallet.custody_operation_id.clone(),
                     wallet_id: Some(cross_wallet.wallet_id.clone()),
@@ -976,6 +1397,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         restarted_service
             .prepare_approval(
                 CeremonyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
                     activation_operation_id: operation("ba"),
                     terms: cli.clone(),
                     review_manifest_digest: digest("bb"),
@@ -1393,6 +1815,7 @@ fn approval_completion_verifies_raw_proof_decrypts_prf_and_is_idempotent() {
     let mut terms = terms(registration.public_key_refs[0].clone());
     terms.wallet_id = registration.wallet_id.unwrap();
     let prepare_request = CeremonyPrepareRequest {
+        surface: bloom_signer_api::legacy_local_surface(),
         activation_operation_id: operation("10"),
         terms: terms.clone(),
         review_manifest_digest: digest("77"),
@@ -1407,6 +1830,7 @@ fn approval_completion_verifies_raw_proof_decrypts_prf_and_is_idempotent() {
     );
     let assertion = authenticator.assertion(&prepared.challenges[0].canonical_bytes().unwrap(), 2);
     let aad = LocalPrfHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         signer_nonce: prepared.contribution.signer_nonce.clone(),
         approval_id: terms.approval_id().unwrap(),
@@ -1477,6 +1901,7 @@ fn approval_browser_lifetime_is_capped_by_the_authority_expiry() {
     let prepared = service
         .prepare_approval(
             CeremonyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 activation_operation_id: operation_id.clone(),
                 terms,
                 review_manifest_digest: digest("78"),
@@ -1616,6 +2041,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, _, engine, registry) = service(&authenticator);
     let prepare = CustodyPrepareRequest {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation("20"),
         wallet_id: Some(Token::new("quiet-lilac").unwrap()),
@@ -1633,6 +2059,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
     let prf_assertion =
         authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation("20"),
@@ -1680,6 +2107,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
     );
 
     let retry = CustodyPrepareRequest {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation("21"),
         wallet_id: Some(Token::new("quiet-lilac").unwrap()),
@@ -1697,6 +2125,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
     let prf_assertion =
         authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation("21"),
@@ -1813,6 +2242,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
     let unlock_prepare = restarted
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletDelete,
                 custody_operation_id: operation("22"),
                 wallet_id: Some(registered_wallet_id.clone()),
@@ -1835,6 +2265,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
     let add = restarted
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::CredentialAdd,
                 custody_operation_id: operation("23"),
                 wallet_id: Some(registered_wallet_id.clone()),
@@ -1855,6 +2286,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
     let new_attestation = second.attestation(&add.challenges[1].canonical_bytes().unwrap());
     let new_prf_assertion = second.assertion(&add.challenges[2].canonical_bytes().unwrap(), 1);
     let add_aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: add.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::CredentialAdd,
         custody_operation_id: operation("23"),
@@ -1899,6 +2331,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
     let after_add = restarted
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletDelete,
                 custody_operation_id: operation("24"),
                 wallet_id: Some(registered_wallet_id),
@@ -1937,6 +2370,7 @@ fn registration_requires_and_reserves_the_requested_wallet_id() {
     let unnamed = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletRegistration,
                 custody_operation_id: operation("c3"),
                 wallet_id: None,
@@ -1957,6 +2391,7 @@ fn registration_requires_and_reserves_the_requested_wallet_id() {
     let duplicate = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletRegistration,
                 custody_operation_id: operation("c4"),
                 wallet_id: Some(wallet_id),
@@ -2045,6 +2480,7 @@ fn legacy_passkey_import_converts_existing_credential_into_current_custody() {
     let store = Arc::new(LegacyMigrationStore::open(&migration_root, metadata.uid()).unwrap());
     let service = service.with_legacy_migrations(store.clone());
     let request = CustodyPrepareRequest {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_kind: CeremonyKind::WalletImport,
         custody_operation_id: receipt.operation_id.clone(),
         wallet_id: None,
@@ -2083,6 +2519,7 @@ fn legacy_passkey_import_converts_existing_credential_into_current_custody() {
     }))
     .unwrap();
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletImport,
         custody_operation_id: receipt.operation_id.clone(),
@@ -2166,6 +2603,7 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
     .unwrap();
 
     let output_aad = CustodyOutputHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: registration_operation,
@@ -2185,9 +2623,10 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
         serde_json::from_slice(recovery_plaintext.expose_to_backend()).unwrap();
 
     let recovery_operation = operation("a9");
-    let recovery_prepared = service
+    service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletRecovery,
                 custody_operation_id: recovery_operation.clone(),
                 wallet_id: Some(wallet_id.clone()),
@@ -2203,6 +2642,34 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
             6_000,
         )
         .unwrap();
+    let recovery_result_recipient = HpkeRecipient::generate();
+    let recovery_prepared = service
+        .bind_custody_output_recipient(
+            &recovery_operation,
+            recovery_result_recipient.public_key().clone(),
+            6_001,
+        )
+        .unwrap();
+    let stale_operation = operation("af");
+    let stale_recovery = service
+        .prepare_custody(
+            CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
+                ceremony_kind: CeremonyKind::WalletRecovery,
+                custody_operation_id: stale_operation.clone(),
+                wallet_id: Some(wallet_id.clone()),
+                key_ref: None,
+                exact_terms_digest: digest("d3"),
+                expected_input_class: Token::new("recovery-factor-v1").unwrap(),
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration: None,
+                derivation_requests: Vec::new(),
+                wallet_seed_profile: None,
+            },
+            6_002,
+        )
+        .unwrap();
     let attestation =
         replacement.attestation(&recovery_prepared.challenges[0].canonical_bytes().unwrap());
     let prf_assertion = replacement.assertion(
@@ -2216,6 +2683,7 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
     }))
     .unwrap();
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: recovery_prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletRecovery,
         custody_operation_id: recovery_operation.clone(),
@@ -2235,12 +2703,12 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
         &recovery_input,
     )
     .unwrap();
-    service
+    let recovery_result = service
         .complete_custody(
             CustodyCompleteRequest {
                 ceremony_kind: CeremonyKind::WalletRecovery,
-                custody_operation_id: recovery_operation,
-                ceremony_id: recovery_prepared.contribution.ceremony_id,
+                custody_operation_id: recovery_operation.clone(),
+                ceremony_id: recovery_prepared.contribution.ceremony_id.clone(),
                 proof: WebAuthnCeremonyProof::RecoveryCredentialChange {
                     new_credential_attestation: attestation,
                     new_credential_prf_assertion: Some(prf_assertion),
@@ -2251,6 +2719,72 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
             6_100,
         )
         .unwrap();
+    assert_eq!(
+        recovery_result
+            .credential_authority_generation
+            .unwrap()
+            .get(),
+        1
+    );
+    assert_eq!(recovery_result.credential_summaries.len(), 1);
+    assert_eq!(
+        service
+            .complete_custody(
+                CustodyCompleteRequest {
+                    ceremony_kind: CeremonyKind::WalletRecovery,
+                    custody_operation_id: stale_operation,
+                    ceremony_id: stale_recovery.contribution.ceremony_id,
+                    proof: WebAuthnCeremonyProof::RecoveryCredentialChange {
+                        new_credential_attestation: replacement
+                            .attestation(&stale_recovery.challenges[0].canonical_bytes().unwrap()),
+                        new_credential_prf_assertion: None,
+                    },
+                    encrypted_input: None,
+                    public_binding_digest: digest("d3"),
+                },
+                6_102
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyKindMismatch
+    );
+
+    assert!(matches!(
+        service
+            .status_at(&recovery_operation, 6_100 + 15 * 60_000)
+            .unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::CompletedCustody(_)
+    ));
+    assert!(matches!(
+        service
+            .status_at(&recovery_operation, 6_101 + 15 * 60_000)
+            .unwrap(),
+        bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Succeeded)
+    ));
+    assert!(
+        service
+            .credential(&wallet_id, &authenticator.credential(0).credential_id)
+            .is_err()
+    );
+    let rotated_factor = recovery_result_recipient
+        .open(
+            recovery_result.encrypted_browser_result.as_ref().unwrap(),
+            CUSTODY_OUTPUT_INFO,
+            &CustodyOutputHpkeAad {
+                surface: bloom_signer_api::legacy_local_surface(),
+                ceremony_id: recovery_prepared.contribution.ceremony_id.clone(),
+                ceremony_kind: CeremonyKind::WalletRecovery,
+                custody_operation_id: recovery_operation.clone(),
+                signer_contribution_digest: recovery_prepared.contribution.digest().unwrap(),
+                public_binding_digest: digest("d2"),
+            }
+            .canonical_bytes()
+            .unwrap(),
+        )
+        .unwrap();
+    let rotated: serde_json::Value =
+        serde_json::from_slice(rotated_factor.expose_to_backend()).unwrap();
+    assert_ne!(rotated["recovery_id"], recovery["recovery_id"]);
     assert!(
         service
             .credential(&wallet_id, &replacement.credential(0).credential_id)
@@ -2277,6 +2811,7 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
     let forged_registration = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletRegistration,
                 custody_operation_id: operation("ad"),
                 wallet_id: Some(Token::new("forged-wallet").unwrap()),
@@ -2293,6 +2828,70 @@ fn registration_returns_signed_public_projection_and_enables_one_time_recovery()
         )
         .unwrap_err();
     assert_eq!(forged_registration.code, ProtocolErrorCode::KeyrefMismatch);
+    let recovery_probe = |wallet_id: Token, operation_id: OperationId| {
+        service
+            .prepare_custody(
+                CustodyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
+                    ceremony_kind: CeremonyKind::WalletRecovery,
+                    custody_operation_id: operation_id,
+                    wallet_id: Some(wallet_id),
+                    key_ref: None,
+                    exact_terms_digest: digest("d4"),
+                    expected_input_class: Token::new("recovery-factor-v1").unwrap(),
+                    browser_output_recipient_key: None,
+                    petal_key_scope: None,
+                    legacy_passkey_migration: None,
+                    derivation_requests: Vec::new(),
+                    wallet_seed_profile: None,
+                },
+                6_200,
+            )
+            .unwrap()
+    };
+    let known = recovery_probe(wallet_id.clone(), operation("b7"));
+    let unknown = recovery_probe(Token::new("nonexistent-wallet").unwrap(), operation("b8"));
+    for prepared in [&known, &unknown] {
+        assert!(prepared.webauthn_options.allowed_credentials.is_empty());
+        assert!(prepared.verification_credentials.is_empty());
+        assert_eq!(
+            prepared.contribution.credential_authority_generation.get(),
+            0
+        );
+        assert_eq!(
+            prepared
+                .webauthn_options
+                .registration_user_handle
+                .as_ref()
+                .unwrap()
+                .decode()
+                .len(),
+            32
+        );
+        assert_eq!(
+            prepared
+                .webauthn_options
+                .registration_prf_salt
+                .as_ref()
+                .unwrap()
+                .decode()
+                .len(),
+            32
+        );
+    }
+    assert_ne!(
+        known.webauthn_options.registration_user_handle,
+        Some(replacement.credential(0).user_handle.clone())
+    );
+    let browser = HpkeRecipient::generate();
+    for operation_id in [operation("b7"), operation("b8")] {
+        let bound = service
+            .bind_custody_output_recipient(&operation_id, browser.public_key().clone(), 6_201)
+            .unwrap();
+        assert!(bound.webauthn_options.allowed_credentials.is_empty());
+        assert!(bound.verification_credentials.is_empty());
+        assert_eq!(bound.contribution.credential_authority_generation.get(), 0);
+    }
 }
 
 #[test]
@@ -2450,6 +3049,7 @@ fn credential_replace_remove_and_backend_enrollment_do_not_spend_approval_capaci
     let remove_prepared = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::CredentialRemove,
                 custody_operation_id: remove_operation.clone(),
                 wallet_id: Some(wallet_id.clone()),
@@ -2536,6 +3136,7 @@ fn generic_custody_export_policy_and_delete_apply_exact_typed_effects() {
     )
     .unwrap();
     let output_aad = CustodyOutputHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: export_contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletExport,
         custody_operation_id: operation("b1"),
@@ -2736,6 +3337,7 @@ fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
     let prepared = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::KeyDerive,
                 custody_operation_id: scope.custody_operation_id.clone(),
                 wallet_id: Some(scope.wallet_id.clone()),
@@ -2900,6 +3502,7 @@ fn bip39_registration_prepare(
     service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletRegistration,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(wallet_id.clone()),
@@ -2940,6 +3543,7 @@ fn try_complete_bip39_registration(
     let prf_assertion =
         authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation_id.clone(),
@@ -2986,6 +3590,7 @@ fn complete_bip39_mnemonic_import(
     let prepared = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletImport,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(wallet_id.clone()),
@@ -3010,6 +3615,7 @@ fn complete_bip39_mnemonic_import(
     }))
     .unwrap();
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletImport,
         custody_operation_id: operation_id.clone(),
@@ -3059,6 +3665,7 @@ fn attempt_bip39_mnemonic_import(
     let prepared = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletImport,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(wallet_id.clone()),
@@ -3086,6 +3693,7 @@ fn attempt_bip39_mnemonic_import(
     }
     let plaintext = serde_jcs::to_vec(&input).unwrap();
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletImport,
         custody_operation_id: operation_id.clone(),
@@ -3135,6 +3743,7 @@ fn complete_account_allocate(
     let prepared = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::AccountAllocate,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(wallet_id.clone()),
@@ -3155,6 +3764,7 @@ fn complete_account_allocate(
         now_ms as u32,
     );
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::AccountAllocate,
         custody_operation_id: operation_id.clone(),
@@ -3206,6 +3816,7 @@ fn account_allocate_prepare(
         Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&effect).unwrap()).into());
     (
         CustodyPrepareRequest {
+            surface: bloom_signer_api::legacy_local_surface(),
             ceremony_kind: CeremonyKind::AccountAllocate,
             custody_operation_id: operation_id.clone(),
             wallet_id: Some(wallet_id.clone()),
@@ -3242,6 +3853,7 @@ fn try_complete_account_allocate_many(
         now_ms as u32,
     );
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::AccountAllocate,
         custody_operation_id: operation_id.clone(),
@@ -3295,6 +3907,7 @@ fn complete_account_allocate_many(
         now_ms as u32,
     );
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::AccountAllocate,
         custody_operation_id: operation_id.clone(),
@@ -3752,6 +4365,7 @@ fn complete_account_retire(
     let prepared = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::AccountRetire,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(wallet_id.clone()),
@@ -3772,6 +4386,7 @@ fn complete_account_retire(
         now_ms as u32,
     );
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::AccountRetire,
         custody_operation_id: operation_id.clone(),
@@ -4079,6 +4694,7 @@ fn bip39_mnemonic_export_seals_words_and_frozen_import_reproduces_vectors() {
     service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletExport,
                 custody_operation_id: operation("e0"),
                 wallet_id: Some(frozen_wallet.clone()),
@@ -4100,6 +4716,7 @@ fn bip39_mnemonic_export_seals_words_and_frozen_import_reproduces_vectors() {
     let assertion =
         authenticator.assertion(&prepared.challenges[0].canonical_bytes().unwrap(), 10_100);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletExport,
         custody_operation_id: operation("e0"),
@@ -4159,6 +4776,7 @@ fn bip39_import_accepts_12_to_24_words_and_records_the_entropy_bits() {
     let prepared = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletImport,
                 custody_operation_id: operation("c0"),
                 wallet_id: Some(Token::new("bad-import").unwrap()),
@@ -4183,6 +4801,7 @@ fn bip39_import_accepts_12_to_24_words_and_records_the_entropy_bits() {
     }))
     .unwrap();
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletImport,
         custody_operation_id: operation("c0"),
@@ -4412,6 +5031,7 @@ fn an_approval_ceremony_is_bounded_by_its_terms_not_by_the_ceremony_ttl() {
     let prepared = service
         .prepare_approval(
             CeremonyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 activation_operation_id: operation("10"),
                 terms: terms.clone(),
                 review_manifest_digest: digest("77"),
@@ -4436,6 +5056,7 @@ fn prepared_wallet_registration(
     now_ms: u64,
 ) -> PreparedCustodyCeremony {
     let prepare = CustodyPrepareRequest {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_kind: CeremonyKind::WalletRegistration,
         custody_operation_id: operation("2e"),
         wallet_id: Some(Token::new("ttl-gates").unwrap()),
@@ -4498,6 +5119,7 @@ fn a_longer_window_extends_an_approval_ceremony_only_to_its_terms() {
     let prepared = service
         .prepare_approval(
             CeremonyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 activation_operation_id: operation("11"),
                 terms: long_terms,
                 review_manifest_digest: digest("77"),
@@ -5031,6 +5653,7 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
         service
             .prepare_approval(
                 CeremonyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
                     activation_operation_id: operation("c4"),
                     terms: terms(reusable(), "d9", 40_000, 50_000),
                     review_manifest_digest: digest("c5"),
@@ -5047,6 +5670,7 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
     let prepared = service
         .prepare_approval(
             CeremonyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 activation_operation_id: operation("c5"),
                 terms: terms(exact("e6"), "da", 40_000, 50_000),
                 review_manifest_digest: digest("c5"),

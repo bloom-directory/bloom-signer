@@ -7,6 +7,7 @@
 mod approval;
 mod ceremony;
 mod codec;
+mod cross_surface;
 mod crypto;
 mod error;
 mod methods;
@@ -15,12 +16,14 @@ mod policy;
 mod revocation;
 mod service;
 mod signing;
+mod surface;
 mod wallet_seed;
 mod webauthn;
 
 pub use approval::*;
 pub use ceremony::*;
 pub use codec::*;
+pub use cross_surface::*;
 pub use crypto::*;
 pub use error::*;
 pub use methods::*;
@@ -29,6 +32,7 @@ pub use policy::*;
 pub use revocation::*;
 pub use service::*;
 pub use signing::*;
+pub use surface::*;
 pub use wallet_seed::*;
 pub use webauthn::*;
 
@@ -42,14 +46,11 @@ pub use bloom_rpc_wire::{
 
 /// Broker-to-Signer authority contract.
 ///
-/// Version 1.5 is the first complete authority contract for BIP-39 wallets.
-/// It includes the durable terminal ceremony status introduced during 1.4
-/// development plus the wallet-seed profile, account-allocation ceremonies,
-/// and derived-account projection. Registration and import semantics require
-/// those fields, so a 1.4 peer must not negotiate this contract.
+/// Version 1.6 requires exact Signer-owned surface bindings for ceremonies.
+/// Earlier peers cannot safely represent remote WebAuthn authority.
 pub const SIGNER_API_MAJOR: u16 = 1;
-pub const SIGNER_API_MINOR_MIN: u16 = 5;
-pub const SIGNER_API_MINOR_MAX: u16 = 5;
+pub const SIGNER_API_MINOR_MIN: u16 = 6;
+pub const SIGNER_API_MINOR_MAX: u16 = 6;
 pub const SIGNER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(SIGNER_API_MAJOR, SIGNER_API_MINOR_MAX);
 pub const SIGNER_API_RANGE: ProtocolVersionRange =
