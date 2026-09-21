@@ -257,6 +257,14 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
     let (identity, manifest) = loaded_identity;
     let trusted_time_source = manifest.trusted_time_source.clone();
     let signer_effective_uid = manifest.signer.effective_uid;
+    #[cfg(feature = "triad-dev-harness")]
+    let admin_peer_uid = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
+        signer_effective_uid
+    } else {
+        0
+    };
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let admin_peer_uid = 0;
     tracing::info!(
         event = "service.identity_loaded",
         service_role = "signer",
@@ -572,6 +580,7 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
                 admin_listener,
                 admin_ceremony,
                 admin_receipt_key,
+                admin_peer_uid,
                 &mut admin_shutdown
             ),
             async move {

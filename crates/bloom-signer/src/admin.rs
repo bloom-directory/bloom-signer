@@ -16,6 +16,8 @@ use bloom_relay_admin_client::{
 use bloom_relay_protocol::{AllocationReceipt, Scope};
 use bloom_signer::ceremony::SignerCeremonyService;
 use bloom_signer_api::{Digest32, ExposureMode, SurfaceStatus};
+#[cfg(feature = "triad-dev-harness")]
+use bloom_triad_local_transport::load_developer_identity_and_manifest;
 use bloom_triad_local_transport::require_local_admin_peer;
 use ed25519_dalek::{Signer as _, SigningKey};
 use rand::{TryRng as _, rngs::SysRng};
@@ -32,6 +34,34 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 const MAX_FRAME: usize = 16 * 1024;
 const ADMIN_IDENTITY_FILE: &str = "relay-admin-seed.hex";
+
+fn admin_owner_uid(_signer_uid: u32) -> io::Result<u32> {
+    #[cfg(feature = "triad-dev-harness")]
+    if let Some(root) = std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT") {
+        let identity = std::env::var_os("BLOOM_SIGNER_IDENTITY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/var/run/bloom/signer-identity.json"));
+        let manifest = std::env::var_os("BLOOM_EDGE_MANIFEST")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/etc/bloom/edge-manifest.json"));
+        let (_, manifest) = load_developer_identity_and_manifest(
+            Path::new(&root),
+            &identity,
+            &manifest,
+            "bloom-signer",
+        )
+        .map_err(io::Error::other)?;
+        let current_uid = manifest.signer.effective_uid;
+        if current_uid == 0 || _signer_uid != current_uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "developer administration requires the validated non-root Signer UID",
+            ));
+        }
+        return Ok(current_uid);
+    }
+    Ok(0)
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -65,6 +95,12 @@ struct PendingCredentialIssue {
     installation_id: Uuid,
     operation_id: Uuid,
     token: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AllocationOperation {
+    operation_id: Uuid,
 }
 
 impl Drop for PendingCredentialIssue {
@@ -120,6 +156,7 @@ pub(super) async fn serve(
     listener: Option<UnixListener>,
     ceremony: Arc<SignerCeremonyService>,
     receipt_key: Option<[u8; 32]>,
+    admin_peer_uid: u32,
     shutdown: &mut watch::Receiver<bool>,
 ) -> io::Result<()> {
     let Some(listener) = listener else {
@@ -134,7 +171,7 @@ pub(super) async fn serve(
             }
             accepted = listener.accept() => {
                 let (mut stream, _) = accepted?;
-                if require_local_admin_peer(&stream, 0).is_err() {
+                if require_local_admin_peer(&stream, admin_peer_uid).is_err() {
                     continue;
                 }
                 // One bounded operation per connection; a slow root client
@@ -210,8 +247,9 @@ pub(super) async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let socket = std::env::var_os("BLOOM_SIGNER_ADMIN_SOCKET")
         .map(PathBuf::from)
         .ok_or("BLOOM_SIGNER_ADMIN_SOCKET is required")?;
+    let admin_owner_uid = admin_owner_uid(signer_uid)?;
     if command == "provision" {
-        let status = provision(&socket, signer_uid).await?;
+        let status = provision(&socket, signer_uid, admin_owner_uid).await?;
         println!("{}", serde_json::to_string_pretty(&status)?);
         return Ok(());
     }
@@ -256,19 +294,23 @@ pub(super) async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
 async fn provision(
     socket: &Path,
     signer_uid: u32,
+    admin_owner_uid: u32,
 ) -> Result<SurfaceStatus, Box<dyn std::error::Error>> {
     let root = std::env::var_os("BLOOM_SIGNER_ADMIN_STATE_DIR")
         .map(PathBuf::from)
         .ok_or("BLOOM_SIGNER_ADMIN_STATE_DIR is required")?;
-    let key = load_or_create_admin_key(&root)?;
+    let key = load_or_create_admin_key(&root, admin_owner_uid)?;
     let config_path = std::env::var_os("BLOOM_SIGNER_RELAY_CONFIG")
         .map(PathBuf::from)
         .ok_or("BLOOM_SIGNER_RELAY_CONFIG is required")?;
-    let config_bytes = read_root_private_file(&config_path)?;
+    let config_bytes = read_admin_private_file(&config_path, admin_owner_uid)?;
     let config: RelayConfig = serde_json::from_slice(&config_bytes)?;
     let receipt_key = decode_fixed_32(&config.receipt_public_key_hex)?;
-    let ca_pem = read_root_private_file(&config.control_ca_pem_path)?;
-    let operation_id = Uuid::new_v4();
+    let ca_pem = read_admin_private_file(&config.control_ca_pem_path, admin_owner_uid)?;
+    // Enrollment is an exact-retry operation. Retain its operation ID across
+    // the later certificate/CAA readiness retries so a retry cannot allocate
+    // a second hostname for the same installation administrator.
+    let operation_id = allocation_operation(&root, admin_owner_uid)?;
     let public_key = key.verifying_key().to_bytes();
     let receipt = enroll(
         EnrollmentConfig {
@@ -334,6 +376,7 @@ async fn provision(
         ensure_scoped_credential(
             &root,
             &destination,
+            admin_owner_uid,
             broker_uid,
             broker_gid,
             receipt.allocation.installation_id,
@@ -367,7 +410,7 @@ async fn provision(
     let bind_path = root.join("acme-bind-pending.json");
     let pending = if bind_path.exists() {
         let pending: PendingAcmeBind =
-            serde_json::from_slice(&read_root_private_file(&bind_path)?)?;
+            serde_json::from_slice(&read_admin_private_file(&bind_path, admin_owner_uid)?)?;
         if pending.installation_id != receipt.allocation.installation_id
             || pending.account_uri != account_uri
         {
@@ -385,7 +428,8 @@ async fn provision(
     };
     let bound_path = root.join("acme-account-bound.json");
     if bound_path.exists() {
-        let bound: PendingAcmeBind = serde_json::from_slice(&read_root_private_file(&bound_path)?)?;
+        let bound: PendingAcmeBind =
+            serde_json::from_slice(&read_admin_private_file(&bound_path, admin_owner_uid)?)?;
         if bound.installation_id != pending.installation_id
             || bound.account_uri != pending.account_uri
         {
@@ -467,6 +511,7 @@ fn read_broker_acme_uri(path: &Path, uid: u32, gid: u32) -> io::Result<String> {
 fn ensure_scoped_credential(
     root: &Path,
     destination: &Path,
+    admin_owner_uid: u32,
     broker_uid: u32,
     broker_gid: u32,
     installation_id: Uuid,
@@ -480,7 +525,7 @@ fn ensure_scoped_credential(
     let metadata_path = destination.with_file_name(format!("relay-{label}.metadata.json"));
     let installed = if state_path.exists() && destination.exists() && metadata_path.exists() {
         let state: IssuedCredentialState =
-            serde_json::from_slice(&read_root_private_file(&state_path)?)?;
+            serde_json::from_slice(&read_admin_private_file(&state_path, admin_owner_uid)?)?;
         let token = fs::symlink_metadata(destination)?;
         let handoff = fs::symlink_metadata(&metadata_path)?;
         let handoff_state = if handoff.len() <= 512 {
@@ -517,7 +562,7 @@ fn ensure_scoped_credential(
 
     let pending_path = root.join(format!("{label}-credential-pending.json"));
     let pending = if pending_path.exists() {
-        let bytes = Zeroizing::new(read_root_private_file(&pending_path)?);
+        let bytes = Zeroizing::new(read_admin_private_file(&pending_path, admin_owner_uid)?);
         let pending: PendingCredentialIssue = serde_json::from_slice(&bytes)?;
         if pending.installation_id != installation_id {
             return Err("pending relay credential belongs to another installation".into());
@@ -612,6 +657,21 @@ fn write_root_state<T: Serialize>(root: &Path, destination: &Path, value: &T) ->
     fs::File::open(root)?.sync_all()
 }
 
+fn allocation_operation(root: &Path, owner_uid: u32) -> io::Result<Uuid> {
+    let path = root.join("allocation-operation.json");
+    if path.exists() {
+        let state: AllocationOperation =
+            serde_json::from_slice(&read_admin_private_file(&path, owner_uid)?)
+                .map_err(io::Error::other)?;
+        return Ok(state.operation_id);
+    }
+    let state = AllocationOperation {
+        operation_id: Uuid::new_v4(),
+    };
+    write_root_state(root, &path, &state)?;
+    Ok(state.operation_id)
+}
+
 fn install_broker_file(
     root: &Path,
     destination: &Path,
@@ -637,12 +697,12 @@ fn install_broker_file(
     .sync_all()
 }
 
-fn load_or_create_admin_key(root: &Path) -> io::Result<SigningKey> {
+fn load_or_create_admin_key(root: &Path, owner_uid: u32) -> io::Result<SigningKey> {
     if !root.exists() {
         fs::create_dir(root)?;
         fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
     }
-    require_root_private(root, true)?;
+    require_admin_private(root, true, owner_uid)?;
     let path = root.join(ADMIN_IDENTITY_FILE);
     if !path.exists() {
         let mut seed = Zeroizing::new([0_u8; 32]);
@@ -657,14 +717,14 @@ fn load_or_create_admin_key(root: &Path) -> io::Result<SigningKey> {
         file.write_all(hex::encode(*seed).as_bytes())?;
         file.sync_all()?;
     }
-    let seed = Zeroizing::new(read_root_private_file(&path)?);
+    let seed = Zeroizing::new(read_admin_private_file(&path, owner_uid)?);
     let text = std::str::from_utf8(&seed).map_err(io::Error::other)?;
     let bytes = Zeroizing::new(decode_fixed_32(text)?);
     Ok(SigningKey::from_bytes(&bytes))
 }
 
-fn read_root_private_file(path: &Path) -> io::Result<Vec<u8>> {
-    require_root_private(path, false)?;
+fn read_admin_private_file(path: &Path, owner_uid: u32) -> io::Result<Vec<u8>> {
+    require_admin_private(path, false, owner_uid)?;
     let bytes = fs::read(path)?;
     if bytes.len() > MAX_FRAME {
         return Err(io::Error::new(
@@ -675,9 +735,9 @@ fn read_root_private_file(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn require_root_private(path: &Path, directory: bool) -> io::Result<()> {
+fn require_admin_private(path: &Path, directory: bool, owner_uid: u32) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.uid() != 0
+    if metadata.uid() != owner_uid
         || metadata.mode() & 0o077 != 0
         || if directory {
             !metadata.file_type().is_dir()
@@ -687,7 +747,7 @@ fn require_root_private(path: &Path, directory: bool) -> io::Result<()> {
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "admin state and relay pins must be root-owned non-symlinks with private permissions",
+            "admin state and relay pins must be expected-owner non-symlinks with private permissions",
         ));
     }
     Ok(())
@@ -801,5 +861,19 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), b"public pinned CA");
         fs::set_permissions(broker.path(), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(require_private_broker_parent(&destination, owner.uid(), owner.gid()).is_err());
+    }
+
+    #[test]
+    fn allocation_enrollment_reuses_operation_across_retry_and_restart() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = fs::metadata(root.path()).unwrap().uid();
+        let first = allocation_operation(root.path(), uid).unwrap();
+        let retry = allocation_operation(root.path(), uid).unwrap();
+        assert_eq!(retry, first);
+        let state = root.path().join("allocation-operation.json");
+        let metadata = fs::symlink_metadata(state).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), uid);
     }
 }
