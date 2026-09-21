@@ -14,8 +14,8 @@ use std::{
 };
 
 use bloom_signer_api::{
-    Base64UrlBytes, DecimalU64, Digest32, OperationId, ProtocolError, ProtocolErrorCode, Token,
-    WebAuthnCredential,
+    Base64UrlBytes, DecimalU64, Digest32, OperationId, ProtocolError, ProtocolErrorCode, RpId,
+    Token, WebAuthnCredential,
 };
 use bloom_signer_backend_api::SecretBytes;
 use chacha20poly1305::{
@@ -481,7 +481,7 @@ impl LegacyPasskeyFile {
             credential_id: legacy.cred_id,
             cose_public_key: es256_cose_public_key(&x, &y)?,
             user_handle: Base64UrlBytes::from_bytes(&legacy_user_handle(wallet_name.as_str())),
-            rp_id: Token::new("localhost")?,
+            rp_id: RpId::new("localhost")?,
             prf_salt: Base64UrlBytes::from_bytes(&prf_salt),
             sign_count: DecimalU64::new(legacy.counter),
         })

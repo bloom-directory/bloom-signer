@@ -11,13 +11,70 @@ pub const LOCAL_CEREMONY_RP_ID: &str = "localhost";
 pub const SURFACE_IDENTITY_SCHEMA: &str = "bloom.surface.identity.v1";
 const SURFACE_IDENTITY_DOMAIN: &[u8] = b"bloom.surface.identity.v1\0";
 
+/// A WebAuthn relying-party identifier encoded as a lowercase DNS name.
+///
+/// Unlike the generic protocol [`Token`], DNS labels may begin with a digit.
+/// The surface validator separately restricts which RP IDs this product can
+/// authorize.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RpId(String);
+
+impl RpId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 253
+            || value.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || !label.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+                    || !label
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    || !label
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+            })
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "WebAuthn RP ID must be a lowercase DNS name",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for RpId {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<RpId> for String {
+    fn from(value: RpId) -> Self {
+        value.0
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurfaceIdentity {
     pub schema: Token,
     pub surface_id: Token,
     pub origin: String,
-    pub rp_id: Token,
+    pub rp_id: RpId,
     pub created_at_ms: DecimalU64,
 }
 
@@ -27,7 +84,7 @@ impl SurfaceIdentity {
             schema: Token::new(SURFACE_IDENTITY_SCHEMA).expect("static surface schema"),
             surface_id: Token::new("local").expect("static surface ID"),
             origin: LOCAL_CEREMONY_ORIGIN.to_owned(),
-            rp_id: Token::new(LOCAL_CEREMONY_RP_ID).expect("static RP ID"),
+            rp_id: RpId::new(LOCAL_CEREMONY_RP_ID).expect("static RP ID"),
             created_at_ms: DecimalU64::new(created_at_ms),
         }
     }
@@ -38,7 +95,7 @@ impl SurfaceIdentity {
             schema: Token::new(SURFACE_IDENTITY_SCHEMA)?,
             surface_id: Token::new("remote")?,
             origin: format!("https://{hostname}"),
-            rp_id: Token::new(hostname)?,
+            rp_id: RpId::new(hostname)?,
             created_at_ms: DecimalU64::new(created_at_ms),
         })
     }
@@ -221,6 +278,30 @@ mod tests {
             "*.relay.bloom.directory",
         ] {
             assert!(SurfaceIdentity::remote(invalid, 9).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn digit_leading_relay_rp_id_round_trips_as_a_json_string() {
+        let hostname = "2bcdefghijklmnopqrstuv2345.relay.bloom.directory";
+        let identity = SurfaceIdentity::remote(hostname, 9).unwrap();
+        assert_eq!(identity.rp_id.as_str(), hostname);
+        let encoded = serde_json::to_vec(&identity).unwrap();
+        let decoded: SurfaceIdentity = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, identity);
+        assert_eq!(decoded.reference().unwrap(), identity.reference().unwrap());
+    }
+
+    #[test]
+    fn rp_id_rejects_non_dns_token_shapes() {
+        for invalid in [
+            "",
+            "Upper.example",
+            "-bad.example",
+            "bad-.example",
+            "bad..example",
+        ] {
+            assert!(RpId::new(invalid).is_err(), "{invalid}");
         }
     }
 }

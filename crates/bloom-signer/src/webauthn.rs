@@ -8,7 +8,7 @@ use sha2::{Digest as _, Sha256};
 use std::io::Cursor;
 
 use bloom_signer_api::{
-    Base64UrlBytes, DecimalU64, ProtocolError, ProtocolErrorCode, Token, WebAuthnAssertion,
+    Base64UrlBytes, DecimalU64, ProtocolError, ProtocolErrorCode, RpId, WebAuthnAssertion,
     WebAuthnAttestation, WebAuthnCredential,
 };
 
@@ -235,7 +235,7 @@ pub fn verify_webauthn_attestation_for_origin(
         credential_id: attestation.credential_id.clone(),
         cose_public_key: Base64UrlBytes::from_bytes(&cose_public_key),
         user_handle: expected_user_handle,
-        rp_id: Token::new(expected_rp_id)?,
+        rp_id: RpId::new(expected_rp_id)?,
         prf_salt: expected_prf_salt,
         sign_count: DecimalU64::new(u64::from(parsed.sign_count)),
     })

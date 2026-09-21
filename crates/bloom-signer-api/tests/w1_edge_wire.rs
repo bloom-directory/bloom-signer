@@ -181,7 +181,7 @@ fn custody_result() -> CustodyResult {
         credential_summaries: vec![CredentialSummary {
             surface: Some(bloom_signer_api::legacy_local_surface()),
             credential_id: Base64UrlBytes::from_bytes(&[19]),
-            rp_id: token("localhost"),
+            rp_id: RpId::new("localhost").unwrap(),
             active: true,
         }],
         initial_policy: Some(policy_snapshot()),

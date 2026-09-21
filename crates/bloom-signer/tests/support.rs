@@ -94,7 +94,7 @@ impl VirtualAuthenticator {
                 &self.cose_public_key().expect("generated key encodes"),
             ),
             user_handle: self.user_handle.clone(),
-            rp_id: Token::new(self.rp_id.clone()).expect("test RP token"),
+            rp_id: bloom_signer_api::RpId::new(self.rp_id.clone()).expect("test RP ID"),
             prf_salt: Base64UrlBytes::from_bytes(&Sha256::digest(
                 [
                     b"bloom-debug-driver-salt/v1".as_slice(),

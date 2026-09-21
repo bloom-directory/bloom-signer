@@ -1,6 +1,9 @@
 mod support;
 
-use bloom_signer::webauthn::{verify_webauthn_assertion, verify_webauthn_attestation};
+use bloom_signer::webauthn::{
+    verify_webauthn_assertion, verify_webauthn_assertion_for_origin, verify_webauthn_attestation,
+    verify_webauthn_attestation_for_origin,
+};
 use bloom_signer::{
     ceremony::{PreparedCustodyCeremony, SignerCeremonyService},
     clock::{ClockCondition, ClockDecision},
@@ -22,6 +25,37 @@ use k256::{SecretKey as Secp256k1Secret, elliptic_curve::sec1::ToSec1Point as _}
 use sha2::Digest as _;
 use std::{collections::BTreeMap, os::unix::fs::MetadataExt as _, sync::Arc};
 use support::{VirtualAuthenticator, seal_hpke};
+
+#[test]
+fn digit_leading_remote_rp_id_verifies_attestation_and_assertion() {
+    let rp_id = "2bcdefghijklmnopqrstuv2345.relay.bloom.directory";
+    let origin = format!("https://{rp_id}");
+    let user_handle = Base64UrlBytes::from_bytes(b"digit-leading-user-handle");
+    let prf_salt = Base64UrlBytes::from_bytes(&[7_u8; 32]);
+    let authenticator =
+        VirtualAuthenticator::generate_for_surface(&user_handle.decode(), &origin, rp_id);
+    let creation_challenge = b"digit-leading-creation";
+    let credential = verify_webauthn_attestation_for_origin(
+        &authenticator.attestation(creation_challenge),
+        creation_challenge,
+        user_handle,
+        prf_salt,
+        &origin,
+        rp_id,
+    )
+    .unwrap();
+    assert_eq!(credential.rp_id.as_str(), rp_id);
+    let assertion_challenge = b"digit-leading-assertion";
+    verify_webauthn_assertion_for_origin(
+        &authenticator.assertion(assertion_challenge, 1),
+        &credential,
+        assertion_challenge,
+        true,
+        &origin,
+        rp_id,
+    )
+    .unwrap();
+}
 
 fn signed_petal_request(
     terms: &SealedApprovalTerms,

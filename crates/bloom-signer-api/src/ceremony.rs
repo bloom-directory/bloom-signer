@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ActivationMode, Base64UrlBytes, CeremonyState, CryptoSuite, DecimalU64, Digest32, HpkeEnvelope,
-    KeyRef, OperationId, PetalKeyScope, ProtocolError, ProtocolErrorCode, SealedApprovalTerms,
-    SurfaceRef, Token,
+    KeyRef, OperationId, PetalKeyScope, ProtocolError, ProtocolErrorCode, RpId,
+    SealedApprovalTerms, SurfaceRef, Token,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -168,7 +168,7 @@ pub struct WebAuthnCredential {
     pub credential_id: Base64UrlBytes,
     pub cose_public_key: Base64UrlBytes,
     pub user_handle: Base64UrlBytes,
-    pub rp_id: Token,
+    pub rp_id: RpId,
     pub prf_salt: Base64UrlBytes,
     pub sign_count: DecimalU64,
 }
@@ -828,7 +828,7 @@ pub struct CredentialSummary {
     pub credential_id: Base64UrlBytes,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<SurfaceRef>,
-    pub rp_id: Token,
+    pub rp_id: RpId,
     pub active: bool,
 }
 
