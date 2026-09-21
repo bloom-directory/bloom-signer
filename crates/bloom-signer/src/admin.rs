@@ -299,6 +299,7 @@ async fn provision(
     let root = std::env::var_os("BLOOM_SIGNER_ADMIN_STATE_DIR")
         .map(PathBuf::from)
         .ok_or("BLOOM_SIGNER_ADMIN_STATE_DIR is required")?;
+    let admin_key_existed = root.join(ADMIN_IDENTITY_FILE).exists();
     let key = load_or_create_admin_key(&root, admin_owner_uid)?;
     let config_path = std::env::var_os("BLOOM_SIGNER_RELAY_CONFIG")
         .map(PathBuf::from)
@@ -307,36 +308,59 @@ async fn provision(
     let config: RelayConfig = serde_json::from_slice(&config_bytes)?;
     let receipt_key = decode_fixed_32(&config.receipt_public_key_hex)?;
     let ca_pem = read_admin_private_file(&config.control_ca_pem_path, admin_owner_uid)?;
-    // Enrollment is an exact-retry operation. Retain its operation ID across
-    // the later certificate/CAA readiness retries so a retry cannot allocate
-    // a second hostname for the same installation administrator.
-    let operation_id = allocation_operation(&root, admin_owner_uid)?;
     let public_key = key.verifying_key().to_bytes();
-    let receipt = enroll(
-        EnrollmentConfig {
-            control_ca_pem: ca_pem.clone(),
-        },
-        &public_key,
-        &receipt_key,
-        operation_id,
-        |message| Ok(key.sign(message).to_bytes()),
-    )?;
-    // Assignment must be installed first: only then can Broker begin the
-    // account/certificate worker that publishes its production ACME URI.
-    let response = request_once(
-        socket,
-        signer_uid,
-        &AdminRequest::Provision {
-            receipt: receipt.clone(),
-            admin_public_key: public_key,
-        },
-    )
-    .await?;
-    let mut status = response.status.ok_or_else(|| {
-        response
-            .error
-            .unwrap_or("Signer rejected relay assignment".into())
-    })?;
+    let response = request_once(socket, signer_uid, &AdminRequest::Status).await?;
+    let mut status = response
+        .status
+        .ok_or_else(|| response.error.unwrap_or("admin status failed".into()))?;
+    let allocation_path = root.join("allocation-operation.json");
+    let installation_id = if allocation_path.exists() || !admin_key_existed {
+        // Enrollment is an exact-retry operation. Retain its operation ID
+        // across the later certificate/CAA readiness retries so a retry
+        // cannot allocate a second hostname.
+        let operation_id = allocation_operation(&root, admin_owner_uid, true)?;
+        let receipt = enroll(
+            EnrollmentConfig {
+                control_ca_pem: ca_pem.clone(),
+            },
+            &public_key,
+            &receipt_key,
+            operation_id,
+            |message| Ok(key.sign(message).to_bytes()),
+        )?;
+        // Assignment must be installed first: only then can Broker begin the
+        // account/certificate worker that publishes its ACME URI.
+        let response = request_once(
+            socket,
+            signer_uid,
+            &AdminRequest::Provision {
+                receipt: receipt.clone(),
+                admin_public_key: public_key,
+            },
+        )
+        .await?;
+        status = response.status.ok_or_else(|| {
+            response
+                .error
+                .unwrap_or("Signer rejected relay assignment".into())
+        })?;
+        receipt.allocation.installation_id
+    } else {
+        // Builds predating allocation-operation.json may already have
+        // installed an assignment. Recover only from Signer's authoritative
+        // binding; an unassigned old key is ambiguous and must not allocate.
+        let expected_digest = Digest32::from_bytes(Sha256::digest(public_key).into());
+        if status.installation_admin_key_sha256.as_ref() != Some(&expected_digest) {
+            return Err("existing admin identity lacks a matching Signer assignment; refusing a new relay allocation".into());
+        }
+        status
+            .installation_id
+            .as_deref()
+            .ok_or(
+                "existing admin identity has no Signer assignment; refusing a new relay allocation",
+            )?
+            .parse::<Uuid>()?
+    };
     let broker_uid: u32 = std::env::var("BLOOM_SIGNER_BROKER_UID")
         .map_err(|_| "BLOOM_SIGNER_BROKER_UID is required")?
         .parse()?;
@@ -379,7 +403,7 @@ async fn provision(
             admin_owner_uid,
             broker_uid,
             broker_gid,
-            receipt.allocation.installation_id,
+            installation_id,
             scope,
             label,
             &ca_pem,
@@ -411,15 +435,13 @@ async fn provision(
     let pending = if bind_path.exists() {
         let pending: PendingAcmeBind =
             serde_json::from_slice(&read_admin_private_file(&bind_path, admin_owner_uid)?)?;
-        if pending.installation_id != receipt.allocation.installation_id
-            || pending.account_uri != account_uri
-        {
+        if pending.installation_id != installation_id || pending.account_uri != account_uri {
             return Err("ACME account changed; ordinary provisioning refuses rebinding".into());
         }
         pending
     } else {
         let pending = PendingAcmeBind {
-            installation_id: receipt.allocation.installation_id,
+            installation_id,
             account_uri: account_uri.clone(),
             operation_id: Uuid::new_v4(),
         };
@@ -657,13 +679,19 @@ fn write_root_state<T: Serialize>(root: &Path, destination: &Path, value: &T) ->
     fs::File::open(root)?.sync_all()
 }
 
-fn allocation_operation(root: &Path, owner_uid: u32) -> io::Result<Uuid> {
+fn allocation_operation(root: &Path, owner_uid: u32, allow_create: bool) -> io::Result<Uuid> {
     let path = root.join("allocation-operation.json");
     if path.exists() {
         let state: AllocationOperation =
             serde_json::from_slice(&read_admin_private_file(&path, owner_uid)?)
                 .map_err(io::Error::other)?;
         return Ok(state.operation_id);
+    }
+    if !allow_create {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "existing administrator has no durable relay allocation operation",
+        ));
     }
     let state = AllocationOperation {
         operation_id: Uuid::new_v4(),
@@ -868,12 +896,34 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let uid = fs::metadata(root.path()).unwrap().uid();
-        let first = allocation_operation(root.path(), uid).unwrap();
-        let retry = allocation_operation(root.path(), uid).unwrap();
+        let first = allocation_operation(root.path(), uid, true).unwrap();
+        let retry = allocation_operation(root.path(), uid, false).unwrap();
         assert_eq!(retry, first);
         let state = root.path().join("allocation-operation.json");
         let metadata = fs::symlink_metadata(state).unwrap();
         assert_eq!(metadata.mode() & 0o777, 0o600);
         assert_eq!(metadata.uid(), uid);
+    }
+
+    #[test]
+    fn malformed_allocation_operation_fails_without_replacing_state() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = fs::metadata(root.path()).unwrap().uid();
+        let path = root.path().join("allocation-operation.json");
+        let malformed = b"{\"operation_id\":\"not-a-uuid\"}";
+        fs::write(&path, malformed).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(allocation_operation(root.path(), uid, true).is_err());
+        assert_eq!(fs::read(path).unwrap(), malformed);
+    }
+
+    #[test]
+    fn existing_administrator_cannot_create_missing_allocation_operation() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = fs::metadata(root.path()).unwrap().uid();
+        assert!(allocation_operation(root.path(), uid, false).is_err());
+        assert!(!root.path().join("allocation-operation.json").exists());
     }
 }
