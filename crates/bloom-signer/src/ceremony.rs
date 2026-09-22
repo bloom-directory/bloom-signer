@@ -553,6 +553,7 @@ impl SignerCeremonyService {
             return Err(operation_conflict());
         }
         let mut pairs = self.cross_surface.lock();
+        self.require_unopened_operation_id(&request.operation_id)?;
         pairs.retain(|_, pair| pair.pairing.expires_at_ms.get() > now_ms);
         if let Some(existing) = pairs
             .values()
@@ -2360,6 +2361,33 @@ impl SignerCeremonyService {
     pub fn cancel(&self, operation_id: &OperationId) -> Result<(), ProtocolError> {
         if self.completed.lock().contains_key(operation_id) {
             return Err(committed_conflict());
+        }
+        {
+            // Pairings live separately from ordinary pending ceremonies. Fence
+            // completion and durably cancel before dropping any unlocked material.
+            let _guard = self.custody_completion_barrier.lock();
+            let mut pairs = self.cross_surface.lock();
+            if let Some((id, pair)) = pairs
+                .iter()
+                .find(|(_, pair)| &pair.pairing.operation_id == operation_id)
+            {
+                if self.engine.custody_receipt(operation_id)?.is_some() {
+                    return Err(committed_conflict());
+                }
+                let id = id.clone();
+                self.engine
+                    .persist_ceremony_public_status(&CeremonyPublicStatus {
+                        ceremony_id: id.clone(),
+                        ceremony_kind: CeremonyKind::CredentialAdd,
+                        operation_id: operation_id.clone(),
+                        state: CeremonyState::Cancelled,
+                        expires_at_ms: pair.pairing.expires_at_ms.clone(),
+                        ceremony_url: None,
+                        receipt_digest: None,
+                    })?;
+                pairs.remove(&id);
+                return Ok(());
+            }
         }
         let Some(pending) = self.pending.lock().remove(operation_id) else {
             return self.cancel_consumed_ceremony(operation_id);

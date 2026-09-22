@@ -182,6 +182,13 @@ fn cross_surface_pairing_preserves_original_deadline_after_browser_delay() {
             .code,
         ProtocolErrorCode::OperationIdConflict
     );
+    service.cancel(&request.operation_id).unwrap();
+    service.cancel(&request.operation_id).unwrap();
+    assert!(
+        service
+            .cross_surface_pair_start(request.clone(), 33_000)
+            .is_err()
+    );
     assert!(
         service
             .cross_surface_pair_start(request.clone(), 601_000)
