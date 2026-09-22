@@ -270,13 +270,18 @@ fn verify_client_data(
     let decoded = encoded.decode();
     let data: ClientData = serde_json::from_slice(&decoded)
         .map_err(|_| proof_error("WebAuthn clientDataJSON is malformed"))?;
+    if data.origin != expected_origin {
+        return Err(proof_error(format!(
+            "WebAuthn origin mismatch: expected {expected_origin}, observed {}",
+            data.origin
+        )));
+    }
     if data.ceremony_type != expected_type
-        || data.origin != expected_origin
         || data.cross_origin
         || Base64UrlBytes::parse(data.challenge)? != Base64UrlBytes::from_bytes(expected_challenge)
     {
         return Err(proof_error(
-            "WebAuthn type, challenge, origin, or cross-origin binding is invalid",
+            "WebAuthn type, challenge, or cross-origin binding is invalid",
         ));
     }
     Ok(())
@@ -453,6 +458,26 @@ mod tests {
 
         let error = verify_client_data(&encoded, "webauthn.get", challenge, &origin).unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
+    }
+
+    #[test]
+    fn client_data_origin_mismatch_names_expected_origin() {
+        let challenge = b"origin-mismatch-challenge";
+        let expected = ceremony_origin_for_port(28736);
+        let encoded = client_data(serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": Base64UrlBytes::from_bytes(challenge),
+            "origin": ceremony_origin_for_port(28735),
+            "crossOrigin": false,
+        }));
+
+        let error = verify_client_data(&encoded, "webauthn.get", challenge, &expected).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
+        assert!(
+            error.message.contains(&expected),
+            "origin mismatch must name the expected origin: {}",
+            error.message
+        );
     }
 
     #[test]
