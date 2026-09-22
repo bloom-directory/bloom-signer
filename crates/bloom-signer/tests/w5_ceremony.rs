@@ -279,6 +279,79 @@ fn cross_surface_add_requires_source_authority_and_destination_pair_key() {
             .assertion(&prepared.source_challenge.canonical_bytes().unwrap(), 2),
         encrypted_authority_prf: source_envelope,
     };
+    let destination_envelope = seal_hpke(
+        &prepared.destination_hpke_recipient_key,
+        b"bloom-cross-surface-destination-prf/v1",
+        &cross_aad(&prepared, "destination_prf"),
+        &destination.deterministic_prf(),
+    )
+    .unwrap();
+    let mut completion = CrossSurfaceCompleteDestinationRequest {
+        pairing_id: pair.pairing_id.clone(),
+        operation_id: pair.operation_id.clone(),
+        capability: Base64UrlBytes::from_bytes(&[0; 32]),
+        attestation: destination.attestation(
+            &prepared.destination_challenges[0]
+                .canonical_bytes()
+                .unwrap(),
+        ),
+        prf_assertion: destination.assertion(
+            &prepared.destination_challenges[1]
+                .canonical_bytes()
+                .unwrap(),
+            1,
+        ),
+        encrypted_new_prf: destination_envelope,
+    };
+
+    // A direct Broker completion can arrive before source authorization. It
+    // must not turn the not-yet-created unlocked state into terminal cleanup.
+    assert_eq!(
+        service
+            .cross_surface_complete_destination(completion.clone(), 2_250)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyReplay
+    );
+
+    // The even earlier pair-start state likewise has no destination recipient
+    // yet. Rejecting completion must leave it available for source preparation.
+    let unprepared_recipient = HpkeRecipient::generate();
+    let unprepared_pair = service
+        .cross_surface_pair_start(
+            CrossSurfacePairStartRequest {
+                destination_surface: remote.reference(),
+                operation_id: operation("84"),
+                exact_terms_digest: digest("85"),
+                destination_hpke_public_key: unprepared_recipient.public_key().clone(),
+                expires_at_ms: DecimalU64::new(600_000),
+            },
+            2_260,
+        )
+        .unwrap();
+    let mut premature = completion.clone();
+    premature.pairing_id = unprepared_pair.pairing_id.clone();
+    premature.operation_id = unprepared_pair.operation_id.clone();
+    assert_eq!(
+        service
+            .cross_surface_complete_destination(premature, 2_270)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyReplay
+    );
+    service
+        .cross_surface_prepare_source(
+            CrossSurfacePrepareSourceRequest {
+                pairing_id: unprepared_pair.pairing_id,
+                operation_id: unprepared_pair.operation_id,
+                source_surface: legacy_local_surface(),
+                wallet_id: wallet_id.clone(),
+                exact_terms_digest: digest("85"),
+            },
+            2_280,
+        )
+        .unwrap();
+
     let handoff = service
         .cross_surface_complete_source(source_completion.clone(), 2_300)
         .unwrap();
@@ -304,30 +377,6 @@ fn cross_surface_add_requires_source_authority_and_destination_pair_key() {
             &cross_aad(&prepared, "handoff"),
         )
         .unwrap();
-    let destination_envelope = seal_hpke(
-        &prepared.destination_hpke_recipient_key,
-        b"bloom-cross-surface-destination-prf/v1",
-        &cross_aad(&prepared, "destination_prf"),
-        &destination.deterministic_prf(),
-    )
-    .unwrap();
-    let mut completion = CrossSurfaceCompleteDestinationRequest {
-        pairing_id: pair.pairing_id.clone(),
-        operation_id: pair.operation_id.clone(),
-        capability: Base64UrlBytes::from_bytes(&[0; 32]),
-        attestation: destination.attestation(
-            &prepared.destination_challenges[0]
-                .canonical_bytes()
-                .unwrap(),
-        ),
-        prf_assertion: destination.assertion(
-            &prepared.destination_challenges[1]
-                .canonical_bytes()
-                .unwrap(),
-            1,
-        ),
-        encrypted_new_prf: destination_envelope,
-    };
     assert_eq!(
         service
             .cross_surface_complete_destination(completion.clone(), 2_400)
@@ -441,6 +490,103 @@ fn cross_surface_add_requires_source_authority_and_destination_pair_key() {
         .unwrap();
     assert_eq!(reverse_result.credential_summaries.len(), 3);
 
+    // Once destination HPKE processing consumes its recipient, a failure is
+    // terminal: retrying cannot safely reuse the one-shot recipient state.
+    let consumed_recipient = HpkeRecipient::generate();
+    let consumed_pair = service
+        .cross_surface_pair_start(
+            CrossSurfacePairStartRequest {
+                destination_surface: remote.reference(),
+                operation_id: operation("98"),
+                exact_terms_digest: digest("99"),
+                destination_hpke_public_key: consumed_recipient.public_key().clone(),
+                expires_at_ms: DecimalU64::new(600_000),
+            },
+            3_400,
+        )
+        .unwrap();
+    let consumed = service
+        .cross_surface_prepare_source(
+            CrossSurfacePrepareSourceRequest {
+                pairing_id: consumed_pair.pairing_id.clone(),
+                operation_id: consumed_pair.operation_id.clone(),
+                source_surface: legacy_local_surface(),
+                wallet_id: reverse_result.wallet_id.clone().unwrap(),
+                exact_terms_digest: digest("99"),
+            },
+            3_500,
+        )
+        .unwrap();
+    let consumed_source_input = seal_hpke(
+        &consumed.source_hpke_recipient_key,
+        b"bloom-cross-surface-source-prf/v1",
+        &cross_aad(&consumed, "source_prf"),
+        &local.deterministic_prf(),
+    )
+    .unwrap();
+    let consumed_handoff = service
+        .cross_surface_complete_source(
+            CrossSurfaceCompleteSourceRequest {
+                pairing_id: consumed_pair.pairing_id.clone(),
+                operation_id: consumed_pair.operation_id.clone(),
+                authority_assertion: local
+                    .assertion(&consumed.source_challenge.canonical_bytes().unwrap(), 3),
+                encrypted_authority_prf: consumed_source_input,
+            },
+            3_600,
+        )
+        .unwrap();
+    let consumed_capability = consumed_recipient
+        .open(
+            &consumed_handoff.encrypted_capability,
+            b"bloom-cross-surface-handoff/v1",
+            &cross_aad(&consumed, "handoff"),
+        )
+        .unwrap();
+    let consumed_destination = VirtualAuthenticator::generate_for_surface(
+        &consumed.destination_user_handle.decode(),
+        &remote.identity.origin,
+        remote.identity.rp_id.as_str(),
+    );
+    let valid_consumed_input = seal_hpke(
+        &consumed.destination_hpke_recipient_key,
+        b"bloom-cross-surface-destination-prf/v1",
+        &cross_aad(&consumed, "destination_prf"),
+        &consumed_destination.deterministic_prf(),
+    )
+    .unwrap();
+    let mut consumed_completion = CrossSurfaceCompleteDestinationRequest {
+        pairing_id: consumed_pair.pairing_id,
+        operation_id: consumed_pair.operation_id,
+        capability: Base64UrlBytes::from_bytes(consumed_capability.expose_to_backend()),
+        attestation: consumed_destination.attestation(
+            &consumed.destination_challenges[0]
+                .canonical_bytes()
+                .unwrap(),
+        ),
+        prf_assertion: consumed_destination.assertion(
+            &consumed.destination_challenges[1]
+                .canonical_bytes()
+                .unwrap(),
+            1,
+        ),
+        encrypted_new_prf: valid_consumed_input.clone(),
+    };
+    consumed_completion.encrypted_new_prf.ciphertext = Base64UrlBytes::from_bytes(&[1]);
+    assert!(
+        service
+            .cross_surface_complete_destination(consumed_completion.clone(), 3_700)
+            .is_err()
+    );
+    consumed_completion.encrypted_new_prf = valid_consumed_input;
+    assert_eq!(
+        service
+            .cross_surface_complete_destination(consumed_completion, 3_800)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyReplay
+    );
+
     let pending_recipient = HpkeRecipient::generate();
     let pending_pair = service
         .cross_surface_pair_start(
@@ -479,7 +625,7 @@ fn cross_surface_add_requires_source_authority_and_destination_pair_key() {
                 pairing_id: pending_pair.pairing_id.clone(),
                 operation_id: pending_pair.operation_id.clone(),
                 authority_assertion: local
-                    .assertion(&pending.source_challenge.canonical_bytes().unwrap(), 3),
+                    .assertion(&pending.source_challenge.canonical_bytes().unwrap(), 4),
                 encrypted_authority_prf: input,
             },
             4_200,

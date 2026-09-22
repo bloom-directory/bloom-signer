@@ -831,10 +831,13 @@ impl SignerCeremonyService {
         if result.is_err() {
             let mut pairs = self.cross_surface.lock();
             let terminal = pairs.get(&pairing_id).is_some_and(|pair| {
+                // Optional secrets are absent both before their stage begins
+                // and after one-shot consumption. Only the latter is terminal.
+                let source_completed = pair.source_completion_digest.is_some();
                 pair.attempts >= 5
                     || pair.pairing.expires_at_ms.get() <= now_ms
-                    || pair.destination_recipient.is_none()
-                    || pair.unlocked.is_none()
+                    || (pair.prepared.is_some() && pair.destination_recipient.is_none())
+                    || (source_completed && pair.unlocked.is_none())
                     || pair.prepared.as_ref().is_some_and(|prepared| {
                         self.require_surface(&prepared.source_surface, false)
                             .is_err()
@@ -843,9 +846,10 @@ impl SignerCeremonyService {
                                 .is_err()
                             || self.authority_generation(Some(&prepared.wallet_id))
                                 != prepared.credential_authority_generation.get()
-                            || pair.source_credential_id.as_ref().is_none_or(|id| {
-                                self.bound_credential(id, &prepared.wallet_id).is_err()
-                            })
+                            || (source_completed
+                                && pair.source_credential_id.as_ref().is_none_or(|id| {
+                                    self.bound_credential(id, &prepared.wallet_id).is_err()
+                                }))
                     })
             });
             if terminal {
