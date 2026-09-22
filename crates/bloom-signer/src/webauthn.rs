@@ -86,7 +86,7 @@ fn ceremony_origin_for(_env_value: Option<&std::ffi::OsStr>) -> Result<String, P
     #[cfg(feature = "triad-dev-harness")]
     if let Some(value) = _env_value {
         let port = parse_developer_ceremony_port(value)?;
-        return Ok(format!("http://localhost:{port}"));
+        return Ok(ceremony_origin_for_port(port));
     }
     Ok(CEREMONY_ORIGIN.to_owned())
 }
@@ -598,6 +598,12 @@ mod tests {
             assert_eq!(
                 ceremony_origin_for(Some(OsStr::new("65535"))).unwrap(),
                 "http://localhost:65535"
+            );
+            // The legacy fallback formats port 80 the way browsers do, with
+            // no port suffix, exactly like the service construction path.
+            assert_eq!(
+                ceremony_origin_for(Some(OsStr::new("80"))).unwrap(),
+                "http://localhost"
             );
             for invalid in ["0", "65536", "not-a-port", " 28735", ""] {
                 let error = ceremony_origin_for(Some(OsStr::new(invalid))).unwrap_err();
