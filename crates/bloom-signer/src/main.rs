@@ -45,6 +45,7 @@ use bloom_triad_local_transport::{
     AuthenticatedRequestContext, EndpointQuota, JournalExchange, LocalIdentity, PeerAcl,
     load_identity_and_manifest,
 };
+use clap::{Parser, Subcommand};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
@@ -141,14 +142,9 @@ impl Drop for SignerConfig {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    if std::env::args_os().len() == 2
-        && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--version"))
-    {
-        println!("bloom-signer {}", env!("CARGO_PKG_VERSION"));
-        return;
-    }
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("admin")) {
-        if let Err(error) = admin::run_cli().await {
+    let cli = Cli::parse();
+    if let Some(Command::Admin(command)) = cli.command {
+        if let Err(error) = admin::run_cli(command).await {
             eprintln!("Bloom Signer administration failed: {error}");
             std::process::exit(1);
         }
@@ -181,6 +177,68 @@ async fn main() {
             );
         }
         std::process::exit(1);
+    }
+}
+
+/// Bloom key-custody service and administrative client.
+#[derive(Parser)]
+#[command(name = "bloom-signer", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Inspect or change the installed Signer's ceremony surface.
+    Admin(admin::AdminCli),
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn administration_requires_one_explicit_target() {
+        assert!(Cli::try_parse_from(["bloom-signer"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["bloom-signer", "admin", "status", "--login-uid", "501"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["bloom-signer", "admin", "status", "--signer-uid", "501"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["bloom-signer", "admin", "status"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "bloom-signer",
+                "admin",
+                "status",
+                "--login-uid",
+                "501",
+                "--signer-uid",
+                "502"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["bloom-signer", "admin", "status", "--login-uid", "0"]).is_err()
+        );
+    }
+
+    #[test]
+    fn help_is_resolved_entirely_by_the_parser() {
+        for args in [
+            vec!["bloom-signer", "--help"],
+            vec!["bloom-signer", "admin", "--help"],
+            vec!["bloom-signer", "admin", "provision", "--help"],
+        ] {
+            let error = match Cli::try_parse_from(args) {
+                Ok(_) => panic!("help must exit through clap"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        }
     }
 }
 

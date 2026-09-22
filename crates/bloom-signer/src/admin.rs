@@ -19,6 +19,7 @@ use bloom_signer_api::{Digest32, ExposureMode, SurfaceStatus};
 #[cfg(feature = "triad-dev-harness")]
 use bloom_triad_local_transport::load_developer_identity_and_manifest;
 use bloom_triad_local_transport::require_local_admin_peer;
+use clap::{Args, Subcommand};
 use ed25519_dalek::{Signer as _, SigningKey};
 use rand::{TryRng as _, rngs::SysRng};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,65 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 const MAX_FRAME: usize = 16 * 1024;
 const ADMIN_IDENTITY_FILE: &str = "relay-admin-seed.hex";
+
+#[derive(Args)]
+pub(super) struct AdminCli {
+    #[command(subcommand)]
+    command: AdminCommand,
+}
+
+#[derive(Subcommand)]
+enum AdminCommand {
+    /// Show the desired and effective ceremony-surface state.
+    Status(AdminTarget),
+    /// Allocate and install the relay identity and scoped Broker credentials.
+    Provision(AdminTarget),
+    /// Enable the remotely reachable ceremony surface.
+    RemoteEnabled(AdminTarget),
+    /// Disable remote ceremonies while retaining localhost ceremonies.
+    LocalhostOnly(AdminTarget),
+}
+
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct AdminTarget {
+    /// Login UID of an installed Bloom instance (requires root).
+    #[arg(long, value_name = "UID", value_parser = parse_nonzero_uid)]
+    login_uid: Option<u32>,
+
+    /// Explicit Signer UID with BLOOM_* paths (root or validated developer harness).
+    #[arg(long, value_name = "UID", value_parser = parse_nonzero_uid)]
+    signer_uid: Option<u32>,
+}
+
+#[derive(Debug)]
+struct AdminContext {
+    socket: PathBuf,
+    signer_uid: u32,
+    admin_owner_uid: u32,
+    provisioning: Option<ProvisionContext>,
+}
+
+#[derive(Debug)]
+struct ProvisionContext {
+    admin_state: PathBuf,
+    relay_config: PathBuf,
+    tunnel_credential: PathBuf,
+    dns_credential: PathBuf,
+    acme_account_uri: PathBuf,
+    broker_uid: u32,
+    broker_gid: u32,
+}
+
+fn parse_nonzero_uid(value: &str) -> Result<u32, String> {
+    let uid = value
+        .parse::<u32>()
+        .map_err(|_| "UID must be a decimal integer".to_owned())?;
+    if uid == 0 {
+        return Err("UID must be nonzero".to_owned());
+    }
+    Ok(uid)
+}
 
 fn admin_owner_uid(_signer_uid: u32) -> io::Result<u32> {
     #[cfg(feature = "triad-dev-harness")]
@@ -233,38 +293,32 @@ fn execute(
     }
 }
 
-pub(super) async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
+pub(super) async fn run_cli(cli: AdminCli) -> Result<(), Box<dyn std::error::Error>> {
     bloom_signer_process_hardening::harden_process()?;
-    let mut args = std::env::args().skip(2);
-    let command = args.next().ok_or("expected admin command")?;
-    if args.next().as_deref() != Some("--signer-uid") {
-        return Err("expected --signer-uid UID".into());
-    }
-    let signer_uid: u32 = args.next().ok_or("missing Signer UID")?.parse()?;
-    if args.next().is_some() {
-        return Err("unexpected admin argument".into());
-    }
-    let socket = std::env::var_os("BLOOM_SIGNER_ADMIN_SOCKET")
-        .map(PathBuf::from)
-        .ok_or("BLOOM_SIGNER_ADMIN_SOCKET is required")?;
-    let admin_owner_uid = admin_owner_uid(signer_uid)?;
-    if command == "provision" {
-        let status = provision(&socket, signer_uid, admin_owner_uid).await?;
+    let (command, target) = match cli.command {
+        AdminCommand::Status(target) => (AdminOperation::Status, target),
+        AdminCommand::Provision(target) => (AdminOperation::Provision, target),
+        AdminCommand::RemoteEnabled(target) => (AdminOperation::RemoteEnabled, target),
+        AdminCommand::LocalhostOnly(target) => (AdminOperation::LocalhostOnly, target),
+    };
+    let context = resolve_admin_context(target, command == AdminOperation::Provision)?;
+    if command == AdminOperation::Provision {
+        let status = provision(&context).await?;
         println!("{}", serde_json::to_string_pretty(&status)?);
         return Ok(());
     }
-    let request = match command.as_str() {
-        "status" => AdminRequest::Status,
-        "remote-enabled" => AdminRequest::RemoteEnabled,
-        "localhost-only" => AdminRequest::LocalhostOnly,
-        _ => return Err("unknown admin command".into()),
+    let request = match command {
+        AdminOperation::Status => AdminRequest::Status,
+        AdminOperation::RemoteEnabled => AdminRequest::RemoteEnabled,
+        AdminOperation::LocalhostOnly => AdminRequest::LocalhostOnly,
+        AdminOperation::Provision => unreachable!("provision returned above"),
     };
     let requested_mode = match &request {
         AdminRequest::RemoteEnabled => Some(ExposureMode::RemoteEnabled),
         AdminRequest::LocalhostOnly => Some(ExposureMode::LocalhostOnly),
         _ => None,
     };
-    let response = request_once(&socket, signer_uid, &request).await?;
+    let response = request_once(&context.socket, context.signer_uid, &request).await?;
     let mut status = response
         .status
         .ok_or_else(|| response.error.unwrap_or("admin operation failed".into()))?;
@@ -281,7 +335,8 @@ pub(super) async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let response = request_once(&socket, signer_uid, &AdminRequest::Status).await?;
+            let response =
+                request_once(&context.socket, context.signer_uid, &AdminRequest::Status).await?;
             status = response
                 .status
                 .ok_or_else(|| response.error.unwrap_or("admin status failed".into()))?;
@@ -291,25 +346,183 @@ pub(super) async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn provision(
-    socket: &Path,
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AdminOperation {
+    Status,
+    Provision,
+    RemoteEnabled,
+    LocalhostOnly,
+}
+
+fn resolve_admin_context(
+    target: AdminTarget,
+    needs_provisioning: bool,
+) -> Result<AdminContext, Box<dyn std::error::Error>> {
+    match (target.login_uid, target.signer_uid) {
+        (Some(login_uid), None) => installed_admin_context(login_uid),
+        (None, Some(signer_uid)) => developer_admin_context(signer_uid, needs_provisioning),
+        _ => Err("exactly one administration target is required".into()),
+    }
+}
+
+fn installed_admin_context(login_uid: u32) -> Result<AdminContext, Box<dyn std::error::Error>> {
+    if bloom_signer_process_hardening::effective_uid() != 0 {
+        return Err("installed administration requires root (effective UID 0)".into());
+    }
+    #[cfg(target_os = "linux")]
+    let context = installed_admin_context_at(
+        login_uid,
+        Path::new("/etc/bloom"),
+        Path::new("/var/lib/bloom"),
+        Path::new("/run/bloom"),
+        InstalledPlatform::Linux,
+    );
+    #[cfg(target_os = "macos")]
+    let context = installed_admin_context_at(
+        login_uid,
+        Path::new("/Library/Application Support/BloomTriad/config"),
+        Path::new("/Library/Application Support/BloomTriad/config"),
+        Path::new("/private/var/run/bloom"),
+        InstalledPlatform::Macos,
+    );
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let context = Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "installed administration supports Linux and macOS only",
+    ));
+    context.map_err(Into::into)
+}
+
+#[derive(Clone, Copy)]
+// Each production target constructs one variant; tests exercise both layouts.
+#[allow(dead_code)]
+enum InstalledPlatform {
+    Linux,
+    Macos,
+}
+
+fn installed_admin_context_at(
+    login_uid: u32,
+    config_root: &Path,
+    state_root: &Path,
+    runtime_root: &Path,
+    platform: InstalledPlatform,
+) -> io::Result<AdminContext> {
+    let uid = login_uid.to_string();
+    let config = config_root.join(&uid);
+    let signer = installed_principal(&config.join("signer"), "Signer")?;
+    let broker = installed_principal(&config.join("broker"), "Broker")?;
+    let signer_uid = signer.uid();
+    let broker_uid = broker.uid();
+    let broker_gid = broker.gid();
+    if signer_uid == 0 || broker_uid == 0 || broker_gid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "installed Signer and Broker principals must be non-root",
+        ));
+    }
+    let (admin_state, broker_relay, socket) = match platform {
+        InstalledPlatform::Linux => (
+            state_root.join(&uid).join("installer/admin"),
+            state_root.join(&uid).join("broker/relay"),
+            runtime_root.join(&uid).join("signer/admin/admin.sock"),
+        ),
+        InstalledPlatform::Macos => (
+            config.join("installer/admin"),
+            config.join("broker"),
+            runtime_root.join(&uid).join("signer-admin/admin.sock"),
+        ),
+    };
+    Ok(AdminContext {
+        socket,
+        signer_uid,
+        admin_owner_uid: 0,
+        provisioning: Some(ProvisionContext {
+            admin_state,
+            relay_config: config.join("relay.json"),
+            tunnel_credential: broker_relay.join("relay-tunnel.credential"),
+            dns_credential: broker_relay.join("relay-dns.credential"),
+            acme_account_uri: broker_relay.join("acme-account-uri"),
+            broker_uid,
+            broker_gid,
+        }),
+    })
+}
+
+fn installed_principal(path: &Path, label: &str) -> io::Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("{label} enrollment is unavailable: {error}"),
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{label} enrollment must be a non-symlink directory"),
+        ));
+    }
+    Ok(metadata)
+}
+
+fn developer_admin_context(
     signer_uid: u32,
-    admin_owner_uid: u32,
-) -> Result<SurfaceStatus, Box<dyn std::error::Error>> {
-    let root = std::env::var_os("BLOOM_SIGNER_ADMIN_STATE_DIR")
-        .map(PathBuf::from)
-        .ok_or("BLOOM_SIGNER_ADMIN_STATE_DIR is required")?;
+    needs_provisioning: bool,
+) -> Result<AdminContext, Box<dyn std::error::Error>> {
+    fn path(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{name} is required for developer administration").into())
+    }
+    let admin_owner_uid = admin_owner_uid(signer_uid)?;
+    if admin_owner_uid == 0 && bloom_signer_process_hardening::effective_uid() != 0 {
+        return Err(
+            "explicit --signer-uid administration requires root or the validated developer harness"
+                .into(),
+        );
+    }
+    let provisioning = if needs_provisioning {
+        let broker_uid = std::env::var("BLOOM_SIGNER_BROKER_UID")?.parse::<u32>()?;
+        let broker_gid = std::env::var("BLOOM_SIGNER_BROKER_GID")?.parse::<u32>()?;
+        if broker_uid == 0 || broker_gid == 0 {
+            return Err("developer Broker UID and GID must be nonzero".into());
+        }
+        Some(ProvisionContext {
+            admin_state: path("BLOOM_SIGNER_ADMIN_STATE_DIR")?,
+            relay_config: path("BLOOM_SIGNER_RELAY_CONFIG")?,
+            tunnel_credential: path("BLOOM_SIGNER_TUNNEL_CREDENTIAL_PATH")?,
+            dns_credential: path("BLOOM_SIGNER_DNS_CREDENTIAL_PATH")?,
+            acme_account_uri: path("BLOOM_SIGNER_ACME_ACCOUNT_URI_PATH")?,
+            broker_uid,
+            broker_gid,
+        })
+    } else {
+        None
+    };
+    Ok(AdminContext {
+        socket: path("BLOOM_SIGNER_ADMIN_SOCKET")?,
+        signer_uid,
+        admin_owner_uid,
+        provisioning,
+    })
+}
+
+async fn provision(context: &AdminContext) -> Result<SurfaceStatus, Box<dyn std::error::Error>> {
+    let provisioning = context
+        .provisioning
+        .as_ref()
+        .ok_or("provisioning context is unavailable")?;
+    let root = provisioning.admin_state.clone();
+    let signer_uid = context.signer_uid;
+    let admin_owner_uid = context.admin_owner_uid;
     let admin_key_existed = root.join(ADMIN_IDENTITY_FILE).exists();
     let key = load_or_create_admin_key(&root, admin_owner_uid)?;
-    let config_path = std::env::var_os("BLOOM_SIGNER_RELAY_CONFIG")
-        .map(PathBuf::from)
-        .ok_or("BLOOM_SIGNER_RELAY_CONFIG is required")?;
-    let config_bytes = read_admin_private_file(&config_path, admin_owner_uid)?;
+    let config_bytes = read_admin_private_file(&provisioning.relay_config, admin_owner_uid)?;
     let config: RelayConfig = serde_json::from_slice(&config_bytes)?;
     let receipt_key = decode_fixed_32(&config.receipt_public_key_hex)?;
     let ca_pem = read_admin_private_file(&config.control_ca_pem_path, admin_owner_uid)?;
     let public_key = key.verifying_key().to_bytes();
-    let response = request_once(socket, signer_uid, &AdminRequest::Status).await?;
+    let response = request_once(&context.socket, signer_uid, &AdminRequest::Status).await?;
     let mut status = response
         .status
         .ok_or_else(|| response.error.unwrap_or("admin status failed".into()))?;
@@ -331,7 +544,7 @@ async fn provision(
         // Assignment must be installed first: only then can Broker begin the
         // account/certificate worker that publishes its ACME URI.
         let response = request_once(
-            socket,
+            &context.socket,
             signer_uid,
             &AdminRequest::Provision {
                 receipt: receipt.clone(),
@@ -361,15 +574,9 @@ async fn provision(
             )?
             .parse::<Uuid>()?
     };
-    let broker_uid: u32 = std::env::var("BLOOM_SIGNER_BROKER_UID")
-        .map_err(|_| "BLOOM_SIGNER_BROKER_UID is required")?
-        .parse()?;
-    let broker_gid: u32 = std::env::var("BLOOM_SIGNER_BROKER_GID")
-        .map_err(|_| "BLOOM_SIGNER_BROKER_GID is required")?
-        .parse()?;
-    let tunnel_path = std::env::var_os("BLOOM_SIGNER_TUNNEL_CREDENTIAL_PATH")
-        .map(PathBuf::from)
-        .ok_or("BLOOM_SIGNER_TUNNEL_CREDENTIAL_PATH is required")?;
+    let broker_uid = provisioning.broker_uid;
+    let broker_gid = provisioning.broker_gid;
+    let tunnel_path = provisioning.tunnel_credential.clone();
     let broker_parent = require_private_broker_parent(&tunnel_path, broker_uid, broker_gid)?;
     install_broker_file(
         &root,
@@ -378,28 +585,13 @@ async fn provision(
         broker_uid,
         broker_gid,
     )?;
-    for (scope, variable, label) in [
-        (
-            Scope::Tunnel,
-            "BLOOM_SIGNER_TUNNEL_CREDENTIAL_PATH",
-            "tunnel",
-        ),
-        (
-            Scope::DnsChallenge,
-            "BLOOM_SIGNER_DNS_CREDENTIAL_PATH",
-            "dns",
-        ),
+    for (scope, destination, label) in [
+        (Scope::Tunnel, &provisioning.tunnel_credential, "tunnel"),
+        (Scope::DnsChallenge, &provisioning.dns_credential, "dns"),
     ] {
-        let destination = if scope == Scope::Tunnel {
-            tunnel_path.clone()
-        } else {
-            std::env::var_os(variable)
-                .map(PathBuf::from)
-                .ok_or_else(|| format!("{variable} is required"))?
-        };
         ensure_scoped_credential(
             &root,
-            &destination,
+            destination,
             admin_owner_uid,
             broker_uid,
             broker_gid,
@@ -410,9 +602,7 @@ async fn provision(
             &key,
         )?;
     }
-    let account_path = std::env::var_os("BLOOM_SIGNER_ACME_ACCOUNT_URI_PATH")
-        .map(PathBuf::from)
-        .ok_or("BLOOM_SIGNER_ACME_ACCOUNT_URI_PATH is required")?;
+    let account_path = provisioning.acme_account_uri.clone();
     if account_path.parent() != tunnel_path.parent()
         || account_path.file_name().and_then(|name| name.to_str()) != Some("acme-account-uri")
     {
@@ -484,7 +674,7 @@ async fn provision(
                 );
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let response = request_once(socket, signer_uid, &AdminRequest::Status).await?;
+            let response = request_once(&context.socket, signer_uid, &AdminRequest::Status).await?;
             status = response
                 .status
                 .ok_or_else(|| response.error.unwrap_or("admin status failed".into()))?;
@@ -831,6 +1021,88 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    #[test]
+    fn installed_layout_derives_fixed_linux_and_macos_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let config_root = root.path().join("config");
+        let state_root = root.path().join("state");
+        let runtime_root = root.path().join("run");
+        let signer = config_root.join("501/signer");
+        let broker = config_root.join("501/broker");
+        fs::create_dir_all(&signer).unwrap();
+        fs::create_dir_all(&broker).unwrap();
+        if bloom_signer_process_hardening::effective_uid() == 0 {
+            for path in [&signer, &broker] {
+                let directory = fs::File::open(path).unwrap();
+                bloom_signer_process_hardening::set_open_file_owner(&directory, 501, 501).unwrap();
+            }
+        }
+
+        let linux = installed_admin_context_at(
+            501,
+            &config_root,
+            &state_root,
+            &runtime_root,
+            InstalledPlatform::Linux,
+        )
+        .unwrap();
+        let linux_provisioning = linux.provisioning.unwrap();
+        assert_eq!(
+            linux_provisioning.relay_config,
+            config_root.join("501/relay.json")
+        );
+        assert_eq!(
+            linux_provisioning.admin_state,
+            state_root.join("501/installer/admin")
+        );
+        assert_eq!(
+            linux_provisioning.tunnel_credential,
+            state_root.join("501/broker/relay/relay-tunnel.credential")
+        );
+        assert_eq!(
+            linux.socket,
+            runtime_root.join("501/signer/admin/admin.sock")
+        );
+
+        let macos = installed_admin_context_at(
+            501,
+            &config_root,
+            &state_root,
+            &runtime_root,
+            InstalledPlatform::Macos,
+        )
+        .unwrap();
+        let macos_provisioning = macos.provisioning.unwrap();
+        assert_eq!(
+            macos_provisioning.admin_state,
+            config_root.join("501/installer/admin")
+        );
+        assert_eq!(
+            macos_provisioning.tunnel_credential,
+            config_root.join("501/broker/relay-tunnel.credential")
+        );
+        assert_eq!(
+            macos.socket,
+            runtime_root.join("501/signer-admin/admin.sock")
+        );
+    }
+
+    #[test]
+    fn installed_principal_rejects_symlinks_and_files() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        assert!(installed_principal(&directory, "Signer").is_ok());
+
+        let link = root.path().join("link");
+        symlink(&directory, &link).unwrap();
+        assert!(installed_principal(&link, "Signer").is_err());
+
+        let file = root.path().join("file");
+        fs::write(&file, b"not a principal directory").unwrap();
+        assert!(installed_principal(&file, "Signer").is_err());
+    }
 
     #[test]
     fn broker_acme_uri_handoff_checks_owner_mode_link_and_production_uri() {

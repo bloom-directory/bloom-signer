@@ -55,6 +55,7 @@ futures = "0.3"
 bip32 = { version = "0.6.0-rc.0", features = ["alloc", "secp256k1"] }
 blake3 = "1"
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
+clap = { version = "4", features = ["derive"] }
 ciborium = "0.2"
 ed25519-dalek = "3"
 hex = "0.4"

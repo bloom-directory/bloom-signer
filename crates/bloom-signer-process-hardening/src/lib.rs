@@ -121,6 +121,16 @@ pub fn set_open_file_owner(file: &std::fs::File, uid: u32, gid: u32) -> io::Resu
     Ok(())
 }
 
+/// Return the kernel's effective user ID for privilege decisions.
+///
+/// This lives beside the crate's other audited libc calls so callers with
+/// `forbid(unsafe_code)` do not need to approximate effective identity with an
+/// environment variable or real-user lookup.
+pub fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` has no arguments and no failure case.
+    unsafe { libc::geteuid() }
+}
+
 /// Disable core dumps and same-user debugger/process-memory attachment.
 pub fn harden_process() -> io::Result<()> {
     disable_core_dumps()?;
