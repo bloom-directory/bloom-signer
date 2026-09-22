@@ -547,6 +547,7 @@ fn signer_requests() -> Vec<BrokerSignerRequest> {
             operation_id: operation(91),
             exact_terms_digest: digest(92),
             destination_hpke_public_key: Base64UrlBytes::from_bytes(&[93; 32]),
+            expires_at_ms: DecimalU64::new(600_000),
         }),
         BrokerSignerRequest::CrossSurfacePrepareSource(CrossSurfacePrepareSourceRequest {
             pairing_id: digest(90),
@@ -783,11 +784,12 @@ where
 fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     // The v1.6 signer frame sets include exact surface status and the four
     // cross-surface operations. These digests freeze every authority variant
-    // together with the strict v1.6 protocol range.
+    // together with the strict v1.6 protocol range. Pair start includes the
+    // original ceremony deadline; the pre-release callers must be repinned together.
     assert_wire_digest(
         "signer requests",
         signer_requests(),
-        "a64eb396809eb2eb7896c57efa3956a2c096ef9c8bedd5d3d89f38aa646ae3fe",
+        "bb35d7b57410111a8a55a1db7f5d075b332c7428b6b84f3b5a414c7e4698c802",
     );
     assert_wire_digest(
         "signer responses",

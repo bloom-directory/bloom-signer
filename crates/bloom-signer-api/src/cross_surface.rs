@@ -14,6 +14,8 @@ pub struct CrossSurfacePairStartRequest {
     pub operation_id: OperationId,
     pub exact_terms_digest: Digest32,
     pub destination_hpke_public_key: Base64UrlBytes,
+    /// Original Broker ceremony deadline; pairing must not restart its lifetime.
+    pub expires_at_ms: DecimalU64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -531,6 +531,14 @@ impl SignerCeremonyService {
         now_ms: u64,
     ) -> Result<CrossSurfacePairing, ProtocolError> {
         self.require_surface(&request.destination_surface, true)?;
+        if request.expires_at_ms.get() <= now_ms
+            || request.expires_at_ms.get() > now_ms.saturating_add(CROSS_PAIR_TTL_MS)
+        {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                "pairing deadline must be unexpired and within ten minutes",
+            ));
+        }
         if request.destination_hpke_public_key.decode().len() != 32 {
             return Err(protocol(
                 ProtocolErrorCode::MalformedFrame,
@@ -551,6 +559,7 @@ impl SignerCeremonyService {
             .find(|pair| pair.pairing.operation_id == request.operation_id)
         {
             if existing.pairing.destination_surface == request.destination_surface
+                && existing.pairing.expires_at_ms == request.expires_at_ms
                 && existing.pairing.exact_terms_digest == request.exact_terms_digest
                 && existing.pairing.destination_hpke_public_key
                     == request.destination_hpke_public_key
@@ -577,7 +586,7 @@ impl SignerCeremonyService {
             destination_hpke_public_key: request.destination_hpke_public_key,
             destination_challenge: random_digest(),
             confirmation_code: format!("{code:06}"),
-            expires_at_ms: DecimalU64::new(now_ms.saturating_add(CROSS_PAIR_TTL_MS)),
+            expires_at_ms: request.expires_at_ms,
         };
         pairs.insert(
             pairing_id,

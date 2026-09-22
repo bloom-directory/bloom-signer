@@ -151,6 +151,49 @@ fn cross_aad(prepared: &CrossSurfaceSourcePrepared, phase: &str) -> Vec<u8> {
 }
 
 #[test]
+fn cross_surface_pairing_preserves_original_deadline_after_browser_delay() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, _, _) = service(&authenticator);
+    let recipient = HpkeRecipient::generate();
+    // The link was issued at 1s; the browser prepares it 30s later.
+    let request = CrossSurfacePairStartRequest {
+        destination_surface: legacy_local_surface(),
+        operation_id: operation("81"),
+        exact_terms_digest: digest("82"),
+        destination_hpke_public_key: recipient.public_key().clone(),
+        expires_at_ms: DecimalU64::new(601_000),
+    };
+    let pair = service
+        .cross_surface_pair_start(request.clone(), 31_000)
+        .unwrap();
+    assert_eq!(pair.expires_at_ms, request.expires_at_ms);
+    assert_eq!(
+        service
+            .cross_surface_pair_start(request.clone(), 32_000)
+            .unwrap(),
+        pair
+    );
+    let mut extended = request.clone();
+    extended.expires_at_ms = DecimalU64::new(602_000);
+    assert_eq!(
+        service
+            .cross_surface_pair_start(extended, 32_000)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::OperationIdConflict
+    );
+    assert!(
+        service
+            .cross_surface_pair_start(request.clone(), 601_000)
+            .is_err()
+    );
+    let mut excessive = request;
+    excessive.operation_id = operation("83");
+    excessive.expires_at_ms = DecimalU64::new(631_001);
+    assert!(service.cross_surface_pair_start(excessive, 31_000).is_err());
+}
+
+#[test]
 fn cross_surface_add_requires_source_authority_and_destination_pair_key() {
     let local = VirtualAuthenticator::generate();
     let (service, _, _, _) = service(&local);
@@ -192,6 +235,7 @@ fn cross_surface_add_requires_source_authority_and_destination_pair_key() {
                 operation_id: operation("92"),
                 exact_terms_digest: digest("93"),
                 destination_hpke_public_key: destination_recipient.public_key().clone(),
+                expires_at_ms: DecimalU64::new(600_000),
             },
             2_100,
         )
@@ -319,6 +363,7 @@ fn cross_surface_add_requires_source_authority_and_destination_pair_key() {
                 operation_id: operation("94"),
                 exact_terms_digest: digest("95"),
                 destination_hpke_public_key: host_recipient.public_key().clone(),
+                expires_at_ms: DecimalU64::new(600_000),
             },
             3_000,
         )
@@ -397,6 +442,7 @@ fn cross_surface_add_requires_source_authority_and_destination_pair_key() {
                 operation_id: operation("96"),
                 exact_terms_digest: digest("97"),
                 destination_hpke_public_key: pending_recipient.public_key().clone(),
+                expires_at_ms: DecimalU64::new(600_000),
             },
             4_000,
         )
