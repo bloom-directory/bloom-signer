@@ -31,7 +31,10 @@ use crate::{
         CUSTODY_INPUT_INFO, CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO, seal_to_recipient,
     },
     legacy_passkey::{LEGACY_PASSKEY_INPUT_CLASS, LegacyMigrationStore, PreparedLegacyMigration},
-    webauthn::{verify_webauthn_assertion, verify_webauthn_attestation},
+    webauthn::{
+        ceremony_origin_for_port, resolve_ceremony_port, verify_webauthn_assertion,
+        verify_webauthn_attestation,
+    },
 };
 
 fn ceremony_state_name(state: CeremonyState) -> &'static str {
@@ -244,6 +247,13 @@ pub struct SignerCeremonyService {
     engine: Arc<SignerEngine>,
     signer_key_id: Token,
     signing_key: SigningKey,
+    /// Effective ceremony port resolved once at construction from the
+    /// explicit config value or the legacy default/fallback. Fixed
+    /// hostname/RP ID is `localhost`; only the port varies.
+    ceremony_port: u16,
+    /// Immutable expected WebAuthn origin derived from `ceremony_port`,
+    /// threaded through every assertion and attestation verification.
+    expected_origin: String,
     pending: Mutex<HashMap<OperationId, PendingCeremony>>,
     completed: Mutex<HashMap<OperationId, CompletedCeremony>>,
     credentials: Mutex<BTreeMap<String, BoundCredential>>,
@@ -261,6 +271,52 @@ impl SignerCeremonyService {
         engine: Arc<SignerEngine>,
         signer_key_id: Token,
         signing_key: SigningKey,
+    ) -> Result<Self, ProtocolError> {
+        // Existing callers keep the current default/fallback behavior: an
+        // absent file value retains the development-only legacy environment
+        // fallback, then the default port.
+        let ceremony_port = resolve_ceremony_port(None)?;
+        Self::new_with_ceremony_port(engine, signer_key_id, signing_key, ceremony_port)
+    }
+
+    /// Build a service trusting the WebAuthn origin for an explicit ceremony
+    /// port. The port is validated (integer 1 through 65535) and the expected
+    /// origin is resolved once here as immutable instance state, never read
+    /// per assertion from process-global state or the environment.
+    pub fn new_with_ceremony_port(
+        engine: Arc<SignerEngine>,
+        signer_key_id: Token,
+        signing_key: SigningKey,
+        ceremony_port: u16,
+    ) -> Result<Self, ProtocolError> {
+        let ceremony_port = resolve_ceremony_port(Some(ceremony_port))?;
+        let expected_origin = ceremony_origin_for_port(ceremony_port);
+        Self::new_impl(
+            engine,
+            signer_key_id,
+            signing_key,
+            ceremony_port,
+            expected_origin,
+        )
+    }
+
+    /// Effective ceremony port this service instance trusts.
+    pub fn ceremony_port(&self) -> u16 {
+        self.ceremony_port
+    }
+
+    /// Expected WebAuthn origin (`http://localhost:<port>`, or
+    /// `http://localhost` for port 80) every clientDataJSON must carry.
+    pub fn ceremony_origin(&self) -> &str {
+        &self.expected_origin
+    }
+
+    fn new_impl(
+        engine: Arc<SignerEngine>,
+        signer_key_id: Token,
+        signing_key: SigningKey,
+        ceremony_port: u16,
+        expected_origin: String,
     ) -> Result<Self, ProtocolError> {
         let recovery_now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -380,6 +436,8 @@ impl SignerCeremonyService {
             engine,
             signer_key_id,
             signing_key,
+            ceremony_port,
+            expected_origin,
             pending: Mutex::new(HashMap::new()),
             completed: Mutex::new(HashMap::new()),
             credentials: Mutex::new(credentials),
@@ -1069,6 +1127,7 @@ impl SignerCeremonyService {
             assertion,
             &bound.credential,
             &pending.challenges[0].canonical_bytes()?,
+            &self.expected_origin,
             true,
         )?;
 
@@ -1701,6 +1760,7 @@ impl SignerCeremonyService {
                         assertion,
                         &legacy.credential,
                         &challenges[0].canonical_bytes()?,
+                        &self.expected_origin,
                         true,
                     )?;
                     if verified
@@ -1745,12 +1805,14 @@ impl SignerCeremonyService {
                         &challenges[0].canonical_bytes()?,
                         registration.user_handle.clone(),
                         registration.prf_salt.clone(),
+                        &self.expected_origin,
                     )?;
                     if let Some(assertion) = prf_assertion {
                         let verified = verify_webauthn_assertion(
                             assertion,
                             &credential,
                             &challenges[1].canonical_bytes()?,
+                            &self.expected_origin,
                             true,
                         )?;
                         credential.sign_count = DecimalU64::new(u64::from(verified.sign_count));
@@ -2009,6 +2071,7 @@ impl SignerCeremonyService {
                     authority,
                     &authority_bound.credential,
                     &challenges[0].canonical_bytes()?,
+                    &self.expected_origin,
                     true,
                 )?;
                 let new_credential = verify_webauthn_attestation(
@@ -2020,6 +2083,7 @@ impl SignerCeremonyService {
                         .as_ref()
                         .map(|creation| creation.prf_salt.clone())
                         .ok_or_else(kind_mismatch)?,
+                    &self.expected_origin,
                 )?;
                 let mut new_credential = new_credential;
                 if let Some(assertion) = prf_assertion {
@@ -2027,6 +2091,7 @@ impl SignerCeremonyService {
                         assertion,
                         &new_credential,
                         &challenges[2].canonical_bytes()?,
+                        &self.expected_origin,
                         true,
                     )?;
                     new_credential.sign_count = DecimalU64::new(u64::from(verified.sign_count));
@@ -2074,6 +2139,7 @@ impl SignerCeremonyService {
                     assertion,
                     &bound.credential,
                     &challenges[0].canonical_bytes()?,
+                    &self.expected_origin,
                     true,
                 )?;
                 let target = prepare.key_ref.as_ref().ok_or_else(|| {
@@ -2106,12 +2172,14 @@ impl SignerCeremonyService {
                     &challenges[0].canonical_bytes()?,
                     creation.user_handle.clone(),
                     creation.prf_salt.clone(),
+                    &self.expected_origin,
                 )?;
                 if let Some(assertion) = prf_assertion {
                     let verified = verify_webauthn_assertion(
                         assertion,
                         &new_credential,
                         &challenges[1].canonical_bytes()?,
+                        &self.expected_origin,
                         true,
                     )?;
                     new_credential.sign_count = DecimalU64::new(u64::from(verified.sign_count));
@@ -2154,6 +2222,7 @@ impl SignerCeremonyService {
                     assertion,
                     &bound.credential,
                     &challenges[0].canonical_bytes()?,
+                    &self.expected_origin,
                     true,
                 )?;
                 let encrypted = self.decrypt_custody_input(

@@ -95,7 +95,19 @@ impl VirtualAuthenticator {
     }
 
     pub fn assertion(&self, challenge: &[u8], sign_count: u32) -> WebAuthnAssertion {
-        let client_data = client_data("webauthn.get", challenge);
+        self.assertion_with_origin(challenge, sign_count, &default_origin())
+    }
+
+    /// Correctly signed assertion binding an explicit origin, for
+    /// wrong-origin rejection tests: the signature stays valid so only the
+    /// origin check can fail.
+    pub fn assertion_with_origin(
+        &self,
+        challenge: &[u8],
+        sign_count: u32,
+        origin: &str,
+    ) -> WebAuthnAssertion {
+        let client_data = client_data_with_origin("webauthn.get", challenge, origin);
         let authenticator_data = authenticator_data(0x05, sign_count);
         let mut message = authenticator_data.clone();
         message.extend_from_slice(&Sha256::digest(&client_data));
@@ -110,6 +122,12 @@ impl VirtualAuthenticator {
     }
 
     pub fn attestation(&self, challenge: &[u8]) -> WebAuthnAttestation {
+        self.attestation_with_origin(challenge, &default_origin())
+    }
+
+    /// Correctly formed attestation binding an explicit origin, for
+    /// wrong-origin rejection tests.
+    pub fn attestation_with_origin(&self, challenge: &[u8], origin: &str) -> WebAuthnAttestation {
         let mut auth_data = authenticator_data(0x45, 0);
         auth_data.extend_from_slice(&[0_u8; 16]);
         let credential_id = self.credential_id.decode();
@@ -125,9 +143,10 @@ impl VirtualAuthenticator {
         ciborium::into_writer(&object, &mut encoded).expect("attestation encodes");
         WebAuthnAttestation {
             credential_id: self.credential_id.clone(),
-            client_data_json: Base64UrlBytes::from_bytes(&client_data(
+            client_data_json: Base64UrlBytes::from_bytes(&client_data_with_origin(
                 "webauthn.create",
                 challenge,
+                origin,
             )),
             attestation_object: Base64UrlBytes::from_bytes(&encoded),
             transports: vec![Token::new("internal").expect("static transport token")],
@@ -181,11 +200,19 @@ pub fn seal_hpke(
 }
 
 fn client_data(kind: &str, challenge: &[u8]) -> Vec<u8> {
+    client_data_with_origin(kind, challenge, &default_origin())
+}
+
+fn default_origin() -> String {
+    bloom_signer::webauthn::configured_ceremony_origin()
+        .expect("the test environment selects a valid ceremony origin")
+}
+
+fn client_data_with_origin(kind: &str, challenge: &[u8], origin: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "type": kind,
         "challenge": Base64UrlBytes::from_bytes(challenge),
-        "origin": bloom_signer::webauthn::configured_ceremony_origin()
-            .expect("the test environment selects a valid ceremony origin"),
+        "origin": origin,
         "crossOrigin": false
     }))
     .expect("client data serializes")
