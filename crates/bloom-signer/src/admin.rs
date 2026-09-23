@@ -516,16 +516,16 @@ async fn provision(context: &AdminContext) -> Result<SurfaceStatus, Box<dyn std:
     let signer_uid = context.signer_uid;
     let admin_owner_uid = context.admin_owner_uid;
     let admin_key_existed = root.join(ADMIN_IDENTITY_FILE).exists();
-    let key = load_or_create_admin_key(&root, admin_owner_uid)?;
     let config_bytes = read_admin_private_file(&provisioning.relay_config, admin_owner_uid)?;
     let config: RelayConfig = serde_json::from_slice(&config_bytes)?;
     let receipt_key = decode_fixed_32(&config.receipt_public_key_hex)?;
     let ca_pem = read_admin_private_file(&config.control_ca_pem_path, admin_owner_uid)?;
-    let public_key = key.verifying_key().to_bytes();
     let response = request_once(&context.socket, signer_uid, &AdminRequest::Status).await?;
     let mut status = response
         .status
         .ok_or_else(|| response.error.unwrap_or("admin status failed".into()))?;
+    let key = prepare_admin_identity(&root, admin_owner_uid)?;
+    let public_key = key.verifying_key().to_bytes();
     let allocation_path = root.join("allocation-operation.json");
     let installation_id = if allocation_path.exists() || !admin_key_existed {
         // Enrollment is an exact-retry operation. Retain its operation ID
@@ -934,11 +934,27 @@ fn load_or_create_admin_key(root: &Path, owner_uid: u32) -> io::Result<SigningKe
             .open(&path)?;
         file.write_all(hex::encode(*seed).as_bytes())?;
         file.sync_all()?;
+        fs::File::open(root)?.sync_all()?;
     }
     let seed = Zeroizing::new(read_admin_private_file(&path, owner_uid)?);
     let text = std::str::from_utf8(&seed).map_err(io::Error::other)?;
     let bytes = Zeroizing::new(decode_fixed_32(text)?);
     Ok(SigningKey::from_bytes(&bytes))
+}
+
+fn prepare_admin_identity(root: &Path, owner_uid: u32) -> io::Result<SigningKey> {
+    if !root.exists() {
+        fs::create_dir(root)?;
+        fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    }
+    require_admin_private(root, true, owner_uid)?;
+    if !root.join(ADMIN_IDENTITY_FILE).exists() {
+        // Persist the retry identity before creating the administration key.
+        // A crash at either step must never strand a new key without its
+        // allocation operation, or allocate a second hostname on retry.
+        allocation_operation(root, owner_uid, true)?;
+    }
+    load_or_create_admin_key(root, owner_uid)
 }
 
 fn read_admin_private_file(path: &Path, owner_uid: u32) -> io::Result<Vec<u8>> {
@@ -1019,6 +1035,43 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn missing_relay_configuration_does_not_create_admin_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let uid = bloom_signer_process_hardening::effective_uid();
+        let context = AdminContext {
+            socket: root.path().join("absent.sock"),
+            signer_uid: uid,
+            admin_owner_uid: uid,
+            provisioning: Some(ProvisionContext {
+                admin_state: root.path().join("admin"),
+                relay_config: root.path().join("missing.json"),
+                tunnel_credential: root.path().join("tunnel"),
+                dns_credential: root.path().join("dns"),
+                acme_account_uri: root.path().join("acme"),
+                broker_uid: uid,
+                broker_gid: fs::metadata(root.path()).unwrap().gid(),
+            }),
+        };
+        assert!(provision(&context).await.is_err());
+        assert!(!root.path().join("admin").exists());
+    }
+
+    #[test]
+    fn new_admin_identity_has_durable_operation_before_retry() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = bloom_signer_process_hardening::effective_uid();
+        let operation = super::allocation_operation(root.path(), uid, true).unwrap();
+        // Models interruption after the operation is committed, before key creation.
+        let first = super::prepare_admin_identity(root.path(), uid).unwrap();
+        let retry = super::prepare_admin_identity(root.path(), uid).unwrap();
+        assert_eq!(first.verifying_key(), retry.verifying_key());
+        assert_eq!(
+            super::allocation_operation(root.path(), uid, false).unwrap(),
+            operation
+        );
+    }
     use super::*;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
