@@ -56,6 +56,20 @@ impl VirtualAuthenticator {
         authenticator
     }
 
+    pub fn from_test_material(
+        signing_key: [u8; 32],
+        credential_id: &[u8],
+        user_handle: &[u8],
+    ) -> Self {
+        Self {
+            signing_key: SigningKey::from_slice(&signing_key).expect("valid test signing key"),
+            credential_id: Base64UrlBytes::from_bytes(credential_id),
+            user_handle: Base64UrlBytes::from_bytes(user_handle),
+            origin: bloom_signer::webauthn::configured_ceremony_origin().expect("test origin"),
+            rp_id: "localhost".into(),
+        }
+    }
+
     pub fn generate_for_surface(user_handle: &[u8], origin: &str, rp_id: &str) -> Self {
         let mut authenticator = Self::generate_with_user_handle(user_handle);
         authenticator.origin = origin.to_owned();
