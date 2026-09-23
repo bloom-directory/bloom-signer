@@ -1,0 +1,20 @@
+# The build context only needs the workspace manifests, Cargo.lock and crate
+# sources. Everything else is excluded so unrelated edits cannot invalidate the
+# dependency or build layers.
+.git
+.github
+.gitignore
+.DS_Store
+**/.DS_Store
+
+target
+**/target
+
+Dockerfile
+.dockerignore
+README.md
+docs
+
+# Tests and their golden vectors are not compiled by the release build.
+crates/*/tests
+crates/*/vectors
