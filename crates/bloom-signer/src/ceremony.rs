@@ -36,7 +36,10 @@ use crate::{
         CUSTODY_INPUT_INFO, CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO, seal_to_recipient,
     },
     legacy_passkey::{LEGACY_PASSKEY_INPUT_CLASS, LegacyMigrationStore, PreparedLegacyMigration},
-    webauthn::{verify_webauthn_assertion_for_origin, verify_webauthn_attestation_for_origin},
+    webauthn::{
+        ceremony_origin_for_port, resolve_ceremony_port, verify_webauthn_assertion_for_origin,
+        verify_webauthn_attestation_for_origin,
+    },
 };
 
 fn ceremony_state_name(state: CeremonyState) -> &'static str {
@@ -104,16 +107,6 @@ fn default_surface_status() -> SurfaceStatus {
     }
 }
 
-fn verification_origin(surface: &SurfaceDescriptor) -> Result<String, ProtocolError> {
-    // The developer-only harness already serves localhost on a selected port.
-    // Keep the persisted local surface identity fixed at the shipping origin,
-    // and scope this clientDataJSON override to that harness build only.
-    #[cfg(feature = "triad-dev-harness")]
-    if surface.identity.surface_id.as_str() == "local" {
-        return crate::webauthn::configured_ceremony_origin();
-    }
-    Ok(surface.identity.origin.clone())
-}
 const CONTRIBUTION_DOMAIN: &[u8] = b"bloom-signer-ceremony-contribution/v1";
 const RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1";
 const WRAP_INFO: &[u8] = b"bloom-passkey-wallet-wrap/v1";
@@ -303,6 +296,13 @@ pub struct SignerCeremonyService {
     engine: Arc<SignerEngine>,
     signer_key_id: Token,
     signing_key: SigningKey,
+    /// Effective ceremony port resolved once at construction from the
+    /// explicit config value or the legacy default/fallback. Fixed
+    /// hostname/RP ID is `localhost`; only the port varies.
+    ceremony_port: u16,
+    /// Immutable expected WebAuthn origin derived from `ceremony_port`,
+    /// threaded through every assertion and attestation verification.
+    expected_origin: String,
     pending: Mutex<HashMap<OperationId, PendingCeremony>>,
     completed: Mutex<HashMap<OperationId, CompletedCeremony>>,
     cross_surface: Mutex<HashMap<Digest32, CrossSurfacePairState>>,
@@ -321,6 +321,63 @@ impl SignerCeremonyService {
         engine: Arc<SignerEngine>,
         signer_key_id: Token,
         signing_key: SigningKey,
+    ) -> Result<Self, ProtocolError> {
+        // Existing callers keep the current default/fallback behavior: an
+        // absent file value retains the development-only legacy environment
+        // fallback, then the default port.
+        let ceremony_port = resolve_ceremony_port(None)?;
+        Self::new_with_ceremony_port(engine, signer_key_id, signing_key, ceremony_port)
+    }
+
+    /// Build a service trusting the WebAuthn origin for an explicit ceremony
+    /// port. The port is validated (integer 1 through 65535) and the expected
+    /// origin is resolved once here as immutable instance state, never read
+    /// per assertion from process-global state or the environment.
+    pub fn new_with_ceremony_port(
+        engine: Arc<SignerEngine>,
+        signer_key_id: Token,
+        signing_key: SigningKey,
+        ceremony_port: u16,
+    ) -> Result<Self, ProtocolError> {
+        let ceremony_port = resolve_ceremony_port(Some(ceremony_port))?;
+        let expected_origin = ceremony_origin_for_port(ceremony_port);
+        Self::new_impl(
+            engine,
+            signer_key_id,
+            signing_key,
+            ceremony_port,
+            expected_origin,
+        )
+    }
+
+    /// Effective ceremony port this service instance trusts.
+    pub fn ceremony_port(&self) -> u16 {
+        self.ceremony_port
+    }
+
+    /// Expected WebAuthn origin (`http://localhost:<port>`, or
+    /// `http://localhost` for port 80) every clientDataJSON must carry.
+    pub fn ceremony_origin(&self) -> &str {
+        &self.expected_origin
+    }
+
+    /// The clientDataJSON origin a surface's proofs must carry. The local
+    /// surface is served on this service's configured ceremony port; its
+    /// persisted identity stays fixed at the shipping origin. Every other
+    /// surface (the remote relay origin) verifies against its own identity.
+    fn verification_origin(&self, surface: &SurfaceDescriptor) -> Result<String, ProtocolError> {
+        if surface.identity.surface_id.as_str() == "local" {
+            return Ok(self.expected_origin.clone());
+        }
+        Ok(surface.identity.origin.clone())
+    }
+
+    fn new_impl(
+        engine: Arc<SignerEngine>,
+        signer_key_id: Token,
+        signing_key: SigningKey,
+        ceremony_port: u16,
+        expected_origin: String,
     ) -> Result<Self, ProtocolError> {
         let recovery_now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -440,6 +497,8 @@ impl SignerCeremonyService {
             engine,
             signer_key_id,
             signing_key,
+            ceremony_port,
+            expected_origin,
             pending: Mutex::new(HashMap::new()),
             completed: Mutex::new(HashMap::new()),
             cross_surface: Mutex::new(HashMap::new()),
@@ -780,7 +839,7 @@ impl SignerCeremonyService {
             credential,
             &prepared.source_challenge.canonical_bytes()?,
             true,
-            &verification_origin(&source)?,
+            &self.verification_origin(&source)?,
             source.identity.rp_id.as_str(),
         )?;
         let aad = cross_surface_aad(prepared, "source_prf")?.canonical_bytes()?;
@@ -909,7 +968,7 @@ impl SignerCeremonyService {
             &challenges[0].canonical_bytes()?,
             prepared.destination_user_handle.clone(),
             prepared.destination_prf_salt.clone(),
-            &verification_origin(&destination)?,
+            &self.verification_origin(&destination)?,
             destination.identity.rp_id.as_str(),
         )?;
         credential.surface = pair.pairing.destination_surface.clone();
@@ -918,7 +977,7 @@ impl SignerCeremonyService {
             &credential,
             &challenges[1].canonical_bytes()?,
             true,
-            &verification_origin(&destination)?,
+            &self.verification_origin(&destination)?,
             destination.identity.rp_id.as_str(),
         )?;
         credential.sign_count = DecimalU64::new(u64::from(verified.sign_count));
@@ -1940,7 +1999,7 @@ impl SignerCeremonyService {
                 credential,
                 challenge,
                 uv,
-                &verification_origin(&surface)?,
+                &self.verification_origin(&surface)?,
                 surface.identity.rp_id.as_str(),
             )
         };
@@ -2676,7 +2735,7 @@ impl SignerCeremonyService {
                 credential,
                 challenge,
                 uv,
-                &verification_origin(&surface)?,
+                &self.verification_origin(&surface)?,
                 surface.identity.rp_id.as_str(),
             )
         };
@@ -2690,7 +2749,7 @@ impl SignerCeremonyService {
                     challenge,
                     user_handle,
                     prf_salt,
-                    &verification_origin(&surface)?,
+                    &self.verification_origin(&surface)?,
                     surface.identity.rp_id.as_str(),
                 )
             };

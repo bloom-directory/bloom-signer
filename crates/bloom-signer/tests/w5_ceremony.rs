@@ -793,6 +793,41 @@ fn service(
     (service, key_ref, engine, registry)
 }
 
+fn service_with_port(
+    authenticator: &VirtualAuthenticator,
+    ceremony_port: u16,
+) -> (
+    SignerCeremonyService,
+    KeyRef,
+    Arc<SignerEngine>,
+    Arc<BackendRegistry>,
+) {
+    let (backend, key_ref) = backend(authenticator.deterministic_prf());
+    let registry =
+        Arc::new(BackendRegistry::from_compiled(vec![CompiledBackend::Local(backend)]).unwrap());
+    let engine = Arc::new(
+        SignerEngine::open_in_memory(
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            SigningKey::from_bytes(&[9; 32]).verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            audit_keys(),
+            registry.clone(),
+        )
+        .unwrap(),
+    );
+    engine.enroll_key(&key_ref).unwrap();
+    let service = SignerCeremonyService::new_with_ceremony_port(
+        engine.clone(),
+        Token::new("signer-ceremony-key").unwrap(),
+        SigningKey::from_bytes(&[9; 32]),
+        ceremony_port,
+    )
+    .unwrap();
+    (service, key_ref, engine, registry)
+}
+
 fn terms(key_ref: KeyRef) -> SealedApprovalTerms {
     SealedApprovalTerms {
         subject: ApprovalSubject::Cli {
@@ -1947,8 +1982,10 @@ fn raw_webauthn_assertion_and_attestation_are_independently_verified() {
     let authenticator = VirtualAuthenticator::generate();
     let challenge = b"exact signed ceremony challenge";
     let credential = authenticator.credential(0);
+    let origin = bloom_signer::webauthn::configured_ceremony_origin().unwrap();
     let assertion = authenticator.assertion(challenge, 1);
-    let verified = verify_webauthn_assertion(&assertion, &credential, challenge, true).unwrap();
+    let verified =
+        verify_webauthn_assertion(&assertion, &credential, challenge, &origin, true).unwrap();
     assert_eq!(verified.sign_count, 1);
 
     let attestation = authenticator.attestation(challenge);
@@ -1957,19 +1994,125 @@ fn raw_webauthn_assertion_and_attestation_are_independently_verified() {
         challenge,
         credential.user_handle.clone(),
         credential.prf_salt.clone(),
+        &origin,
     )
     .unwrap();
     assert_eq!(extracted.credential_id, credential.credential_id);
-    verify_webauthn_assertion(&assertion, &extracted, challenge, true).unwrap();
+    verify_webauthn_assertion(&assertion, &extracted, challenge, &origin, true).unwrap();
 
     let mut wrong_origin = assertion;
     wrong_origin.client_data_json = Base64UrlBytes::from_bytes(
         br#"{"type":"webauthn.get","challenge":"ZXhhY3Qgc2lnbmVkIGNlcmVtb255IGNoYWxsZW5nZQ","origin":"http://127.0.0.1:18734","crossOrigin":false}"#,
     );
     assert_eq!(
-        verify_webauthn_assertion(&wrong_origin, &credential, challenge, true)
+        verify_webauthn_assertion(&wrong_origin, &credential, challenge, &origin, true)
             .unwrap_err()
             .code,
+        ProtocolErrorCode::UnauthenticatedPeer
+    );
+}
+
+#[test]
+fn wrong_origin_assertion_and_attestation_are_rejected_when_correctly_signed() {
+    use bloom_signer::webauthn::{ceremony_origin_for_port, resolve_ceremony_port};
+    // Two independently configured verifiers live in the same process, each
+    // trusting only its own origin.
+    let port_a = resolve_ceremony_port(Some(28735)).unwrap();
+    let port_b = resolve_ceremony_port(Some(28736)).unwrap();
+    let origin_a = ceremony_origin_for_port(port_a);
+    let origin_b = ceremony_origin_for_port(port_b);
+    assert_ne!(origin_a, origin_b);
+
+    let authenticator = VirtualAuthenticator::generate();
+    let challenge = b"cross-port origin challenge";
+    let credential = authenticator.credential(0);
+
+    // Correctly signed under origin A: accepted by A, rejected by B.
+    let assertion_a = authenticator.assertion_with_origin(challenge, 1, &origin_a);
+    verify_webauthn_assertion(&assertion_a, &credential, challenge, &origin_a, true).unwrap();
+    assert_eq!(
+        verify_webauthn_assertion(&assertion_a, &credential, challenge, &origin_b, true)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::UnauthenticatedPeer
+    );
+
+    // Correctly signed under origin B: accepted by B, rejected by A.
+    let assertion_b = authenticator.assertion_with_origin(challenge, 1, &origin_b);
+    verify_webauthn_assertion(&assertion_b, &credential, challenge, &origin_b, true).unwrap();
+    assert_eq!(
+        verify_webauthn_assertion(&assertion_b, &credential, challenge, &origin_a, true)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::UnauthenticatedPeer
+    );
+
+    // Attestation origin rejection likewise rests on a correctly formed
+    // attestation, not a broken signature.
+    let attestation_a = authenticator.attestation_with_origin(challenge, &origin_a);
+    let extracted = verify_webauthn_attestation(
+        &attestation_a,
+        challenge,
+        credential.user_handle.clone(),
+        credential.prf_salt.clone(),
+        &origin_a,
+    )
+    .unwrap();
+    assert_eq!(extracted.credential_id, credential.credential_id);
+    assert_eq!(
+        verify_webauthn_attestation(
+            &attestation_a,
+            challenge,
+            credential.user_handle.clone(),
+            credential.prf_salt.clone(),
+            &origin_b,
+        )
+        .unwrap_err()
+        .code,
+        ProtocolErrorCode::UnauthenticatedPeer
+    );
+}
+
+#[test]
+fn two_services_with_distinct_ports_trust_only_their_own_origin() {
+    use bloom_signer::webauthn::{ceremony_origin_for_port, resolve_ceremony_port};
+    let authenticator = VirtualAuthenticator::generate();
+    let (service_a, _, _, _) = service_with_port(&authenticator, 28735);
+    let (service_b, _, _, _) = service_with_port(&authenticator, 28736);
+    assert_eq!(service_a.ceremony_port(), 28735);
+    assert_eq!(service_b.ceremony_port(), 28736);
+    assert_eq!(
+        service_a.ceremony_origin(),
+        ceremony_origin_for_port(resolve_ceremony_port(Some(28735)).unwrap())
+    );
+    assert_eq!(
+        service_b.ceremony_origin(),
+        ceremony_origin_for_port(resolve_ceremony_port(Some(28736)).unwrap())
+    );
+    assert_ne!(service_a.ceremony_origin(), service_b.ceremony_origin());
+
+    let challenge = b"per-instance origin challenge";
+    let credential = authenticator.credential(0);
+    let assertion_a =
+        authenticator.assertion_with_origin(challenge, 1, service_a.ceremony_origin());
+    verify_webauthn_assertion(
+        &assertion_a,
+        &credential,
+        challenge,
+        service_a.ceremony_origin(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        verify_webauthn_assertion(
+            &assertion_a,
+            &credential,
+            challenge,
+            service_b.ceremony_origin(),
+            true,
+        )
+        .unwrap_err()
+        .code,
         ProtocolErrorCode::UnauthenticatedPeer
     );
 }

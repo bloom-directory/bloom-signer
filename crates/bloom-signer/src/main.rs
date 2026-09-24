@@ -95,6 +95,14 @@ struct SignerConfig {
     ceremony_ttl_ms: Option<u64>,
     #[serde(default)]
     relay_receipt_public_key_hex: Option<String>,
+    /// Optional ceremony port for an independent development Triad. Missing
+    /// keeps the default 18734 (or the development-only legacy environment
+    /// fallback); an explicit integer 1 through 65535 always wins and is
+    /// rejected before listeners open or ceremony state is touched when
+    /// invalid. Hostname/RP ID stay fixed at `localhost` and binds stay on
+    /// loopback (`127.0.0.1` and `::1`); only the port varies.
+    #[serde(default)]
+    ceremony_port: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -402,6 +410,11 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
         }
     };
     let mut config = load_config(&config_path)?;
+    // Resolve the effective ceremony port once at startup, before opening
+    // durable state or acquiring listeners, and carry it as instance state
+    // from here on. An explicit file value wins over the legacy fallback;
+    // an invalid explicit value fails startup here.
+    let ceremony_port = bloom_signer::webauthn::resolve_ceremony_port(config.ceremony_port)?;
     let broker_public_key = verifying_key(&config.broker_signing_public_key_hex)?;
     let ceremony_public_key = verifying_key(&config.ceremony_verifying_public_key_hex)?;
     let revocation_signing_key = take_signing_key(&mut config.revocation_signing_seed_hex)?;
@@ -467,10 +480,11 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
         migration_root,
         signer_effective_uid,
     )?);
-    let mut ceremony = SignerCeremonyService::new(
+    let mut ceremony = SignerCeremonyService::new_with_ceremony_port(
         engine.clone(),
         Token::new(config.ceremony_key_id.clone())?,
         ceremony_signing_key,
+        ceremony_port,
     )?
     .with_legacy_migrations(migration_store);
     if let Some(ttl_ms) = config.ceremony_ttl_ms {
@@ -2431,6 +2445,110 @@ mod tests {
         let event: serde_json::Value = serde_json::from_str(capture.text().trim()).unwrap();
         assert_eq!(event["fields"]["event"], "service.fatal_exit");
         assert_eq!(event["spans"][0]["service_id"], "bloom-signer");
+    }
+
+    fn ceremony_port_config_fixture(port: serde_json::Value) -> serde_json::Value {
+        let mut config = serde_json::json!({
+            "database_path": "/var/db/bloom/signer/signer.sqlite3",
+            "broker_signing_key_id": "broker-app-1",
+            "broker_signing_public_key_hex": "00".repeat(32),
+            "ceremony_verifying_public_key_hex": "11".repeat(32),
+            "revocation_key_id": "signer-revocation-key",
+            "revocation_signing_seed_hex": "22".repeat(32),
+            "audit_key_id": "signer-audit-key",
+            "audit_signing_seed_hex": "33".repeat(32),
+            "ceremony_key_id": "signer-ceremony-key",
+            "ceremony_signing_seed_hex": "44".repeat(32),
+            "build_digest": "55".repeat(32),
+            "maximum_connections": 8,
+            "maximum_in_flight_mutations": 4,
+            "maximum_requests_per_window": 100,
+            "request_window_ms": 1000,
+            "maximum_journal_admissions_per_window": 10,
+            "journal_window_ms": 1000,
+            "control_maximum_connections": 4,
+            "control_maximum_in_flight_mutations": 2,
+            "control_maximum_requests_per_window": 50,
+            "control_request_window_ms": 1000,
+            "control_maximum_journal_admissions_per_window": 5,
+            "control_journal_window_ms": 1000,
+            "aws_kms_backends": []
+        });
+        if !port.is_null() {
+            config["ceremony_port"] = port;
+        }
+        config
+    }
+
+    fn parse_ceremony_port_fixture(port: serde_json::Value) -> Result<Option<u16>, String> {
+        serde_json::from_value::<SignerConfig>(ceremony_port_config_fixture(port))
+            .map(|config| config.ceremony_port)
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn ceremony_port_config_missing_means_default() {
+        // A missing field parses as absent; resolution (default or legacy
+        // fallback) is covered by the webauthn unit tests. This stays
+        // environment-independent so the focused harness CI can run it.
+        assert_eq!(
+            parse_ceremony_port_fixture(serde_json::Value::Null).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn ceremony_port_config_explicit_alternate_parses() {
+        assert_eq!(
+            parse_ceremony_port_fixture(serde_json::json!(28735)).unwrap(),
+            Some(28735)
+        );
+        assert_eq!(
+            parse_ceremony_port_fixture(serde_json::json!(1)).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            parse_ceremony_port_fixture(serde_json::json!(65535)).unwrap(),
+            Some(65535)
+        );
+    }
+
+    #[test]
+    fn ceremony_port_config_rejects_non_integer_values() {
+        // Wrong JSON types never reach resolution: serde rejects them while
+        // parsing the protected config, before listeners or ceremony state.
+        for invalid in [
+            serde_json::json!("28735"),
+            serde_json::json!(28.735),
+            serde_json::json!(-1),
+            serde_json::json!(65536),
+            serde_json::json!(true),
+            serde_json::json!([28735]),
+        ] {
+            assert!(
+                parse_ceremony_port_fixture(invalid.clone()).is_err(),
+                "ceremony_port value {invalid} must be rejected at parse time"
+            );
+        }
+    }
+
+    #[test]
+    fn ceremony_port_config_zero_is_rejected_at_resolution() {
+        // Zero parses as a u16 but fails explicit validation, so startup
+        // rejects it through the same path as any invalid explicit value.
+        let parsed = parse_ceremony_port_fixture(serde_json::json!(0)).unwrap();
+        assert_eq!(parsed, Some(0));
+        assert_eq!(
+            bloom_signer::webauthn::resolve_ceremony_port(parsed)
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::MalformedFrame
+        );
+        // And a valid explicit port resolves regardless of resolution order.
+        assert_eq!(
+            bloom_signer::webauthn::resolve_ceremony_port(Some(28735)).unwrap(),
+            28735
+        );
     }
 
     #[test]

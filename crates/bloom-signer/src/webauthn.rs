@@ -14,6 +14,9 @@ use bloom_signer_api::{
 
 pub const CEREMONY_ORIGIN: &str = "http://localhost:18734";
 pub const CEREMONY_RP_ID: &str = "localhost";
+/// Default ceremony port retained when the Signer config omits
+/// `ceremony_port` and no development fallback selects another port.
+pub const DEFAULT_CEREMONY_PORT: u16 = 18734;
 
 /// The origin every WebAuthn clientDataJSON must carry.
 ///
@@ -27,13 +30,63 @@ pub fn configured_ceremony_origin() -> Result<String, ProtocolError> {
     ceremony_origin_for(std::env::var_os("BLOOM_TRIAD_DEV_CEREMONY_PORT").as_deref())
 }
 
+/// Serialize a ceremony origin the way browsers do: normally
+/// `http://localhost:<port>`; HTTP port 80 serializes as `http://localhost`.
+pub fn ceremony_origin_for_port(port: u16) -> String {
+    if port == 80 {
+        "http://localhost".to_owned()
+    } else {
+        format!("http://localhost:{port}")
+    }
+}
+
+/// Resolve the effective ceremony port from the optional `ceremony_port`
+/// Signer config field, reading the legacy development fallback only when
+/// the file sets no explicit value.
+///
+/// An explicit file value always wins: a valid explicit port is never
+/// rejected because an unused legacy override is malformed, and ordinary
+/// builds ignore the legacy variable entirely.
+pub fn resolve_ceremony_port(explicit: Option<u16>) -> Result<u16, ProtocolError> {
+    resolve_ceremony_port_for_env(
+        explicit,
+        std::env::var_os("BLOOM_TRIAD_DEV_CEREMONY_PORT").as_deref(),
+    )
+}
+
+fn resolve_ceremony_port_for_env(
+    explicit: Option<u16>,
+    _env_value: Option<&std::ffi::OsStr>,
+) -> Result<u16, ProtocolError> {
+    if let Some(port) = explicit {
+        return validate_explicit_ceremony_port(port);
+    }
+    // The underscore name keeps default builds (which never read the
+    // override) warning-free while the harness arm uses the value below.
+    #[cfg(feature = "triad-dev-harness")]
+    if let Some(value) = _env_value {
+        return parse_developer_ceremony_port(value);
+    }
+    Ok(DEFAULT_CEREMONY_PORT)
+}
+
+fn validate_explicit_ceremony_port(port: u16) -> Result<u16, ProtocolError> {
+    if port == 0 {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::MalformedFrame,
+            "ceremony_port must be an integer from 1 to 65535",
+        ));
+    }
+    Ok(port)
+}
+
 fn ceremony_origin_for(_env_value: Option<&std::ffi::OsStr>) -> Result<String, ProtocolError> {
     // The underscore name keeps default builds (which never read the
     // override) warning-free while the harness arm uses the value below.
     #[cfg(feature = "triad-dev-harness")]
     if let Some(value) = _env_value {
         let port = parse_developer_ceremony_port(value)?;
-        return Ok(format!("http://localhost:{port}"));
+        return Ok(ceremony_origin_for_port(port));
     }
     Ok(CEREMONY_ORIGIN.to_owned())
 }
@@ -73,6 +126,7 @@ pub fn verify_webauthn_assertion(
     assertion: &WebAuthnAssertion,
     credential: &WebAuthnCredential,
     expected_challenge: &[u8],
+    expected_origin: &str,
     require_user_verification: bool,
 ) -> Result<VerifiedAssertion, ProtocolError> {
     verify_webauthn_assertion_for_origin(
@@ -80,7 +134,7 @@ pub fn verify_webauthn_assertion(
         credential,
         expected_challenge,
         require_user_verification,
-        &configured_ceremony_origin()?,
+        expected_origin,
         CEREMONY_RP_ID,
     )
 }
@@ -151,13 +205,14 @@ pub fn verify_webauthn_attestation(
     expected_challenge: &[u8],
     expected_user_handle: Base64UrlBytes,
     expected_prf_salt: Base64UrlBytes,
+    expected_origin: &str,
 ) -> Result<WebAuthnCredential, ProtocolError> {
     verify_webauthn_attestation_for_origin(
         attestation,
         expected_challenge,
         expected_user_handle,
         expected_prf_salt,
-        &configured_ceremony_origin()?,
+        expected_origin,
         CEREMONY_RP_ID,
     )
 }
@@ -260,13 +315,18 @@ fn verify_client_data(
     let decoded = encoded.decode();
     let data: ClientData = serde_json::from_slice(&decoded)
         .map_err(|_| proof_error("WebAuthn clientDataJSON is malformed"))?;
+    if data.origin != expected_origin {
+        return Err(proof_error(format!(
+            "WebAuthn origin mismatch: expected {expected_origin}, observed {}",
+            data.origin
+        )));
+    }
     if data.ceremony_type != expected_type
-        || data.origin != expected_origin
         || data.cross_origin
         || Base64UrlBytes::parse(data.challenge)? != Base64UrlBytes::from_bytes(expected_challenge)
     {
         return Err(proof_error(
-            "WebAuthn type, challenge, origin, or cross-origin binding is invalid",
+            "WebAuthn type, challenge, or cross-origin binding is invalid",
         ));
     }
     Ok(())
@@ -417,7 +477,7 @@ mod tests {
     #[test]
     fn client_data_tolerates_future_unknown_members() {
         let challenge = b"future-compatible-challenge";
-        let origin = configured_ceremony_origin().unwrap();
+        let origin = ceremony_origin_for_port(28735);
         let encoded = client_data(serde_json::json!({
             "type": "webauthn.get",
             "challenge": Base64UrlBytes::from_bytes(challenge),
@@ -432,7 +492,7 @@ mod tests {
     #[test]
     fn client_data_still_rejects_cross_origin_with_top_origin() {
         let challenge = b"cross-origin-challenge";
-        let origin = configured_ceremony_origin().unwrap();
+        let origin = ceremony_origin_for_port(28735);
         let encoded = client_data(serde_json::json!({
             "type": "webauthn.get",
             "challenge": Base64UrlBytes::from_bytes(challenge),
@@ -443,6 +503,97 @@ mod tests {
 
         let error = verify_client_data(&encoded, "webauthn.get", challenge, &origin).unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
+    }
+
+    #[test]
+    fn client_data_origin_mismatch_names_expected_origin() {
+        let challenge = b"origin-mismatch-challenge";
+        let expected = ceremony_origin_for_port(28736);
+        let encoded = client_data(serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": Base64UrlBytes::from_bytes(challenge),
+            "origin": ceremony_origin_for_port(28735),
+            "crossOrigin": false,
+        }));
+
+        let error = verify_client_data(&encoded, "webauthn.get", challenge, &expected).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
+        assert!(
+            error.message.contains(&expected),
+            "origin mismatch must name the expected origin: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn ceremony_origin_for_port_serializes_browser_origins() {
+        assert_eq!(ceremony_origin_for_port(18734), "http://localhost:18734");
+        assert_eq!(ceremony_origin_for_port(28735), "http://localhost:28735");
+        assert_eq!(ceremony_origin_for_port(1), "http://localhost:1");
+        assert_eq!(ceremony_origin_for_port(65535), "http://localhost:65535");
+        // HTTP port 80 is the default port and is omitted from serialization.
+        assert_eq!(ceremony_origin_for_port(80), "http://localhost");
+        assert_eq!(
+            CEREMONY_ORIGIN,
+            ceremony_origin_for_port(DEFAULT_CEREMONY_PORT)
+        );
+    }
+
+    #[test]
+    fn explicit_ceremony_port_is_validated_without_env() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            resolve_ceremony_port_for_env(Some(28735), None).unwrap(),
+            28735
+        );
+        assert_eq!(resolve_ceremony_port_for_env(Some(80), None).unwrap(), 80);
+        assert_eq!(
+            resolve_ceremony_port_for_env(Some(65535), None).unwrap(),
+            65535
+        );
+        let error = resolve_ceremony_port_for_env(Some(0), None).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::MalformedFrame);
+        // An explicit file value wins even when an unused legacy override is
+        // malformed; the malformed value must not fail a valid configuration.
+        assert_eq!(
+            resolve_ceremony_port_for_env(Some(28735), Some(OsStr::new("not-a-port"))).unwrap(),
+            28735
+        );
+    }
+
+    #[test]
+    fn missing_ceremony_port_falls_back_to_default_or_legacy_env() {
+        use std::ffi::OsStr;
+        #[cfg(not(feature = "triad-dev-harness"))]
+        {
+            // Ordinary builds ignore the legacy variable entirely.
+            assert_eq!(
+                resolve_ceremony_port_for_env(None, None).unwrap(),
+                DEFAULT_CEREMONY_PORT
+            );
+            assert_eq!(
+                resolve_ceremony_port_for_env(None, Some(OsStr::new("28735"))).unwrap(),
+                DEFAULT_CEREMONY_PORT
+            );
+            assert_eq!(
+                resolve_ceremony_port_for_env(None, Some(OsStr::new("not-a-port"))).unwrap(),
+                DEFAULT_CEREMONY_PORT
+            );
+        }
+        #[cfg(feature = "triad-dev-harness")]
+        {
+            assert_eq!(
+                resolve_ceremony_port_for_env(None, None).unwrap(),
+                DEFAULT_CEREMONY_PORT
+            );
+            assert_eq!(
+                resolve_ceremony_port_for_env(None, Some(OsStr::new("28735"))).unwrap(),
+                28735
+            );
+            let error =
+                resolve_ceremony_port_for_env(None, Some(OsStr::new("not-a-port"))).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+        }
     }
 
     #[test]
@@ -517,6 +668,12 @@ mod tests {
             assert_eq!(
                 ceremony_origin_for(Some(OsStr::new("65535"))).unwrap(),
                 "http://localhost:65535"
+            );
+            // The legacy fallback formats port 80 the way browsers do, with
+            // no port suffix, exactly like the service construction path.
+            assert_eq!(
+                ceremony_origin_for(Some(OsStr::new("80"))).unwrap(),
+                "http://localhost"
             );
             for invalid in ["0", "65536", "not-a-port", " 28735", ""] {
                 let error = ceremony_origin_for(Some(OsStr::new(invalid))).unwrap_err();

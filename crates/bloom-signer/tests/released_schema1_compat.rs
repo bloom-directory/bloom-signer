@@ -151,6 +151,7 @@ fn released_schema1_state_migrates_and_preserves_wallet_access() {
         &authenticator.assertion(challenge, 5),
         &credential,
         challenge,
+        service.ceremony_origin(),
         true,
     )
     .unwrap();
