@@ -592,7 +592,22 @@ impl SignerRpcService {
                         },
                         "Signer finalized a failed signing operation"
                     );
-                    return Err(map_backend_error(error));
+                    // An operation this Signer quarantined is one where a
+                    // signature may already exist, and it must not be reported
+                    // with a code whose contract says otherwise. Broker keys
+                    // its reservation accounting off the code, and every
+                    // definitive-refusal code releases the reservation — which
+                    // drops the operation, its signatures and its value out of
+                    // the approval's limits. Saying "ambiguous" is not a
+                    // downgrade here; it is the accurate statement, and its
+                    // contract carries PossibleProviderEffect.
+                    return Err(match effect {
+                        SignerOperationEffect::Quarantined => ProtocolError::new(
+                            ProtocolErrorCode::AmbiguousProviderEffect,
+                            format!("Signer backend failed after signing may have begun: {error}"),
+                        ),
+                        _ => map_backend_error(error),
+                    });
                 }
             };
             if signature.crypto_suite != request.unsigned.crypto_suite
@@ -608,8 +623,11 @@ impl SignerRpcService {
                     outcome = "quarantined",
                     "Signer quarantined a signing operation"
                 );
+                // The backend returned a signature; only its suite or
+                // encoding is wrong. A signature exists, so this is ambiguous,
+                // not a refusal, and the reservation must keep counting.
                 return Err(ProtocolError::new(
-                    ProtocolErrorCode::BackendInvalidRequest,
+                    ProtocolErrorCode::AmbiguousProviderEffect,
                     "backend returned a mismatched signature suite or encoding",
                 ));
             }
