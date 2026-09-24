@@ -9,6 +9,11 @@ pub enum CompiledBackend {
     Local(Arc<bloom_signer_backend_local::LocalSignerBackend>),
     #[cfg(feature = "aws-kms")]
     AwsKms(Arc<bloom_signer_backend_aws_kms::AwsKmsSignerBackend>),
+    /// A fault-injecting stand-in for in-crate service tests: it wraps a real
+    /// local backend and only changes what `sign` returns. It never exists in
+    /// a production build, so no production path can reach it.
+    #[cfg(all(test, feature = "local"))]
+    Test(Arc<test_fault::FaultSignerBackend>),
 }
 
 impl CompiledBackend {
@@ -18,6 +23,113 @@ impl CompiledBackend {
             Self::Local(backend) => backend.clone(),
             #[cfg(feature = "aws-kms")]
             Self::AwsKms(backend) => backend.clone(),
+            #[cfg(all(test, feature = "local"))]
+            Self::Test(backend) => backend.clone(),
+        }
+    }
+}
+
+/// Fault injection for the signing-path tests in this crate. Lives next to
+/// [`CompiledBackend`] because only that enum can install a backend into the
+/// production registry.
+#[cfg(all(test, feature = "local"))]
+pub(crate) mod test_fault {
+    use bloom_signer_api::{
+        CryptoSuite, KeyRef, ProtocolError, ProtocolErrorCode, SignatureEncoding, Token,
+    };
+    use bloom_signer_backend_api::{
+        BackendCapabilities, BackendError, BackendFuture, BackendSignRequest, BackendSignature,
+        KeyDescription, SignerBackend,
+    };
+    use bloom_signer_backend_local::LocalSignerBackend;
+    use parking_lot::Mutex;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    /// What the next backend `sign` call does. When the script runs out, every
+    /// further call delegates to the wrapped backend unchanged.
+    pub enum SignFault {
+        /// Behave like the wrapped backend.
+        Sign,
+        /// Fail the backend call itself.
+        Fail(BackendError),
+        /// Sign, then claim the signature belongs to another crypto suite.
+        ClaimSuite(CryptoSuite),
+        /// Sign, then claim the signature uses the other signature encoding.
+        ClaimEncoding(SignatureEncoding),
+    }
+
+    pub struct FaultSignerBackend {
+        inner: Arc<LocalSignerBackend>,
+        script: Mutex<VecDeque<SignFault>>,
+    }
+
+    impl FaultSignerBackend {
+        pub(crate) fn new(inner: Arc<LocalSignerBackend>, script: Vec<SignFault>) -> Self {
+            Self {
+                inner,
+                script: Mutex::new(script.into()),
+            }
+        }
+
+        pub(crate) fn key_is_available(&self, key_ref: &KeyRef) -> Result<bool, ProtocolError> {
+            self.inner.key_is_available(key_ref).map_err(|error| {
+                ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!("local backend key availability failed: {error:?}"),
+                )
+            })
+        }
+
+        pub(crate) fn key_is_registered(&self, key_ref: &KeyRef) -> Result<bool, ProtocolError> {
+            Ok(self.inner.key_is_registered(key_ref))
+        }
+    }
+
+    impl SignerBackend for FaultSignerBackend {
+        fn backend_id(&self) -> Token {
+            SignerBackend::backend_id(self.inner.as_ref())
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            SignerBackend::capabilities(self.inner.as_ref())
+        }
+
+        fn describe_key<'a>(
+            &'a self,
+            key: &'a KeyRef,
+        ) -> BackendFuture<'a, Result<KeyDescription, BackendError>> {
+            Box::pin(async move { SignerBackend::describe_key(self.inner.as_ref(), key).await })
+        }
+
+        fn sign<'a>(
+            &'a self,
+            request: BackendSignRequest,
+        ) -> BackendFuture<'a, Result<BackendSignature, BackendError>> {
+            Box::pin(async move {
+                // Pop before awaiting: the guard must not be held across the
+                // backend call (it is not Send, and the backend may wait).
+                let fault = self.script.lock().pop_front();
+                match fault {
+                    Some(SignFault::Sign) => {
+                        SignerBackend::sign(self.inner.as_ref(), request).await
+                    }
+                    Some(SignFault::Fail(error)) => Err(error),
+                    Some(SignFault::ClaimSuite(suite)) => {
+                        let mut signature =
+                            SignerBackend::sign(self.inner.as_ref(), request).await?;
+                        signature.crypto_suite = suite;
+                        Ok(signature)
+                    }
+                    Some(SignFault::ClaimEncoding(encoding)) => {
+                        let mut signature =
+                            SignerBackend::sign(self.inner.as_ref(), request).await?;
+                        signature.encoding = encoding;
+                        Ok(signature)
+                    }
+                    None => SignerBackend::sign(self.inner.as_ref(), request).await,
+                }
+            })
         }
     }
 }
@@ -88,6 +200,8 @@ impl BackendRegistry {
                 CompiledBackend::AwsKms(aws) => aws.audit_events(),
                 #[cfg(feature = "local")]
                 CompiledBackend::Local(_) => Vec::new(),
+                #[cfg(all(test, feature = "local"))]
+                CompiledBackend::Test(_) => Vec::new(),
             })
             .collect()
     }
@@ -120,6 +234,8 @@ impl BackendRegistry {
             }),
             #[cfg(feature = "aws-kms")]
             CompiledBackend::AwsKms(aws) => Ok(aws.key_is_available(key_ref)),
+            #[cfg(all(test, feature = "local"))]
+            CompiledBackend::Test(backend) => backend.key_is_available(key_ref),
         }
     }
 
@@ -146,6 +262,8 @@ impl BackendRegistry {
             CompiledBackend::Local(local) => Ok(local.key_is_registered(key_ref)),
             #[cfg(feature = "aws-kms")]
             CompiledBackend::AwsKms(aws) => Ok(aws.key_is_registered(key_ref)),
+            #[cfg(all(test, feature = "local"))]
+            CompiledBackend::Test(backend) => backend.key_is_registered(key_ref),
         }
     }
 
@@ -184,6 +302,11 @@ impl BackendRegistry {
                 ProtocolErrorCode::BackendUnsupported,
                 "AWS KMS keys do not use Signer activation",
             )),
+            #[cfg(all(test, feature = "local"))]
+            CompiledBackend::Test(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "the fault-injection test backend does not manage activation",
+            )),
         }
     }
 
@@ -218,6 +341,11 @@ impl BackendRegistry {
                 ProtocolErrorCode::BackendUnsupported,
                 "AWS KMS keys do not use Signer activation",
             )),
+            #[cfg(all(test, feature = "local"))]
+            CompiledBackend::Test(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "the fault-injection test backend does not manage activation",
+            )),
         }
     }
 
@@ -248,6 +376,11 @@ impl BackendRegistry {
             CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
                 "AWS KMS keys do not use Signer activation",
+            )),
+            #[cfg(all(test, feature = "local"))]
+            CompiledBackend::Test(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "the fault-injection test backend does not manage activation",
             )),
         }
     }
@@ -498,6 +631,11 @@ impl BackendRegistry {
                 ProtocolErrorCode::BackendUnsupported,
                 "AWS KMS does not support bip39 child registration",
             )),
+            #[cfg(all(test, feature = "local"))]
+            CompiledBackend::Test(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "the fault-injection test backend does not manage derivation",
+            )),
         }
     }
 
@@ -527,6 +665,11 @@ impl BackendRegistry {
             CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
                 "AWS KMS does not support bip39 child retirement",
+            )),
+            #[cfg(all(test, feature = "local"))]
+            CompiledBackend::Test(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "the fault-injection test backend does not manage derivation",
             )),
         }
     }
@@ -635,6 +778,11 @@ impl BackendRegistry {
                 ProtocolErrorCode::BackendUnsupported,
                 "AWS KMS does not expose local custody backups",
             )),
+            #[cfg(all(test, feature = "local"))]
+            CompiledBackend::Test(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "the fault-injection test backend does not expose custody backups",
+            )),
         }
     }
 
@@ -671,6 +819,11 @@ impl BackendRegistry {
             CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
                 "AWS KMS does not support derived keys",
+            )),
+            #[cfg(all(test, feature = "local"))]
+            CompiledBackend::Test(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "the fault-injection test backend does not manage derived keys",
             )),
         }
     }
@@ -714,6 +867,11 @@ impl BackendRegistry {
                 ProtocolErrorCode::BackendUnsupported,
                 "AWS KMS does not support derived keys",
             )),
+            #[cfg(all(test, feature = "local"))]
+            CompiledBackend::Test(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "the fault-injection test backend does not manage derived keys",
+            )),
         }
     }
 
@@ -746,6 +904,11 @@ impl BackendRegistry {
             CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
                 "AWS KMS does not support derived keys",
+            )),
+            #[cfg(all(test, feature = "local"))]
+            CompiledBackend::Test(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "the fault-injection test backend does not manage derived keys",
             )),
         }
     }
@@ -781,6 +944,11 @@ impl BackendRegistry {
                 ProtocolErrorCode::BackendUnsupported,
                 "AWS KMS does not support derived keys",
             )),
+            #[cfg(all(test, feature = "local"))]
+            CompiledBackend::Test(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "the fault-injection test backend does not manage derived keys",
+            )),
         }
     }
 
@@ -795,6 +963,8 @@ impl BackendRegistry {
                 CompiledBackend::Local(local) => local.pending_derivations(),
                 #[cfg(feature = "aws-kms")]
                 CompiledBackend::AwsKms(_) => Vec::new(),
+                #[cfg(all(test, feature = "local"))]
+                CompiledBackend::Test(_) => Vec::new(),
             })
             .collect()
     }

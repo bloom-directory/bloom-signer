@@ -852,14 +852,17 @@ fn now_ms() -> Result<u64, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::test_fault::{FaultSignerBackend, SignFault};
     use crate::{custody::WalletCustody, engine::SignerAuditKeys};
     use bloom_signer_api::{
         ActivationMode, ApprovalLimits, ApprovalSelector, ApprovalSubject, CeremonyKind,
         CeremonyPrepareRequest, CryptoSuite, CustodyPrepareRequest, KeyRef, KeySpec,
         ProtocolVersion, RequestNonce, RevokeRequest, SealedApprovalTerms, SelectorKind,
-        SignOperationIdentity, UnsignedSignRequest, WalletRequest,
+        SignOperationIdentity, SignatureEncoding, UnsignedSignRequest, WalletRequest,
     };
-    use bloom_signer_backend_api::{SecretBytes, SignerBackend, SignerBackendActivation};
+    use bloom_signer_backend_api::{
+        BackendError, SecretBytes, SignerBackend, SignerBackendActivation,
+    };
     use bloom_signer_backend_local::LocalSignerBackend;
     use ed25519_dalek::{Signer as _, SigningKey};
     use std::collections::BTreeMap;
@@ -926,7 +929,10 @@ mod tests {
         );
     }
 
-    async fn fixture() -> (SignerRpcService, SigningKey, SealedApprovalTerms) {
+    async fn fixture_with(
+        customize_terms: impl FnOnce(&mut SealedApprovalTerms),
+        wrap_backend: impl FnOnce(Arc<LocalSignerBackend>) -> crate::registry::CompiledBackend,
+    ) -> (SignerRpcService, SigningKey, SealedApprovalTerms) {
         let broker_key = SigningKey::from_bytes(&[7; 32]);
         let activation_secret = vec![9; 32];
         let backend = Arc::new(
@@ -945,10 +951,7 @@ mod tests {
             .await
             .unwrap();
         let registry = Arc::new(
-            crate::registry::BackendRegistry::from_compiled(vec![
-                crate::registry::CompiledBackend::Local(backend),
-            ])
-            .unwrap(),
+            crate::registry::BackendRegistry::from_compiled(vec![wrap_backend(backend)]).unwrap(),
         );
         let engine = Arc::new(
             SignerEngine::open_in_memory(
@@ -967,7 +970,7 @@ mod tests {
             .unwrap(),
         );
         let current = now_ms().unwrap();
-        let terms = SealedApprovalTerms {
+        let mut terms = SealedApprovalTerms {
             subject: ApprovalSubject::Cli {
                 client_id: Token::new("bloom-machine").unwrap(),
                 command_class: Token::new("wallet.sign").unwrap(),
@@ -997,6 +1000,7 @@ mod tests {
             expires_at_ms: DecimalU64::new(current + 60_000),
             renewal_of: None,
         };
+        customize_terms(&mut terms);
         engine
             .enroll_wallet_root_key(&terms.wallet_id, &terms.key_ref)
             .unwrap();
@@ -1029,6 +1033,10 @@ mod tests {
             broker_key,
             terms,
         )
+    }
+
+    async fn fixture() -> (SignerRpcService, SigningKey, SealedApprovalTerms) {
+        fixture_with(|_| (), crate::registry::CompiledBackend::Local).await
     }
 
     #[tokio::test]
@@ -1124,10 +1132,27 @@ mod tests {
         terms: &SealedApprovalTerms,
         attempt_byte: u8,
     ) -> SignRequest {
+        batch_sign_request(broker_key, terms, attempt_byte, 1, 22, 33)
+    }
+
+    /// A batch request of `count` hashes whose payload digests start at
+    /// `payload_base` and whose input hashes start at `hash_base`.
+    fn batch_sign_request(
+        broker_key: &SigningKey,
+        terms: &SealedApprovalTerms,
+        attempt_byte: u8,
+        count: usize,
+        payload_base: u8,
+        hash_base: u8,
+    ) -> SignRequest {
         let current = now_ms().unwrap();
         let operation_id = OperationId::from_bytes([1; 32]);
-        let payloads = vec![Digest32::from_bytes([22; 32])];
-        let hashes = vec![Digest32::from_bytes([33; 32])];
+        let payloads = (0..count)
+            .map(|index| Digest32::from_bytes([payload_base + index as u8; 32]))
+            .collect::<Vec<_>>();
+        let hashes = (0..count)
+            .map(|index| Digest32::from_bytes([hash_base + index as u8; 32]))
+            .collect::<Vec<_>>();
         let identity = SignOperationIdentity {
             operation_id: operation_id.clone(),
             approval_id: terms.approval_id().unwrap(),
@@ -1158,7 +1183,7 @@ mod tests {
             ordered_payload_digests: payloads,
             ordered_hashes: hashes,
             ordered_messages: Vec::new(),
-            signature_count: DecimalU64::new(1),
+            signature_count: DecimalU64::new(count as u64),
             petal_use_claim_digest: None,
             claim_assurance_digest: None,
             policy_version: terms.policy_version.clone(),
@@ -1503,6 +1528,176 @@ mod tests {
                 .unwrap_err()
                 .code,
             ProtocolErrorCode::AmbiguousProviderEffect
+        );
+    }
+
+    // The quarantine accounting tests. A quarantined signing operation is one
+    // where a signature may already exist, so its answer must carry the
+    // ambiguous contract — never a refusal code, whose contract tells Broker
+    // that the reserved allowance is free to spend elsewhere (pm#35).
+
+    #[tokio::test]
+    async fn a_batch_that_failed_after_a_signature_reports_ambiguous_not_a_refusal() {
+        let (service, broker_key, terms) = fixture_with(
+            |terms| {
+                terms.selector = ApprovalSelector::Exact {
+                    ordered_payload_digests: (0..2)
+                        .map(|index| Digest32::from_bytes([22 + index; 32]))
+                        .collect(),
+                    ordered_hashes: (0..2)
+                        .map(|index| Digest32::from_bytes([33 + index; 32]))
+                        .collect(),
+                };
+                terms.limits.max_operations = DecimalU64::new(1);
+                terms.limits.max_signatures = DecimalU64::new(2);
+            },
+            |backend| {
+                crate::registry::CompiledBackend::Test(Arc::new(FaultSignerBackend::new(
+                    backend,
+                    vec![
+                        SignFault::Sign,
+                        SignFault::Fail(BackendError::IndeterminateAcceptance),
+                    ],
+                )))
+            },
+        )
+        .await;
+        let first = batch_sign_request(&broker_key, &terms, 3, 2, 22, 33);
+        let error =
+            BrokerSignerService::dispatch(&service, BrokerSignerRequest::SignerSignBatch(first))
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error.code,
+            ProtocolErrorCode::AmbiguousProviderEffect,
+            "the second hash failed after the first signed: a refusal here would release the allowance ({error})"
+        );
+
+        // The durable state must keep saying ambiguous, so a retry cannot
+        // restart the operation and a released allowance cannot be reused.
+        let retry = batch_sign_request(&broker_key, &terms, 4, 2, 22, 33);
+        assert_eq!(
+            BrokerSignerService::dispatch(&service, BrokerSignerRequest::SignerSignBatch(retry))
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::AmbiguousProviderEffect
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_signature_suite_is_ambiguous_not_a_refusal() {
+        let (service, broker_key, terms) = fixture_with(
+            |_| (),
+            |backend| {
+                crate::registry::CompiledBackend::Test(Arc::new(FaultSignerBackend::new(
+                    backend,
+                    vec![SignFault::ClaimSuite(CryptoSuite::Ed25519Message)],
+                )))
+            },
+        )
+        .await;
+        let first = sign_request(&broker_key, &terms, 3);
+        assert_eq!(
+            BrokerSignerService::dispatch(&service, BrokerSignerRequest::SignerSign(first))
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::AmbiguousProviderEffect,
+            "a signature exists; only its claimed suite is wrong"
+        );
+        let retry = sign_request(&broker_key, &terms, 4);
+        assert_eq!(
+            BrokerSignerService::dispatch(&service, BrokerSignerRequest::SignerSign(retry))
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::AmbiguousProviderEffect
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_signature_encoding_is_ambiguous_not_a_refusal() {
+        let (service, broker_key, terms) = fixture_with(
+            |_| (),
+            |backend| {
+                crate::registry::CompiledBackend::Test(Arc::new(FaultSignerBackend::new(
+                    backend,
+                    vec![SignFault::ClaimEncoding(SignatureEncoding::Ed25519Raw64)],
+                )))
+            },
+        )
+        .await;
+        let first = sign_request(&broker_key, &terms, 3);
+        assert_eq!(
+            BrokerSignerService::dispatch(&service, BrokerSignerRequest::SignerSign(first))
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::AmbiguousProviderEffect
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_backend_response_is_ambiguous_and_stays_ambiguous() {
+        let (service, broker_key, terms) = fixture_with(
+            |_| (),
+            |backend| {
+                crate::registry::CompiledBackend::Test(Arc::new(FaultSignerBackend::new(
+                    backend,
+                    vec![SignFault::Fail(BackendError::IndeterminateAcceptance)],
+                )))
+            },
+        )
+        .await;
+        let first = sign_request(&broker_key, &terms, 3);
+        assert_eq!(
+            BrokerSignerService::dispatch(&service, BrokerSignerRequest::SignerSign(first))
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::AmbiguousProviderEffect,
+            "an indeterminate backend answer may hide a committed signature"
+        );
+        let retry = sign_request(&broker_key, &terms, 4);
+        assert_eq!(
+            BrokerSignerService::dispatch(&service, BrokerSignerRequest::SignerSign(retry))
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::AmbiguousProviderEffect
+        );
+    }
+
+    #[tokio::test]
+    async fn a_definitive_first_hash_refusal_still_refuses_and_releases() {
+        let (service, broker_key, terms) = fixture_with(
+            |_| (),
+            |backend| {
+                crate::registry::CompiledBackend::Test(Arc::new(FaultSignerBackend::new(
+                    backend,
+                    vec![SignFault::Fail(BackendError::DefinitiveRejected)],
+                )))
+            },
+        )
+        .await;
+        let first = sign_request(&broker_key, &terms, 3);
+        assert_eq!(
+            BrokerSignerService::dispatch(&service, BrokerSignerRequest::SignerSign(first))
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::BackendInvalidRequest,
+            "nothing signed on any hash, so the refusal contract holds and Broker may release"
+        );
+        let retry = sign_request(&broker_key, &terms, 4);
+        assert_eq!(
+            BrokerSignerService::dispatch(&service, BrokerSignerRequest::SignerSign(retry))
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::OperationIdConflict,
+            "the released operation cannot be retried"
         );
     }
 
