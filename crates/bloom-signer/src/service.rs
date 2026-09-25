@@ -1556,7 +1556,10 @@ mod tests {
                     backend,
                     vec![
                         SignFault::Sign,
-                        SignFault::Fail(BackendError::IndeterminateAcceptance),
+                        // A refusal-class backend error. The old mapping turned
+                        // this into BACKEND_INVALID_REQUEST after a signature
+                        // already existed, and Broker releases that code.
+                        SignFault::Fail(BackendError::DefinitiveRejected),
                     ],
                 )))
             },
@@ -1631,6 +1634,14 @@ mod tests {
         let first = sign_request(&broker_key, &terms, 3);
         assert_eq!(
             BrokerSignerService::dispatch(&service, BrokerSignerRequest::SignerSign(first))
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::AmbiguousProviderEffect
+        );
+        let retry = sign_request(&broker_key, &terms, 4);
+        assert_eq!(
+            BrokerSignerService::dispatch(&service, BrokerSignerRequest::SignerSign(retry))
                 .await
                 .unwrap_err()
                 .code,
