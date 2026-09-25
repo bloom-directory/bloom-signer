@@ -694,6 +694,264 @@ fn cross_surface_add_requires_source_authority_and_destination_pair_key() {
     );
 }
 
+/// Pair, prepare and authorize one two-device addition whose approving passkey
+/// is `source` on `source_surface`, returning the prepared terms and the
+/// handoff capability the destination decrypts.
+#[allow(clippy::too_many_arguments)]
+fn authorize_second_device(
+    service: &SignerCeremonyService,
+    source: &VirtualAuthenticator,
+    source_sign_count: u32,
+    wallet_id: &Token,
+    source_surface: SurfaceRef,
+    destination_surface: SurfaceRef,
+    operation_id: OperationId,
+    terms: Digest32,
+    now_ms: u64,
+) -> (CrossSurfaceSourcePrepared, Base64UrlBytes) {
+    let recipient = HpkeRecipient::generate();
+    let pair = service
+        .cross_surface_pair_start(
+            CrossSurfacePairStartRequest {
+                destination_surface,
+                operation_id,
+                exact_terms_digest: terms.clone(),
+                destination_hpke_public_key: recipient.public_key().clone(),
+                expires_at_ms: DecimalU64::new(600_000),
+            },
+            now_ms,
+        )
+        .unwrap();
+    let prepared = service
+        .cross_surface_prepare_source(
+            CrossSurfacePrepareSourceRequest {
+                pairing_id: pair.pairing_id.clone(),
+                operation_id: pair.operation_id.clone(),
+                source_surface,
+                wallet_id: wallet_id.clone(),
+                exact_terms_digest: terms,
+            },
+            now_ms + 1,
+        )
+        .unwrap();
+    let handoff = service
+        .cross_surface_complete_source(
+            CrossSurfaceCompleteSourceRequest {
+                pairing_id: pair.pairing_id.clone(),
+                operation_id: pair.operation_id.clone(),
+                authority_assertion: source.assertion(
+                    &prepared.source_challenge.canonical_bytes().unwrap(),
+                    source_sign_count,
+                ),
+                encrypted_authority_prf: seal_hpke(
+                    &prepared.source_hpke_recipient_key,
+                    b"bloom-cross-surface-source-prf/v1",
+                    &cross_aad(&prepared, "source_prf"),
+                    &source.deterministic_prf(),
+                )
+                .unwrap(),
+            },
+            now_ms + 2,
+        )
+        .unwrap();
+    let capability = recipient
+        .open(
+            &handoff.encrypted_capability,
+            b"bloom-cross-surface-handoff/v1",
+            &cross_aad(&prepared, "handoff"),
+        )
+        .unwrap();
+    let capability = Base64UrlBytes::from_bytes(capability.expose_to_backend());
+    (prepared, capability)
+}
+
+#[test]
+fn same_surface_add_pairs_a_second_device_and_records_an_existing_passkey() {
+    let first = VirtualAuthenticator::generate();
+    let (service, _, _, _) = service(&first);
+    let (registered, _) = complete_new_wallet(
+        &service,
+        &first,
+        CeremonyKind::WalletRegistration,
+        operation("a1"),
+        None,
+        None,
+        1_000,
+    );
+    let wallet_id = registered.wallet_id.unwrap();
+    let local = legacy_local_surface();
+
+    // A second device on the same origin: the first passkey approves, the new
+    // one enrolls, and the destination learns which passkeys to exclude.
+    let (prepared, capability) = authorize_second_device(
+        &service,
+        &first,
+        2,
+        &wallet_id,
+        local.clone(),
+        local.clone(),
+        operation("a2"),
+        digest("a3"),
+        2_000,
+    );
+    assert_eq!(prepared.source_surface, local);
+    assert_eq!(
+        prepared.destination_existing_credentials,
+        vec![first.credential(0).credential_id]
+    );
+    let second =
+        VirtualAuthenticator::generate_with_user_handle(&prepared.destination_user_handle.decode());
+    let result = service
+        .cross_surface_complete_destination(
+            CrossSurfaceCompleteDestinationRequest {
+                pairing_id: prepared.pairing.pairing_id.clone(),
+                operation_id: prepared.pairing.operation_id.clone(),
+                capability,
+                attestation: second.attestation(
+                    &prepared.destination_challenges[0]
+                        .canonical_bytes()
+                        .unwrap(),
+                ),
+                prf_assertion: second.assertion(
+                    &prepared.destination_challenges[1]
+                        .canonical_bytes()
+                        .unwrap(),
+                    1,
+                ),
+                encrypted_new_prf: seal_hpke(
+                    &prepared.destination_hpke_recipient_key,
+                    b"bloom-cross-surface-destination-prf/v1",
+                    &cross_aad(&prepared, "destination_prf"),
+                    &second.deterministic_prf(),
+                )
+                .unwrap(),
+            },
+            2_100,
+        )
+        .unwrap();
+    assert_eq!(result.public_status, CeremonyState::Succeeded);
+    assert_eq!(
+        result
+            .credential_summaries
+            .iter()
+            .filter(|summary| summary.surface.as_ref() == Some(&local))
+            .count(),
+        2
+    );
+
+    // A third attempt lands on a device that already holds one of them. Only
+    // the capability holder may say so; nothing is enrolled and the outcome is
+    // durable, idempotent and closed to later completion.
+    let (prepared, capability) = authorize_second_device(
+        &service,
+        &first,
+        3,
+        &wallet_id,
+        local.clone(),
+        local.clone(),
+        operation("a4"),
+        digest("a5"),
+        3_000,
+    );
+    let mut existing = prepared.destination_existing_credentials.clone();
+    existing.sort_by_key(|id| id.decode());
+    let mut expected = vec![
+        first.credential(0).credential_id,
+        second.credential(0).credential_id,
+    ];
+    expected.sort_by_key(|id| id.decode());
+    assert_eq!(existing, expected);
+    let mut report = CrossSurfaceAlreadyRegisteredRequest {
+        pairing_id: prepared.pairing.pairing_id.clone(),
+        operation_id: prepared.pairing.operation_id.clone(),
+        capability: Base64UrlBytes::from_bytes(&[7; 32]),
+    };
+    assert_eq!(
+        service
+            .cross_surface_already_registered(report.clone(), 3_100)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::UnauthenticatedPeer
+    );
+    report.capability = capability;
+    let status = service
+        .cross_surface_already_registered(report.clone(), 3_200)
+        .unwrap();
+    assert_eq!(status.state, CeremonyState::AlreadyRegistered);
+    assert_eq!(status.receipt_digest, None);
+    assert_eq!(
+        service
+            .cross_surface_already_registered(report, 3_300)
+            .unwrap(),
+        status
+    );
+    service.cancel(&prepared.pairing.operation_id).unwrap();
+    assert_eq!(
+        service
+            .cross_surface_pair_start(
+                CrossSurfacePairStartRequest {
+                    destination_surface: local.clone(),
+                    operation_id: prepared.pairing.operation_id.clone(),
+                    exact_terms_digest: digest("a5"),
+                    destination_hpke_public_key: HpkeRecipient::generate().public_key().clone(),
+                    expires_at_ms: DecimalU64::new(600_000),
+                },
+                3_400,
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::OperationIdConflict
+    );
+
+    // A destination surface with no wallet passkey cannot claim a match.
+    let hostname = "abcdefghijklmnopqrstuv2345.relay.bloom.directory";
+    service
+        .install_remote_surface(hostname, "installation-1", digest("ab"), 4_000)
+        .unwrap();
+    let current = service.surface_status().unwrap();
+    service
+        .report_effective(SurfaceEffectiveReport {
+            desired_revision: current.desired_revision,
+            remote_tls_ready: true,
+            remote_routing_ready: true,
+            remote_closed: false,
+        })
+        .unwrap();
+    let remote = service
+        .surface_status()
+        .unwrap()
+        .surfaces
+        .into_iter()
+        .find(|surface| surface.identity.surface_id.as_str() == "remote")
+        .unwrap();
+    let (prepared, capability) = authorize_second_device(
+        &service,
+        &first,
+        4,
+        &wallet_id,
+        local,
+        remote.reference(),
+        operation("a6"),
+        digest("a7"),
+        4_100,
+    );
+    assert!(prepared.destination_existing_credentials.is_empty());
+    assert_eq!(
+        service
+            .cross_surface_already_registered(
+                CrossSurfaceAlreadyRegisteredRequest {
+                    pairing_id: prepared.pairing.pairing_id.clone(),
+                    operation_id: prepared.pairing.operation_id.clone(),
+                    capability,
+                },
+                4_200,
+            )
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::OperationIdConflict
+    );
+}
+
 #[test]
 fn signer_restart_fences_stale_remote_readiness_until_broker_reconciles() {
     let authenticator = VirtualAuthenticator::generate();

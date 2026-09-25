@@ -7353,6 +7353,7 @@ fn ceremony_state_code(state: bloom_signer_api::CeremonyState) -> &'static str {
         CeremonyState::Cancelled => "cancelled",
         CeremonyState::Expired => "expired",
         CeremonyState::Failed => "failed",
+        CeremonyState::AlreadyRegistered => "already_registered",
     }
 }
 

@@ -161,6 +161,12 @@ impl SignerRpcService {
                         .cross_surface_complete_destination(request, now_ms)?,
                 ))
             }
+            Request::CrossSurfaceAlreadyRegistered(request) => {
+                Ok(Response::CrossSurfaceAlreadyRegistered(
+                    self.ceremony
+                        .cross_surface_already_registered(request, now_ms)?,
+                ))
+            }
             Request::KeyGetPublic(request) => Ok(Response::KeyGetPublic(
                 self.describe_key(&request.key_ref).await?,
             )),

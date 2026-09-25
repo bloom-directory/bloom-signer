@@ -289,6 +289,11 @@ pub enum CeremonyState {
     Expired,
     #[serde(rename = "FAILED")]
     Failed,
+    /// Terminal credential addition that changed nothing: the destination
+    /// device's passkey provider already held one of the wallet's passkeys on
+    /// that surface, so WebAuthn refused to create a duplicate.
+    #[serde(rename = "ALREADY_REGISTERED")]
+    AlreadyRegistered,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -327,6 +332,8 @@ pub enum BrokerSignerRequest {
     CrossSurfaceCompleteSource(crate::CrossSurfaceCompleteSourceRequest),
     #[serde(rename = "cross_surface.complete_destination")]
     CrossSurfaceCompleteDestination(crate::CrossSurfaceCompleteDestinationRequest),
+    #[serde(rename = "cross_surface.already_registered")]
+    CrossSurfaceAlreadyRegistered(crate::CrossSurfaceAlreadyRegisteredRequest),
     #[serde(rename = "key.get_public")]
     KeyGetPublic(KeyRequest),
     #[serde(rename = "key.list_public")]
@@ -422,6 +429,8 @@ pub enum BrokerSignerResponse {
     CrossSurfaceCompleteSource(crate::CrossSurfaceHandoff),
     #[serde(rename = "cross_surface.complete_destination")]
     CrossSurfaceCompleteDestination(crate::CustodyResult),
+    #[serde(rename = "cross_surface.already_registered")]
+    CrossSurfaceAlreadyRegistered(CeremonyPublicStatus),
     #[serde(rename = "key.get_public")]
     KeyGetPublic(KeyPublic),
     #[serde(rename = "key.list_public")]
@@ -588,6 +597,7 @@ impl crate::TypedRequestMethod for BrokerSignerRequest {
             Request::CrossSurfacePrepareSource(request) => Some(request.operation_id.clone()),
             Request::CrossSurfaceCompleteSource(request) => Some(request.operation_id.clone()),
             Request::CrossSurfaceCompleteDestination(request) => Some(request.operation_id.clone()),
+            Request::CrossSurfaceAlreadyRegistered(request) => Some(request.operation_id.clone()),
             _ => None,
         })
     }
@@ -676,6 +686,6 @@ mod tests {
 
     #[test]
     fn typed_request_inventories_cover_every_normative_method() {
-        assert_eq!(crate::BrokerSignerMethod::ALL.len(), 45);
+        assert_eq!(crate::BrokerSignerMethod::ALL.len(), 46);
     }
 }

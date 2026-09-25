@@ -1,4 +1,8 @@
-//! Authority-first passkey addition across the two Signer-owned origins.
+//! Authority-first passkey addition on a second device.
+//!
+//! The approving (source) and new (destination) passkeys may be on different
+//! Signer-owned origins or on the same one; the two legs keep independent
+//! sessions, challenges and capabilities either way.
 
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +61,13 @@ pub struct CrossSurfaceSourcePrepared {
     pub source_hpke_recipient_key: Base64UrlBytes,
     pub destination_hpke_recipient_key: Base64UrlBytes,
     pub credential_authority_generation: DecimalU64,
+    /// The wallet's active credential IDs on the destination surface. The
+    /// destination browser passes them as WebAuthn `excludeCredentials`, so a
+    /// device whose passkey provider already holds one (a synced copy or an
+    /// earlier registration) refuses instead of overwriting it. Omitted when
+    /// empty to keep earlier canonical bytes stable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destination_existing_credentials: Vec<Base64UrlBytes>,
     pub signer_signature: Base64UrlBytes,
 }
 
@@ -86,6 +97,18 @@ pub struct CrossSurfaceCompleteDestinationRequest {
     pub attestation: WebAuthnAttestation,
     pub prf_assertion: WebAuthnAssertion,
     pub encrypted_new_prf: HpkeEnvelope,
+}
+
+/// The paired destination reports that WebAuthn refused to create a passkey
+/// because the device already holds one of `destination_existing_credentials`.
+/// The handoff capability proves this is the authorized destination tab. Nothing
+/// is enrolled; Signer records the terminal `ALREADY_REGISTERED` outcome.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrossSurfaceAlreadyRegisteredRequest {
+    pub pairing_id: Digest32,
+    pub operation_id: OperationId,
+    pub capability: Base64UrlBytes,
 }
 
 /// The same canonical pair AAD is used with distinct HPKE info strings for

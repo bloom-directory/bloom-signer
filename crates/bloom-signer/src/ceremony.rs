@@ -2,16 +2,16 @@ use bloom_signer_api::{
     ActivationMode, Base64UrlBytes, CeremonyChallenge, CeremonyCompleteRequest, CeremonyKind,
     CeremonyPhase, CeremonyPrepareRequest, CeremonyPublicStatus, CeremonyState,
     CeremonyWebAuthnOptions, CredentialPrfInput, CredentialSummary,
-    CrossSurfaceCompleteDestinationRequest, CrossSurfaceCompleteSourceRequest, CrossSurfaceHandoff,
-    CrossSurfaceHpkeAad, CrossSurfacePairStartRequest, CrossSurfacePairing,
-    CrossSurfacePrepareSourceRequest, CrossSurfaceSourcePrepared, CustodyCompleteRequest,
-    CustodyHpkeAad, CustodyOutputHpkeAad, CustodyPrepareRequest, CustodyResult,
-    CustodySignerContribution, DecimalU64, DerivationRef, Digest32, ExposureMode, LocalPrfHpkeAad,
-    OperationId, PetalKeyScope, PolicyUpdateCeremonyCompleteRequest,
-    PolicyUpdateCeremonyPrepareRequest, ProtocolError, ProtocolErrorCode, SignerActivationReceipt,
-    SignerCeremonyContribution, SurfaceDescriptor, SurfaceEffectiveReport, SurfaceIdentity,
-    SurfaceLifecycle, SurfaceRef, SurfaceStatus, Token, WebAuthnAssertion, WebAuthnAttestation,
-    WebAuthnCeremonyProof, WebAuthnCredential,
+    CrossSurfaceAlreadyRegisteredRequest, CrossSurfaceCompleteDestinationRequest,
+    CrossSurfaceCompleteSourceRequest, CrossSurfaceHandoff, CrossSurfaceHpkeAad,
+    CrossSurfacePairStartRequest, CrossSurfacePairing, CrossSurfacePrepareSourceRequest,
+    CrossSurfaceSourcePrepared, CustodyCompleteRequest, CustodyHpkeAad, CustodyOutputHpkeAad,
+    CustodyPrepareRequest, CustodyResult, CustodySignerContribution, DecimalU64, DerivationRef,
+    Digest32, ExposureMode, LocalPrfHpkeAad, OperationId, PetalKeyScope,
+    PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest, ProtocolError,
+    ProtocolErrorCode, SignerActivationReceipt, SignerCeremonyContribution, SurfaceDescriptor,
+    SurfaceEffectiveReport, SurfaceIdentity, SurfaceLifecycle, SurfaceRef, SurfaceStatus, Token,
+    WebAuthnAssertion, WebAuthnAttestation, WebAuthnCeremonyProof, WebAuthnCredential,
 };
 use bloom_signer_backend_api::SecretBytes;
 use ed25519_dalek::{Signer as _, SigningKey};
@@ -57,6 +57,7 @@ fn ceremony_state_name(state: CeremonyState) -> &'static str {
         CeremonyState::Cancelled => "cancelled",
         CeremonyState::Expired => "expired",
         CeremonyState::Failed => "failed",
+        CeremonyState::AlreadyRegistered => "already_registered",
     }
 }
 
@@ -688,10 +689,12 @@ impl SignerCeremonyService {
             ));
         }
         let pair = pairs.get_mut(&request.pairing_id).ok_or_else(replay)?;
+        // The approving passkey may live on the destination's own surface: a
+        // second device on the same origin is paired exactly like one on the
+        // other origin, with separate sessions, challenges and capabilities.
         if now_ms >= pair.pairing.expires_at_ms.get()
             || pair.pairing.operation_id != request.operation_id
             || pair.pairing.exact_terms_digest != request.exact_terms_digest
-            || pair.pairing.destination_surface == request.source_surface
         {
             return Err(operation_conflict());
         }
@@ -761,6 +764,12 @@ impl SignerCeremonyService {
             credential_authority_generation: DecimalU64::new(
                 self.authority_generation(Some(&request.wallet_id)),
             ),
+            destination_existing_credentials: self
+                .options_for_wallet(Some(&request.wallet_id), &pair.pairing.destination_surface)
+                .allowed_credentials
+                .into_iter()
+                .map(|allowed| allowed.credential_id)
+                .collect(),
             signer_signature: Base64UrlBytes::from_bytes(&[]),
         };
         let unsigned = serde_jcs::to_vec(&prepared).map_err(malformed)?;
@@ -1073,6 +1082,81 @@ impl SignerCeremonyService {
             pairs.remove(&request.pairing_id);
         }
         result
+    }
+
+    /// Record that the paired destination already holds one of the wallet's
+    /// passkeys on its surface, so WebAuthn refused to create another.
+    ///
+    /// Only the authorized destination tab holds the handoff capability, so it
+    /// alone can end the pairing this way. Nothing is enrolled: the unlocked
+    /// wallet material is dropped with the pairing and the durable outcome is
+    /// the terminal `ALREADY_REGISTERED` status. A retry after that commit
+    /// answers with the same status.
+    pub fn cross_surface_already_registered(
+        &self,
+        request: CrossSurfaceAlreadyRegisteredRequest,
+        now_ms: u64,
+    ) -> Result<CeremonyPublicStatus, ProtocolError> {
+        use subtle::ConstantTimeEq as _;
+        let _guard = self.custody_completion_barrier.lock();
+        let mut pairs = self.cross_surface.lock();
+        let Some(pair) = pairs.get(&request.pairing_id) else {
+            return match self.engine.ceremony_public_status(&request.operation_id)? {
+                Some(status)
+                    if status.state == CeremonyState::AlreadyRegistered
+                        && status.ceremony_id == request.pairing_id =>
+                {
+                    Ok(status)
+                }
+                _ => Err(replay()),
+            };
+        };
+        if pair.pairing.operation_id != request.operation_id {
+            return Err(operation_conflict());
+        }
+        if now_ms >= pair.pairing.expires_at_ms.get() {
+            return Err(replay());
+        }
+        if self
+            .engine
+            .custody_receipt(&request.operation_id)?
+            .is_some()
+        {
+            return Err(committed_conflict());
+        }
+        let prepared = pair.prepared.as_ref().ok_or_else(replay)?;
+        if prepared.destination_existing_credentials.is_empty() {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "the destination surface has no existing wallet passkey to match",
+            ));
+        }
+        let capability = pair.capability.as_ref().ok_or_else(replay)?;
+        if request.capability.decode().len() != 32
+            || request
+                .capability
+                .decode()
+                .ct_eq(&capability[..])
+                .unwrap_u8()
+                != 1
+        {
+            return Err(protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "destination handoff capability is invalid",
+            ));
+        }
+        let status = CeremonyPublicStatus {
+            ceremony_id: pair.pairing.pairing_id.clone(),
+            ceremony_kind: CeremonyKind::CredentialAdd,
+            operation_id: pair.pairing.operation_id.clone(),
+            state: CeremonyState::AlreadyRegistered,
+            expires_at_ms: pair.pairing.expires_at_ms.clone(),
+            ceremony_url: None,
+            receipt_digest: None,
+        };
+        self.engine.persist_ceremony_public_status(&status)?;
+        pairs.remove(&request.pairing_id);
+        Ok(status)
     }
 
     pub fn expire_cross_surface_pairs(&self, now_ms: u64) {
@@ -2481,7 +2565,10 @@ impl SignerCeremonyService {
         }
         match self.engine.ceremony_public_status(operation_id)? {
             Some(status) => match status.state {
-                CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed => Ok(()),
+                CeremonyState::Cancelled
+                | CeremonyState::Expired
+                | CeremonyState::Failed
+                | CeremonyState::AlreadyRegistered => Ok(()),
                 _ => Err(committed_conflict()),
             },
             None => Err(protocol(

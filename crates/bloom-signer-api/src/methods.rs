@@ -48,6 +48,7 @@ method_enum!(BrokerSignerMethod {
     CrossSurfacePrepareSource => "cross_surface.prepare_source",
     CrossSurfaceCompleteSource => "cross_surface.complete_source",
     CrossSurfaceCompleteDestination => "cross_surface.complete_destination",
+    CrossSurfaceAlreadyRegistered => "cross_surface.already_registered",
     KeyGetPublic => "key.get_public",
     KeyListPublic => "key.list_public",
     KeyDerivationCapabilities => "key.derivation_capabilities",
@@ -125,6 +126,7 @@ impl BrokerSignerMethod {
             | Self::CrossSurfacePrepareSource
             | Self::CrossSurfaceCompleteSource
             | Self::CrossSurfaceCompleteDestination
+            | Self::CrossSurfaceAlreadyRegistered
             | Self::KeyEnrollPrepare
             | Self::CeremonyPrepare
             | Self::CeremonyComplete
