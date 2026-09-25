@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ActivationMode, Base64UrlBytes, CeremonyState, CryptoSuite, DecimalU64, Digest32, HpkeEnvelope,
-    KeyRef, OperationId, PetalKeyScope, ProtocolError, ProtocolErrorCode, SealedApprovalTerms,
-    Token,
+    KeyRef, OperationId, PetalKeyScope, ProtocolError, ProtocolErrorCode, RpId,
+    SealedApprovalTerms, SurfaceRef, Token,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -52,6 +52,7 @@ impl CeremonyKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CeremonyPrepareRequest {
+    pub surface: SurfaceRef,
     pub activation_operation_id: OperationId,
     pub terms: SealedApprovalTerms,
     pub review_manifest_digest: Digest32,
@@ -63,6 +64,8 @@ pub struct CeremonyPrepareRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignerCeremonyContribution {
+    pub surface: SurfaceRef,
+    pub credential_authority_generation: DecimalU64,
     pub ceremony_id: Digest32,
     pub signer_nonce: Digest32,
     pub approval_digest: Digest32,
@@ -94,6 +97,8 @@ impl SignerCeremonyContribution {
     pub fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, crate::ProtocolError> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
+            surface: &'a SurfaceRef,
+            credential_authority_generation: &'a DecimalU64,
             ceremony_id: &'a Digest32,
             signer_nonce: &'a Digest32,
             approval_digest: &'a Digest32,
@@ -108,6 +113,8 @@ impl SignerCeremonyContribution {
             signer_key_id: &'a Token,
         }
         serde_jcs::to_vec(&Unsigned {
+            surface: &self.surface,
+            credential_authority_generation: &self.credential_authority_generation,
             ceremony_id: &self.ceremony_id,
             signer_nonce: &self.signer_nonce,
             approval_digest: &self.approval_digest,
@@ -156,10 +163,12 @@ pub struct WebAuthnAttestation {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebAuthnCredential {
+    #[serde(default = "crate::legacy_local_surface")]
+    pub surface: SurfaceRef,
     pub credential_id: Base64UrlBytes,
     pub cose_public_key: Base64UrlBytes,
     pub user_handle: Base64UrlBytes,
-    pub rp_id: Token,
+    pub rp_id: RpId,
     pub prf_salt: Base64UrlBytes,
     pub sign_count: DecimalU64,
 }
@@ -217,6 +226,10 @@ pub struct CeremonyCompleteRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignerActivationReceipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<SurfaceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_authority_generation: Option<DecimalU64>,
     pub activation_operation_id: OperationId,
     pub ceremony_id: Digest32,
     pub approval_id: Digest32,
@@ -237,6 +250,10 @@ impl SignerActivationReceipt {
     pub fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, crate::ProtocolError> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            surface: &'a Option<SurfaceRef>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            credential_authority_generation: &'a Option<DecimalU64>,
             activation_operation_id: &'a OperationId,
             ceremony_id: &'a Digest32,
             approval_id: &'a Digest32,
@@ -252,6 +269,8 @@ impl SignerActivationReceipt {
             signer_key_id: &'a Token,
         }
         serde_jcs::to_vec(&Unsigned {
+            surface: &self.surface,
+            credential_authority_generation: &self.credential_authority_generation,
             activation_operation_id: &self.activation_operation_id,
             ceremony_id: &self.ceremony_id,
             approval_id: &self.approval_id,
@@ -317,6 +336,7 @@ impl LegacyPasskeyMigrationPublic {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustodyPrepareRequest {
+    pub surface: SurfaceRef,
     pub ceremony_kind: CeremonyKind,
     pub custody_operation_id: OperationId,
     /// The authoritative wallet ID. New registrations and ordinary imports
@@ -496,6 +516,8 @@ impl CustodyPrepareRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustodySignerContribution {
+    pub surface: SurfaceRef,
+    pub credential_authority_generation: DecimalU64,
     pub ceremony_id: Digest32,
     pub ceremony_kind: CeremonyKind,
     pub custody_operation_id: OperationId,
@@ -595,6 +617,7 @@ impl CustodySignerContribution {
             return Ok(());
         }
         if self.ceremony_kind != request.ceremony_kind
+            || self.surface != request.surface
             || self.custody_operation_id != request.custody_operation_id
             || self.wallet_id != request.wallet_id
             || self.key_ref != request.key_ref
@@ -611,6 +634,8 @@ impl CustodySignerContribution {
     pub fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, crate::ProtocolError> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
+            surface: &'a SurfaceRef,
+            credential_authority_generation: &'a DecimalU64,
             ceremony_id: &'a Digest32,
             ceremony_kind: CeremonyKind,
             custody_operation_id: &'a OperationId,
@@ -629,6 +654,8 @@ impl CustodySignerContribution {
             signer_key_id: &'a Token,
         }
         serde_jcs::to_vec(&Unsigned {
+            surface: &self.surface,
+            credential_authority_generation: &self.credential_authority_generation,
             ceremony_id: &self.ceremony_id,
             ceremony_kind: self.ceremony_kind,
             custody_operation_id: &self.custody_operation_id,
@@ -668,6 +695,7 @@ pub struct CustodyCompleteRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CeremonyChallenge {
+    pub surface: SurfaceRef,
     pub schema: Token,
     pub ceremony_id: Digest32,
     pub ceremony_kind: CeremonyKind,
@@ -710,6 +738,7 @@ pub enum CeremonyPhase {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalPrfHpkeAad {
+    pub surface: SurfaceRef,
     pub ceremony_id: Digest32,
     pub signer_nonce: Digest32,
     pub approval_id: Digest32,
@@ -734,6 +763,7 @@ impl LocalPrfHpkeAad {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustodyHpkeAad {
+    pub surface: SurfaceRef,
     pub ceremony_id: Digest32,
     pub ceremony_kind: CeremonyKind,
     pub custody_operation_id: OperationId,
@@ -758,6 +788,7 @@ impl CustodyHpkeAad {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustodyOutputHpkeAad {
+    pub surface: SurfaceRef,
     pub ceremony_id: Digest32,
     pub ceremony_kind: CeremonyKind,
     pub custody_operation_id: OperationId,
@@ -774,6 +805,10 @@ impl CustodyOutputHpkeAad {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustodyResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<SurfaceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_authority_generation: Option<DecimalU64>,
     pub ceremony_kind: CeremonyKind,
     pub custody_operation_id: OperationId,
     pub public_status: crate::CeremonyState,
@@ -791,7 +826,9 @@ pub struct CustodyResult {
 #[serde(deny_unknown_fields)]
 pub struct CredentialSummary {
     pub credential_id: Base64UrlBytes,
-    pub rp_id: Token,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<SurfaceRef>,
+    pub rp_id: RpId,
     pub active: bool,
 }
 
@@ -799,6 +836,10 @@ impl CustodyResult {
     pub fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, crate::ProtocolError> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            surface: &'a Option<SurfaceRef>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            credential_authority_generation: &'a Option<DecimalU64>,
             ceremony_kind: CeremonyKind,
             custody_operation_id: &'a OperationId,
             public_status: crate::CeremonyState,
@@ -811,6 +852,8 @@ impl CustodyResult {
             signer_key_id: &'a Token,
         }
         serde_jcs::to_vec(&Unsigned {
+            surface: &self.surface,
+            credential_authority_generation: &self.credential_authority_generation,
             ceremony_kind: self.ceremony_kind,
             custody_operation_id: &self.custody_operation_id,
             public_status: self.public_status,
@@ -877,6 +920,7 @@ mod tests {
     fn scoped_prepare() -> CustodyPrepareRequest {
         let scope = petal_scope();
         CustodyPrepareRequest {
+            surface: crate::legacy_local_surface(),
             ceremony_kind: CeremonyKind::KeyDerive,
             custody_operation_id: scope.custody_operation_id.clone(),
             wallet_id: Some(scope.wallet_id.clone()),
@@ -893,6 +937,7 @@ mod tests {
 
     fn registration_prepare(wallet_id: Option<Token>) -> CustodyPrepareRequest {
         CustodyPrepareRequest {
+            surface: crate::legacy_local_surface(),
             ceremony_kind: CeremonyKind::WalletRegistration,
             custody_operation_id: operation(4),
             wallet_id,
@@ -987,6 +1032,8 @@ mod tests {
     fn custody_contribution_with_petal_scope() -> CustodySignerContribution {
         let scope = petal_scope();
         CustodySignerContribution {
+            surface: crate::legacy_local_surface(),
+            credential_authority_generation: DecimalU64::new(0),
             ceremony_id: digest(4),
             ceremony_kind: CeremonyKind::KeyDerive,
             custody_operation_id: scope.custody_operation_id.clone(),

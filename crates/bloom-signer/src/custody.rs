@@ -79,6 +79,8 @@ impl RootMaterialProfile {
 #[serde(deny_unknown_fields)]
 pub struct WalletCustodyBackup {
     pub wallet_id: Token,
+    #[serde(default)]
+    pub credential_authority_generation: u64,
     pub policy_version: u64,
     pub wrap_format_version: u32,
     pub encrypted_root: EncryptedBlob,
@@ -102,9 +104,9 @@ pub struct WalletCustody {
 
 pub struct UnlockedWallet {
     wallet_id: Token,
-    root: Zeroizing<Vec<u8>>,
-    policy_signing_seed: Zeroizing<Vec<u8>>,
-    wkek: Zeroizing<Vec<u8>>,
+    root: bloom_signer_process_hardening::LockedSecret,
+    policy_signing_seed: bloom_signer_process_hardening::LockedSecret,
+    wkek: bloom_signer_process_hardening::LockedSecret,
     root_material_profile: RootMaterialProfile,
     entropy_bits: Option<u32>,
 }
@@ -214,6 +216,89 @@ impl UnlockedWallet {
 }
 
 impl WalletCustody {
+    pub fn credential_authority_generation(&self) -> u64 {
+        self.state.lock().backup.credential_authority_generation
+    }
+
+    /// Rotate recovery and replace every old passkey in one custody snapshot.
+    /// The caller commits that snapshot and the ceremony receipt in the same
+    /// Signer database transaction.
+    pub fn recover_replace_credentials(
+        &self,
+        unlocked: &UnlockedWallet,
+        credential_id: Base64UrlBytes,
+        credential_key: &SecretBytes,
+        recovery_id: Token,
+        recovery_key: &SecretBytes,
+    ) -> Result<(), ProtocolError> {
+        validate_key(credential_key)?;
+        validate_key(recovery_key)?;
+        let mut state = self.state.lock();
+        if state
+            .backup
+            .credential_wraps
+            .iter()
+            .any(|wrap| wrap.credential_id == credential_id)
+        {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "replacement credential ID already exists",
+            ));
+        }
+        let wkek = recover_wkek_from_unlocked(&state.backup, unlocked)?;
+        let version = state.backup.wrap_format_version;
+        let root_fingerprint = root_ciphertext_fingerprint(&state.backup.encrypted_root);
+        let wrapped_credential = encrypt(
+            credential_key,
+            &wkek,
+            &credential_aad(
+                &state.backup.wallet_id,
+                &credential_id,
+                &root_fingerprint,
+                version,
+            )?,
+        )?;
+        let wrapped_recovery = encrypt(
+            recovery_key,
+            &wkek,
+            &recovery_aad(
+                &state.backup.wallet_id,
+                &recovery_id,
+                &root_fingerprint,
+                version,
+            )?,
+        )?;
+        let previous = state.backup.clone();
+        for wrap in &mut state.backup.credential_wraps {
+            wrap.active = false;
+        }
+        state.backup.credential_wraps.push(CredentialWrap {
+            credential_id,
+            active: true,
+            wrap_format_version: version,
+            wrapped_wkek: wrapped_credential,
+        });
+        state.backup.recovery_wrap = Some(RecoveryWrap {
+            recovery_id,
+            wrap_format_version: version,
+            wrapped_wkek: wrapped_recovery,
+        });
+        state.backup.credential_authority_generation = state
+            .backup
+            .credential_authority_generation
+            .checked_add(1)
+            .ok_or_else(|| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "credential authority generation exhausted",
+                )
+            })?;
+        if let Err(error) = persist_custody(&state) {
+            state.backup = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
     /// Register a wallet whose root is one imported secp256k1 scalar
     /// (raw-key import or a migrated pre-triad single key). Non-HD: this
     /// profile signs only its own root key and never derives accounts.
@@ -335,6 +420,7 @@ impl WalletCustody {
             state: Mutex::new(CustodyState {
                 backup: WalletCustodyBackup {
                     wallet_id,
+                    credential_authority_generation: 0,
                     policy_version: 1,
                     wrap_format_version,
                     encrypted_root,
@@ -747,7 +833,7 @@ fn unlock_with_wkek(
     wkek: &[u8],
 ) -> Result<UnlockedWallet, ProtocolError> {
     let key = SecretBytes::new(wkek.to_vec());
-    let root = decrypt(
+    let mut root = Zeroizing::new(decrypt(
         &key,
         &backup.encrypted_root,
         &root_aad(
@@ -756,7 +842,7 @@ fn unlock_with_wkek(
             backup.root_material_profile,
             backup.entropy_bits,
         ),
-    )?;
+    )?);
     // Decrypt-time plaintext validation: authenticate (done above), then
     // require the decrypted root length to match its recorded profile.
     match backup.root_material_profile {
@@ -793,16 +879,35 @@ fn unlock_with_wkek(
         // (16-64 bytes) at unlock/sign; custody applies no check here.
         RootMaterialProfile::LegacySecp => {}
     }
-    let policy_signing_seed = decrypt(
+    let mut policy_signing_seed = Zeroizing::new(decrypt(
         &key,
         &backup.encrypted_policy_signing_key,
         &policy_key_aad(&backup.wallet_id, backup.wrap_format_version),
-    )?;
+    )?);
     Ok(UnlockedWallet {
         wallet_id: backup.wallet_id.clone(),
-        root: Zeroizing::new(root),
-        policy_signing_seed: Zeroizing::new(policy_signing_seed),
-        wkek: Zeroizing::new(wkek.to_vec()),
+        root: bloom_signer_process_hardening::LockedSecret::new(std::mem::take(&mut *root))
+            .map_err(|_| {
+                protocol(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "cannot lock decrypted root in memory",
+                )
+            })?,
+        policy_signing_seed: bloom_signer_process_hardening::LockedSecret::new(std::mem::take(
+            &mut *policy_signing_seed,
+        ))
+        .map_err(|_| {
+            protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                "cannot lock decrypted policy key in memory",
+            )
+        })?,
+        wkek: bloom_signer_process_hardening::LockedSecret::new(wkek.to_vec()).map_err(|_| {
+            protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                "cannot lock decrypted WKEK in memory",
+            )
+        })?,
         root_material_profile: backup.root_material_profile,
         entropy_bits: backup.entropy_bits,
     })

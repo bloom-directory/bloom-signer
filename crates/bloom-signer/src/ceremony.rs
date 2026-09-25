@@ -1,12 +1,17 @@
 use bloom_signer_api::{
     ActivationMode, Base64UrlBytes, CeremonyChallenge, CeremonyCompleteRequest, CeremonyKind,
     CeremonyPhase, CeremonyPrepareRequest, CeremonyPublicStatus, CeremonyState,
-    CeremonyWebAuthnOptions, CredentialPrfInput, CredentialSummary, CryptoSuite,
-    CustodyCompleteRequest, CustodyHpkeAad, CustodyOutputHpkeAad, CustodyPrepareRequest,
-    CustodyResult, CustodySignerContribution, DecimalU64, DerivationRef, Digest32, LocalPrfHpkeAad,
-    OperationId, PetalKeyScope, PolicyUpdateCeremonyCompleteRequest,
-    PolicyUpdateCeremonyPrepareRequest, ProtocolError, ProtocolErrorCode, SignerActivationReceipt,
-    SignerCeremonyContribution, Token, WebAuthnCeremonyProof, WebAuthnCredential,
+    CeremonyWebAuthnOptions, CredentialPrfInput, CredentialSummary,
+    CrossSurfaceAlreadyRegisteredRequest, CrossSurfaceCompleteDestinationRequest,
+    CrossSurfaceCompleteSourceRequest, CrossSurfaceHandoff, CrossSurfaceHpkeAad,
+    CrossSurfacePairStartRequest, CrossSurfacePairing, CrossSurfacePrepareSourceRequest,
+    CrossSurfaceSourcePrepared, CustodyCompleteRequest, CustodyHpkeAad, CustodyOutputHpkeAad,
+    CustodyPrepareRequest, CustodyResult, CustodySignerContribution, DecimalU64, DerivationRef,
+    Digest32, ExposureMode, LocalPrfHpkeAad, OperationId, PetalKeyScope,
+    PolicyUpdateCeremonyCompleteRequest, PolicyUpdateCeremonyPrepareRequest, ProtocolError,
+    ProtocolErrorCode, SignerActivationReceipt, SignerCeremonyContribution, SurfaceDescriptor,
+    SurfaceEffectiveReport, SurfaceIdentity, SurfaceLifecycle, SurfaceRef, SurfaceStatus, Token,
+    WebAuthnAssertion, WebAuthnAttestation, WebAuthnCeremonyProof, WebAuthnCredential,
 };
 use bloom_signer_backend_api::SecretBytes;
 use ed25519_dalek::{Signer as _, SigningKey};
@@ -32,8 +37,8 @@ use crate::{
     },
     legacy_passkey::{LEGACY_PASSKEY_INPUT_CLASS, LegacyMigrationStore, PreparedLegacyMigration},
     webauthn::{
-        ceremony_origin_for_port, resolve_ceremony_port, verify_webauthn_assertion,
-        verify_webauthn_attestation,
+        ceremony_origin_for_port, resolve_ceremony_port, verify_webauthn_assertion_for_origin,
+        verify_webauthn_attestation_for_origin,
     },
 };
 
@@ -52,6 +57,7 @@ fn ceremony_state_name(state: CeremonyState) -> &'static str {
         CeremonyState::Cancelled => "cancelled",
         CeremonyState::Expired => "expired",
         CeremonyState::Failed => "failed",
+        CeremonyState::AlreadyRegistered => "already_registered",
     }
 }
 
@@ -80,6 +86,28 @@ pub const CEREMONY_TTL_MS: u64 = 5 * 60 * 1_000;
 /// The longest ceremony window a Signer config may set. The developer harness
 /// uses it because a person drives each ceremony by hand.
 pub const MAXIMUM_CEREMONY_TTL_MS: u64 = 30 * 60 * 1_000;
+
+fn default_surface_status() -> SurfaceStatus {
+    let identity = SurfaceIdentity::local(0);
+    let reference = identity.reference().expect("static local identity");
+    SurfaceStatus {
+        surfaces: vec![SurfaceDescriptor {
+            identity,
+            identity_digest: reference.identity_digest,
+            lifecycle: SurfaceLifecycle::Active,
+            lifecycle_revision: DecimalU64::new(0),
+        }],
+        installation_id: None,
+        installation_admin_key_sha256: None,
+        desired_mode: ExposureMode::RemoteEnabled,
+        desired_revision: DecimalU64::new(0),
+        effective_mode: ExposureMode::LocalhostOnly,
+        effective_revision: DecimalU64::new(0),
+        remote_tls_ready: false,
+        remote_routing_ready: false,
+    }
+}
+
 const CONTRIBUTION_DOMAIN: &[u8] = b"bloom-signer-ceremony-contribution/v1";
 const RECEIPT_DOMAIN: &[u8] = b"bloom-signer-ceremony-receipt/v1";
 const WRAP_INFO: &[u8] = b"bloom-passkey-wallet-wrap/v1";
@@ -140,12 +168,34 @@ struct PendingCeremony {
     registration: Option<RegistrationSecrets>,
     credential_creation: Option<CredentialCreation>,
     legacy_migration: Option<PreparedLegacyMigration>,
+    /// Recovery publishes a fixed generation to unauthenticated browsers;
+    /// the actual epoch remains private until its factor is proven.
+    private_recovery_generation: Option<u64>,
 }
 
 #[derive(Clone)]
 struct BoundCredential {
     wallet_id: Token,
     credential: WebAuthnCredential,
+}
+
+const CROSS_SOURCE_INFO: &[u8] = b"bloom-cross-surface-source-prf/v1";
+const CROSS_DESTINATION_INFO: &[u8] = b"bloom-cross-surface-destination-prf/v1";
+const CROSS_HANDOFF_INFO: &[u8] = b"bloom-cross-surface-handoff/v1";
+const CROSS_PAIR_TTL_MS: u64 = 10 * 60 * 1_000;
+
+struct CrossSurfacePairState {
+    pairing: CrossSurfacePairing,
+    prepared: Option<CrossSurfaceSourcePrepared>,
+    source_recipient: Option<HpkeRecipient>,
+    destination_recipient: Option<HpkeRecipient>,
+    unlocked: Option<UnlockedWallet>,
+    source_credential_id: Option<Base64UrlBytes>,
+    source_sign_count: Option<u32>,
+    capability: Option<Zeroizing<[u8; 32]>>,
+    handoff: Option<CrossSurfaceHandoff>,
+    source_completion_digest: Option<Digest32>,
+    attempts: u8,
 }
 
 enum CompletedCeremony {
@@ -256,6 +306,7 @@ pub struct SignerCeremonyService {
     expected_origin: String,
     pending: Mutex<HashMap<OperationId, PendingCeremony>>,
     completed: Mutex<HashMap<OperationId, CompletedCeremony>>,
+    cross_surface: Mutex<HashMap<Digest32, CrossSurfacePairState>>,
     credentials: Mutex<BTreeMap<String, BoundCredential>>,
     wallets: Mutex<BTreeMap<Token, Arc<WalletCustody>>>,
     legacy_migrations: Option<Arc<LegacyMigrationStore>>,
@@ -309,6 +360,17 @@ impl SignerCeremonyService {
     /// `http://localhost` for port 80) every clientDataJSON must carry.
     pub fn ceremony_origin(&self) -> &str {
         &self.expected_origin
+    }
+
+    /// The clientDataJSON origin a surface's proofs must carry. The local
+    /// surface is served on this service's configured ceremony port; its
+    /// persisted identity stays fixed at the shipping origin. Every other
+    /// surface (the remote relay origin) verifies against its own identity.
+    fn verification_origin(&self, surface: &SurfaceDescriptor) -> Result<String, ProtocolError> {
+        if surface.identity.surface_id.as_str() == "local" {
+            return Ok(self.expected_origin.clone());
+        }
+        Ok(surface.identity.origin.clone())
     }
 
     fn new_impl(
@@ -432,7 +494,7 @@ impl SignerCeremonyService {
                 )
             })
             .collect();
-        Ok(Self {
+        let service = Self {
             engine,
             signer_key_id,
             signing_key,
@@ -440,18 +502,843 @@ impl SignerCeremonyService {
             expected_origin,
             pending: Mutex::new(HashMap::new()),
             completed: Mutex::new(HashMap::new()),
+            cross_surface: Mutex::new(HashMap::new()),
             credentials: Mutex::new(credentials),
             wallets: Mutex::new(wallets),
             legacy_migrations: None,
             ceremony_ttl_ms: CEREMONY_TTL_MS,
             approval_completion_barrier: AsyncMutex::new(()),
             custody_completion_barrier: Mutex::new(()),
-        })
+        };
+        // Broker-observed TLS and routing cannot survive a Signer process
+        // boundary. Fence the persisted remote surface before serving RPC;
+        // Broker must prove readiness again at the current desired revision.
+        let status = service.surface_status()?;
+        if status.effective_mode == ExposureMode::RemoteEnabled
+            || status.remote_tls_ready
+            || status.remote_routing_ready
+        {
+            service.report_effective(SurfaceEffectiveReport {
+                desired_revision: status.desired_revision,
+                remote_tls_ready: false,
+                remote_routing_ready: false,
+                remote_closed: true,
+            })?;
+        }
+        Ok(service)
     }
 
     pub fn with_legacy_migrations(mut self, store: Arc<LegacyMigrationStore>) -> Self {
         self.legacy_migrations = Some(store);
         self
+    }
+
+    pub fn surface_status(&self) -> Result<SurfaceStatus, ProtocolError> {
+        Ok(self
+            .engine
+            .load_surface_status()?
+            .unwrap_or_else(default_surface_status))
+    }
+
+    /// Install only a relay-assigned identity after the privileged endpoint
+    /// verifies its signed allocation receipt. Repeated setup keeps the
+    /// original identity and the operator's desired exposure preference.
+    pub fn install_remote_surface(
+        &self,
+        hostname: &str,
+        installation_id: &str,
+        admin_key_sha256: Digest32,
+        created_at_ms: u64,
+    ) -> Result<SurfaceStatus, ProtocolError> {
+        let _guard = self.custody_completion_barrier.lock();
+        let persisted = self.engine.load_surface_status()?;
+        let current = persisted.clone().unwrap_or_else(default_surface_status);
+        let remote_identity = SurfaceIdentity::remote(hostname, created_at_ms)?;
+        if let Some(existing) = current
+            .surfaces
+            .iter()
+            .find(|surface| surface.identity.surface_id.as_str() == "remote")
+        {
+            if existing.identity.origin != remote_identity.origin
+                || current.installation_id.as_deref() != Some(installation_id)
+                || current.installation_admin_key_sha256.as_ref() != Some(&admin_key_sha256)
+            {
+                return Err(operation_conflict());
+            }
+            return Ok(current);
+        }
+        if current.installation_id.is_some() || current.installation_admin_key_sha256.is_some() {
+            return Err(operation_conflict());
+        }
+        let reference = remote_identity.reference()?;
+        let mut next = current.clone();
+        next.surfaces.push(SurfaceDescriptor {
+            identity: remote_identity,
+            identity_digest: reference.identity_digest,
+            lifecycle: SurfaceLifecycle::Disabled,
+            lifecycle_revision: DecimalU64::new(0),
+        });
+        next.installation_id = Some(installation_id.to_owned());
+        next.installation_admin_key_sha256 = Some(admin_key_sha256);
+        self.engine
+            .commit_surface_status(persisted.as_ref(), &next, "surface.install")?;
+        Ok(next)
+    }
+
+    pub fn cross_surface_pair_start(
+        &self,
+        request: CrossSurfacePairStartRequest,
+        now_ms: u64,
+    ) -> Result<CrossSurfacePairing, ProtocolError> {
+        self.require_surface(&request.destination_surface, true)?;
+        if request.expires_at_ms.get() <= now_ms
+            || request.expires_at_ms.get() > now_ms.saturating_add(CROSS_PAIR_TTL_MS)
+        {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                "pairing deadline must be unexpired and within ten minutes",
+            ));
+        }
+        if request.destination_hpke_public_key.decode().len() != 32 {
+            return Err(protocol(
+                ProtocolErrorCode::MalformedFrame,
+                "destination pairing key must be an X25519 public key",
+            ));
+        }
+        if self
+            .engine
+            .custody_receipt(&request.operation_id)?
+            .is_some()
+        {
+            return Err(operation_conflict());
+        }
+        let mut pairs = self.cross_surface.lock();
+        self.require_unopened_operation_id(&request.operation_id)?;
+        pairs.retain(|_, pair| pair.pairing.expires_at_ms.get() > now_ms);
+        if let Some(existing) = pairs
+            .values()
+            .find(|pair| pair.pairing.operation_id == request.operation_id)
+        {
+            if existing.pairing.destination_surface == request.destination_surface
+                && existing.pairing.expires_at_ms == request.expires_at_ms
+                && existing.pairing.exact_terms_digest == request.exact_terms_digest
+                && existing.pairing.destination_hpke_public_key
+                    == request.destination_hpke_public_key
+            {
+                return Ok(existing.pairing.clone());
+            }
+            return Err(operation_conflict());
+        }
+        if pairs.len() >= 64 {
+            return Err(protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                "too many active destination pairings",
+            ));
+        }
+        let pairing_id = random_digest();
+        let code_bytes = pairing_id.to_bytes();
+        let code =
+            u32::from_be_bytes(code_bytes[..4].try_into().expect("digest prefix")) % 1_000_000;
+        let pairing = CrossSurfacePairing {
+            pairing_id: pairing_id.clone(),
+            destination_surface: request.destination_surface,
+            operation_id: request.operation_id,
+            exact_terms_digest: request.exact_terms_digest,
+            destination_hpke_public_key: request.destination_hpke_public_key,
+            destination_challenge: random_digest(),
+            confirmation_code: format!("{code:06}"),
+            expires_at_ms: request.expires_at_ms,
+        };
+        pairs.insert(
+            pairing_id,
+            CrossSurfacePairState {
+                pairing: pairing.clone(),
+                prepared: None,
+                source_recipient: None,
+                destination_recipient: None,
+                unlocked: None,
+                source_credential_id: None,
+                source_sign_count: None,
+                capability: None,
+                handoff: None,
+                source_completion_digest: None,
+                attempts: 0,
+            },
+        );
+        Ok(pairing)
+    }
+
+    pub fn cross_surface_prepare_source(
+        &self,
+        request: CrossSurfacePrepareSourceRequest,
+        now_ms: u64,
+    ) -> Result<CrossSurfaceSourcePrepared, ProtocolError> {
+        let source_descriptor = self.require_surface(&request.source_surface, false)?;
+        self.wallet(&request.wallet_id)?;
+        let mut pairs = self.cross_surface.lock();
+        if pairs.values().any(|pair| {
+            (pair.unlocked.is_some() || pair.handoff.is_some())
+                && pair.prepared.as_ref().is_some_and(|prepared| {
+                    prepared.wallet_id == request.wallet_id
+                        && pair.pairing.pairing_id != request.pairing_id
+                })
+        }) {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "wallet already has a live cross-surface addition",
+            ));
+        }
+        let pair = pairs.get_mut(&request.pairing_id).ok_or_else(replay)?;
+        // The approving passkey may live on the destination's own surface: a
+        // second device on the same origin is paired exactly like one on the
+        // other origin, with separate sessions, challenges and capabilities.
+        if now_ms >= pair.pairing.expires_at_ms.get()
+            || pair.pairing.operation_id != request.operation_id
+            || pair.pairing.exact_terms_digest != request.exact_terms_digest
+        {
+            return Err(operation_conflict());
+        }
+        if let Some(prepared) = &pair.prepared {
+            if prepared.source_surface == request.source_surface
+                && prepared.wallet_id == request.wallet_id
+            {
+                return Ok(prepared.clone());
+            }
+            return Err(operation_conflict());
+        }
+        let destination_descriptor =
+            self.require_surface(&pair.pairing.destination_surface, true)?;
+        let options = self.options_for_wallet(Some(&request.wallet_id), &request.source_surface);
+        if options.allowed_credentials.is_empty() {
+            return Err(protocol(
+                ProtocolErrorCode::ApprovalNotFound,
+                "source surface has no enrolled authority credential",
+            ));
+        }
+        let source_credentials = options
+            .allowed_credentials
+            .iter()
+            .filter_map(|allowed| {
+                self.credential(&request.wallet_id, &allowed.credential_id)
+                    .ok()
+            })
+            .filter(|credential| credential.surface == request.source_surface)
+            .collect::<Vec<_>>();
+        let creation = self
+            .new_credential_creation(Some(&request.wallet_id), &pair.pairing.destination_surface);
+        let source_recipient = HpkeRecipient::generate();
+        let destination_recipient = HpkeRecipient::generate();
+        let challenge = |surface: SurfaceRef, phase: CeremonyPhase| CeremonyChallenge {
+            surface,
+            schema: Token::new("bloom.ceremony.challenge.v1").expect("static challenge schema"),
+            ceremony_id: pair.pairing.pairing_id.clone(),
+            ceremony_kind: CeremonyKind::CredentialAdd,
+            operation_id: pair.pairing.operation_id.clone(),
+            signer_nonce: pair.pairing.destination_challenge.clone(),
+            review_manifest_digest: pair.pairing.exact_terms_digest.clone(),
+            signer_contribution_digest: pair.pairing.pairing_id.clone(),
+            exact_terms_digest: pair.pairing.exact_terms_digest.clone(),
+            phase,
+        };
+        let mut prepared = CrossSurfaceSourcePrepared {
+            pairing: pair.pairing.clone(),
+            source_surface: request.source_surface,
+            wallet_id: request.wallet_id.clone(),
+            source_challenge: challenge(source_descriptor.reference(), CeremonyPhase::Approve),
+            destination_challenges: vec![
+                challenge(
+                    destination_descriptor.reference(),
+                    CeremonyPhase::RegisterCredential,
+                ),
+                challenge(
+                    destination_descriptor.reference(),
+                    CeremonyPhase::ConfirmPrf,
+                ),
+            ],
+            source_credentials,
+            source_prf_inputs: options.allowed_credentials,
+            destination_user_handle: creation.user_handle,
+            destination_prf_salt: creation.prf_salt,
+            source_hpke_recipient_key: source_recipient.public_key().clone(),
+            destination_hpke_recipient_key: destination_recipient.public_key().clone(),
+            credential_authority_generation: DecimalU64::new(
+                self.authority_generation(Some(&request.wallet_id)),
+            ),
+            destination_existing_credentials: self
+                .options_for_wallet(Some(&request.wallet_id), &pair.pairing.destination_surface)
+                .allowed_credentials
+                .into_iter()
+                .map(|allowed| allowed.credential_id)
+                .collect(),
+            signer_signature: Base64UrlBytes::from_bytes(&[]),
+        };
+        let unsigned = serde_jcs::to_vec(&prepared).map_err(malformed)?;
+        prepared.signer_signature = Base64UrlBytes::from_bytes(
+            &self
+                .signing_key
+                .sign(
+                    &[
+                        b"bloom-cross-surface-source-prepared/v1".as_slice(),
+                        &unsigned,
+                    ]
+                    .concat(),
+                )
+                .to_bytes(),
+        );
+        pair.source_recipient = Some(source_recipient);
+        pair.destination_recipient = Some(destination_recipient);
+        pair.prepared = Some(prepared.clone());
+        Ok(prepared)
+    }
+
+    pub fn cross_surface_complete_source(
+        &self,
+        request: CrossSurfaceCompleteSourceRequest,
+        now_ms: u64,
+    ) -> Result<CrossSurfaceHandoff, ProtocolError> {
+        let mut pairs = self.cross_surface.lock();
+        pairs.retain(|_, pair| pair.pairing.expires_at_ms.get() > now_ms && pair.attempts < 5);
+        if pairs
+            .values()
+            .filter(|pair| pair.unlocked.is_some())
+            .count()
+            >= 4
+            && pairs
+                .get(&request.pairing_id)
+                .is_none_or(|pair| pair.handoff.is_none())
+        {
+            return Err(protocol(
+                ProtocolErrorCode::ServiceUnavailable,
+                "too many volatile unlocked cross-surface sessions",
+            ));
+        }
+        let pair = pairs.get_mut(&request.pairing_id).ok_or_else(replay)?;
+        if pair.pairing.operation_id != request.operation_id {
+            return Err(operation_conflict());
+        }
+        let request_digest = canonical_digest(&request)?;
+        if let Some(handoff) = &pair.handoff {
+            if pair.source_completion_digest.as_ref() != Some(&request_digest) {
+                return Err(operation_conflict());
+            }
+            return Ok(handoff.clone());
+        }
+        pair.attempts += 1;
+        let prepared = pair.prepared.as_ref().ok_or_else(replay)?;
+        let source = self.require_surface(&prepared.source_surface, false)?;
+        let credential = prepared
+            .source_credentials
+            .iter()
+            .find(|credential| {
+                credential.credential_id == request.authority_assertion.credential_id
+            })
+            .ok_or_else(|| {
+                protocol(
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "source credential is not enrolled on the approved surface",
+                )
+            })?;
+        if self.authority_generation(Some(&prepared.wallet_id))
+            != prepared.credential_authority_generation.get()
+        {
+            return Err(replay());
+        }
+        let verified = verify_webauthn_assertion_for_origin(
+            &request.authority_assertion,
+            credential,
+            &prepared.source_challenge.canonical_bytes()?,
+            true,
+            &self.verification_origin(&source)?,
+            source.identity.rp_id.as_str(),
+        )?;
+        let aad = cross_surface_aad(prepared, "source_prf")?.canonical_bytes()?;
+        let prf = pair.source_recipient.take().ok_or_else(replay)?.open(
+            &request.encrypted_authority_prf,
+            CROSS_SOURCE_INFO,
+            &aad,
+        )?;
+        if prf.expose_to_backend().len() != 32 {
+            return Err(protocol(
+                ProtocolErrorCode::BackendInvalidRequest,
+                "source credential PRF must be 32 bytes",
+            ));
+        }
+        let key = credential_wrap_key(&prf, &prepared.wallet_id, &credential.credential_id)?;
+        let unlocked = self
+            .wallet(&prepared.wallet_id)?
+            .unlock_with_credential(&credential.credential_id, &key)?;
+        let capability = Zeroizing::new(random_32());
+        let aad = cross_surface_aad(prepared, "handoff")?.canonical_bytes()?;
+        let encrypted_capability = seal_to_recipient(
+            &pair.pairing.destination_hpke_public_key,
+            CROSS_HANDOFF_INFO,
+            &aad,
+            &*capability,
+        )?;
+        let handoff = CrossSurfaceHandoff {
+            pairing_id: request.pairing_id,
+            encrypted_capability,
+            expires_at_ms: pair.pairing.expires_at_ms.clone(),
+        };
+        pair.source_credential_id = Some(credential.credential_id.clone());
+        pair.source_sign_count = Some(verified.sign_count);
+        pair.unlocked = Some(unlocked);
+        pair.capability = Some(capability);
+        pair.handoff = Some(handoff.clone());
+        pair.source_completion_digest = Some(request_digest);
+        Ok(handoff)
+    }
+
+    pub fn cross_surface_complete_destination(
+        &self,
+        request: CrossSurfaceCompleteDestinationRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, ProtocolError> {
+        let pairing_id = request.pairing_id.clone();
+        let result = self.cross_surface_complete_destination_inner(request, now_ms);
+        if result.is_err() {
+            let mut pairs = self.cross_surface.lock();
+            let terminal = pairs.get(&pairing_id).is_some_and(|pair| {
+                // Optional secrets are absent both before their stage begins
+                // and after one-shot consumption. Only the latter is terminal.
+                let source_completed = pair.source_completion_digest.is_some();
+                pair.attempts >= 5
+                    || pair.pairing.expires_at_ms.get() <= now_ms
+                    || (pair.prepared.is_some() && pair.destination_recipient.is_none())
+                    || (source_completed && pair.unlocked.is_none())
+                    || pair.prepared.as_ref().is_some_and(|prepared| {
+                        self.require_surface(&prepared.source_surface, false)
+                            .is_err()
+                            || self
+                                .require_surface(&pair.pairing.destination_surface, true)
+                                .is_err()
+                            || self.authority_generation(Some(&prepared.wallet_id))
+                                != prepared.credential_authority_generation.get()
+                            || (source_completed
+                                && pair.source_credential_id.as_ref().is_none_or(|id| {
+                                    self.bound_credential(id, &prepared.wallet_id).is_err()
+                                }))
+                    })
+            });
+            if terminal {
+                pairs.remove(&pairing_id);
+            }
+        }
+        result
+    }
+
+    fn cross_surface_complete_destination_inner(
+        &self,
+        request: CrossSurfaceCompleteDestinationRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, ProtocolError> {
+        use subtle::ConstantTimeEq as _;
+        let _guard = self.custody_completion_barrier.lock();
+        let mut pairs = self.cross_surface.lock();
+        pairs.retain(|_, pair| pair.pairing.expires_at_ms.get() > now_ms && pair.attempts < 5);
+        let pair = pairs.get_mut(&request.pairing_id).ok_or_else(replay)?;
+        if pair.pairing.operation_id != request.operation_id {
+            return Err(operation_conflict());
+        }
+        if let Some(result) = self.engine.custody_receipt(&pair.pairing.operation_id)? {
+            return Ok(result);
+        }
+        pair.attempts += 1;
+        let prepared = pair.prepared.as_ref().ok_or_else(replay)?;
+        self.require_surface(&prepared.source_surface, false)?;
+        let destination = self.require_surface(&pair.pairing.destination_surface, true)?;
+        let source_id = pair.source_credential_id.as_ref().ok_or_else(replay)?;
+        let current_source = self.bound_credential(source_id, &prepared.wallet_id)?;
+        if current_source.credential.surface != prepared.source_surface {
+            return Err(replay());
+        }
+        let capability = pair.capability.as_ref().ok_or_else(replay)?;
+        if request.capability.decode().len() != 32
+            || request
+                .capability
+                .decode()
+                .ct_eq(&capability[..])
+                .unwrap_u8()
+                != 1
+        {
+            return Err(protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "destination handoff capability is invalid",
+            ));
+        }
+        if self.authority_generation(Some(&prepared.wallet_id))
+            != prepared.credential_authority_generation.get()
+        {
+            return Err(replay());
+        }
+        let challenges = &prepared.destination_challenges;
+        let mut credential = verify_webauthn_attestation_for_origin(
+            &request.attestation,
+            &challenges[0].canonical_bytes()?,
+            prepared.destination_user_handle.clone(),
+            prepared.destination_prf_salt.clone(),
+            &self.verification_origin(&destination)?,
+            destination.identity.rp_id.as_str(),
+        )?;
+        credential.surface = pair.pairing.destination_surface.clone();
+        let verified = verify_webauthn_assertion_for_origin(
+            &request.prf_assertion,
+            &credential,
+            &challenges[1].canonical_bytes()?,
+            true,
+            &self.verification_origin(&destination)?,
+            destination.identity.rp_id.as_str(),
+        )?;
+        credential.sign_count = DecimalU64::new(u64::from(verified.sign_count));
+        let aad = cross_surface_aad(prepared, "destination_prf")?.canonical_bytes()?;
+        let prf = pair.destination_recipient.take().ok_or_else(replay)?.open(
+            &request.encrypted_new_prf,
+            CROSS_DESTINATION_INFO,
+            &aad,
+        )?;
+        if prf.expose_to_backend().len() != 32 {
+            return Err(protocol(
+                ProtocolErrorCode::BackendInvalidRequest,
+                "destination credential PRF must be 32 bytes",
+            ));
+        }
+        let key = credential_wrap_key(&prf, &prepared.wallet_id, &credential.credential_id)?;
+        let unlocked = pair.unlocked.take().ok_or_else(replay)?;
+        let wallet = self.wallet(&prepared.wallet_id)?;
+        let before = self.custody_snapshot();
+        let result = (|| {
+            wallet.add_credential(&unlocked, credential.credential_id.clone(), &key)?;
+            self.register_existing_credential(prepared.wallet_id.clone(), credential)?;
+            if let (Some(id), Some(counter)) = (&pair.source_credential_id, pair.source_sign_count)
+            {
+                self.advance_counter(id, counter);
+            }
+            let receipt_digest = canonical_digest(&CustodyReceiptPreimage {
+                ceremony_id: &pair.pairing.pairing_id,
+                ceremony_kind: CeremonyKind::CredentialAdd,
+                operation_id: &pair.pairing.operation_id,
+                public_binding_digest: &pair.pairing.exact_terms_digest,
+                completed_at_ms: now_ms,
+            })?;
+            let credential_summaries = self
+                .credentials
+                .lock()
+                .values()
+                .filter(|bound| bound.wallet_id == prepared.wallet_id)
+                .map(|bound| CredentialSummary {
+                    credential_id: bound.credential.credential_id.clone(),
+                    surface: Some(bound.credential.surface.clone()),
+                    rp_id: bound.credential.rp_id.clone(),
+                    active: true,
+                })
+                .collect();
+            let mut result = CustodyResult {
+                surface: Some(pair.pairing.destination_surface.clone()),
+                credential_authority_generation: Some(
+                    prepared.credential_authority_generation.clone(),
+                ),
+                ceremony_kind: CeremonyKind::CredentialAdd,
+                custody_operation_id: pair.pairing.operation_id.clone(),
+                public_status: CeremonyState::Succeeded,
+                wallet_id: Some(prepared.wallet_id.clone()),
+                public_key_refs: Vec::new(),
+                credential_summaries,
+                initial_policy: None,
+                receipt_digest,
+                encrypted_browser_result: None,
+                signer_key_id: self.signer_key_id.clone(),
+                signer_signature: Base64UrlBytes::from_bytes(&[]),
+            };
+            result.signer_signature = self.sign_receipt(&result.unsigned_canonical_bytes()?);
+            let after = self.custody_snapshot();
+            let status = CeremonyPublicStatus {
+                ceremony_id: pair.pairing.pairing_id.clone(),
+                ceremony_kind: CeremonyKind::CredentialAdd,
+                operation_id: pair.pairing.operation_id.clone(),
+                state: CeremonyState::Succeeded,
+                expires_at_ms: pair.pairing.expires_at_ms.clone(),
+                ceremony_url: None,
+                receipt_digest: Some(result.receipt_digest.clone()),
+            };
+            self.engine
+                .commit_custody_snapshot_with_effect(CustodySnapshotCommit {
+                    result: &result,
+                    wallets: &after.0,
+                    credentials: &after.1,
+                    committed_at_ms: now_ms,
+                    status: &status,
+                    committed_allocations: &[],
+                    effect: CeremonyDatabaseEffect::None,
+                })?;
+            Ok::<_, ProtocolError>(result)
+        })();
+        if result.is_err() {
+            self.restore_custody_snapshot(before)?;
+        }
+        if result.is_ok() {
+            pair.capability = None;
+            pair.handoff = None;
+        } else if pair.destination_recipient.is_none() || pair.unlocked.is_none() {
+            pairs.remove(&request.pairing_id);
+        }
+        result
+    }
+
+    /// Record that the paired destination already holds one of the wallet's
+    /// passkeys on its surface, so WebAuthn refused to create another.
+    ///
+    /// Only the authorized destination tab holds the handoff capability, so it
+    /// alone can end the pairing this way. Nothing is enrolled: the unlocked
+    /// wallet material is dropped with the pairing and the durable outcome is
+    /// the terminal `ALREADY_REGISTERED` status. A retry after that commit
+    /// answers with the same status.
+    pub fn cross_surface_already_registered(
+        &self,
+        request: CrossSurfaceAlreadyRegisteredRequest,
+        now_ms: u64,
+    ) -> Result<CeremonyPublicStatus, ProtocolError> {
+        use subtle::ConstantTimeEq as _;
+        let _guard = self.custody_completion_barrier.lock();
+        let mut pairs = self.cross_surface.lock();
+        let Some(pair) = pairs.get(&request.pairing_id) else {
+            return match self.engine.ceremony_public_status(&request.operation_id)? {
+                Some(status)
+                    if status.state == CeremonyState::AlreadyRegistered
+                        && status.ceremony_id == request.pairing_id =>
+                {
+                    Ok(status)
+                }
+                _ => Err(replay()),
+            };
+        };
+        if pair.pairing.operation_id != request.operation_id {
+            return Err(operation_conflict());
+        }
+        if now_ms >= pair.pairing.expires_at_ms.get() {
+            return Err(replay());
+        }
+        if self
+            .engine
+            .custody_receipt(&request.operation_id)?
+            .is_some()
+        {
+            return Err(committed_conflict());
+        }
+        let prepared = pair.prepared.as_ref().ok_or_else(replay)?;
+        if prepared.destination_existing_credentials.is_empty() {
+            return Err(protocol(
+                ProtocolErrorCode::OperationIdConflict,
+                "the destination surface has no existing wallet passkey to match",
+            ));
+        }
+        let capability = pair.capability.as_ref().ok_or_else(replay)?;
+        if request.capability.decode().len() != 32
+            || request
+                .capability
+                .decode()
+                .ct_eq(&capability[..])
+                .unwrap_u8()
+                != 1
+        {
+            return Err(protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "destination handoff capability is invalid",
+            ));
+        }
+        let status = CeremonyPublicStatus {
+            ceremony_id: pair.pairing.pairing_id.clone(),
+            ceremony_kind: CeremonyKind::CredentialAdd,
+            operation_id: pair.pairing.operation_id.clone(),
+            state: CeremonyState::AlreadyRegistered,
+            expires_at_ms: pair.pairing.expires_at_ms.clone(),
+            ceremony_url: None,
+            receipt_digest: None,
+        };
+        self.engine.persist_ceremony_public_status(&status)?;
+        pairs.remove(&request.pairing_id);
+        Ok(status)
+    }
+
+    pub fn expire_cross_surface_pairs(&self, now_ms: u64) {
+        self.cross_surface
+            .lock()
+            .retain(|_, pair| pair.pairing.expires_at_ms.get() > now_ms && pair.attempts < 5);
+    }
+
+    pub fn clear_cross_surface_pairs(&self) {
+        self.cross_surface.lock().clear();
+    }
+
+    /// Broker reports externally observed readiness over the authenticated
+    /// Broker-to-Signer edge. It cannot create an origin or change desired mode.
+    pub fn report_effective(
+        &self,
+        report: SurfaceEffectiveReport,
+    ) -> Result<SurfaceStatus, ProtocolError> {
+        let _guard = self.custody_completion_barrier.lock();
+        let persisted = self.engine.load_surface_status()?;
+        let current = persisted.clone().unwrap_or_else(default_surface_status);
+        if report.desired_revision != current.desired_revision {
+            return Err(operation_conflict());
+        }
+        let mut next = current.clone();
+        let remote_id = Token::new("remote")?;
+        let remote = next
+            .surfaces
+            .iter_mut()
+            .find(|descriptor| descriptor.identity.surface_id == remote_id);
+        match current.desired_mode {
+            ExposureMode::RemoteEnabled => {
+                if report.remote_closed || !report.remote_tls_ready || !report.remote_routing_ready
+                {
+                    if let Some(descriptor) = remote {
+                        if descriptor.lifecycle != SurfaceLifecycle::Disabled {
+                            descriptor.lifecycle = SurfaceLifecycle::Disabled;
+                            descriptor.lifecycle_revision =
+                                DecimalU64::new(descriptor.lifecycle_revision.get() + 1);
+                        }
+                    }
+                    next.effective_mode = ExposureMode::LocalhostOnly;
+                } else {
+                    let descriptor = remote.ok_or_else(|| {
+                        protocol(
+                            ProtocolErrorCode::ServiceUnavailable,
+                            "remote surface is not provisioned",
+                        )
+                    })?;
+                    if descriptor.lifecycle == SurfaceLifecycle::Tombstoned {
+                        return Err(protocol(
+                            ProtocolErrorCode::UnauthenticatedPeer,
+                            "remote surface is retired",
+                        ));
+                    }
+                    if descriptor.lifecycle != SurfaceLifecycle::Active {
+                        descriptor.lifecycle = SurfaceLifecycle::Active;
+                        descriptor.lifecycle_revision =
+                            DecimalU64::new(descriptor.lifecycle_revision.get() + 1);
+                    }
+                    next.effective_mode = ExposureMode::RemoteEnabled;
+                }
+            }
+            ExposureMode::LocalhostOnly => {
+                if !report.remote_closed {
+                    return Err(protocol(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "remote listener and tunnel closure is not acknowledged",
+                    ));
+                }
+                if let Some(descriptor) = remote {
+                    descriptor.lifecycle = SurfaceLifecycle::Disabled;
+                    if current.effective_mode != ExposureMode::LocalhostOnly {
+                        descriptor.lifecycle_revision =
+                            DecimalU64::new(descriptor.lifecycle_revision.get() + 1);
+                    }
+                }
+                next.effective_mode = ExposureMode::LocalhostOnly;
+            }
+        }
+        next.effective_revision = next.desired_revision.clone();
+        next.remote_tls_ready = report.remote_tls_ready;
+        next.remote_routing_ready = report.remote_routing_ready;
+        if next != current {
+            self.engine
+                .commit_surface_status(persisted.as_ref(), &next, "surface.effective")?;
+        }
+        Ok(next)
+    }
+
+    /// Called only after local administrator authentication. The local guard
+    /// and the custody completion lock serialize wallet-set/credential changes
+    /// with the remote disable preflight.
+    pub fn set_exposure_mode(&self, mode: ExposureMode) -> Result<SurfaceStatus, ProtocolError> {
+        let _guard = self.custody_completion_barrier.lock();
+        let persisted = self.engine.load_surface_status()?;
+        let current = persisted.clone().unwrap_or_else(default_surface_status);
+        if current.desired_mode == mode {
+            return Ok(current);
+        }
+        let mut next = current.clone();
+        match mode {
+            ExposureMode::LocalhostOnly => {
+                let local = bloom_signer_api::legacy_local_surface();
+                let credentials = self.credentials.lock();
+                let blocked = self
+                    .engine
+                    .active_wallet_ids()?
+                    .into_iter()
+                    .filter(|wallet_id| {
+                        !credentials.values().any(|bound| {
+                            &bound.wallet_id == wallet_id && bound.credential.surface == local
+                        })
+                    })
+                    .map(|wallet_id| wallet_id.to_string())
+                    .collect::<Vec<_>>();
+                if !blocked.is_empty() {
+                    return Err(protocol(
+                        ProtocolErrorCode::ApprovalRearmRequired,
+                        format!(
+                            "enroll local credentials before disabling remote access: {}",
+                            blocked.join(", ")
+                        ),
+                    ));
+                }
+                if let Some(remote) = next
+                    .surfaces
+                    .iter_mut()
+                    .find(|surface| surface.identity.surface_id.as_str() == "remote")
+                {
+                    remote.lifecycle = SurfaceLifecycle::Disabled;
+                    remote.lifecycle_revision =
+                        DecimalU64::new(remote.lifecycle_revision.get() + 1);
+                }
+            }
+            ExposureMode::RemoteEnabled => {
+                if !next.surfaces.iter().any(|surface| {
+                    surface.identity.surface_id.as_str() == "remote"
+                        && surface.lifecycle != SurfaceLifecycle::Tombstoned
+                }) {
+                    return Err(protocol(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "relay assignment and remote surface are not provisioned",
+                    ));
+                }
+            }
+        }
+        next.desired_mode = mode;
+        next.desired_revision = DecimalU64::new(current.desired_revision.get() + 1);
+        next.remote_tls_ready = false;
+        next.remote_routing_ready = false;
+        self.engine
+            .commit_surface_status(persisted.as_ref(), &next, "surface.desired")?;
+        Ok(next)
+    }
+
+    fn require_surface(
+        &self,
+        reference: &SurfaceRef,
+        enrollment: bool,
+    ) -> Result<SurfaceDescriptor, ProtocolError> {
+        let surfaces = self.surface_status()?;
+        let descriptor = surfaces
+            .surfaces
+            .iter()
+            .find(|descriptor| descriptor.identity.surface_id == reference.surface_id)
+            .ok_or_else(|| {
+                protocol(
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "ceremony surface is not installed",
+                )
+            })?;
+        if descriptor.reference() != *reference
+            || !matches!(descriptor.lifecycle, SurfaceLifecycle::Active)
+                && (enrollment || descriptor.lifecycle != SurfaceLifecycle::AuthenticationOnly)
+        {
+            return Err(protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "ceremony surface is ineligible",
+            ));
+        }
+        Ok(descriptor.clone())
     }
 
     /// Sets how long newly minted ceremonies stay open, up to
@@ -480,6 +1367,13 @@ impl SignerCeremonyService {
         wallet_id: Token,
         credential: WebAuthnCredential,
     ) -> Result<(), ProtocolError> {
+        let surface = self.require_surface(&credential.surface, false)?;
+        if surface.identity.rp_id != credential.rp_id {
+            return Err(protocol(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "credential RP does not match its Signer-owned surface",
+            ));
+        }
         let key = credential.credential_id.encoded().to_owned();
         let mut credentials = self.credentials.lock();
         if credentials.contains_key(&key) {
@@ -503,6 +1397,7 @@ impl SignerCeremonyService {
         request: CeremonyPrepareRequest,
         now_ms: u64,
     ) -> Result<PreparedApprovalCeremony, ProtocolError> {
+        self.require_surface(&request.surface, false)?;
         request.terms.validate()?;
         self.engine
             .validate_petal_scope_for_approval(&request.terms, now_ms)?;
@@ -564,7 +1459,8 @@ impl SignerCeremonyService {
                 return Ok(PreparedApprovalCeremony {
                     contribution: contribution.clone(),
                     challenges: existing.challenges.clone(),
-                    webauthn_options: self.options_for_approval(&request.terms.wallet_id),
+                    webauthn_options: self
+                        .options_for_approval(&request.terms.wallet_id, &request.surface),
                 });
             }
             return Err(kind_mismatch());
@@ -580,6 +1476,10 @@ impl SignerCeremonyService {
         ))
         .then(HpkeRecipient::generate);
         let mut contribution = SignerCeremonyContribution {
+            surface: request.surface.clone(),
+            credential_authority_generation: DecimalU64::new(
+                self.authority_generation(Some(&request.terms.wallet_id)),
+            ),
             ceremony_id: ceremony_id.clone(),
             signer_nonce: signer_nonce.clone(),
             approval_digest: request.terms.approval_digest()?,
@@ -607,6 +1507,7 @@ impl SignerCeremonyService {
         contribution.signer_signature =
             self.sign_contribution(&contribution.unsigned_canonical_bytes()?);
         let challenge = CeremonyChallenge {
+            surface: request.surface.clone(),
             schema: Token::new("bloom.ceremony.challenge.v1")?,
             ceremony_id,
             ceremony_kind: CeremonyKind::SealedApproval,
@@ -620,7 +1521,7 @@ impl SignerCeremonyService {
         let prepared = PreparedApprovalCeremony {
             contribution: contribution.clone(),
             challenges: vec![challenge.clone()],
-            webauthn_options: self.options_for_approval(&request.terms.wallet_id),
+            webauthn_options: self.options_for_approval(&request.terms.wallet_id, &request.surface),
         };
         self.pending.lock().insert(
             request.activation_operation_id.clone(),
@@ -633,6 +1534,7 @@ impl SignerCeremonyService {
                 registration: None,
                 credential_creation: None,
                 legacy_migration: None,
+                private_recovery_generation: None,
             },
         );
         tracing::info!(
@@ -649,6 +1551,17 @@ impl SignerCeremonyService {
         request: CustodyPrepareRequest,
         now_ms: u64,
     ) -> Result<PreparedCustodyCeremony, ProtocolError> {
+        self.require_surface(
+            &request.surface,
+            matches!(
+                request.ceremony_kind,
+                CeremonyKind::WalletRegistration
+                    | CeremonyKind::WalletImport
+                    | CeremonyKind::WalletRecovery
+                    | CeremonyKind::CredentialAdd
+                    | CeremonyKind::CredentialReplace
+            ),
+        )?;
         if request.ceremony_kind == CeremonyKind::SealedApproval {
             return Err(kind_mismatch());
         }
@@ -696,7 +1609,9 @@ impl SignerCeremonyService {
         }
         self.require_unopened_operation_id(&request.custody_operation_id)?;
         if let Some(wallet_id) = &request.wallet_id {
-            self.require_no_live_wallet_session(wallet_id)?;
+            if request.ceremony_kind != CeremonyKind::WalletRecovery {
+                self.require_no_live_wallet_session(wallet_id)?;
+            }
         }
 
         let ceremony_id = random_digest();
@@ -783,7 +1698,14 @@ impl SignerCeremonyService {
                 | CeremonyKind::CredentialReplace
                 | CeremonyKind::WalletRecovery
         ) {
-            Some(self.new_credential_creation(request.wallet_id.as_ref()))
+            Some(self.new_credential_creation(
+                if request.ceremony_kind == CeremonyKind::WalletRecovery {
+                    None
+                } else {
+                    request.wallet_id.as_ref()
+                },
+                &request.surface,
+            ))
         } else {
             None
         };
@@ -791,7 +1713,16 @@ impl SignerCeremonyService {
             .as_ref()
             .map(|registration| registration.wallet_id.clone())
             .or_else(|| request.wallet_id.clone());
+        let private_generation = self.authority_generation(effective_wallet_id.as_ref());
         let mut contribution = CustodySignerContribution {
+            surface: request.surface.clone(),
+            credential_authority_generation: DecimalU64::new(
+                if request.ceremony_kind == CeremonyKind::WalletRecovery {
+                    0
+                } else {
+                    private_generation
+                },
+            ),
             ceremony_id: ceremony_id.clone(),
             ceremony_kind: request.ceremony_kind,
             custody_operation_id: request.custody_operation_id.clone(),
@@ -815,6 +1746,7 @@ impl SignerCeremonyService {
         let challenges = phases
             .into_iter()
             .map(|phase| CeremonyChallenge {
+                surface: request.surface.clone(),
                 schema: Token::new("bloom.ceremony.challenge.v1").expect("static protocol token"),
                 ceremony_id: ceremony_id.clone(),
                 ceremony_kind: request.ceremony_kind,
@@ -849,13 +1781,23 @@ impl SignerCeremonyService {
             })
             .or_else(|| {
                 credential_creation.as_ref().map(|creation| {
-                    let mut options = self.options_for_wallet(request.wallet_id.as_ref());
+                    let mut options = if request.ceremony_kind == CeremonyKind::WalletRecovery {
+                        CeremonyWebAuthnOptions {
+                            allowed_credentials: Vec::new(),
+                            registration_user_handle: None,
+                            registration_prf_salt: None,
+                        }
+                    } else {
+                        self.options_for_wallet(request.wallet_id.as_ref(), &request.surface)
+                    };
                     options.registration_user_handle = Some(creation.user_handle.clone());
                     options.registration_prf_salt = Some(creation.prf_salt.clone());
                     options
                 })
             })
-            .unwrap_or_else(|| self.options_for_wallet(request.wallet_id.as_ref()));
+            .unwrap_or_else(|| {
+                self.options_for_wallet(request.wallet_id.as_ref(), &request.surface)
+            });
         let verification_credentials = legacy_migration
             .as_ref()
             .map(|legacy| vec![legacy.credential.clone()])
@@ -891,6 +1833,9 @@ impl SignerCeremonyService {
                 registration,
                 credential_creation,
                 legacy_migration,
+                private_recovery_generation: (prepared.contribution.ceremony_kind
+                    == CeremonyKind::WalletRecovery)
+                    .then_some(private_generation),
             },
         );
         tracing::info!(
@@ -990,6 +1935,7 @@ impl SignerCeremonyService {
             request.ceremony_kind,
             CeremonyKind::WalletRegistration
                 | CeremonyKind::WalletImport
+                | CeremonyKind::WalletRecovery
                 | CeremonyKind::WalletExport
                 | CeremonyKind::KeyDerive
         ) || contribution.expires_at_ms.get() <= now_ms
@@ -1017,6 +1963,7 @@ impl SignerCeremonyService {
             required_phases(request.ceremony_kind, pending.legacy_migration.is_some())
                 .into_iter()
                 .map(|phase| CeremonyChallenge {
+                    surface: contribution.surface.clone(),
                     schema: Token::new("bloom.ceremony.challenge.v1")
                         .expect("static protocol token"),
                     ceremony_id: contribution.ceremony_id.clone(),
@@ -1111,6 +2058,8 @@ impl SignerCeremonyService {
         };
         if contribution != &request.contribution
             || contribution.expires_at_ms.get() <= now_ms
+            || contribution.credential_authority_generation.get()
+                != self.authority_generation(Some(&prepare.terms.wallet_id))
             || !self.verify_contribution(
                 &contribution.unsigned_canonical_bytes()?,
                 &contribution.signer_signature,
@@ -1118,6 +2067,26 @@ impl SignerCeremonyService {
         {
             return Err(replay());
         }
+        let surface = self.require_surface(&prepare.surface, false)?;
+        let verify_webauthn_assertion = |assertion: &WebAuthnAssertion,
+                                         credential: &WebAuthnCredential,
+                                         challenge: &[u8],
+                                         uv: bool| {
+            if credential.surface != prepare.surface {
+                return Err(protocol(
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "credential surface mismatch",
+                ));
+            }
+            verify_webauthn_assertion_for_origin(
+                assertion,
+                credential,
+                challenge,
+                uv,
+                &self.verification_origin(&surface)?,
+                surface.identity.rp_id.as_str(),
+            )
+        };
         let assertion = match &request.proof {
             WebAuthnCeremonyProof::Assertion { assertion } => assertion,
             _ => return Err(kind_mismatch()),
@@ -1127,7 +2096,6 @@ impl SignerCeremonyService {
             assertion,
             &bound.credential,
             &pending.challenges[0].canonical_bytes()?,
-            &self.expected_origin,
             true,
         )?;
 
@@ -1142,6 +2110,7 @@ impl SignerCeremonyService {
                 )
             })?;
             let aad = LocalPrfHpkeAad {
+                surface: contribution.surface.clone(),
                 ceremony_id: contribution.ceremony_id.clone(),
                 signer_nonce: contribution.signer_nonce.clone(),
                 approval_id: prepare.terms.approval_id()?,
@@ -1177,6 +2146,10 @@ impl SignerCeremonyService {
         }
 
         let mut receipt = SignerActivationReceipt {
+            surface: Some(contribution.surface.clone()),
+            credential_authority_generation: Some(
+                contribution.credential_authority_generation.clone(),
+            ),
             activation_operation_id: request.activation_operation_id.clone(),
             ceremony_id: contribution.ceremony_id.clone(),
             approval_id: prepare.terms.approval_id()?,
@@ -1242,6 +2215,16 @@ impl SignerCeremonyService {
         if let Some(CompletedCeremony::Custody { result, .. }) =
             self.completed.lock().get(&request.custody_operation_id)
         {
+            if result.ceremony_kind == CeremonyKind::WalletRecovery
+                && !self
+                    .engine
+                    .recovery_result_delivery_valid(&request.custody_operation_id, now_ms)?
+            {
+                return Err(protocol(
+                    ProtocolErrorCode::ApprovalNotFound,
+                    "recovery result delivery window ended",
+                ));
+            }
             tracing::info!(
                 event = "signer.ceremony_recovered",
                 operation_id = request.custody_operation_id.as_str(),
@@ -1252,6 +2235,16 @@ impl SignerCeremonyService {
             return Ok((**result).clone());
         }
         if let Some(result) = self.engine.custody_receipt(&request.custody_operation_id)? {
+            if result.ceremony_kind == CeremonyKind::WalletRecovery
+                && !self
+                    .engine
+                    .recovery_result_delivery_valid(&request.custody_operation_id, now_ms)?
+            {
+                return Err(protocol(
+                    ProtocolErrorCode::ApprovalNotFound,
+                    "recovery result delivery window ended",
+                ));
+            }
             if result.ceremony_kind != request.ceremony_kind {
                 tracing::warn!(
                     event = "signer.ceremony_retry_conflict",
@@ -1316,6 +2309,11 @@ impl SignerCeremonyService {
             || request.ceremony_id != contribution.ceremony_id
             || contribution.expires_at_ms.get() <= now_ms
             || request.public_binding_digest != prepare.exact_terms_digest
+            || (if prepare.ceremony_kind == CeremonyKind::WalletRecovery {
+                pending.private_recovery_generation.ok_or_else(replay)?
+            } else {
+                contribution.credential_authority_generation.get()
+            }) != self.authority_generation(contribution.wallet_id.as_ref())
             || !self.verify_contribution(
                 &contribution.unsigned_canonical_bytes()?,
                 &contribution.signer_signature,
@@ -1367,6 +2365,7 @@ impl SignerCeremonyService {
                         )
                     })?;
                 let aad = CustodyOutputHpkeAad {
+                    surface: contribution.surface.clone(),
                     ceremony_id: contribution.ceremony_id.clone(),
                     ceremony_kind: contribution.ceremony_kind,
                     custody_operation_id: contribution.custody_operation_id.clone(),
@@ -1399,6 +2398,7 @@ impl SignerCeremonyService {
                     .filter(|bound| &bound.wallet_id == wallet_id)
                     .map(|bound| CredentialSummary {
                         credential_id: bound.credential.credential_id.clone(),
+                        surface: Some(bound.credential.surface.clone()),
                         rp_id: bound.credential.rp_id.clone(),
                         active: true,
                     })
@@ -1410,6 +2410,10 @@ impl SignerCeremonyService {
             _ => None,
         };
         let mut result = CustodyResult {
+            surface: Some(contribution.surface.clone()),
+            credential_authority_generation: Some(DecimalU64::new(
+                self.authority_generation(wallet_id.as_ref()),
+            )),
             ceremony_kind: request.ceremony_kind,
             custody_operation_id: request.custody_operation_id.clone(),
             public_status: request
@@ -1505,6 +2509,33 @@ impl SignerCeremonyService {
         if self.completed.lock().contains_key(operation_id) {
             return Err(committed_conflict());
         }
+        {
+            // Pairings live separately from ordinary pending ceremonies. Fence
+            // completion and durably cancel before dropping any unlocked material.
+            let _guard = self.custody_completion_barrier.lock();
+            let mut pairs = self.cross_surface.lock();
+            if let Some((id, pair)) = pairs
+                .iter()
+                .find(|(_, pair)| &pair.pairing.operation_id == operation_id)
+            {
+                if self.engine.custody_receipt(operation_id)?.is_some() {
+                    return Err(committed_conflict());
+                }
+                let id = id.clone();
+                self.engine
+                    .persist_ceremony_public_status(&CeremonyPublicStatus {
+                        ceremony_id: id.clone(),
+                        ceremony_kind: CeremonyKind::CredentialAdd,
+                        operation_id: operation_id.clone(),
+                        state: CeremonyState::Cancelled,
+                        expires_at_ms: pair.pairing.expires_at_ms.clone(),
+                        ceremony_url: None,
+                        receipt_digest: None,
+                    })?;
+                pairs.remove(&id);
+                return Ok(());
+            }
+        }
         let Some(pending) = self.pending.lock().remove(operation_id) else {
             return self.cancel_consumed_ceremony(operation_id);
         };
@@ -1534,7 +2565,10 @@ impl SignerCeremonyService {
         }
         match self.engine.ceremony_public_status(operation_id)? {
             Some(status) => match status.state {
-                CeremonyState::Cancelled | CeremonyState::Expired | CeremonyState::Failed => Ok(()),
+                CeremonyState::Cancelled
+                | CeremonyState::Expired
+                | CeremonyState::Failed
+                | CeremonyState::AlreadyRegistered => Ok(()),
                 _ => Err(committed_conflict()),
             },
             None => Err(protocol(
@@ -1664,6 +2698,24 @@ impl SignerCeremonyService {
         })
     }
 
+    pub fn status_at(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+    ) -> Result<SignerCeremonyStatus, ProtocolError> {
+        let status = self.status(operation_id)?;
+        if let SignerCeremonyStatus::CompletedCustody(result) = &status {
+            if result.ceremony_kind == CeremonyKind::WalletRecovery
+                && !self
+                    .engine
+                    .recovery_result_delivery_valid(operation_id, now_ms)?
+            {
+                return Ok(SignerCeremonyStatus::Terminal(CeremonyState::Succeeded));
+            }
+        }
+        Ok(status)
+    }
+
     pub fn public_status(
         &self,
         operation_id: &OperationId,
@@ -1744,6 +2796,50 @@ impl SignerCeremonyService {
         now_ms: u64,
         mut context: CustodyApplyContext,
     ) -> Result<CustodyApplyOutcome, ProtocolError> {
+        let surface = self.require_surface(
+            &prepare.surface,
+            matches!(
+                prepare.ceremony_kind,
+                CeremonyKind::WalletRegistration
+                    | CeremonyKind::WalletImport
+                    | CeremonyKind::WalletRecovery
+                    | CeremonyKind::CredentialAdd
+                    | CeremonyKind::CredentialReplace
+            ),
+        )?;
+        let verify_webauthn_assertion = |assertion: &WebAuthnAssertion,
+                                         credential: &WebAuthnCredential,
+                                         challenge: &[u8],
+                                         uv: bool| {
+            if credential.surface != prepare.surface {
+                return Err(protocol(
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "credential surface mismatch",
+                ));
+            }
+            verify_webauthn_assertion_for_origin(
+                assertion,
+                credential,
+                challenge,
+                uv,
+                &self.verification_origin(&surface)?,
+                surface.identity.rp_id.as_str(),
+            )
+        };
+        let verify_webauthn_attestation =
+            |attestation: &WebAuthnAttestation,
+             challenge: &[u8],
+             user_handle: Base64UrlBytes,
+             prf_salt: Base64UrlBytes| {
+                verify_webauthn_attestation_for_origin(
+                    attestation,
+                    challenge,
+                    user_handle,
+                    prf_salt,
+                    &self.verification_origin(&surface)?,
+                    surface.identity.rp_id.as_str(),
+                )
+            };
         let mut sensitive_output = None;
         let mut database_effect = CeremonyDatabaseEffect::None;
         let mut derived_keys = Vec::new();
@@ -1760,7 +2856,6 @@ impl SignerCeremonyService {
                         assertion,
                         &legacy.credential,
                         &challenges[0].canonical_bytes()?,
-                        &self.expected_origin,
                         true,
                     )?;
                     if verified
@@ -1805,14 +2900,13 @@ impl SignerCeremonyService {
                         &challenges[0].canonical_bytes()?,
                         registration.user_handle.clone(),
                         registration.prf_salt.clone(),
-                        &self.expected_origin,
                     )?;
+                    credential.surface = prepare.surface.clone();
                     if let Some(assertion) = prf_assertion {
                         let verified = verify_webauthn_assertion(
                             assertion,
                             &credential,
                             &challenges[1].canonical_bytes()?,
-                            &self.expected_origin,
                             true,
                         )?;
                         credential.sign_count = DecimalU64::new(u64::from(verified.sign_count));
@@ -2071,7 +3165,6 @@ impl SignerCeremonyService {
                     authority,
                     &authority_bound.credential,
                     &challenges[0].canonical_bytes()?,
-                    &self.expected_origin,
                     true,
                 )?;
                 let new_credential = verify_webauthn_attestation(
@@ -2083,15 +3176,14 @@ impl SignerCeremonyService {
                         .as_ref()
                         .map(|creation| creation.prf_salt.clone())
                         .ok_or_else(kind_mismatch)?,
-                    &self.expected_origin,
                 )?;
                 let mut new_credential = new_credential;
+                new_credential.surface = prepare.surface.clone();
                 if let Some(assertion) = prf_assertion {
                     let verified = verify_webauthn_assertion(
                         assertion,
                         &new_credential,
                         &challenges[2].canonical_bytes()?,
-                        &self.expected_origin,
                         true,
                     )?;
                     new_credential.sign_count = DecimalU64::new(u64::from(verified.sign_count));
@@ -2139,7 +3231,6 @@ impl SignerCeremonyService {
                     assertion,
                     &bound.credential,
                     &challenges[0].canonical_bytes()?,
-                    &self.expected_origin,
                     true,
                 )?;
                 let target = prepare.key_ref.as_ref().ok_or_else(|| {
@@ -2172,14 +3263,13 @@ impl SignerCeremonyService {
                     &challenges[0].canonical_bytes()?,
                     creation.user_handle.clone(),
                     creation.prf_salt.clone(),
-                    &self.expected_origin,
                 )?;
+                new_credential.surface = prepare.surface.clone();
                 if let Some(assertion) = prf_assertion {
                     let verified = verify_webauthn_assertion(
                         assertion,
                         &new_credential,
                         &challenges[1].canonical_bytes()?,
-                        &self.expected_origin,
                         true,
                     )?;
                     new_credential.sign_count = DecimalU64::new(u64::from(verified.sign_count));
@@ -2201,12 +3291,40 @@ impl SignerCeremonyService {
                     wallet_id,
                     &new_credential.credential_id,
                 )?;
-                wallet.add_credential(
+                if contribution.browser_output_recipient_key.is_none() {
+                    return Err(protocol(
+                        ProtocolErrorCode::BackendInvalidRequest,
+                        "recovery requires a bound Browser result recipient",
+                    ));
+                }
+                let replacement_recovery_id =
+                    Token::new(format!("recovery-{}", &random_digest().as_str()[..24]))?;
+                let replacement_recovery_secret = SecretBytes::new(random_32().to_vec());
+                let replacement_recovery_key = recovery_wrap_key(
+                    &Base64UrlBytes::from_bytes(replacement_recovery_secret.expose_to_backend()),
+                    wallet_id,
+                )?;
+                wallet.recover_replace_credentials(
                     &unlocked,
                     new_credential.credential_id.clone(),
                     &credential_key,
+                    replacement_recovery_id.clone(),
+                    &replacement_recovery_key,
                 )?;
-                self.register_existing_credential(wallet_id.clone(), new_credential)
+                self.credentials
+                    .lock()
+                    .retain(|_, bound| &bound.wallet_id != wallet_id);
+                self.register_existing_credential(wallet_id.clone(), new_credential)?;
+                sensitive_output = Some(Zeroizing::new(
+                    serde_jcs::to_vec(&RegistrationRecoveryOutput {
+                        recovery_id: replacement_recovery_id,
+                        recovery_secret: Base64UrlBytes::from_bytes(
+                            replacement_recovery_secret.expose_to_backend(),
+                        ),
+                    })
+                    .map_err(malformed)?,
+                ));
+                Ok(())
             }
             CeremonyKind::WalletExport
             | CeremonyKind::WalletDelete
@@ -2222,7 +3340,6 @@ impl SignerCeremonyService {
                     assertion,
                     &bound.credential,
                     &challenges[0].canonical_bytes()?,
-                    &self.expected_origin,
                     true,
                 )?;
                 let encrypted = self.decrypt_custody_input(
@@ -2705,6 +3822,7 @@ impl SignerCeremonyService {
             )
         })?;
         let aad = CustodyHpkeAad {
+            surface: contribution.surface.clone(),
             ceremony_id: contribution.ceremony_id.clone(),
             ceremony_kind: contribution.ceremony_kind,
             custody_operation_id: contribution.custody_operation_id.clone(),
@@ -2818,17 +3936,33 @@ impl SignerCeremonyService {
         Ok(())
     }
 
-    fn options_for_approval(&self, wallet_id: &Token) -> CeremonyWebAuthnOptions {
-        self.options_for_wallet(Some(wallet_id))
+    fn authority_generation(&self, wallet_id: Option<&Token>) -> u64 {
+        wallet_id
+            .and_then(|id| self.wallets.lock().get(id).cloned())
+            .map_or(0, |wallet| wallet.credential_authority_generation())
     }
 
-    fn options_for_wallet(&self, wallet_id: Option<&Token>) -> CeremonyWebAuthnOptions {
+    fn options_for_approval(
+        &self,
+        wallet_id: &Token,
+        surface: &SurfaceRef,
+    ) -> CeremonyWebAuthnOptions {
+        self.options_for_wallet(Some(wallet_id), surface)
+    }
+
+    fn options_for_wallet(
+        &self,
+        wallet_id: Option<&Token>,
+        surface: &SurfaceRef,
+    ) -> CeremonyWebAuthnOptions {
         let allowed_credentials = wallet_id
             .map(|wallet_id| {
                 self.credentials
                     .lock()
                     .values()
-                    .filter(|bound| &bound.wallet_id == wallet_id)
+                    .filter(|bound| {
+                        &bound.wallet_id == wallet_id && &bound.credential.surface == surface
+                    })
                     .map(|bound| CredentialPrfInput {
                         credential_id: bound.credential.credential_id.clone(),
                         prf_salt: bound.credential.prf_salt.clone(),
@@ -2844,6 +3978,21 @@ impl SignerCeremonyService {
     }
 
     fn options_for_pending(&self, pending: &PendingCeremony) -> CeremonyWebAuthnOptions {
+        if matches!(&pending.request, PendingRequest::Custody(request)
+            if request.ceremony_kind == CeremonyKind::WalletRecovery)
+        {
+            return CeremonyWebAuthnOptions {
+                allowed_credentials: Vec::new(),
+                registration_user_handle: pending
+                    .credential_creation
+                    .as_ref()
+                    .map(|creation| creation.user_handle.clone()),
+                registration_prf_salt: pending
+                    .credential_creation
+                    .as_ref()
+                    .map(|creation| creation.prf_salt.clone()),
+            };
+        }
         pending
             .legacy_migration
             .as_ref()
@@ -2868,15 +4017,15 @@ impl SignerCeremonyService {
             .or_else(|| {
                 pending.credential_creation.as_ref().map(|creation| {
                     let mut options = match &pending.request {
-                        PendingRequest::Approval(request) => {
-                            self.options_for_wallet(Some(&request.terms.wallet_id))
-                        }
+                        PendingRequest::Approval(request) => self
+                            .options_for_wallet(Some(&request.terms.wallet_id), &request.surface),
                         PendingRequest::Custody(request) => {
-                            self.options_for_wallet(request.wallet_id.as_ref())
+                            self.options_for_wallet(request.wallet_id.as_ref(), &request.surface)
                         }
-                        PendingRequest::PolicyUpdate(request) => {
-                            self.options_for_wallet(Some(&request.update.wallet_id))
-                        }
+                        PendingRequest::PolicyUpdate(request) => self.options_for_wallet(
+                            Some(&request.update.wallet_id),
+                            &request.custody.surface,
+                        ),
                     };
                     options.registration_user_handle = Some(creation.user_handle.clone());
                     options.registration_prf_salt = Some(creation.prf_salt.clone());
@@ -2885,14 +4034,13 @@ impl SignerCeremonyService {
             })
             .unwrap_or_else(|| match &pending.request {
                 PendingRequest::Approval(request) => {
-                    self.options_for_wallet(Some(&request.terms.wallet_id))
+                    self.options_for_wallet(Some(&request.terms.wallet_id), &request.surface)
                 }
                 PendingRequest::Custody(request) => {
-                    self.options_for_wallet(request.wallet_id.as_ref())
+                    self.options_for_wallet(request.wallet_id.as_ref(), &request.surface)
                 }
-                PendingRequest::PolicyUpdate(request) => {
-                    self.options_for_wallet(Some(&request.update.wallet_id))
-                }
+                PendingRequest::PolicyUpdate(request) => self
+                    .options_for_wallet(Some(&request.update.wallet_id), &request.custody.surface),
             })
     }
 
@@ -2900,6 +4048,11 @@ impl SignerCeremonyService {
         &self,
         pending: &PendingCeremony,
     ) -> Vec<WebAuthnCredential> {
+        if matches!(&pending.request, PendingRequest::Custody(request)
+            if request.ceremony_kind == CeremonyKind::WalletRecovery)
+        {
+            return Vec::new();
+        }
         if let Some(legacy) = &pending.legacy_migration {
             return vec![legacy.credential.clone()];
         }
@@ -2919,12 +4072,16 @@ impl SignerCeremonyService {
             .collect()
     }
 
-    fn new_credential_creation(&self, wallet_id: Option<&Token>) -> CredentialCreation {
+    fn new_credential_creation(
+        &self,
+        wallet_id: Option<&Token>,
+        surface: &SurfaceRef,
+    ) -> CredentialCreation {
         let existing_user_handle = wallet_id.and_then(|wallet_id| {
             self.credentials
                 .lock()
                 .values()
-                .find(|bound| &bound.wallet_id == wallet_id)
+                .find(|bound| &bound.wallet_id == wallet_id && &bound.credential.surface == surface)
                 .map(|bound| bound.credential.user_handle.clone())
         });
         CredentialCreation {
@@ -3248,38 +4405,7 @@ fn recovery_wrap_key(
 }
 
 fn approval_receipt_bytes(receipt: &SignerActivationReceipt) -> Result<Vec<u8>, ProtocolError> {
-    #[derive(Serialize)]
-    struct Unsigned<'a> {
-        activation_operation_id: &'a OperationId,
-        ceremony_id: &'a Digest32,
-        approval_id: &'a Digest32,
-        approval_digest: &'a Digest32,
-        review_manifest_digest: &'a Digest32,
-        key_ref: &'a bloom_signer_api::KeyRef,
-        allowed_crypto_suites: &'a [CryptoSuite],
-        activation_mode: ActivationMode,
-        wallet_revocation_epoch: &'a DecimalU64,
-        replaced_approval_id: &'a Option<Digest32>,
-        activated_at_ms: &'a DecimalU64,
-        expires_at_ms: &'a DecimalU64,
-        signer_key_id: &'a Token,
-    }
-    serde_jcs::to_vec(&Unsigned {
-        activation_operation_id: &receipt.activation_operation_id,
-        ceremony_id: &receipt.ceremony_id,
-        approval_id: &receipt.approval_id,
-        approval_digest: &receipt.approval_digest,
-        review_manifest_digest: &receipt.review_manifest_digest,
-        key_ref: &receipt.key_ref,
-        allowed_crypto_suites: &receipt.allowed_crypto_suites,
-        activation_mode: receipt.activation_mode.clone(),
-        wallet_revocation_epoch: &receipt.wallet_revocation_epoch,
-        replaced_approval_id: &receipt.replaced_approval_id,
-        activated_at_ms: &receipt.activated_at_ms,
-        expires_at_ms: &receipt.expires_at_ms,
-        signer_key_id: &receipt.signer_key_id,
-    })
-    .map_err(malformed)
+    receipt.unsigned_canonical_bytes().map_err(malformed)
 }
 
 fn canonical_digest(value: &impl Serialize) -> Result<Digest32, ProtocolError> {
@@ -3290,6 +4416,22 @@ fn canonical_digest(value: &impl Serialize) -> Result<Digest32, ProtocolError> {
 
 fn random_digest() -> Digest32 {
     Digest32::from_bytes(random_32())
+}
+
+fn cross_surface_aad(
+    prepared: &CrossSurfaceSourcePrepared,
+    phase: &str,
+) -> Result<CrossSurfaceHpkeAad, ProtocolError> {
+    Ok(CrossSurfaceHpkeAad {
+        pairing_id: prepared.pairing.pairing_id.clone(),
+        operation_id: prepared.pairing.operation_id.clone(),
+        wallet_id: prepared.wallet_id.clone(),
+        source_surface: prepared.source_surface.clone(),
+        destination_surface: prepared.pairing.destination_surface.clone(),
+        exact_terms_digest: prepared.pairing.exact_terms_digest.clone(),
+        destination_challenge: prepared.pairing.destination_challenge.clone(),
+        phase: Token::new(phase)?,
+    })
 }
 
 fn random_32() -> [u8; 32] {
@@ -3408,6 +4550,7 @@ mod tests {
 
     fn import_request() -> CustodyPrepareRequest {
         CustodyPrepareRequest {
+            surface: bloom_signer_api::legacy_local_surface(),
             ceremony_kind: CeremonyKind::WalletImport,
             custody_operation_id: OperationId::from_bytes([9; 32]),
             wallet_id: Some(Token::new("wallet").unwrap()),

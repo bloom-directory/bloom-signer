@@ -8,7 +8,7 @@ use sha2::{Digest as _, Sha256};
 use std::io::Cursor;
 
 use bloom_signer_api::{
-    Base64UrlBytes, DecimalU64, ProtocolError, ProtocolErrorCode, Token, WebAuthnAssertion,
+    Base64UrlBytes, DecimalU64, ProtocolError, ProtocolErrorCode, RpId, WebAuthnAssertion,
     WebAuthnAttestation, WebAuthnCredential,
 };
 
@@ -129,6 +129,27 @@ pub fn verify_webauthn_assertion(
     expected_origin: &str,
     require_user_verification: bool,
 ) -> Result<VerifiedAssertion, ProtocolError> {
+    verify_webauthn_assertion_for_origin(
+        assertion,
+        credential,
+        expected_challenge,
+        require_user_verification,
+        expected_origin,
+        CEREMONY_RP_ID,
+    )
+}
+
+/// Verify against the exact Signer-approved surface, never a Browser-provided
+/// RP or a host header. Callers must resolve this origin and RP from Signer
+/// state before accepting the proof.
+pub fn verify_webauthn_assertion_for_origin(
+    assertion: &WebAuthnAssertion,
+    credential: &WebAuthnCredential,
+    expected_challenge: &[u8],
+    require_user_verification: bool,
+    expected_origin: &str,
+    expected_rp_id: &str,
+) -> Result<VerifiedAssertion, ProtocolError> {
     if assertion.credential_id != credential.credential_id {
         return Err(proof_error(
             "credential ID does not match Signer enrollment",
@@ -143,7 +164,12 @@ pub fn verify_webauthn_assertion(
 
     let authenticator_data = assertion.authenticator_data.decode();
     let parsed = parse_authenticator_data(&authenticator_data, require_user_verification)?;
-    let rp_hash: [u8; 32] = Sha256::digest(credential.rp_id.as_str().as_bytes()).into();
+    if credential.rp_id.as_str() != expected_rp_id {
+        return Err(proof_error(
+            "credential belongs to a different ceremony surface",
+        ));
+    }
+    let rp_hash: [u8; 32] = Sha256::digest(expected_rp_id.as_bytes()).into();
     if parsed.rp_id_hash != rp_hash {
         return Err(proof_error("authenticator RP ID hash is invalid"));
     }
@@ -181,6 +207,24 @@ pub fn verify_webauthn_attestation(
     expected_prf_salt: Base64UrlBytes,
     expected_origin: &str,
 ) -> Result<WebAuthnCredential, ProtocolError> {
+    verify_webauthn_attestation_for_origin(
+        attestation,
+        expected_challenge,
+        expected_user_handle,
+        expected_prf_salt,
+        expected_origin,
+        CEREMONY_RP_ID,
+    )
+}
+
+pub fn verify_webauthn_attestation_for_origin(
+    attestation: &WebAuthnAttestation,
+    expected_challenge: &[u8],
+    expected_user_handle: Base64UrlBytes,
+    expected_prf_salt: Base64UrlBytes,
+    expected_origin: &str,
+    expected_rp_id: &str,
+) -> Result<WebAuthnCredential, ProtocolError> {
     verify_client_data(
         &attestation.client_data_json,
         "webauthn.create",
@@ -208,7 +252,7 @@ pub fn verify_webauthn_attestation(
     if parsed.flags & FLAG_ATTESTED_CREDENTIAL == 0 {
         return Err(proof_error("attested credential data flag is absent"));
     }
-    let rp_hash: [u8; 32] = Sha256::digest(CEREMONY_RP_ID.as_bytes()).into();
+    let rp_hash: [u8; 32] = Sha256::digest(expected_rp_id.as_bytes()).into();
     if parsed.rp_id_hash != rp_hash {
         return Err(proof_error("attestation RP ID hash is invalid"));
     }
@@ -242,10 +286,11 @@ pub fn verify_webauthn_attestation(
     let cose_public_key = canonical_cbor(&cose)?;
 
     Ok(WebAuthnCredential {
+        surface: bloom_signer_api::legacy_local_surface(),
         credential_id: attestation.credential_id.clone(),
         cose_public_key: Base64UrlBytes::from_bytes(&cose_public_key),
         user_handle: expected_user_handle,
-        rp_id: Token::new(CEREMONY_RP_ID)?,
+        rp_id: RpId::new(expected_rp_id)?,
         prf_salt: expected_prf_salt,
         sign_count: DecimalU64::new(u64::from(parsed.sign_count)),
     })

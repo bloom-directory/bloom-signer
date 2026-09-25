@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+mod admin;
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -43,6 +45,7 @@ use bloom_triad_local_transport::{
     AuthenticatedRequestContext, EndpointQuota, JournalExchange, LocalIdentity, PeerAcl,
     load_identity_and_manifest,
 };
+use clap::{Parser, Subcommand};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
@@ -90,6 +93,8 @@ struct SignerConfig {
     /// five-minute default. The developer harness sets thirty minutes.
     #[serde(default)]
     ceremony_ttl_ms: Option<u64>,
+    #[serde(default)]
+    relay_receipt_public_key_hex: Option<String>,
     /// Optional ceremony port for an independent development Triad. Missing
     /// keeps the default 18734 (or the development-only legacy environment
     /// fallback); an explicit integer 1 through 65535 always wins and is
@@ -145,10 +150,12 @@ impl Drop for SignerConfig {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    if std::env::args_os().len() == 2
-        && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--version"))
-    {
-        println!("bloom-signer {}", env!("CARGO_PKG_VERSION"));
+    let cli = Cli::parse();
+    if let Some(Command::Admin(command)) = cli.command {
+        if let Err(error) = admin::run_cli(command).await {
+            eprintln!("Bloom Signer administration failed: {error}");
+            std::process::exit(1);
+        }
         return;
     }
     if let Err(error) = bloom_signer_process_hardening::harden_process() {
@@ -178,6 +185,68 @@ async fn main() {
             );
         }
         std::process::exit(1);
+    }
+}
+
+/// Bloom key-custody service and administrative client.
+#[derive(Parser)]
+#[command(name = "bloom-signer", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Inspect or change the installed Signer's ceremony surface.
+    Admin(admin::AdminCli),
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn administration_requires_one_explicit_target() {
+        assert!(Cli::try_parse_from(["bloom-signer"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["bloom-signer", "admin", "status", "--login-uid", "501"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["bloom-signer", "admin", "status", "--signer-uid", "501"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["bloom-signer", "admin", "status"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "bloom-signer",
+                "admin",
+                "status",
+                "--login-uid",
+                "501",
+                "--signer-uid",
+                "502"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["bloom-signer", "admin", "status", "--login-uid", "0"]).is_err()
+        );
+    }
+
+    #[test]
+    fn help_is_resolved_entirely_by_the_parser() {
+        for args in [
+            vec!["bloom-signer", "--help"],
+            vec!["bloom-signer", "admin", "--help"],
+            vec!["bloom-signer", "admin", "provision", "--help"],
+        ] {
+            let error = match Cli::try_parse_from(args) {
+                Ok(_) => panic!("help must exit through clap"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        }
     }
 }
 
@@ -254,6 +323,14 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
     let (identity, manifest) = loaded_identity;
     let trusted_time_source = manifest.trusted_time_source.clone();
     let signer_effective_uid = manifest.signer.effective_uid;
+    #[cfg(feature = "triad-dev-harness")]
+    let admin_peer_uid = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
+        signer_effective_uid
+    } else {
+        0
+    };
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let admin_peer_uid = 0;
     tracing::info!(
         event = "service.identity_loaded",
         service_role = "signer",
@@ -462,6 +539,14 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
         identity: identity.clone(),
         last_verified_head: Mutex::new(initial_audit_head),
     });
+    let admin_ceremony = ceremony.clone();
+    let expiry_ceremony = ceremony.clone();
+    let expiry_clock = clock.clone();
+    let admin_receipt_key = config
+        .relay_receipt_public_key_hex
+        .as_ref()
+        .map(|value| admin::decode_fixed_32(value))
+        .transpose()?;
     let mut service = SignerRpcService::new(
         engine,
         ceremony,
@@ -489,6 +574,12 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
         "BLOOM_SIGNER_CONTROL_ACTIVATION_NAME",
         "signer-control",
     )?)?;
+    let admin_listener = std::env::var_os("BLOOM_SIGNER_ADMIN_SOCKET")
+        .map(PathBuf::from)
+        .map(|path| bloom_service_activation::bind_private_unix_listener(&path))
+        .transpose()?
+        .map(UnixListener::from_std)
+        .transpose()?;
     let rpc_quota = Arc::new(EndpointQuota::new(
         config.maximum_in_flight_mutations,
         config.maximum_requests_per_window,
@@ -518,6 +609,17 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut rpc_shutdown = shutdown_rx.clone();
     let mut control_shutdown = shutdown_rx;
+    let mut admin_shutdown = control_shutdown.clone();
+    let expiry_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            match expiry_clock.now_ms_read_only() {
+                Ok(now_ms) => expiry_ceremony.expire_cross_surface_pairs(now_ms),
+                Err(_) => expiry_ceremony.clear_cross_surface_pairs(),
+            }
+        }
+    });
     async move {
         tracing::info!(
             event = "service.ready",
@@ -545,6 +647,13 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
                 control_service,
                 config.control_maximum_connections,
                 &mut control_shutdown,
+            ),
+            admin::serve(
+                admin_listener,
+                admin_ceremony,
+                admin_receipt_key,
+                admin_peer_uid,
+                &mut admin_shutdown
             ),
             async move {
                 let mut unexpected = [0_u8; 1];
@@ -577,6 +686,7 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
     }
     .instrument(service_span)
     .await?;
+    expiry_task.abort();
     trusted_fatal.disarm();
     Ok(())
 }
