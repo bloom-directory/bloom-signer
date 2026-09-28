@@ -3928,8 +3928,11 @@ impl SignerCeremonyService {
                 PendingRequest::PolicyUpdate(request) => &request.update.wallet_id == wallet_id,
             })
         {
+            // A time-based bound like the Broker's own: the wallet admits
+            // one creation once its live ceremony ends. `QUOTA_EXCEEDED`
+            // would read as request exhaustion to every caller above.
             return Err(protocol(
-                ProtocolErrorCode::QuotaExceeded,
+                ProtocolErrorCode::CeremonyRateLimited,
                 "wallet already has a live ceremony",
             ));
         }

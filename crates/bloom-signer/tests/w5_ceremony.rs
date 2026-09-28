@@ -2516,6 +2516,41 @@ fn approval_completion_verifies_raw_proof_decrypts_prf_and_is_idempotent() {
 }
 
 #[test]
+fn a_second_ceremony_for_a_wallet_with_a_live_one_is_rate_limited() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, _, _) = service(&authenticator);
+    let (registration, _) = complete_new_wallet(
+        &service,
+        &authenticator,
+        CeremonyKind::WalletRegistration,
+        operation("13"),
+        None,
+        None,
+        1_000,
+    );
+    let mut terms = terms(registration.public_key_refs[0].clone());
+    terms.wallet_id = registration.wallet_id.unwrap();
+    let prepare = |operation_id: OperationId, review: &str| CeremonyPrepareRequest {
+        surface: bloom_signer_api::legacy_local_surface(),
+        activation_operation_id: operation_id,
+        terms: terms.clone(),
+        review_manifest_digest: digest(review),
+        exact_ordered_payload_digests: vec![digest("22")],
+        exact_ordered_hashes: vec![digest("33")],
+        replacement_approval_id: None,
+    };
+    service
+        .prepare_approval(prepare(operation("14"), "79"), 2_000)
+        .unwrap();
+
+    let error = service
+        .prepare_approval(prepare(operation("15"), "7a"), 2_001)
+        .unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::CeremonyRateLimited);
+    assert_eq!(error.message, "wallet already has a live ceremony");
+}
+
+#[test]
 fn approval_browser_lifetime_is_capped_by_the_authority_expiry() {
     let authenticator = VirtualAuthenticator::generate();
     let (service, _, _, _) = service(&authenticator);
