@@ -527,52 +527,46 @@ async fn provision(context: &AdminContext) -> Result<SurfaceStatus, Box<dyn std:
     let key = prepare_admin_identity(&root, admin_owner_uid)?;
     let public_key = key.verifying_key().to_bytes();
     let allocation_path = root.join("allocation-operation.json");
-    let installation_id = if allocation_path.exists() || !admin_key_existed {
-        // Enrollment is an exact-retry operation. Retain its operation ID
-        // across the later certificate/CAA readiness retries so a retry
-        // cannot allocate a second hostname.
-        let operation_id = allocation_operation(&root, admin_owner_uid, true)?;
-        let receipt = enroll(
-            EnrollmentConfig {
-                control_ca_pem: ca_pem.clone(),
-            },
-            &public_key,
-            &receipt_key,
-            operation_id,
-            |message| Ok(key.sign(message).to_bytes()),
-        )?;
-        // Assignment must be installed first: only then can Broker begin the
-        // account/certificate worker that publishes its ACME URI.
-        let response = request_once(
-            &context.socket,
-            signer_uid,
-            &AdminRequest::Provision {
-                receipt: receipt.clone(),
-                admin_public_key: public_key,
-            },
-        )
-        .await?;
-        status = response.status.ok_or_else(|| {
-            response
-                .error
-                .unwrap_or("Signer rejected relay assignment".into())
-        })?;
-        receipt.allocation.installation_id
-    } else {
-        // Builds predating allocation-operation.json may already have
-        // installed an assignment. Recover only from Signer's authoritative
-        // binding; an unassigned old key is ambiguous and must not allocate.
-        let expected_digest = Digest32::from_bytes(Sha256::digest(public_key).into());
-        if status.installation_admin_key_sha256.as_ref() != Some(&expected_digest) {
-            return Err("existing admin identity lacks a matching Signer assignment; refusing a new relay allocation".into());
+    let source = installation_source(
+        &status,
+        &public_key,
+        allocation_path.exists(),
+        admin_key_existed,
+    )?;
+    let installation_id = match source {
+        InstallationSource::Assigned(installation_id) => installation_id,
+        InstallationSource::Enroll => {
+            // Enrollment is an exact-retry operation. Retain its operation ID
+            // across the later certificate/CAA readiness retries so a retry
+            // cannot allocate a second hostname.
+            let operation_id = allocation_operation(&root, admin_owner_uid, true)?;
+            let receipt = enroll(
+                EnrollmentConfig {
+                    control_ca_pem: ca_pem.clone(),
+                },
+                &public_key,
+                &receipt_key,
+                operation_id,
+                |message| Ok(key.sign(message).to_bytes()),
+            )?;
+            // Assignment must be installed first: only then can Broker begin the
+            // account/certificate worker that publishes its ACME URI.
+            let response = request_once(
+                &context.socket,
+                signer_uid,
+                &AdminRequest::Provision {
+                    receipt: receipt.clone(),
+                    admin_public_key: public_key,
+                },
+            )
+            .await?;
+            status = response.status.ok_or_else(|| {
+                response
+                    .error
+                    .unwrap_or("Signer rejected relay assignment".into())
+            })?;
+            receipt.allocation.installation_id
         }
-        status
-            .installation_id
-            .as_deref()
-            .ok_or(
-                "existing admin identity has no Signer assignment; refusing a new relay allocation",
-            )?
-            .parse::<Uuid>()?
     };
     let broker_uid = provisioning.broker_uid;
     let broker_gid = provisioning.broker_gid;
@@ -717,6 +711,42 @@ fn read_broker_acme_uri(path: &Path, uid: u32, gid: u32) -> io::Result<String> {
         ));
     }
     Ok(uri.to_owned())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum InstallationSource {
+    /// Signer already holds this admin key's relay assignment.
+    Assigned(Uuid),
+    /// Allocate, or exactly retry the recorded allocation.
+    Enroll,
+}
+
+/// Where provisioning gets its installation. Once Signer holds the
+/// assignment for this admin key, enrollment has finished: replaying it would
+/// need the public bootstrap route, which stays closed outside enrollment
+/// windows, so re-provisioning (for example to reissue an expired credential)
+/// uses the assignment instead. Without an assignment, a new or recorded
+/// allocation enrolls; an existing key with neither is ambiguous and must not
+/// allocate.
+fn installation_source(
+    status: &SurfaceStatus,
+    admin_public_key: &[u8; 32],
+    allocation_recorded: bool,
+    admin_key_existed: bool,
+) -> Result<InstallationSource, Box<dyn std::error::Error>> {
+    let expected_digest = Digest32::from_bytes(Sha256::digest(admin_public_key).into());
+    if status.installation_admin_key_sha256.as_ref() == Some(&expected_digest)
+        && let Some(installation_id) = status.installation_id.as_deref()
+    {
+        return Ok(InstallationSource::Assigned(installation_id.parse()?));
+    }
+    if allocation_recorded || !admin_key_existed {
+        return Ok(InstallationSource::Enroll);
+    }
+    if status.installation_admin_key_sha256.as_ref() != Some(&expected_digest) {
+        return Err("existing admin identity lacks a matching Signer assignment; refusing a new relay allocation".into());
+    }
+    Err("existing admin identity has no Signer assignment; refusing a new relay allocation".into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1055,6 +1085,74 @@ mod tests {
         };
         assert!(provision(&context).await.is_err());
         assert!(!root.path().join("admin").exists());
+    }
+
+    fn status_assigned(
+        installation_id: Option<&str>,
+        admin_key: Option<&[u8; 32]>,
+    ) -> SurfaceStatus {
+        SurfaceStatus {
+            surfaces: Vec::new(),
+            installation_id: installation_id.map(str::to_owned),
+            installation_admin_key_sha256: admin_key
+                .map(|key| Digest32::from_bytes(Sha256::digest(key).into())),
+            desired_mode: ExposureMode::RemoteEnabled,
+            desired_revision: bloom_signer_api::DecimalU64::new(0),
+            effective_mode: ExposureMode::RemoteEnabled,
+            effective_revision: bloom_signer_api::DecimalU64::new(0),
+            remote_tls_ready: true,
+            remote_routing_ready: true,
+        }
+    }
+
+    #[test]
+    fn an_existing_assignment_is_reused_without_replaying_enrollment() {
+        let key = [7u8; 32];
+        let id = "c1fac7c2-eb49-4227-be36-bf9c5cd2d87e";
+        // A recorded allocation no longer forces enrollment once Signer holds
+        // the assignment: re-provisioning works with enrollment closed.
+        for (recorded, existed) in [(true, true), (false, true), (true, false)] {
+            assert_eq!(
+                installation_source(
+                    &status_assigned(Some(id), Some(&key)),
+                    &key,
+                    recorded,
+                    existed
+                )
+                .unwrap(),
+                InstallationSource::Assigned(id.parse().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn without_an_assignment_only_a_new_or_recorded_allocation_enrolls() {
+        let key = [7u8; 32];
+        let unassigned = status_assigned(None, None);
+        assert_eq!(
+            installation_source(&unassigned, &key, false, false).unwrap(),
+            InstallationSource::Enroll
+        );
+        assert_eq!(
+            installation_source(&unassigned, &key, true, true).unwrap(),
+            InstallationSource::Enroll
+        );
+        let other_key = status_assigned(
+            Some("c1fac7c2-eb49-4227-be36-bf9c5cd2d87e"),
+            Some(&[8u8; 32]),
+        );
+        assert!(
+            installation_source(&other_key, &key, false, true)
+                .unwrap_err()
+                .to_string()
+                .contains("lacks a matching Signer assignment")
+        );
+        assert!(
+            installation_source(&status_assigned(None, Some(&key)), &key, false, true)
+                .unwrap_err()
+                .to_string()
+                .contains("has no Signer assignment")
+        );
     }
 
     #[test]
