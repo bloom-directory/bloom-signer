@@ -146,7 +146,36 @@ struct AdminResponse {
 #[serde(deny_unknown_fields)]
 struct RelayConfig {
     control_ca_pem_path: PathBuf,
-    receipt_public_key_hex: String,
+    receipt_public_key_hex: ReceiptKeysHex,
+}
+
+/// Pinned relay receipt keys: a list (the current key and its pre-published
+/// successor) or, in configuration written before pin sets, one key.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum ReceiptKeysHex {
+    One(String),
+    Set(Vec<String>),
+}
+
+impl ReceiptKeysHex {
+    pub(super) fn decode(&self) -> Result<Vec<[u8; 32]>, io::Error> {
+        let values = match self {
+            Self::One(value) => std::slice::from_ref(value),
+            Self::Set(values) => values.as_slice(),
+        };
+        let keys = values
+            .iter()
+            .map(|value| decode_fixed_32(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        if keys.is_empty() || keys.len() > 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected one to four relay receipt public keys",
+            ));
+        }
+        Ok(keys)
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -215,7 +244,7 @@ pub(super) fn decode_fixed_32(value: &str) -> Result<[u8; 32], io::Error> {
 pub(super) async fn serve(
     listener: Option<UnixListener>,
     ceremony: Arc<SignerCeremonyService>,
-    receipt_key: Option<[u8; 32]>,
+    receipt_keys: Option<Vec<[u8; 32]>>,
     admin_peer_uid: u32,
     shutdown: &mut watch::Receiver<bool>,
 ) -> io::Result<()> {
@@ -238,7 +267,7 @@ pub(super) async fn serve(
                 // cannot hold the service event loop indefinitely.
                 let result = timeout(Duration::from_secs(5), async {
                     let request: AdminRequest = read_frame(&mut stream).await?;
-                    let result = execute(request, &ceremony, receipt_key);
+                    let result = execute(request, &ceremony, receipt_keys.as_deref());
                     let response = match result {
                         Ok(status) => AdminResponse { status: Some(status), error: None },
                         Err(error) => AdminResponse { status: None, error: Some(error) },
@@ -256,7 +285,7 @@ pub(super) async fn serve(
 fn execute(
     request: AdminRequest,
     ceremony: &SignerCeremonyService,
-    receipt_key: Option<[u8; 32]>,
+    receipt_keys: Option<&[[u8; 32]]>,
 ) -> Result<SurfaceStatus, String> {
     match request {
         AdminRequest::Status => ceremony.surface_status().map_err(|e| e.to_string()),
@@ -270,9 +299,9 @@ fn execute(
             receipt,
             admin_public_key,
         } => {
-            let receipt_key = receipt_key
-                .ok_or("relay receipt public key is not pinned in Signer configuration")?;
-            receipt.verify_bytes(&receipt_key, receipt.operation_id, &admin_public_key, now_ms())
+            let receipt_keys = receipt_keys
+                .ok_or("relay receipt public keys are not pinned in Signer configuration")?;
+            receipt.verify_bytes(receipt_keys, receipt.operation_id, &admin_public_key, now_ms())
                 .map_err(|_| "relay allocation receipt failed signature, identity, or freshness verification")?;
             if matches!(
                 receipt.allocation.state,
@@ -518,7 +547,7 @@ async fn provision(context: &AdminContext) -> Result<SurfaceStatus, Box<dyn std:
     let admin_key_existed = root.join(ADMIN_IDENTITY_FILE).exists();
     let config_bytes = read_admin_private_file(&provisioning.relay_config, admin_owner_uid)?;
     let config: RelayConfig = serde_json::from_slice(&config_bytes)?;
-    let receipt_key = decode_fixed_32(&config.receipt_public_key_hex)?;
+    let receipt_keys = config.receipt_public_key_hex.decode()?;
     let ca_pem = read_admin_private_file(&config.control_ca_pem_path, admin_owner_uid)?;
     let response = request_once(&context.socket, signer_uid, &AdminRequest::Status).await?;
     let mut status = response
@@ -545,7 +574,7 @@ async fn provision(context: &AdminContext) -> Result<SurfaceStatus, Box<dyn std:
                     control_ca_pem: ca_pem.clone(),
                 },
                 &public_key,
-                &receipt_key,
+                &receipt_keys,
                 operation_id,
                 |message| Ok(key.sign(message).to_bytes()),
             )?;
@@ -1065,6 +1094,24 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn receipt_pins_accept_a_set_or_one_legacy_key() {
+        let decode = |json: &str| {
+            serde_json::from_str::<super::ReceiptKeysHex>(json)
+                .unwrap()
+                .decode()
+        };
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        assert_eq!(decode(&format!("\"{a}\"")).unwrap(), vec![[0xaa; 32]]);
+        assert_eq!(
+            decode(&format!("[\"{a}\",\"{b}\"]")).unwrap(),
+            vec![[0xaa; 32], [0xbb; 32]]
+        );
+        assert!(decode("[]").is_err());
+        assert!(decode(&format!("[{}]", vec![format!("\"{a}\""); 5].join(","))).is_err());
+        assert!(decode(&format!("[\"{a}\",\"zz\"]")).is_err());
+    }
+
     #[tokio::test]
     async fn missing_relay_configuration_does_not_create_admin_identity() {
         let root = tempfile::tempdir().unwrap();

@@ -763,7 +763,7 @@ dependencies = [
 [[package]]
 name = "bloom-relay-admin-client"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=060046f87d1f2b11c2aebd3306e1c814e5c80fc3#060046f87d1f2b11c2aebd3306e1c814e5c80fc3"
+source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=1984f053c4e015a56b489f247722cd242bdb4560#1984f053c4e015a56b489f247722cd242bdb4560"
 dependencies = [
  "base64 0.22.1",
  "bloom-relay-protocol",
@@ -780,7 +780,7 @@ dependencies = [
 [[package]]
 name = "bloom-relay-protocol"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=060046f87d1f2b11c2aebd3306e1c814e5c80fc3#060046f87d1f2b11c2aebd3306e1c814e5c80fc3"
+source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=1984f053c4e015a56b489f247722cd242bdb4560#1984f053c4e015a56b489f247722cd242bdb4560"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -3967,7 +3967,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

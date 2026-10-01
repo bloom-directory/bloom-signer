@@ -93,8 +93,9 @@ struct SignerConfig {
     /// five-minute default. The developer harness sets thirty minutes.
     #[serde(default)]
     ceremony_ttl_ms: Option<u64>,
+    /// Pinned relay receipt keys: a list, or one key in older configuration.
     #[serde(default)]
-    relay_receipt_public_key_hex: Option<String>,
+    relay_receipt_public_key_hex: Option<admin::ReceiptKeysHex>,
     /// Optional ceremony port for an independent development Triad. Missing
     /// keeps the default 18734 (or the development-only legacy environment
     /// fallback); an explicit integer 1 through 65535 always wins and is
@@ -542,10 +543,10 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
     let admin_ceremony = ceremony.clone();
     let expiry_ceremony = ceremony.clone();
     let expiry_clock = clock.clone();
-    let admin_receipt_key = config
+    let admin_receipt_keys = config
         .relay_receipt_public_key_hex
         .as_ref()
-        .map(|value| admin::decode_fixed_32(value))
+        .map(admin::ReceiptKeysHex::decode)
         .transpose()?;
     let mut service = SignerRpcService::new(
         engine,
@@ -651,7 +652,7 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
             admin::serve(
                 admin_listener,
                 admin_ceremony,
-                admin_receipt_key,
+                admin_receipt_keys,
                 admin_peer_uid,
                 &mut admin_shutdown
             ),
