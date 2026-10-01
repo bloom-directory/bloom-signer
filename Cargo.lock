@@ -763,7 +763,7 @@ dependencies = [
 [[package]]
 name = "bloom-relay-admin-client"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=6c8771b66b618cd13b7cad3e0cd850af2982b5aa#6c8771b66b618cd13b7cad3e0cd850af2982b5aa"
+source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=060046f87d1f2b11c2aebd3306e1c814e5c80fc3#060046f87d1f2b11c2aebd3306e1c814e5c80fc3"
 dependencies = [
  "base64 0.22.1",
  "bloom-relay-protocol",
@@ -780,7 +780,7 @@ dependencies = [
 [[package]]
 name = "bloom-relay-protocol"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=6c8771b66b618cd13b7cad3e0cd850af2982b5aa#6c8771b66b618cd13b7cad3e0cd850af2982b5aa"
+source = "git+https://github.com/bloom-directory/bloom-relay.git?rev=060046f87d1f2b11c2aebd3306e1c814e5c80fc3#060046f87d1f2b11c2aebd3306e1c814e5c80fc3"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
