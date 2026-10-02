@@ -29,6 +29,35 @@ derivation. AWS service capabilities and Bloom adapter support are separate:
 adding another signing curve to the adapter would not by itself provide
 BIP-39 seed custody or shared-seed account derivation.
 
+## Ceremony surface administration
+
+The installed Signer binary is the administrative interface for inspecting,
+provisioning, enabling, and disabling the remote ceremony surface:
+
+```text
+sudo /usr/libexec/bloom/current/bloom-signer admin status --login-uid UID
+sudo /usr/libexec/bloom/current/bloom-signer admin provision --login-uid UID
+sudo /usr/libexec/bloom/current/bloom-signer admin remote-enabled --login-uid UID
+sudo /usr/libexec/bloom/current/bloom-signer admin localhost-only --login-uid UID
+```
+
+On macOS the installed binary is
+`/usr/local/libexec/bloom/current/bloom-signer`. Installed administration does
+not elevate itself: callers must invoke it with effective UID 0. The login UID
+selects only the fixed per-login installation layout. Signer and Broker
+principal IDs are read from their non-symlink configuration directories, not
+accepted from the command line or environment. `--help` is always available
+without privileges.
+
+The explicit path-selected form takes its paths and principal IDs from the
+existing `BLOOM_*` environment variables. It requires root unless the binary
+was built with the developer harness and validates that harness's identity and
+Signer UID. The triad developer launcher continues to use this form:
+
+```text
+bloom-signer admin status --signer-uid UID
+```
+
 ## One-time legacy passkey conversion
 
 `bloom-signer-migrate` is the administrative staging tool for the single

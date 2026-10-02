@@ -136,6 +136,37 @@ impl SignerRpcService {
             Request::SignerCapabilities(_) => {
                 Ok(Response::SignerCapabilities(self.capabilities()?))
             }
+            Request::SurfaceStatus(_) => {
+                Ok(Response::SurfaceStatus(self.ceremony.surface_status()?))
+            }
+            Request::SurfaceReportEffective(report) => Ok(Response::SurfaceReportEffective(
+                self.ceremony.report_effective(report)?,
+            )),
+            Request::CrossSurfacePairStart(request) => Ok(Response::CrossSurfacePairStart(
+                self.ceremony.cross_surface_pair_start(request, now_ms)?,
+            )),
+            Request::CrossSurfacePrepareSource(request) => Ok(Response::CrossSurfacePrepareSource(
+                self.ceremony
+                    .cross_surface_prepare_source(request, now_ms)?,
+            )),
+            Request::CrossSurfaceCompleteSource(request) => {
+                Ok(Response::CrossSurfaceCompleteSource(
+                    self.ceremony
+                        .cross_surface_complete_source(request, now_ms)?,
+                ))
+            }
+            Request::CrossSurfaceCompleteDestination(request) => {
+                Ok(Response::CrossSurfaceCompleteDestination(
+                    self.ceremony
+                        .cross_surface_complete_destination(request, now_ms)?,
+                ))
+            }
+            Request::CrossSurfaceAlreadyRegistered(request) => {
+                Ok(Response::CrossSurfaceAlreadyRegistered(
+                    self.ceremony
+                        .cross_surface_already_registered(request, now_ms)?,
+                ))
+            }
             Request::KeyGetPublic(request) => Ok(Response::KeyGetPublic(
                 self.describe_key(&request.key_ref).await?,
             )),
@@ -213,7 +244,7 @@ impl SignerRpcService {
             Request::CeremonyStatus(request) => {
                 Ok(Response::CeremonyStatus(signer_ceremony_status(
                     self.ceremony
-                        .status(&OperationId::new(request.id.as_str().to_owned())?)?,
+                        .status_at(&OperationId::new(request.id.as_str().to_owned())?, now_ms)?,
                 )))
             }
             Request::CeremonyCancel(request) => {
@@ -340,16 +371,28 @@ impl SignerRpcService {
             Request::CustodyComplete(request) => Ok(Response::CustodyComplete(
                 self.ceremony.complete_custody(request, now_ms)?,
             )),
-            Request::CustodyResult(request) => Ok(Response::CustodyResult(
-                self.engine
+            Request::CustodyResult(request) => {
+                let result = self
+                    .engine
                     .custody_receipt(&request.operation_id)?
                     .ok_or_else(|| {
                         ProtocolError::new(
                             ProtocolErrorCode::ApprovalNotFound,
                             "custody result not found",
                         )
-                    })?,
-            )),
+                    })?;
+                if result.ceremony_kind == bloom_signer_api::CeremonyKind::WalletRecovery
+                    && !self
+                        .engine
+                        .recovery_result_delivery_valid(&request.operation_id, now_ms)?
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ApprovalNotFound,
+                        "recovery result delivery window ended",
+                    ));
+                }
+                Ok(Response::CustodyResult(result))
+            }
             Request::CustodyStatus(request) => Ok(Response::CustodyStatus(
                 self.ceremony.public_status(&request.operation_id)?,
             )),
@@ -1309,6 +1352,7 @@ mod tests {
             .ceremony
             .prepare_approval(
                 CeremonyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
                     activation_operation_id: OperationId::from_bytes([91; 32]),
                     terms: ceremony_terms,
                     review_manifest_digest: Digest32::from_bytes([92; 32]),
@@ -1325,6 +1369,7 @@ mod tests {
             .ceremony
             .prepare_custody(
                 CustodyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
                     ceremony_kind: CeremonyKind::WalletRegistration,
                     custody_operation_id: OperationId::from_bytes([94; 32]),
                     wallet_id: Some(Token::new(custody_marker).unwrap()),

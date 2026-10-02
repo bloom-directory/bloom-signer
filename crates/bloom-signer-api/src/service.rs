@@ -256,6 +256,7 @@ pub enum CredentialState {
 pub struct CredentialPublic {
     pub credential_id: Base64UrlBytes,
     pub wallet_id: Token,
+    pub surface: crate::SurfaceRef,
     pub created_at_ms: DecimalU64,
     pub state: CredentialState,
 }
@@ -288,6 +289,11 @@ pub enum CeremonyState {
     Expired,
     #[serde(rename = "FAILED")]
     Failed,
+    /// Terminal credential addition that changed nothing: the destination
+    /// device's passkey provider already held one of the wallet's passkeys on
+    /// that surface, so WebAuthn refused to create a duplicate.
+    #[serde(rename = "ALREADY_REGISTERED")]
+    AlreadyRegistered,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -314,6 +320,20 @@ pub enum BrokerSignerRequest {
     SignerReadiness(Empty),
     #[serde(rename = "signer.capabilities")]
     SignerCapabilities(Empty),
+    #[serde(rename = "surface.status")]
+    SurfaceStatus(Empty),
+    #[serde(rename = "surface.report_effective")]
+    SurfaceReportEffective(crate::SurfaceEffectiveReport),
+    #[serde(rename = "cross_surface.pair_start")]
+    CrossSurfacePairStart(crate::CrossSurfacePairStartRequest),
+    #[serde(rename = "cross_surface.prepare_source")]
+    CrossSurfacePrepareSource(crate::CrossSurfacePrepareSourceRequest),
+    #[serde(rename = "cross_surface.complete_source")]
+    CrossSurfaceCompleteSource(crate::CrossSurfaceCompleteSourceRequest),
+    #[serde(rename = "cross_surface.complete_destination")]
+    CrossSurfaceCompleteDestination(crate::CrossSurfaceCompleteDestinationRequest),
+    #[serde(rename = "cross_surface.already_registered")]
+    CrossSurfaceAlreadyRegistered(crate::CrossSurfaceAlreadyRegisteredRequest),
     #[serde(rename = "key.get_public")]
     KeyGetPublic(KeyRequest),
     #[serde(rename = "key.list_public")]
@@ -397,6 +417,20 @@ pub enum BrokerSignerResponse {
     SignerReadiness(Readiness),
     #[serde(rename = "signer.capabilities")]
     SignerCapabilities(ServiceCapabilities),
+    #[serde(rename = "surface.status")]
+    SurfaceStatus(crate::SurfaceStatus),
+    #[serde(rename = "surface.report_effective")]
+    SurfaceReportEffective(crate::SurfaceStatus),
+    #[serde(rename = "cross_surface.pair_start")]
+    CrossSurfacePairStart(crate::CrossSurfacePairing),
+    #[serde(rename = "cross_surface.prepare_source")]
+    CrossSurfacePrepareSource(crate::CrossSurfaceSourcePrepared),
+    #[serde(rename = "cross_surface.complete_source")]
+    CrossSurfaceCompleteSource(crate::CrossSurfaceHandoff),
+    #[serde(rename = "cross_surface.complete_destination")]
+    CrossSurfaceCompleteDestination(crate::CustodyResult),
+    #[serde(rename = "cross_surface.already_registered")]
+    CrossSurfaceAlreadyRegistered(CeremonyPublicStatus),
     #[serde(rename = "key.get_public")]
     KeyGetPublic(KeyPublic),
     #[serde(rename = "key.list_public")]
@@ -559,6 +593,11 @@ impl crate::TypedRequestMethod for BrokerSignerRequest {
             | Request::RecoveryPrepare(request) => Some(request.custody_operation_id.clone()),
             Request::CustodyComplete(request) => Some(request.custody_operation_id.clone()),
             Request::CustodyBindOutputRecipient(request) => Some(request.operation_id.clone()),
+            Request::CrossSurfacePairStart(request) => Some(request.operation_id.clone()),
+            Request::CrossSurfacePrepareSource(request) => Some(request.operation_id.clone()),
+            Request::CrossSurfaceCompleteSource(request) => Some(request.operation_id.clone()),
+            Request::CrossSurfaceCompleteDestination(request) => Some(request.operation_id.clone()),
+            Request::CrossSurfaceAlreadyRegistered(request) => Some(request.operation_id.clone()),
             _ => None,
         })
     }
@@ -647,6 +686,6 @@ mod tests {
 
     #[test]
     fn typed_request_inventories_cover_every_normative_method() {
-        assert_eq!(crate::BrokerSignerMethod::ALL.len(), 39);
+        assert_eq!(crate::BrokerSignerMethod::ALL.len(), 46);
     }
 }

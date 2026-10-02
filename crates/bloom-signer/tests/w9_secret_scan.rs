@@ -64,6 +64,7 @@ fn import_mnemonic(
     let prepared = service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletImport,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(wallet_id.clone()),
@@ -88,6 +89,7 @@ fn import_mnemonic(
     }))
     .unwrap();
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletImport,
         custody_operation_id: operation_id.clone(),
@@ -248,6 +250,7 @@ fn bip39_secret_scan_is_empty_across_logs_audit_sqlite_and_responses() {
     service
         .prepare_custody(
             CustodyPrepareRequest {
+                surface: bloom_signer_api::legacy_local_surface(),
                 ceremony_kind: CeremonyKind::WalletExport,
                 custody_operation_id: OperationId::new("44".repeat(32)).unwrap(),
                 wallet_id: Some(wallet_id.clone()),
@@ -273,6 +276,7 @@ fn bip39_secret_scan_is_empty_across_logs_audit_sqlite_and_responses() {
     let assertion =
         authenticator.assertion(&prepared.challenges[0].canonical_bytes().unwrap(), 40_201);
     let aad = CustodyHpkeAad {
+        surface: bloom_signer_api::legacy_local_surface(),
         ceremony_id: prepared.contribution.ceremony_id.clone(),
         ceremony_kind: CeremonyKind::WalletExport,
         custody_operation_id: OperationId::new("44".repeat(32)).unwrap(),

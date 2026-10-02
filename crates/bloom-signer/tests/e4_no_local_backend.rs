@@ -50,6 +50,7 @@ fn bip39_registration_prepare_is_backend_unsupported_without_local() {
 
     let result = service.prepare_custody(
         CustodyPrepareRequest {
+            surface: bloom_signer_api::legacy_local_surface(),
             ceremony_kind: CeremonyKind::WalletRegistration,
             custody_operation_id: OperationId::new("a1".repeat(32)).unwrap(),
             wallet_id: Some(Token::new("bip39-no-local").unwrap()),
