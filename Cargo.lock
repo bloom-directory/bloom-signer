@@ -400,7 +400,7 @@ dependencies = [
  "regex-lite",
  "roxmltree",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -588,9 +588,9 @@ dependencies = [
 
 [[package]]
 name = "bip32"
-version = "0.6.0-rc.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7576e4d45e861ecbf1f5c3d64a174ddcd21cb75995d6e3e82bd3c96e6979485"
+checksum = "0271a2fe2a6f05231419e878b5f50152a5a6dbcc60c18855d924892ecc85a33a"
 dependencies = [
  "bs58",
  "hmac 0.13.0",
@@ -747,7 +747,7 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2 0.11.0",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -771,7 +771,7 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "ureq",
  "uuid",
  "zeroize",
@@ -788,7 +788,7 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2 0.10.9",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "uuid",
 ]
 
@@ -804,7 +804,7 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2 0.11.0",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -814,7 +814,7 @@ source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=a
 dependencies = [
  "bloom-rpc-wire",
  "libc",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -861,7 +861,7 @@ dependencies = [
  "libc",
  "p256",
  "parking_lot",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rusqlite",
  "serde",
  "serde_jcs",
@@ -870,7 +870,7 @@ dependencies = [
  "sha3 0.12.0",
  "subtle",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -885,12 +885,12 @@ dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek 3.0.0",
  "hex",
- "rand 0.10.2",
+ "rand 0.10.3",
  "serde",
  "serde_jcs",
  "serde_json",
  "sha2 0.11.0",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -906,7 +906,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sha3 0.12.0",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "zeroize",
 ]
 
@@ -936,7 +936,7 @@ dependencies = [
  "sha2 0.11.0",
  "sha3 0.12.0",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
 ]
 
@@ -954,7 +954,7 @@ dependencies = [
  "hex",
  "k256 0.14.0",
  "parking_lot",
- "rand 0.10.2",
+ "rand 0.10.3",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -975,9 +975,9 @@ dependencies = [
  "hmac 0.13.0",
  "k256 0.14.0",
  "ows-signer",
- "rand 0.10.2",
+ "rand 0.10.3",
  "sha2 0.11.0",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "unicode-normalization",
  "zeroize",
 ]
@@ -1003,7 +1003,7 @@ dependencies = [
  "bloom-trusted-time",
  "ed25519-dalek 3.0.0",
  "hex",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rustix",
  "serde",
  "serde_jcs",
@@ -1019,7 +1019,7 @@ version = "0.1.3"
 source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab#ad0072512bb97fb4eb68d249ce785ea3ea4a49ab"
 dependencies = [
  "libc",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2823,7 +2823,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "uuid",
 ]
 
@@ -2857,7 +2857,7 @@ dependencies = [
  "sha2 0.10.9",
  "sha3 0.10.9",
  "signal-hook",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "xrpl-rust",
  "zeroize",
 ]
@@ -3120,9 +3120,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
@@ -3321,7 +3321,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
 dependencies = [
  "hashbrown 0.16.1",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3984,11 +3984,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.20",
+ "thiserror-impl 2.0.21",
 ]
 
 [[package]]
@@ -4004,9 +4004,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
