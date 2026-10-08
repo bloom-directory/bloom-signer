@@ -76,7 +76,7 @@ fn service() -> CardCeremonies {
     CardCeremonies::new(
         SigningKey::from_bytes(&[7; 32]),
         Token::new("card-signer").unwrap(),
-        "http://localhost:18734".into(),
+        bloom_signer::webauthn::configured_ceremony_origin().expect("test origin"),
     )
     .unwrap()
 }

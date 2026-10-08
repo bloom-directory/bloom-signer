@@ -1,0 +1,554 @@
+    Blocking waiting for file lock on build directory
+   Compiling bloom-triad-local-transport v0.1.3 (https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab#ad007251)
+   Compiling bloom-signer v0.1.0 (/home/user/code/bloom/worktrees/card-spike-1008/bloom-signer/card-checkout-feasibility/crates/bloom-signer)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.75s
+     Running unittests src/lib.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/bloom_signer-e64e7b883be74d81)
+
+running 59 tests
+test bip39_store::tests::entropy_lengths_map_to_their_metadata ... ok
+test bip39_store::tests::profile_constant_is_stable ... ok
+test clock::tests::host_wall_clock_accepts_forward_and_backward_changes ... ok
+test clock::tests::linux_boot_id_parser_rejects_noncanonical_input ... ok
+test clock::tests::durable_clock_uses_kernel_boot_id_instead_of_enrollment_epoch ... ok
+test ceremony::tests::seed_profile_and_legacy_migration_are_mutually_exclusive ... ok
+test engine::clock_tests::backup_rotation_diagnostic_reports_first_actual_later_mismatch ... ok
+test engine::clock_tests::journal_diagnostic_names_exact_row_and_invariant ... ok
+test engine::clock_tests::rejected_backup_diagnostic_does_not_claim_mutations_are_disabled ... ok
+test engine::clock_tests::forced_audit_write_failure_rolls_back_effect_and_latches_mutations ... ok
+test engine::clock_tests::signer_clock_legacy_zero_anchor_does_not_grant_unbounded_forward_credit ... ok
+test engine::clock_tests::signer_clock_unknown_legacy_boot_epoch_does_not_impersonate_a_reboot ... ok
+test clock::tests::degraded_audit_still_constructs_clock_for_readiness ... ok
+test engine::clock_tests::signer_clock_read_only_restart_credits_downtime_via_matching_absolute_monotonic_anchor ... ok
+test legacy_passkey::tests::legacy_user_handle_matches_historical_uuid_shape ... ok
+test legacy_passkey::tests::receipt_digest_detects_changed_public_terms ... ok
+test engine::clock_tests::signer_clock_accepts_non_decreasing_wall_time_across_a_boot_change ... ok
+test engine::clock_tests::signer_clock_new_boot_with_smaller_anchor_accepts_wall_time ... ok
+test engine::clock_tests::signer_clock_restart_credits_downtime_via_matching_absolute_monotonic_anchor ... ok
+test engine::clock_tests::runtime_full_chain_verification_latches_before_mutation ... ok
+test service::tests::ed25519_address_is_the_base58_solana_public_key ... ok
+test service::tests::ethereum_address_uses_the_uncompressed_sec1_public_key ... ok
+test engine::require_key_tests::failed_bip39_allocation_tombstones_registry_and_backend ... ok
+test engine::require_key_tests::require_key_available_accepts_a_petal_bip39_child_without_account_allocation ... ok
+test engine::clock_tests::signer_clock_denies_untrusted_and_rollback_rate_windows ... ok
+test engine::clock_tests::signer_clock_same_process_incremental_elapsed_still_advances_healthily ... ok
+test service::tests::audit_degradation_preserves_rpc_reads_and_status_but_blocks_mutation ... ok
+test engine::clock_tests::signer_clock_bounds_a_forward_jump_by_monotonic_elapsed ... ok
+test webauthn::tests::ceremony_origin_for_is_exact_about_developer_port_values ... ok
+test webauthn::tests::ceremony_origin_for_port_serializes_browser_origins ... ok
+test webauthn::tests::client_data_origin_mismatch_names_expected_origin ... ok
+test webauthn::tests::client_data_still_rejects_cross_origin_with_top_origin ... ok
+test webauthn::tests::client_data_tolerates_future_unknown_members ... ok
+test webauthn::tests::developer_ceremony_origin_is_build_scoped_and_exact ... ignored, requires BLOOM_TRIAD_DEV_CEREMONY_PORT from the focused CI invocation
+test webauthn::tests::explicit_ceremony_port_is_validated_without_env ... ok
+test webauthn::tests::missing_ceremony_port_falls_back_to_default_or_legacy_env ... ok
+test legacy_passkey::tests::staged_legacy_wallet_decrypts_once_and_consumes ... ok
+test engine::require_key_tests::require_key_available_rejects_a_durably_retired_child ... ok
+test engine::require_key_tests::require_key_available_checks_a_retired_child_whatever_its_class_label ... ok
+test engine::require_key_tests::restart_recovery_tombstones_allocations_without_custody_receipts ... ok
+test service::tests::public_key_projection_identifies_wallet_root_and_derived_roles ... ok
+test engine::require_key_tests::unrelated_custody_receipt_cannot_commit_an_aliased_allocation_id ... ok
+test service::tests::stale_or_missing_root_containment_blocks_signing_but_reports_readiness ... ok
+test service::tests::signer_service_only_release_preserves_authority_control_and_session_contracts ... ok
+test service::tests::policy_ceremony_and_signing_paths_do_not_emit_marker_secrets ... ok
+test service::tests::independent_control_tombstone_stops_new_signing ... ok
+test engine::clock_tests::degradation_closes_mutations_before_first_cause_diagnostics_lock ... ok
+test engine::clock_tests::open_rejects_a_tampered_derivation_event_chain ... ok
+test engine::clock_tests::storage_schema_migrates_baseline_and_refuses_future_version ... ok
+test service::tests::dispatched_restart_state_never_calls_backend_again ... ok
+test service::tests::dedicated_policy_key_is_unreachable_through_single_and_batch_signing ... ok
+test engine::clock_tests::verified_audit_head_uses_entry_count_and_empty_zero_convention ... ok
+test engine::clock_tests::signer_clock_schema_migrates_an_existing_database ... ok
+test engine::clock_tests::audit_rotation_tamper_and_atomic_write_failure_fail_closed ... ok
+test engine::clock_tests::verified_audit_head_rejects_tamper_and_external_latch_blocks_mutations ... ok
+test service::tests::rpc_signing_publishes_once_and_returns_stable_retry_result ... ok
+test engine::clock_tests::audit_detects_non_tail_deletion_and_reordering ... ok
+test engine::clock_tests::dedicated_audit_key_rotation_cross_signs_exact_heads_and_restarts ... ok
+test engine::clock_tests::audit_detects_payload_hash_signature_and_key_id_mutation ... ok
+
+test result: ok. 58 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.22s
+
+     Running unittests src/main.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/bloom_signer-a00720408ed36b65)
+
+running 33 tests
+test admin::tests::an_existing_assignment_is_reused_without_replaying_enrollment ... ok
+test admin::tests::without_an_assignment_only_a_new_or_recorded_allocation_enrolls ... ok
+test admin::tests::receipt_pins_accept_a_set_or_one_legacy_key ... ok
+test tests::ceremony_port_config_missing_means_default ... ok
+test tests::ceremony_port_config_zero_is_rejected_at_resolution ... ok
+test tests::ceremony_port_config_explicit_alternate_parses ... ok
+test admin::tests::existing_administrator_cannot_create_missing_allocation_operation ... ok
+test admin::tests::installed_principal_rejects_symlinks_and_files ... ok
+test admin::tests::malformed_allocation_operation_fails_without_replacing_state ... ok
+test tests::clock_repair_logs_each_exact_expiring_approval_id ... ok
+test tests::checkpoint_event_has_exact_safe_diagnostics_and_no_marker_secret ... ok
+test tests::disarmed_trusted_fatal_guard_emits_nothing ... ok
+test tests::session_disconnect_errors_exit_cleanly_without_keepalive_retry ... ok
+test tests::ceremony_port_config_rejects_non_integer_values ... ok
+test tests::logout_drain_waits_for_an_accepted_operation ... ok
+test admin::tests::broker_acme_uri_handoff_checks_owner_mode_link_and_production_uri ... ok
+test admin::tests::installed_layout_derives_fixed_linux_and_macos_paths ... ok
+test admin::tests::missing_relay_configuration_does_not_create_admin_identity ... ok
+test tests::late_fatal_event_retains_trusted_service_metadata ... ok
+test cli_tests::help_is_resolved_entirely_by_the_parser ... ok
+test tests::dispatch_event_keeps_operation_and_service_metadata_without_error_text ... ok
+test cli_tests::administration_requires_one_explicit_target ... ok
+test tests::successful_checkpoint_event_reports_existing_mutation_latch ... ok
+test tests::request_checkpoint_failure_blocks_mutations_but_keeps_read_heads_available ... ok
+test tests::self_checkpoint_failure_preserves_read_head_and_suppresses_mutations ... ok
+test tests::startup_uses_retained_nonzero_head_and_degrades_on_local_rollback ... ok
+test admin::tests::allocation_enrollment_reuses_operation_across_retry_and_restart ... ok
+test admin::tests::broker_public_ca_handoff_is_atomic_private_and_owner_checked ... ok
+test admin::tests::new_admin_identity_has_durable_operation_before_retry ... ok
+test tests::signer_rejects_authority_protocol_1_0_before_dispatch_or_durable_work ... ok
+test tests::signer_control_endpoint_accepts_protocol_1_0_and_dispatches ... ok
+test tests::retained_self_head_survives_local_corruption_without_peer_rollback ... ok
+test tests::production_audit_key_rotation_restarts_with_verification_only_history ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+     Running unittests src/bin/bloom-signer-migrate.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/bloom_signer_migrate-55f55721fa59c3e5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bip39_sign_edge.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/bip39_sign_edge-039715f5b7bc9e58)
+
+running 6 tests
+test root_is_never_a_signable_key ... ok
+test retired_child_cannot_sign ... ok
+test wrong_pinned_fingerprint_is_refused ... ok
+test curve_mismatch_fails_closed ... ok
+test evm_child_signs_digest_and_recovers_the_frozen_address ... ok
+test solana_child_signs_raw_message_and_matches_the_frozen_key ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/bip39_signing.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/bip39_signing-466fb5bb78b0e038)
+
+running 6 tests
+test input_size_limits_are_enforced ... ok
+test descriptor_mismatch_fails_closed ... ok
+test evm_signs_digest_and_recovers_the_same_key ... ok
+test entropy_to_seed_validates_length_against_metadata ... ok
+test ed25519_signs_raw_message_and_self_verifies ... ok
+test the_seed_is_never_a_signable_root ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/card_custody.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/card_custody-4362de2527e8ea08)
+
+running 9 tests
+test prepare_released_rollback_fixture ... ignored, generates an explicit retained fixture for released-revision rollback testing
+test expired_checkout_cannot_release ... ok
+test exactly_one_concurrent_release_succeeds ... ok
+test approved_release_is_bound_encrypted_and_single_use ... ok
+test invalid_luhn_expiry_and_cvc_enrollment_are_rejected ... ok
+test wrong_credential_missing_uv_and_tampering_never_release ... ok
+test cancellation_and_restart_close_pending_approvals ... ok
+test restart_preserves_cards_and_replay_consumption_and_delete_keeps_container ... ok
+test interrupted_storage_write_does_not_mutate_cards_or_reuse_approval ... ok
+
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.15s
+
+     Running tests/custody_loss_matrix.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/custody_loss_matrix-840056dd21e7ccce)
+
+running 8 tests
+test bip39_final_credential_cannot_be_removed_without_recovery ... ok
+test bip39_mnemonic_export_preserves_the_imported_word_count ... ok
+test backup_round_trip_preserves_the_profile_and_unlocks ... ok
+test generated_entropy_wallet_is_a_valid_bip39_root ... ok
+test imported_scalar_custody_rejects_mnemonic_export_and_keeps_its_path ... ok
+test bip39_mnemonic_export_reconstructs_the_frozen_words ... ok
+test bip39_rekey_preserves_the_child_across_restart ... ok
+test bip39_two_passkeys_and_recovery_unlock_the_same_child ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/derivation_registry.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/derivation_registry-4b1a2a519966c1df)
+
+running 22 tests
+test out_of_range_account_is_rejected_without_a_reservation ... ok
+test descriptor_fingerprint_mismatch_is_refused ... ok
+test operation_retry_returns_the_same_reservation ... ok
+test recorded_invalid_children_are_never_targeted ... ok
+test audit_failure_rolls_back_the_transition ... ok
+test transitions_refuse_out_of_order_advancement ... ok
+test automatic_solana_accounts_advance_across_tombstones_and_roles ... ok
+test lifecycle_walks_the_ratified_states_in_order ... ok
+test abandoned_reservations_never_release_their_index ... ok
+test solana_path_collision_is_permanent_and_does_not_consume_the_next_account ... ok
+test tampered_event_chain_is_refused ... ok
+test invalid_children_are_tombstoned_and_never_reused ... ok
+test retried_allocation_after_full_activation_is_idempotent ... ok
+test public_accounts_are_invisible_before_activation ... ok
+test tombstoned_accounts_leave_public_list_and_chain_stays_verified ... ok
+test explicit_index_targets_the_path_and_only_moves_the_counter_forward ... ok
+test explicit_index_on_an_occupied_tombstoned_or_invalid_index_fails_typed ... ok
+test address_index_counter_is_per_account ... ok
+test next_account_number_spans_both_families_and_counts_dead_paths ... ok
+test crash_at_every_transition_reloads_into_one_valid_state ... ok
+test namespace_cap_is_enforced ... ok
+test concurrent_operations_never_share_an_index ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/e4_no_local_backend.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/e4_no_local_backend-b2d92d9d3c4a81b3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/released_schema1_compat.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/released_schema1_compat-660e5649efbde195)
+
+running 1 test
+test released_schema1_state_migrates_and_preserves_wallet_access ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/support.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/support-830079ace6428dc5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/w3_custody.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/w3_custody-4e55b4171aae90ef)
+
+running 9 tests
+test profile_aad_tags_are_stable_and_distinct ... ok
+test loss_of_every_passkey_without_recovery_is_unrecoverable ... ok
+test credential_wrap_is_bound_to_exact_root_ciphertext_fingerprint ... ok
+test tampering_with_root_interpretation_metadata_fails_before_derivation ... ok
+test legacy_v1_envelopes_still_unlock_and_upgrade_to_v2 ... ok
+test custody_mutations_survive_atomic_file_restart ... ok
+test rekeyed_backup_with_revoked_older_wrap_restarts ... ok
+test ac27_registration_and_multi_passkey_unlock_share_one_root_and_policy_key ... ok
+test ac28_policy_versions_do_not_change_wrap_aad_and_format_rekey_is_atomic ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/w3_engine.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/w3_engine-cb680f965b60b957)
+
+running 10 tests
+test bip39_child_registration_rejects_a_foreign_wallet ... ok
+test production_visible_constructor_rejects_shared_revocation_audit_key ... ok
+test backend_registry_accepts_only_compiled_variants ... ok
+test policy_cas_fails_before_a_completed_policy_ceremony ... ok
+test signed_revocation_state_and_revoke_all_are_monotonic ... ok
+test ac11_replay_retry_revocation_and_structural_failures_are_closed ... ok
+test ac32_backup_restore_refuses_missing_registry_for_derivation_and_lower_state ... ok
+test ac11_forged_expired_wrong_key_unsupported_and_excessive_requests_fail ... ok
+test ac11_approval_ceiling_selector_issuer_key_state_retry_and_release_are_closed ... ok
+test ac32_rotated_audit_export_restore_carries_custody_policy_registry_and_counters ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.91s
+
+     Running tests/w5_ceremony.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/w5_ceremony-c26f4023c1291621)
+
+running 46 tests
+test custody_ceremony_uses_the_five_minute_window_by_default ... ok
+test a_longer_window_extends_an_approval_ceremony_only_to_its_terms ... ok
+test custody_ceremony_uses_the_configured_window ... ok
+test an_approval_ceremony_is_bounded_by_its_terms_not_by_the_ceremony_ttl ... ok
+test digit_leading_remote_rp_id_verifies_attestation_and_assertion ... ok
+test cross_surface_pairing_preserves_original_deadline_after_browser_delay ... ok
+test a_ceremony_window_outside_its_bounds_is_refused ... ok
+test bip39_import_rejects_nfkd_unnormalized_mnemonic ... ok
+test hpke_matches_committed_reviewed_vector ... ok
+test only_petal_key_derivation_arms_the_backend ... ok
+test hpke_is_single_use_and_binds_info_aad_and_session ... ok
+test bip39_import_schema_rejects_any_passphrase_field ... ok
+test legacy_passkey_import_converts_existing_credential_into_current_custody ... ok
+test bip39_registration_allocates_both_initial_children_without_a_root_keyref ... ok
+test bip39_solana_child_export_refuses_empty_pinned_keys ... ok
+test account_allocation_request_shapes_are_validated_at_prepare ... ok
+test raw_webauthn_assertion_and_attestation_are_independently_verified ... ok
+test raw_private_key_import_creates_a_new_wallet_and_first_passkey ... ok
+test bip39_mnemonic_export_seals_words_and_frozen_import_reproduces_vectors ... ok
+test a_second_ceremony_for_a_wallet_with_a_live_one_is_rate_limited ... ok
+test signer_restart_fences_stale_remote_readiness_until_broker_reconciles ... ok
+test approval_browser_lifetime_is_capped_by_the_authority_expiry ... ok
+test wrong_origin_assertion_and_attestation_are_rejected_when_correctly_signed ... ok
+test approval_completion_verifies_raw_proof_decrypts_prf_and_is_idempotent ... ok
+test two_services_with_distinct_ports_trust_only_their_own_origin ... ok
+test bip39_retire_then_sign_is_refused ... ok
+test petal_key_ceremony_stages_without_a_previously_activated_backend ... ok
+test bip39_solana_child_backup_restore_round_trips_derivation_registry ... ok
+test registration_requires_and_reserves_the_requested_wallet_id ... ok
+test key_derive_activates_the_local_backend_from_its_own_ceremony ... ok
+test custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound ... ok
+test generic_custody_export_policy_and_delete_apply_exact_typed_effects ... ok
+test cross_surface_add_requires_source_authority_and_destination_pair_key ... ok
+test stale_webauthn_counter_fails_closed_into_a_durable_terminal_ceremony ... ok
+test registration_returns_signed_public_projection_and_enables_one_time_recovery ... ok
+test same_surface_add_pairs_a_second_device_and_records_an_existing_passkey ... ok
+test failed_bip39_registration_removes_the_provisioned_backend_before_retry ... ok
+test petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not ... ok
+test bip39_import_accepts_12_to_24_words_and_records_the_entropy_bits ... ok
+test credential_replace_remove_and_backend_enrollment_do_not_spend_approval_capacity ... ok
+test bip39_solana_allocation_is_deterministic_and_advances_accounts ... ok
+test petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals ... ok
+test a_taken_over_scope_refuses_the_previous_wallets_exact_approval ... ok
+test petal_subkey_reuses_a_fingerprint_whose_scope_expired_on_a_same_seed_wallet ... ok
+test bip39_enrollment_refresh_failure_after_allocation_rolls_back_every_sibling ... ok
+test bip39_two_family_allocation_shares_one_number_chosen_by_signer ... ok
+
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.04s
+
+     Running tests/w8_process_boundary.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/w8_process_boundary-622be3adca579619)
+
+running 9 tests
+test production_signer_reports_its_semantic_version_without_starting_services ... ok
+test signer_api_dependency_graph_contains_only_its_mechanical_wire_package ... ok
+test production_signer_dependency_graph_has_no_machine_broker_or_debug_driver ... ok
+test bip39_descriptor_rejects_a_profile_key_spec_mismatch ... ok
+test bip39_export_restore_round_trips_allocated_accounts ... ok
+test bip39_process_boundary_end_to_end ... ok
+test bip39_derived_account_list_and_ceremony_retire_are_restart_safe ... ok
+test bip39_restored_wallet_signs_from_its_restored_derived_account ... ok
+test bip39_two_family_allocation_survives_restart_and_retires_per_child ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.85s
+
+     Running tests/w9_secret_scan.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/w9_secret_scan-e9972ea16c3e0f89)
+
+running 1 test
+test bip39_secret_scan_is_empty_across_logs_audit_sqlite_and_responses ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.39s
+
+     Running unittests src/lib.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/bloom_signer_api-7f01a6005bcdd0ac)
+
+running 39 tests
+test approval::tests::exact_selector_count_consistency_is_fail_closed ... ok
+test ceremony::tests::petal_scope_rejects_cross_operation_and_non_derivation_reuse ... ok
+test approval::tests::petal_route_grants_are_canonical_and_legacy_singletons_decode ... ok
+test crypto::tests::keyref_validates_locator_and_derivation ... ok
+test cards::tests::ambiguous_origins_and_invalid_payment_terms_are_rejected ... ok
+test error::tests::serialized_error_contract_cannot_lie ... ok
+test petal_key::tests::malformed_scope_fails_closed_during_decode ... ok
+test service::tests::typed_request_inventories_cover_every_normative_method ... ok
+test surface::tests::identity_digest_is_stable_and_excludes_lifecycle ... ok
+test service::tests::methods_the_suffix_heuristic_misclassified_are_read_only ... ok
+test error::tests::unknown_peer_code_fails_closed_and_is_not_retryable ... ok
+test petal_key::tests::scope_digest_is_canonical_and_domain_separated ... ok
+test service::tests::unknown_methods_are_not_read_only ... ok
+test cards::tests::every_payment_term_and_recipient_changes_the_binding ... ok
+test version_tests::signer_api_range_accepts_the_frozen_current_authority_contract ... ok
+test surface::tests::digit_leading_relay_rp_id_round_trips_as_a_json_string ... ok
+test surface::tests::rp_id_rejects_non_dns_token_shapes ... ok
+test service::tests::derived_account_listing_is_read_only ... ok
+test wallet_seed::tests::rejects_non_bip39_seed_profile_and_invalid_entropy ... ok
+test ceremony::tests::custody_success_states_match_section_13_6 ... ok
+test methods::tests::unknown_methods_fail_closed ... ok
+test wallet_seed::tests::rejects_paths_that_stray_from_the_template ... ok
+test wallet_seed::tests::descriptor_serde_round_trips_and_validates ... ok
+test ceremony::tests::new_wallet_creation_requires_its_authoritative_id ... ok
+test service::tests::every_method_classifies_identically_by_name_and_by_variant ... ok
+test wallet_seed::tests::rejects_profile_curve_mismatch ... ok
+test version_tests::signer_api_range_rejects_incompatible_versions ... ok
+test wallet_seed::tests::rejects_wrong_encoding ... ok
+test approval::tests::approval_digest_excludes_lifecycle_and_nonce_distinguishes_identical_requests ... ok
+test ceremony::tests::petal_key_scope_is_exactly_bound_to_key_derive_request ... ok
+test wallet_seed::tests::rejects_empty_suites ... ok
+test ceremony::tests::signed_custody_contribution_binds_wallet_seed_profile ... ok
+test policy::tests::policy_commit_signature_message_is_golden_and_binds_every_unsigned_field ... ok
+test wallet_seed::tests::canonical_profiles_validate ... ok
+test petal_key::tests::every_scope_identity_field_is_digest_bound ... ok
+test version_tests::signer_control_accepts_1_0_and_current_but_rejects_incompatible_versions ... ok
+test surface::tests::remote_origin_is_exact_and_random_label_only ... ok
+test ceremony::tests::signed_custody_contribution_binds_full_petal_scope ... ok
+test codec::tests::each_payload_bound_is_independent ... ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/w1_domain_golden.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/w1_domain_golden-89dfc1d6b8f6a67d)
+
+running 12 tests
+test keyref_jcs_and_exact_equality_match_reviewed_artifact ... ok
+test sign_request_rejects_issue_time_after_expiry ... ok
+test ed25519_sign_request_rejects_empty_and_oversized_messages ... ok
+test operation_and_attempt_digests_match_reviewed_artifact ... ok
+test broker_signer_journal_head_envelope_matches_reviewed_artifact ... ok
+test identical_terms_with_distinct_request_nonces_have_distinct_ids ... ok
+test operation_identity_excludes_attempt_only_fields ... ok
+test approval_jcs_and_digest_match_reviewed_artifact ... ok
+test ed25519_sign_request_requires_one_payload_digest_per_message ... ok
+test every_immutable_authority_field_changes_the_approval_digest ... ok
+test ceremony_challenge_and_hpke_aad_match_reviewed_artifact ... ok
+test broker_validation_receipt_signature_and_digest_golden ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/w1_edge_wire.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/w1_edge_wire-c0e27360ef840256)
+
+running 2 tests
+test every_edge_request_and_response_variant_matches_frozen_v1_frames ... ok
+test pre_surface_signed_receipts_keep_their_original_canonical_bytes ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running unittests src/lib.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/bloom_signer_backend_api-424a0e762dcb1313)
+
+running 4 tests
+test conformance::tests::capabilities_and_normalized_output_are_checked ... ok
+test tests::unknown_backend_errors_are_indeterminate ... ok
+test conformance::tests::every_backend_fault_outcome_remains_distinct ... ok
+test tests::suite_controls_input_kind ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/normalized_signature_golden.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/normalized_signature_golden-b9988e198e3676e3)
+
+running 3 tests
+test normalized_recoverable_signature_matches_reviewed_artifact ... ok
+test normalized_keccak_recoverable_signature_matches_reviewed_artifact ... ok
+test normalized_ed25519_message_signature_matches_reviewed_artifact ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/bloom_signer_backend_aws_kms-4702104a2acde1fd)
+
+running 11 tests
+test tests::config_requires_explicit_credentials_exact_egress_and_immutable_arns ... ok
+test sdk::tests::sdk_provider_issues_exact_describe_get_and_digest_sign_requests_once ... ok
+test tests::expired_deadline_and_quota_reject_before_dispatch ... ok
+test tests::enrollment_rejects_alias_metadata_drift_and_unpinned_keys ... ok
+test tests::enrollment_pins_metadata_spki_and_normalizes_recoverable_signature ... ok
+test tests::successful_provider_signature_without_correlation_is_indeterminate_and_charged ... ok
+test tests::durable_enrollment_restores_without_provider_reenrollment ... ok
+test tests::high_s_provider_signature_is_normalized_to_low_s ... ok
+test tests::production_constructor_binds_the_explicit_aws_sdk_provider_without_ambient_chain ... ok
+test tests::malformed_or_wrong_key_provider_signatures_fail_closed ... ok
+test tests::provider_faults_preserve_ambiguity_and_never_invent_retry_safety ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running unittests src/lib.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/bloom_signer_backend_local-deea9003c976aaa0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/local_backend.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/local_backend-10c9efb106dfa211)
+
+running 9 tests
+test pre_rename_secp256k1_scalar_backups_still_parse ... ok
+test imported_scalar_roots_reject_derivation_namespaces ... ok
+test restarted_public_projection_rejects_an_spki_fingerprint_mismatch ... ok
+test bip32_seed_backup_deserializes_to_the_bip32_seed_kind ... ok
+test imported_scalar_roots_sign_deactivate_and_restart ... ok
+test bip32_seed_wallet_unlocks_derives_signs_and_round_trips ... ok
+test failed_bip39_child_can_be_tombstoned_without_reusing_its_path ... ok
+test bip39_public_descriptions_survive_a_locked_restart ... ok
+test bip39_solana_parent_allocates_and_signs_a_hardened_petal_child ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running unittests src/lib.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/bloom_signer_derive-804bda18118bfbbe)
+
+running 15 tests
+test allocation::tests::valid_start_allocates_itself ... ok
+test mnemonic::tests::normalizes_whitespace_before_validation ... ok
+test bip32::tests::invalid_child_rules_are_enforced_by_construction ... ok
+test mnemonic::tests::unknown_word_reports_its_position_without_echoing_the_token ... ok
+test mnemonic::tests::rejects_nfkd_unnormalized_mnemonic ... ok
+test allocation::tests::skips_invalid_indices_deterministically ... ok
+test bip32::tests::master_matches_bip32_test_vector_1 ... ok
+test mnemonic::tests::generated_entropy_round_trips ... ok
+test policy::tests::policy_is_frozen_as_documented ... ok
+test mnemonic::tests::rejects_wrong_count_unknown_word_bad_checksum_and_length ... ok
+test slip10::tests::master_and_first_child_match_slip10_test_vector_1 ... ok
+test bip32::tests::children_match_bip32_test_vector_1 ... ok
+test slip10::tests::petal_derivation_matches_independent_ows_implementation ... ok
+test mnemonic::tests::round_trips_every_valid_length ... ok
+test slip10::tests::solana_derivation_matches_independent_ows_implementation ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/differential.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/differential-d2bb85f8d4974be9)
+
+running 6 tests
+test nfkd_unnormalized_separators_are_rejected ... ok
+test frozen_corpus_still_reproduces_after_the_reference_rewrite ... ok
+test zeroizing_wrappers_cover_every_secret_stage ... ok
+test randomized_bip32_paths_agree_with_the_bip32_crate ... ok
+test official_trezor_vectors_reproduce_for_every_available_length ... ok
+test randomized_mnemonics_agree_with_the_independent_codec ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.52s
+
+     Running tests/frozen_vectors.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/frozen_vectors-68ede58d84bc6b05)
+
+running 5 tests
+test frozen_solana_account_reproduces_every_step ... ok
+test frozen_evm_account_reproduces_every_step ... ok
+test evm_and_solana_children_come_from_one_seed_without_shared_material ... ok
+test distinct_accounts_yield_distinct_keys ... ok
+test frozen_bip39_entropy_mnemonic_and_seed_reproduce_exactly ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/bloom_signer_process_hardening-4689f4bb3a06f0f6)
+
+running 2 tests
+test tests::hardening_is_observable_in_kernel_process_state ... ok
+test locked_secret_tests::dropping_one_secret_cannot_unlock_a_surviving_secret_page ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/data/codex-cache/cargo-build/54/e9b53b04a01b6a/debug/deps/bloom_signer_vectors-5c4c4d1893a4cd28)
+
+running 1 test
+test tests::every_hex_vector_is_valid_even_length_hex ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests bloom_signer
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests bloom_signer_api
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests bloom_signer_backend_api
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests bloom_signer_backend_aws_kms
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests bloom_signer_backend_local
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests bloom_signer_derive
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests bloom_signer_process_hardening
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests bloom_signer_vectors
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
