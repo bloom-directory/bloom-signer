@@ -77,6 +77,9 @@ fn ceremony_kind_name(kind: CeremonyKind) -> &'static str {
         CeremonyKind::PolicyUpdate => "policy_update",
         CeremonyKind::AccountAllocate => "account_allocate",
         CeremonyKind::AccountRetire => "account_retire",
+        CeremonyKind::CardAdd => "card_add",
+        CeremonyKind::CardDelete => "card_delete",
+        CeremonyKind::CardCheckout => "card_checkout",
     }
 }
 
@@ -294,6 +297,7 @@ impl Drop for ProvisionedLocalBackendRollback<'_> {
 /// destroys them and therefore fails pre-commit ceremonies closed; completed
 /// receipts remain the responsibility of the durable RPC host.
 pub struct SignerCeremonyService {
+    pub(crate) cards: crate::cards::CardCeremonies,
     engine: Arc<SignerEngine>,
     signer_key_id: Token,
     signing_key: SigningKey,
@@ -354,6 +358,35 @@ impl SignerCeremonyService {
     /// Effective ceremony port this service instance trusts.
     pub fn ceremony_port(&self) -> u16 {
         self.ceremony_port
+    }
+
+    pub fn cards_storage(&self, path: &std::path::Path) -> Result<(), ProtocolError> {
+        self.cards.open_storage(path)
+    }
+
+    pub fn prepare_card(
+        &self,
+        request: bloom_signer_api::CardPrepareRequest,
+        now_ms: u64,
+    ) -> Result<bloom_signer_api::SignerPreparedCustody, ProtocolError> {
+        self.require_surface(
+            &request.surface,
+            matches!(request.effect, bloom_signer_api::CardEffect::Add { .. }),
+        )?;
+        self.cards.prepare(request, now_ms)
+    }
+
+    /// Recheck the active surface before consuming a card approval.
+    pub fn complete_card(
+        &self,
+        request: CustodyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, ProtocolError> {
+        let surface = self
+            .cards
+            .operation_surface(&request.custody_operation_id)?;
+        self.require_surface(&surface, false)?;
+        self.cards.complete(request, now_ms)
     }
 
     /// Expected WebAuthn origin (`http://localhost:<port>`, or
@@ -495,6 +528,11 @@ impl SignerCeremonyService {
             })
             .collect();
         let service = Self {
+            cards: crate::cards::CardCeremonies::new(
+                signing_key.clone(),
+                signer_key_id.clone(),
+                expected_origin.clone(),
+            )?,
             engine,
             signer_key_id,
             signing_key,
@@ -1562,7 +1600,13 @@ impl SignerCeremonyService {
                     | CeremonyKind::CredentialReplace
             ),
         )?;
-        if request.ceremony_kind == CeremonyKind::SealedApproval {
+        if matches!(
+            request.ceremony_kind,
+            CeremonyKind::SealedApproval
+                | CeremonyKind::CardAdd
+                | CeremonyKind::CardDelete
+                | CeremonyKind::CardCheckout
+        ) {
             return Err(kind_mismatch());
         }
         if request.browser_output_recipient_key.is_some() {
@@ -3387,7 +3431,10 @@ impl SignerCeremonyService {
                 self.advance_counter(&verified.credential_id, verified.sign_count);
                 Ok(())
             }
-            CeremonyKind::SealedApproval => Err(kind_mismatch()),
+            CeremonyKind::SealedApproval
+            | CeremonyKind::CardAdd
+            | CeremonyKind::CardDelete
+            | CeremonyKind::CardCheckout => Err(kind_mismatch()),
         };
         effect?;
         Ok(CustodyApplyOutcome {

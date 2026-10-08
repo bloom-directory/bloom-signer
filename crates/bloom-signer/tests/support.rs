@@ -124,6 +124,21 @@ impl VirtualAuthenticator {
         self.assertion_with_origin(challenge, sign_count, &self.origin)
     }
 
+    pub fn assertion_without_uv(&self, challenge: &[u8], sign_count: u32) -> WebAuthnAssertion {
+        let client_data = client_data_with_origin("webauthn.get", challenge, &self.origin);
+        let authenticator_data = authenticator_data(0x01, sign_count, &self.rp_id);
+        let mut message = authenticator_data.clone();
+        message.extend_from_slice(&Sha256::digest(&client_data));
+        let signature: p256::ecdsa::Signature = self.signing_key.sign(&message);
+        WebAuthnAssertion {
+            credential_id: self.credential_id.clone(),
+            authenticator_data: Base64UrlBytes::from_bytes(&authenticator_data),
+            client_data_json: Base64UrlBytes::from_bytes(&client_data),
+            signature: Base64UrlBytes::from_bytes(signature.to_der().as_bytes()),
+            user_handle: Some(self.user_handle.clone()),
+        }
+    }
+
     /// Correctly signed assertion binding an explicit origin, for
     /// wrong-origin rejection tests: the signature stays valid so only the
     /// origin check can fail.

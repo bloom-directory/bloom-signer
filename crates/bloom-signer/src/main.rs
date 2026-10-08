@@ -488,6 +488,14 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
         ceremony_port,
     )?
     .with_legacy_migrations(migration_store);
+    ceremony.cards_storage(
+        config
+            .database_path
+            .parent()
+            .ok_or("Signer state directory missing")?
+            .join("cards.sqlite3")
+            .as_path(),
+    )?;
     if let Some(ttl_ms) = config.ceremony_ttl_ms {
         ceremony = ceremony.with_ceremony_ttl_ms(ttl_ms)?;
         tracing::warn!(

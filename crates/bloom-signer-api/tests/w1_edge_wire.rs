@@ -534,6 +534,50 @@ fn signer_requests() -> Vec<BrokerSignerRequest> {
     let id = IdRequest { id: digest(46) };
     vec![
         BrokerSignerRequest::SystemHello(hello()),
+        BrokerSignerRequest::CardList(Empty {}),
+        BrokerSignerRequest::CardPrepare(CardPrepareRequest {
+            surface: legacy_local_surface(),
+            operation_id: operation(96),
+            effect: CardEffect::Add {
+                card_id: token("card-one"),
+                label: "Main card".into(),
+            },
+        }),
+        BrokerSignerRequest::CardPrepare(CardPrepareRequest {
+            surface: legacy_local_surface(),
+            operation_id: operation(97),
+            effect: CardEffect::Delete {
+                card_id: token("card-one"),
+            },
+        }),
+        BrokerSignerRequest::CardPrepare(CardPrepareRequest {
+            surface: legacy_local_surface(),
+            operation_id: operation(98),
+            effect: CardEffect::Checkout {
+                card_id: token("card-one"),
+                facts: CheckoutFacts {
+                    origin: "https://merchant.example".into(),
+                    payment_frame_origins: vec!["https://payments.example".into()],
+                    total_minor: 199,
+                    currency: "USD".into(),
+                    installments: 1,
+                    recurring: false,
+                },
+                recipient_key: Base64UrlBytes::from_bytes(&[99; 32]),
+                agent_description: "Digital item".into(),
+            },
+        }),
+        BrokerSignerRequest::CardComplete({
+            let mut c = custody_complete();
+            c.ceremony_kind = CeremonyKind::CardCheckout;
+            c
+        }),
+        BrokerSignerRequest::CardStatus(OperationRequest {
+            operation_id: operation(98),
+        }),
+        BrokerSignerRequest::CardCancel(OperationRequest {
+            operation_id: operation(98),
+        }),
         BrokerSignerRequest::SignerReadiness(Empty {}),
         BrokerSignerRequest::SignerCapabilities(Empty {}),
         BrokerSignerRequest::SurfaceStatus(Empty {}),
@@ -668,6 +712,34 @@ fn signer_responses() -> Vec<BrokerSignerResponse> {
     };
     vec![
         BrokerSignerResponse::SystemHello(hello()),
+        BrokerSignerResponse::CardList(vec![CardPublic {
+            card_id: token("card-one"),
+            label: "Main card".into(),
+            brand: "Visa".into(),
+            last4: "4242".into(),
+        }]),
+        BrokerSignerResponse::CardPrepare({
+            let mut p = prepared_custody();
+            p.contribution.ceremony_kind = CeremonyKind::CardAdd;
+            p.contribution.wallet_id = None;
+            p.contribution.key_ref = None;
+            p
+        }),
+        BrokerSignerResponse::CardComplete({
+            let mut c = custody_result();
+            c.ceremony_kind = CeremonyKind::CardCheckout;
+            c.wallet_id = None;
+            c.public_key_refs = vec![];
+            c
+        }),
+        BrokerSignerResponse::CardStatus(CardOperationStatus {
+            operation_id: operation(98),
+            state: CardOperationState::Consumed,
+        }),
+        BrokerSignerResponse::CardCancel(CardOperationStatus {
+            operation_id: operation(98),
+            state: CardOperationState::Cancelled,
+        }),
         BrokerSignerResponse::SignerReadiness(readiness()),
         BrokerSignerResponse::SignerCapabilities(capabilities()),
         BrokerSignerResponse::SurfaceStatus(surface_status()),
@@ -803,12 +875,12 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer requests",
         signer_requests(),
-        "3edaca63e8f8caba354d37d3b23b3d2a4793746d8d792a02cc956214aa227738",
+        "cb78e44f9b2dbe3cd5744ac8f64c2faf6c97b31e39b69dc3e8983188775f3b80",
     );
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "73bdb9219df193c792666873948c9ccd5adc99ff2e682265238bcceb9af899ca",
+        "4405c9db7d8ed4571857f5682fc620478396ac8137890e7a76f24a763f74a9db",
     );
     assert_wire_digest(
         "control requests",

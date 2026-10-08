@@ -5,6 +5,7 @@
 //! custody plaintext are deliberately unrepresentable here.
 
 mod approval;
+mod cards;
 mod ceremony;
 mod codec;
 mod cross_surface;
@@ -21,6 +22,7 @@ mod wallet_seed;
 mod webauthn;
 
 pub use approval::*;
+pub use cards::*;
 pub use ceremony::*;
 pub use codec::*;
 pub use cross_surface::*;
