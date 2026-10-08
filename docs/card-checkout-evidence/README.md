@@ -1,17 +1,21 @@
 # Card custody checkpoint, 2026-10-08
 
-Production custody was validated at
-`bfa213789dd3422ba25a5377369a3ef5b5d3c0f6` using
-`cargo test --workspace --features triad-dev-harness --locked`, workspace /
-all-target strict Clippy, formatting and committed dependency checks.
-The retained test log contains 270 passing tests, zero failures and two ignored.
+The initial Signer/API/vector test log at
+`bfa213789dd3422ba25a5377369a3ef5b5d3c0f6` contains 270 passing tests,
+zero failures and two ignored. This selected-package run should not be
+described as the complete workspace.
 
 The first CI run exposed a fixture error under
 `BLOOM_TRIAD_DEV_CEREMONY_PORT=28735`: the new test service hard-coded the
 canonical port while its authenticator correctly used the configured dev
 origin. The fixture now derives that same origin. Production origin checks
-remain strict. Separate logs record the corrected dev-port and shipped-feature
-test runs; do not treat the first failed CI run as passed.
+remain strict. The corrected fixture at
+`961f5f2b4cc76ce738daa005f7e6b795d5972e6c` was tested with both
+`BLOOM_TRIAD_DEV_CEREMONY_PORT=28735 cargo test --workspace --features triad-dev-harness --locked`
+and `cargo test --workspace --locked`: **326 passed, zero failed, two ignored**
+in each run. Shipped-feature workspace/all-target Clippy with warnings denied,
+formatting and diff checks passed. Separate logs retain these runs; do not
+treat the first failed CI run as passed.
 
 The released-reader test uses compiled Signer engine/custody code from
 `97b9ac7e47ee682e59804d04f6288419f3598a58`. It generates a released wallet,
