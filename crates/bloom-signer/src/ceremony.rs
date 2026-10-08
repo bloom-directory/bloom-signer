@@ -364,6 +364,26 @@ impl SignerCeremonyService {
         self.cards.open_storage(path)
     }
 
+    pub fn card_list(&self) -> Result<Vec<bloom_signer_api::CardPublic>, ProtocolError> {
+        self.cards.list()
+    }
+
+    pub fn card_status(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+    ) -> Result<bloom_signer_api::CardOperationStatus, ProtocolError> {
+        self.cards.status(operation_id, now_ms)
+    }
+
+    pub fn card_cancel(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+    ) -> Result<bloom_signer_api::CardOperationStatus, ProtocolError> {
+        self.cards.cancel(operation_id, now_ms)
+    }
+
     pub fn prepare_card(
         &self,
         request: bloom_signer_api::CardPrepareRequest,
