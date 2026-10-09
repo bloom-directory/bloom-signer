@@ -572,6 +572,14 @@ fn signer_requests() -> Vec<BrokerSignerRequest> {
             c.ceremony_kind = CeremonyKind::CardCheckout;
             c
         }),
+        BrokerSignerRequest::CardPrepare(CardPrepareRequest {
+            surface: legacy_local_surface(),
+            operation_id: operation(100),
+            effect: CardEffect::ManualCheckout {
+                card_id: token("card-one"),
+                agent_description: "Manual view only".into(),
+            },
+        }),
         BrokerSignerRequest::CardStatus(OperationRequest {
             operation_id: operation(98),
         }),
@@ -875,7 +883,7 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer requests",
         signer_requests(),
-        "cb78e44f9b2dbe3cd5744ac8f64c2faf6c97b31e39b69dc3e8983188775f3b80",
+        "054521ebcab189895d0d09aa537d448d4ec45e7c801bd2fd8911259de56aa385",
     );
     assert_wire_digest(
         "signer responses",
