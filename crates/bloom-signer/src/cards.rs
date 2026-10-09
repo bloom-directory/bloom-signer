@@ -100,6 +100,21 @@ impl CardDetails {
         Ok(())
     }
 }
+fn card_brand(number: &str) -> &'static str {
+    let prefix = |len: usize| {
+        number
+            .get(..len)
+            .and_then(|p| p.parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    match () {
+        _ if number.starts_with('4') => "Visa",
+        _ if matches!(prefix(2), 34 | 37) => "Amex",
+        _ if (51..=55).contains(&prefix(2)) || (2221..=2720).contains(&prefix(4)) => "Mastercard",
+        _ if prefix(4) == 6011 || prefix(2) == 65 || (644..=649).contains(&prefix(3)) => "Discover",
+        _ => "Card",
+    }
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PrivateInput {
@@ -690,14 +705,7 @@ impl CardCeremonies {
                 let public = CardPublic {
                     card_id: card_id.clone(),
                     label: label.clone(),
-                    brand: if card.number.starts_with('4') {
-                        "Visa"
-                    } else if card.number.starts_with("34") || card.number.starts_with("37") {
-                        "Amex"
-                    } else {
-                        "Card"
-                    }
-                    .into(),
+                    brand: card_brand(&card.number).into(),
                     last4: card.number[card.number.len() - 4..].into(),
                 };
                 let plaintext = Zeroizing::new(serde_json::to_vec(card).map_err(malformed)?);
@@ -816,5 +824,22 @@ impl CardCeremonies {
         bytes.extend(result.unsigned_canonical_bytes()?);
         result.signer_signature = Base64UrlBytes::from_bytes(&self.key.sign(&bytes).to_bytes());
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn card_brand_names_common_networks() {
+        for (number, brand) in [
+            ("4242424242424242", "Visa"),
+            ("378282246310005", "Amex"),
+            ("5555555555554444", "Mastercard"),
+            ("2223003122003222", "Mastercard"),
+            ("6011111111111117", "Discover"),
+            ("3566002020360505", "Card"),
+        ] {
+            assert_eq!(super::card_brand(number), brand, "{number}");
+        }
     }
 }
