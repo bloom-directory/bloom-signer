@@ -128,6 +128,19 @@ impl SignerRpcService {
             self.clock.now_ms(false)?
         };
         match request {
+            Request::CardList(_) => Ok(Response::CardList(self.ceremony.cards.list()?)),
+            Request::CardPrepare(request) => Ok(Response::CardPrepare(
+                self.ceremony.prepare_card(request, now_ms)?,
+            )),
+            Request::CardComplete(request) => Ok(Response::CardComplete(
+                self.ceremony.complete_card(request, now_ms)?,
+            )),
+            Request::CardStatus(request) => Ok(Response::CardStatus(
+                self.ceremony.cards.status(&request.operation_id, now_ms)?,
+            )),
+            Request::CardCancel(request) => Ok(Response::CardCancel(
+                self.ceremony.cards.cancel(&request.operation_id, now_ms)?,
+            )),
             Request::SystemHello(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::UnknownMethod,
                 "system.hello is consumed by the authenticated transport",
@@ -692,7 +705,10 @@ fn signer_request_requires_containment(request: &BrokerSignerRequest) -> bool {
 
     matches!(
         request,
-        Request::KeyDerivePrepare(_)
+        Request::CardPrepare(_)
+            | Request::CardComplete(_)
+            | Request::CardCancel(_)
+            | Request::KeyDerivePrepare(_)
             | Request::KeyEnrollPrepare(_)
             | Request::CeremonyPrepare(_)
             | Request::CeremonyComplete(_)

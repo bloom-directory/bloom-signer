@@ -23,6 +23,9 @@ pub enum CeremonyKind {
     AccountAllocate,
     AccountRetire,
     PolicyUpdate,
+    CardAdd,
+    CardDelete,
+    CardCheckout,
 }
 
 impl CeremonyKind {
@@ -44,7 +47,10 @@ impl CeremonyKind {
             | Self::KeyDerive
             | Self::AccountAllocate
             | Self::AccountRetire
-            | Self::PolicyUpdate => Some(crate::CeremonyState::Succeeded),
+            | Self::PolicyUpdate
+            | Self::CardAdd
+            | Self::CardDelete
+            | Self::CardCheckout => Some(crate::CeremonyState::Succeeded),
         }
     }
 }

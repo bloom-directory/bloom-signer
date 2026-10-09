@@ -7334,6 +7334,9 @@ fn ceremony_mutation_kind(kind: bloom_signer_api::CeremonyKind) -> &'static str 
         Kind::BackendEnrollment | Kind::KeyDerive => "key",
         Kind::AccountAllocate | Kind::AccountRetire => "account",
         Kind::SealedApproval => "approval",
+        Kind::CardAdd => "card_add",
+        Kind::CardDelete => "card_delete",
+        Kind::CardCheckout => "card_checkout",
     }
 }
 

@@ -39,6 +39,11 @@ macro_rules! method_enum {
 }
 
 method_enum!(BrokerSignerMethod {
+    CardList => "card.list",
+    CardPrepare => "card.prepare",
+    CardComplete => "card.complete",
+    CardStatus => "card.status",
+    CardCancel => "card.cancel",
     SystemHello => "system.hello",
     SignerReadiness => "signer.readiness",
     SignerCapabilities => "signer.capabilities",
@@ -118,7 +123,9 @@ impl BrokerSignerMethod {
             | Self::WalletRegistrationStatus
             | Self::CredentialListPublic
             | Self::CustodyResult
-            | Self::CustodyStatus => true,
+            | Self::CustodyStatus
+            | Self::CardList
+            | Self::CardStatus => true,
 
             Self::KeyDerivePrepare
             | Self::SurfaceReportEffective
@@ -146,7 +153,10 @@ impl BrokerSignerMethod {
             | Self::CredentialReplacePrepare
             | Self::RecoveryPrepare
             | Self::CustodyBindOutputRecipient
-            | Self::CustodyComplete => false,
+            | Self::CustodyComplete
+            | Self::CardPrepare
+            | Self::CardComplete
+            | Self::CardCancel => false,
         }
     }
 }

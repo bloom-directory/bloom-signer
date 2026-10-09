@@ -314,6 +314,16 @@ pub struct CeremonyPublicStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "method", content = "body", deny_unknown_fields)]
 pub enum BrokerSignerRequest {
+    #[serde(rename = "card.list")]
+    CardList(Empty),
+    #[serde(rename = "card.prepare")]
+    CardPrepare(crate::CardPrepareRequest),
+    #[serde(rename = "card.complete")]
+    CardComplete(CustodyCompleteRequest),
+    #[serde(rename = "card.status")]
+    CardStatus(OperationRequest),
+    #[serde(rename = "card.cancel")]
+    CardCancel(OperationRequest),
     #[serde(rename = "system.hello")]
     SystemHello(HelloChallenge),
     #[serde(rename = "signer.readiness")]
@@ -411,6 +421,16 @@ pub enum BrokerSignerRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "method", content = "body", deny_unknown_fields)]
 pub enum BrokerSignerResponse {
+    #[serde(rename = "card.list")]
+    CardList(Vec<crate::CardPublic>),
+    #[serde(rename = "card.prepare")]
+    CardPrepare(crate::SignerPreparedCustody),
+    #[serde(rename = "card.complete")]
+    CardComplete(CustodyResult),
+    #[serde(rename = "card.status")]
+    CardStatus(crate::CardOperationStatus),
+    #[serde(rename = "card.cancel")]
+    CardCancel(crate::CardOperationStatus),
     #[serde(rename = "system.hello")]
     SystemHello(HelloChallenge),
     #[serde(rename = "signer.readiness")]
@@ -553,6 +573,11 @@ impl crate::TypedRequestMethod for BrokerSignerRequest {
     fn operation_id(&self) -> Result<Option<OperationId>, crate::WireError> {
         use BrokerSignerRequest as Request;
         Ok(match self {
+            Request::CardPrepare(request) => Some(request.operation_id.clone()),
+            Request::CardComplete(request) => Some(request.custody_operation_id.clone()),
+            Request::CardStatus(request) | Request::CardCancel(request) => {
+                Some(request.operation_id.clone())
+            }
             Request::CeremonyPrepare(request) => Some(match request {
                 crate::SignerCeremonyPrepareRequest::SealedApproval(request) => {
                     request.activation_operation_id.clone()
@@ -686,6 +711,6 @@ mod tests {
 
     #[test]
     fn typed_request_inventories_cover_every_normative_method() {
-        assert_eq!(crate::BrokerSignerMethod::ALL.len(), 46);
+        assert_eq!(crate::BrokerSignerMethod::ALL.len(), 51);
     }
 }
