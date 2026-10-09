@@ -381,7 +381,9 @@ impl CardCeremonies {
                 |r| r.get(0),
             )
             .map_err(storage)?;
-        if present == matches!(request.effect, CardEffect::Add { .. }) {
+        // Adding under an existing ID replaces that card; nothing else may
+        // name a missing card.
+        if !present && !matches!(request.effect, CardEffect::Add { .. }) {
             return Err(error(
                 ProtocolErrorCode::OperationIdConflict,
                 "card record does not match requested operation",
@@ -711,7 +713,7 @@ impl CardCeremonies {
                 let plaintext = Zeroizing::new(serde_json::to_vec(card).map_err(malformed)?);
                 let encrypted = encrypt(&key, &plaintext, &card_aad(&container_id, card_id)?)?;
                 tx.execute(
-                    "INSERT INTO cards VALUES (?1,?2,?3)",
+                    "INSERT OR REPLACE INTO cards VALUES (?1,?2,?3)",
                     params![card_id.as_str(), json(&public)?, json(&encrypted)?],
                 )
                 .map_err(storage)?;

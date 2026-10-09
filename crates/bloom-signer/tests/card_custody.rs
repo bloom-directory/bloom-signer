@@ -451,3 +451,18 @@ fn interrupted_storage_write_does_not_mutate_cards_or_reuse_approval() {
     assert!(s.list().unwrap().len() == 1);
     assert!(s.complete(c, NOW + 4).is_err());
 }
+#[test]
+fn adding_under_an_existing_id_replaces_that_card() {
+    let s = service();
+    let auth = enroll(&s);
+    let p = s.prepare(add(2, "card-one"), NOW + 2).unwrap();
+    let mut input = private(&auth, true, false);
+    input["card"]["number"] = serde_json::json!("5555555555554444");
+    s.complete(complete(&auth, &p, input, 2), NOW + 3).unwrap();
+    let cards = s.list().unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(
+        (cards[0].brand.as_str(), cards[0].last4.as_str()),
+        ("Mastercard", "4444")
+    );
+}
