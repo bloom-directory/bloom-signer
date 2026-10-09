@@ -22,7 +22,7 @@ fn released_signer_reopens_wallet_state_and_ignores_card_file() {
     );
     let engine = Arc::new(
         SignerEngine::open(
-            &root.join("signer.sqlite3"),
+            root.join("signer.sqlite3"),
             Token::new("broker-app-1").unwrap(),
             SigningKey::from_bytes(&[7; 32]).verifying_key(),
             SigningKey::from_bytes(&[9; 32]).verifying_key(),
