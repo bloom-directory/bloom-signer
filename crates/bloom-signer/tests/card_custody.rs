@@ -10,6 +10,50 @@ use support::{VirtualAuthenticator, seal_hpke};
 const NOW: u64 = 1_760_000_000_000;
 
 #[test]
+fn manual_checkout_authorizes_view_without_release_and_rejects_cvc() {
+    let cards = service();
+    let auth = enroll(&cards);
+    let p = cards
+        .prepare(
+            request(
+                2,
+                CardEffect::ManualCheckout {
+                    card_id: Token::new("card-one").unwrap(),
+                    agent_description: "Unverified checkout".into(),
+                },
+            ),
+            NOW + 2,
+        )
+        .unwrap();
+    assert!(p.contribution.browser_output_recipient_key.is_none());
+    let result = cards
+        .complete(
+            complete(&auth, &p, private(&auth, false, false), 2),
+            NOW + 3,
+        )
+        .unwrap();
+    assert!(result.encrypted_browser_result.is_none());
+    let p = cards
+        .prepare(
+            request(
+                3,
+                CardEffect::ManualCheckout {
+                    card_id: Token::new("card-one").unwrap(),
+                    agent_description: "Unverified checkout".into(),
+                },
+            ),
+            NOW + 4,
+        )
+        .unwrap();
+    assert!(
+        cards
+            .complete(complete(&auth, &p, private(&auth, false, true), 3), NOW + 5)
+            .is_err()
+    );
+    assert_eq!(cards.list().unwrap().len(), 1);
+}
+
+#[test]
 #[ignore = "generates an explicit retained fixture for released-revision rollback testing"]
 fn prepare_released_rollback_fixture() {
     use bloom_signer::{

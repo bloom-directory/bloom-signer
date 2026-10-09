@@ -668,6 +668,14 @@ impl CardCeremonies {
         let mut output = None;
         let tx = state.db.transaction().map_err(storage)?;
         match &pending.request.effect {
+            CardEffect::ManualCheckout { .. } => {
+                if input.card.is_some() || input.cvc.is_some() {
+                    return Err(error(
+                        ProtocolErrorCode::MalformedFrame,
+                        "manual view cannot accept or release card details",
+                    ));
+                }
+            }
             CardEffect::Add { card_id, label } => {
                 if input.cvc.is_some() {
                     return Err(error(

@@ -96,20 +96,26 @@ pub enum CardEffect {
         recipient_key: Base64UrlBytes,
         agent_description: String,
     },
+    /// Authorize the private human view only. Never release a saved card.
+    ManualCheckout {
+        card_id: Token,
+        agent_description: String,
+    },
 }
 impl CardEffect {
     pub fn ceremony_kind(&self) -> CeremonyKind {
         match self {
             Self::Add { .. } => CeremonyKind::CardAdd,
             Self::Delete { .. } => CeremonyKind::CardDelete,
-            Self::Checkout { .. } => CeremonyKind::CardCheckout,
+            Self::Checkout { .. } | Self::ManualCheckout { .. } => CeremonyKind::CardCheckout,
         }
     }
     pub fn card_id(&self) -> &Token {
         match self {
             Self::Add { card_id, .. }
             | Self::Delete { card_id }
-            | Self::Checkout { card_id, .. } => card_id,
+            | Self::Checkout { card_id, .. }
+            | Self::ManualCheckout { card_id, .. } => card_id,
         }
     }
     pub fn validate(&self) -> Result<(), ProtocolError> {
@@ -137,6 +143,12 @@ impl CardEffect {
                 }
                 Ok(())
             }
+            Self::ManualCheckout {
+                agent_description, ..
+            } if agent_description.len() > 1024 => Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "manual checkout description too long",
+            )),
             _ => Ok(()),
         }
     }
