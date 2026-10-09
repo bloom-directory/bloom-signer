@@ -1948,6 +1948,7 @@ mod tests {
         .unwrap();
         let server_stream = server.await.unwrap();
         // The startup deadline does not become an authenticated-session TTL.
+        tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(
             tokio::time::timeout(Duration::from_millis(40), client.read(&mut [0; 1]))
                 .await
