@@ -373,14 +373,17 @@ impl CardCeremonies {
                 "card container is not enrolled",
             ));
         }
-        let present: bool = state
-            .db
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM cards WHERE id=?1)",
-                [request.effect.card_id().as_str()],
-                |r| r.get(0),
-            )
-            .map_err(storage)?;
+        let present: bool = match request.effect.card_id() {
+            Some(card_id) => state
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cards WHERE id=?1)",
+                    [card_id.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(storage)?,
+            None => true,
+        };
         // Adding under an existing ID replaces that card; nothing else may
         // name a missing card.
         if !present && !matches!(request.effect, CardEffect::Add { .. }) {
@@ -685,7 +688,7 @@ impl CardCeremonies {
         let mut output = None;
         let tx = state.db.transaction().map_err(storage)?;
         match &pending.request.effect {
-            CardEffect::ManualCheckout { .. } => {
+            CardEffect::ManualCheckout { .. } | CardEffect::SiteCheckout { .. } => {
                 if input.card.is_some() || input.cvc.is_some() {
                     return Err(error(
                         ProtocolErrorCode::MalformedFrame,

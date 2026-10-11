@@ -576,7 +576,7 @@ fn signer_requests() -> Vec<BrokerSignerRequest> {
             surface: legacy_local_surface(),
             operation_id: operation(100),
             effect: CardEffect::ManualCheckout {
-                card_id: token("card-one"),
+                card_id: Some(token("card-one")),
                 agent_description: "Manual view only".into(),
             },
         }),

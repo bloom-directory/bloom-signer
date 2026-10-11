@@ -18,7 +18,7 @@ fn manual_checkout_authorizes_view_without_release_and_rejects_cvc() {
             request(
                 2,
                 CardEffect::ManualCheckout {
-                    card_id: Token::new("card-one").unwrap(),
+                    card_id: Some(Token::new("card-one").unwrap()),
                     agent_description: "Unverified checkout".into(),
                 },
             ),
@@ -38,7 +38,7 @@ fn manual_checkout_authorizes_view_without_release_and_rejects_cvc() {
             request(
                 3,
                 CardEffect::ManualCheckout {
-                    card_id: Token::new("card-one").unwrap(),
+                    card_id: Some(Token::new("card-one").unwrap()),
                     agent_description: "Unverified checkout".into(),
                 },
             ),
@@ -50,6 +50,50 @@ fn manual_checkout_authorizes_view_without_release_and_rejects_cvc() {
             .complete(complete(&auth, &p, private(&auth, false, true), 3), NOW + 5)
             .is_err()
     );
+    assert_eq!(cards.list().unwrap().len(), 1);
+}
+
+#[test]
+fn takeover_and_site_checkout_release_nothing_and_reject_card_input() {
+    let cards = service();
+    let auth = enroll(&cards);
+    let site = || CardEffect::SiteCheckout {
+        facts: CheckoutFacts {
+            origin: "https://shop.example".into(),
+            payment_frame_origins: vec![],
+            total_minor: 4990,
+            currency: "CHF".into(),
+            installments: 1,
+            recurring: false,
+        },
+        agent_description: "Order with the shop's saved card".into(),
+    };
+    let takeover = CardEffect::ManualCheckout {
+        card_id: None,
+        agent_description: "Log in to the shop".into(),
+    };
+    for (op, effect) in [(2, takeover), (3, site())] {
+        let p = cards.prepare(request(op, effect), NOW + 2).unwrap();
+        assert!(p.contribution.browser_output_recipient_key.is_none());
+        let result = cards
+            .complete(
+                complete(&auth, &p, private(&auth, false, false), op.into()),
+                NOW + 3,
+            )
+            .unwrap();
+        assert!(result.encrypted_browser_result.is_none());
+    }
+    let p = cards.prepare(request(4, site()), NOW + 4).unwrap();
+    assert!(
+        cards
+            .complete(complete(&auth, &p, private(&auth, false, true), 4), NOW + 5)
+            .is_err()
+    );
+    let mut framed = site();
+    if let CardEffect::SiteCheckout { facts, .. } = &mut framed {
+        facts.payment_frame_origins = vec!["https://js.stripe.com".into()];
+    }
+    assert!(cards.prepare(request(5, framed), NOW + 6).is_err());
     assert_eq!(cards.list().unwrap().len(), 1);
 }
 

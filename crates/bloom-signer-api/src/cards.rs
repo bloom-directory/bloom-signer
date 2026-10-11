@@ -97,8 +97,17 @@ pub enum CardEffect {
         agent_description: String,
     },
     /// Authorize the private human view only. Never release a saved card.
+    /// Without a card, the human takes over the browser for a step such as a
+    /// login or a verification code.
     ManualCheckout {
-        card_id: Token,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card_id: Option<Token>,
+        agent_description: String,
+    },
+    /// Click the merchant's pay button once; the merchant charges the payment
+    /// method saved in the buyer's account there. No saved card is released.
+    SiteCheckout {
+        facts: CheckoutFacts,
         agent_description: String,
     },
 }
@@ -107,15 +116,18 @@ impl CardEffect {
         match self {
             Self::Add { .. } => CeremonyKind::CardAdd,
             Self::Delete { .. } => CeremonyKind::CardDelete,
-            Self::Checkout { .. } | Self::ManualCheckout { .. } => CeremonyKind::CardCheckout,
+            Self::Checkout { .. } | Self::ManualCheckout { .. } | Self::SiteCheckout { .. } => {
+                CeremonyKind::CardCheckout
+            }
         }
     }
-    pub fn card_id(&self) -> &Token {
+    pub fn card_id(&self) -> Option<&Token> {
         match self {
             Self::Add { card_id, .. }
             | Self::Delete { card_id }
-            | Self::Checkout { card_id, .. }
-            | Self::ManualCheckout { card_id, .. } => card_id,
+            | Self::Checkout { card_id, .. } => Some(card_id),
+            Self::ManualCheckout { card_id, .. } => card_id.as_ref(),
+            Self::SiteCheckout { .. } => None,
         }
     }
     pub fn validate(&self) -> Result<(), ProtocolError> {
@@ -139,6 +151,19 @@ impl CardEffect {
                     return Err(ProtocolError::new(
                         ProtocolErrorCode::MalformedFrame,
                         "invalid checkout binding",
+                    ));
+                }
+                Ok(())
+            }
+            Self::SiteCheckout {
+                facts,
+                agent_description,
+            } => {
+                facts.validate()?;
+                if !facts.payment_frame_origins.is_empty() || agent_description.len() > 1024 {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::MalformedFrame,
+                        "invalid site checkout binding",
                     ));
                 }
                 Ok(())
