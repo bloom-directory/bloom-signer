@@ -7,7 +7,8 @@ use bloom_signer_api::{
     PolicyCompareAndSwapRequest, PolicyUpdateCeremonyPrepareRequest, PolicyUpdateRequest,
     PolicyValidationReceipt, ProtocolError, ProtocolErrorCode, PublicKeyEncoding, RevocationState,
     SealedApprovalTerms, SelectorKind, SignRequest, SignedPolicySnapshot, SignerActivationReceipt,
-    SigningResult, Token, WalletSeedProfile, WalletSeedRef, WalletTombstone, WebAuthnCredential,
+    SigningResult, SurfaceLifecycle, SurfaceRef, SurfaceStatus, Token, WalletSeedProfile,
+    WalletSeedRef, WalletTombstone, WebAuthnCredential,
 };
 use bloom_trusted_time::{DurableClockCondition, PersistedClockState, evaluate_durable_clock};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
@@ -519,6 +520,88 @@ pub struct SignerAuditKeys {
 }
 
 impl SignerEngine {
+    pub(crate) fn load_surface_status(&self) -> Result<Option<SurfaceStatus>, ProtocolError> {
+        let encoded: Option<String> = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT status_jcs FROM surface_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        encoded
+            .map(|value| serde_json::from_str(&value).map_err(malformed))
+            .transpose()
+    }
+
+    pub(crate) fn active_wallet_ids(&self) -> Result<Vec<Token>, ProtocolError> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT wallet_id FROM wallet_state WHERE wallet_id NOT IN
+             (SELECT wallet_id FROM wallet_tombstones) ORDER BY wallet_id",
+            )
+            .map_err(storage)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage)?;
+        rows.map(|row| -> Result<Token, ProtocolError> {
+            Token::new(row.map_err(storage)?).map_err(malformed)
+        })
+        .collect()
+    }
+
+    pub(crate) fn commit_surface_status(
+        &self,
+        expected: Option<&SurfaceStatus>,
+        next: &SurfaceStatus,
+        event: &str,
+    ) -> Result<(), ProtocolError> {
+        let mut connection = self.connection.lock();
+        let transaction = self.mutation_transaction(&mut connection)?;
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT status_jcs FROM surface_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        let expected_jcs = expected
+            .map(serde_jcs::to_string)
+            .transpose()
+            .map_err(malformed)?;
+        if current != expected_jcs {
+            return Err(error(
+                ProtocolErrorCode::OperationIdConflict,
+                "surface state changed during administration",
+            ));
+        }
+        for descriptor in &next.surfaces {
+            descriptor.validate()?;
+        }
+        let next_jcs = serde_jcs::to_string(next).map_err(malformed)?;
+        transaction
+            .execute(
+                "INSERT INTO surface_state(singleton, status_jcs) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET status_jcs = excluded.status_jcs",
+                [next_jcs],
+            )
+            .map_err(storage)?;
+        self.append_audit(&transaction, event, &serde_json::json!({
+            "desired_mode": next.desired_mode,
+            "desired_revision": next.desired_revision,
+            "effective_mode": next.effective_mode,
+            "effective_revision": next.effective_revision,
+            "installation_id": next.installation_id,
+            "installation_admin_key_sha256": next.installation_admin_key_sha256,
+            "surface_digests": next.surfaces.iter().map(|surface| surface.identity_digest.as_str()).collect::<Vec<_>>(),
+        }))?;
+        transaction.commit().map_err(storage)
+    }
+
     pub(crate) fn backend_registry(&self) -> &Arc<BackendRegistry> {
         &self.backend_registry
     }
@@ -759,6 +842,15 @@ impl SignerEngine {
         mut audit_keys: SignerAuditKeys,
         backend_registry: Arc<BackendRegistry>,
     ) -> Result<Self, ProtocolError> {
+        let storage_version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(storage)?;
+        if storage_version > 2 {
+            return Err(error(
+                ProtocolErrorCode::ServiceUnavailable,
+                "Signer storage schema is newer than this binary",
+            ));
+        }
         if audit_keys.current_key_id == revocation_key_id
             || audit_keys.current_signing_key.verifying_key()
                 == revocation_signing_key.verifying_key()
@@ -915,6 +1007,14 @@ impl SignerEngine {
                     credential_jcs TEXT NOT NULL,
                     created_at_ms TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS surface_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    status_jcs TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS credential_authority_state (
+                    wallet_id TEXT PRIMARY KEY,
+                    generation TEXT NOT NULL
+                );
                 ",
             )
             .map_err(storage)?;
@@ -952,6 +1052,12 @@ impl SignerEngine {
             "TEXT NOT NULL DEFAULT 'unscoped'",
         )?;
         ensure_column(&connection, "enrolled_keys", "wallet_id", "TEXT")?;
+        ensure_column(
+            &connection,
+            "ceremony_receipts",
+            "committed_at_ms",
+            "TEXT NOT NULL DEFAULT '0'",
+        )?;
         backfill_unambiguous_wallet_root_bindings(&connection)?;
         ensure_column(
             &connection,
@@ -971,6 +1077,12 @@ impl SignerEngine {
                  )",
                 [],
             )
+            .map_err(storage)?;
+        // Baseline databases use SQLite user_version 0. Both 0 and the
+        // intermediate 1 marker migrate through the additive, receipt-safe
+        // schema above. Package release-state floor 2 fences old binaries.
+        connection
+            .pragma_update(None, "user_version", 2)
             .map_err(storage)?;
         insert_trusted_audit_key(
             &mut audit_keys.historical_verifying_keys,
@@ -1493,6 +1605,18 @@ impl SignerEngine {
         let terms_jcs = String::from_utf8(terms.canonical_bytes()?).map_err(malformed)?;
         let mut connection = self.connection.lock();
         let transaction = self.mutation_transaction(&mut connection)?;
+        if let Some(receipt) = receipt {
+            require_surface_at_commit(
+                &transaction,
+                receipt.surface.as_ref().ok_or_else(|| {
+                    error(
+                        ProtocolErrorCode::CeremonyReplay,
+                        "new approval receipt lacks ceremony surface",
+                    )
+                })?,
+                false,
+            )?;
+        }
         if !self.backend_registry.key_is_registered(&terms.key_ref)? {
             return Err(error(
                 ProtocolErrorCode::KeyrefMismatch,
@@ -1530,6 +1654,32 @@ impl SignerEngine {
                 ProtocolErrorCode::RevocationEpochUnreconciled,
                 "approval epoch differs from the Signer wallet epoch",
             ));
+        }
+        if let Some(receipt) = receipt {
+            let stored_generation: Option<String> = transaction
+                .query_row(
+                    "SELECT generation FROM credential_authority_state WHERE wallet_id = ?1",
+                    [terms.wallet_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage)?;
+            let generation = stored_generation
+                .as_deref()
+                .unwrap_or("0")
+                .parse::<u64>()
+                .map_err(malformed)?;
+            if receipt
+                .credential_authority_generation
+                .as_ref()
+                .map_or(0, DecimalU64::get)
+                != generation
+            {
+                return Err(error(
+                    ProtocolErrorCode::CeremonyReplay,
+                    "passkey authority changed before approval activation",
+                ));
+            }
         }
         transaction
             .execute(
@@ -1645,6 +1795,30 @@ impl SignerEngine {
             .transpose()
     }
 
+    pub(crate) fn recovery_result_delivery_valid(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+    ) -> Result<bool, ProtocolError> {
+        let committed: Option<String> = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT committed_at_ms FROM ceremony_receipts
+             WHERE operation_id = ?1 AND receipt_kind = 'custody'",
+                [operation_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        let committed = committed
+            .as_deref()
+            .unwrap_or("0")
+            .parse::<u64>()
+            .map_err(malformed)?;
+        Ok(committed != 0 && now_ms <= committed.saturating_add(15 * 60 * 1_000))
+    }
+
     /// Whether a pending backend derivation has a durable authority commit.
     /// BIP-39 account children are committed through their exact allocation
     /// row; accepting an arbitrary custody receipt with the same operation ID
@@ -1669,7 +1843,7 @@ impl SignerEngine {
         let mut wallets_statement = connection
             .prepare("SELECT custody_jcs FROM ceremony_wallets ORDER BY wallet_id")
             .map_err(storage)?;
-        let wallets = wallets_statement
+        let wallets: Vec<WalletCustodyBackup> = wallets_statement
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(storage)?
             .collect::<Result<Vec<_>, _>>()
@@ -1678,6 +1852,27 @@ impl SignerEngine {
             .map(|encoded| serde_json::from_str(&encoded).map_err(malformed))
             .collect::<Result<Vec<_>, _>>()?;
         drop(wallets_statement);
+        for wallet in &wallets {
+            let stored: Option<String> = connection
+                .query_row(
+                    "SELECT generation FROM credential_authority_state WHERE wallet_id = ?1",
+                    [wallet.wallet_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage)?;
+            let generation = stored
+                .as_deref()
+                .unwrap_or("0")
+                .parse::<u64>()
+                .map_err(malformed)?;
+            if generation != wallet.credential_authority_generation {
+                return Err(error(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "wallet credential authority generation differs from durable fence",
+                ));
+            }
+        }
 
         let mut credentials_statement = connection
             .prepare(
@@ -1738,6 +1933,23 @@ impl SignerEngine {
         } = commit;
         let mut connection = self.connection.lock();
         let transaction = self.mutation_transaction(&mut connection)?;
+        require_surface_at_commit(
+            &transaction,
+            result.surface.as_ref().ok_or_else(|| {
+                error(
+                    ProtocolErrorCode::CeremonyReplay,
+                    "new custody receipt lacks ceremony surface",
+                )
+            })?,
+            matches!(
+                result.ceremony_kind,
+                bloom_signer_api::CeremonyKind::WalletRegistration
+                    | bloom_signer_api::CeremonyKind::WalletImport
+                    | bloom_signer_api::CeremonyKind::WalletRecovery
+                    | bloom_signer_api::CeremonyKind::CredentialAdd
+                    | bloom_signer_api::CeremonyKind::CredentialReplace
+            ),
+        )?;
         let wallet_snapshot_digest = Digest32::from_bytes(
             Sha256::digest(serde_jcs::to_vec(wallets).map_err(malformed)?).into(),
         );
@@ -1771,6 +1983,47 @@ impl SignerEngine {
                 "petal_scope": petal_scope,
             }),
         };
+        for wallet in wallets {
+            let stored: Option<String> = transaction
+                .query_row(
+                    "SELECT generation FROM credential_authority_state WHERE wallet_id = ?1",
+                    [wallet.wallet_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage)?;
+            let previous = stored
+                .as_deref()
+                .unwrap_or("0")
+                .parse::<u64>()
+                .map_err(malformed)?;
+            let next = wallet.credential_authority_generation;
+            if next < previous
+                || (result.ceremony_kind == bloom_signer_api::CeremonyKind::WalletRecovery
+                    && result.wallet_id.as_ref() == Some(&wallet.wallet_id)
+                    && next
+                        != previous.checked_add(1).ok_or_else(|| {
+                            error(
+                                ProtocolErrorCode::ServiceUnavailable,
+                                "credential generation exhausted",
+                            )
+                        })?)
+                || (result.ceremony_kind != bloom_signer_api::CeremonyKind::WalletRecovery
+                    && next != previous)
+            {
+                return Err(error(
+                    ProtocolErrorCode::CeremonyReplay,
+                    "stale credential authority generation at custody commit",
+                ));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO credential_authority_state(wallet_id, generation) VALUES (?1, ?2)
+                 ON CONFLICT(wallet_id) DO UPDATE SET generation = excluded.generation",
+                    params![wallet.wallet_id.as_str(), next.to_string()],
+                )
+                .map_err(storage)?;
+        }
         let existing_credential_times = {
             let mut statement = transaction
                 .prepare(
@@ -2049,11 +2302,12 @@ impl SignerEngine {
         transaction
             .execute(
                 "INSERT INTO ceremony_receipts(
-                    operation_id, receipt_kind, receipt_jcs
-                 ) VALUES (?1, 'custody', ?2)",
+                    operation_id, receipt_kind, receipt_jcs, committed_at_ms
+                 ) VALUES (?1, 'custody', ?2, ?3)",
                 params![
                     result.custody_operation_id.as_str(),
-                    serde_jcs::to_string(result).map_err(malformed)?
+                    serde_jcs::to_string(result).map_err(malformed)?,
+                    committed_at_ms.to_string(),
                 ],
             )
             .map_err(storage)?;
@@ -3756,6 +4010,7 @@ impl SignerEngine {
             credentials.push(CredentialPublic {
                 credential_id: credential.credential_id,
                 wallet_id: wallet_id.clone(),
+                surface: credential.surface,
                 created_at_ms: DecimalU64::new(created_at_ms.parse().map_err(malformed)?),
                 state: CredentialState::Active,
             });
@@ -4925,6 +5180,36 @@ impl SignerEngine {
                 .map_err(storage)?;
         }
         if let Some(custody) = &backup.custody {
+            let current_generation: Option<String> = transaction
+                .query_row(
+                    "SELECT generation FROM credential_authority_state WHERE wallet_id = ?1",
+                    [backup.wallet_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage)?;
+            if current_generation
+                .as_deref()
+                .unwrap_or("0")
+                .parse::<u64>()
+                .map_err(malformed)?
+                > custody.credential_authority_generation
+            {
+                return Err(error(
+                    ProtocolErrorCode::CeremonyReplay,
+                    "backup cannot restore revoked credential authority",
+                ));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO credential_authority_state(wallet_id, generation) VALUES (?1, ?2)
+                 ON CONFLICT(wallet_id) DO UPDATE SET generation = excluded.generation",
+                    params![
+                        backup.wallet_id.as_str(),
+                        custody.credential_authority_generation.to_string()
+                    ],
+                )
+                .map_err(storage)?;
             transaction
                 .execute(
                     "INSERT INTO ceremony_wallets(wallet_id, custody_jcs)
@@ -5616,6 +5901,45 @@ impl SignerEngine {
                     "broker SignRequest signature is invalid",
                 )
             })
+    }
+}
+
+fn require_surface_at_commit(
+    transaction: &Transaction<'_>,
+    reference: &SurfaceRef,
+    enrollment: bool,
+) -> Result<(), ProtocolError> {
+    let stored: Option<String> = transaction
+        .query_row(
+            "SELECT status_jcs FROM surface_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    let Some(stored) = stored else {
+        return if *reference == bloom_signer_api::legacy_local_surface() {
+            Ok(())
+        } else {
+            Err(error(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "remote surface was not installed at authority commit",
+            ))
+        };
+    };
+    let status: SurfaceStatus = serde_json::from_str(&stored).map_err(malformed)?;
+    let allowed = status.surfaces.iter().any(|surface| {
+        surface.reference() == *reference
+            && (surface.lifecycle == SurfaceLifecycle::Active
+                || !enrollment && surface.lifecycle == SurfaceLifecycle::AuthenticationOnly)
+    });
+    if allowed {
+        Ok(())
+    } else {
+        Err(error(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            "ceremony surface changed before authority commit",
+        ))
     }
 }
 
@@ -7029,6 +7353,7 @@ fn ceremony_state_code(state: bloom_signer_api::CeremonyState) -> &'static str {
         CeremonyState::Cancelled => "cancelled",
         CeremonyState::Expired => "expired",
         CeremonyState::Failed => "failed",
+        CeremonyState::AlreadyRegistered => "already_registered",
     }
 }
 
@@ -7275,6 +7600,27 @@ mod clock_tests {
 
     fn file_engine(path: &Path) -> SignerEngine {
         try_file_engine(path).unwrap()
+    }
+
+    #[test]
+    fn storage_schema_migrates_baseline_and_refuses_future_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let baseline = directory.path().join("baseline.sqlite");
+        let connection = Connection::open(&baseline).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        drop(connection);
+        drop(file_engine(&baseline));
+        let connection = Connection::open(&baseline).unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        connection.pragma_update(None, "user_version", 3).unwrap();
+        drop(connection);
+        assert_eq!(
+            try_file_engine(&baseline).err().unwrap().code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
     }
 
     #[test]
@@ -8636,6 +8982,8 @@ mod require_key_tests {
         // deterministic child ID as its own operation ID. Its receipt must not
         // authorize registry rows that its apply outcome did not produce.
         let result = CustodyResult {
+            surface: Some(bloom_signer_api::legacy_local_surface()),
+            credential_authority_generation: Some(DecimalU64::new(0)),
             ceremony_kind: CeremonyKind::WalletExport,
             custody_operation_id: orphan_child.clone(),
             public_status: CeremonyState::Succeeded,

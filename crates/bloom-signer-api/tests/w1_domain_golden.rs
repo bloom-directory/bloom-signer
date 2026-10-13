@@ -224,8 +224,8 @@ fn operation_and_attempt_digests_match_reviewed_artifact() {
 #[test]
 fn ceremony_challenge_and_hpke_aad_match_reviewed_artifact() {
     let vector: CeremonyVector =
-        serde_json::from_str(include_str!("../vectors/ceremony-local-prf-v1.json")).unwrap();
-    assert_eq!(vector.name, "sealed-approval-local-prf-v1");
+        serde_json::from_str(include_str!("../vectors/ceremony-local-prf-v2.json")).unwrap();
+    assert_eq!(vector.name, "sealed-approval-local-prf-v2");
     assert_eq!(
         String::from_utf8(vector.challenge.canonical_bytes().unwrap()).unwrap(),
         vector.challenge_canonical_jcs

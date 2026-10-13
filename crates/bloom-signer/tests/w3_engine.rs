@@ -482,6 +482,8 @@ fn policy_cas_fails_before_a_completed_policy_ceremony() {
             assurance_level: Token::new("user_verified").unwrap(),
         },
         ceremony_receipt: CustodyResult {
+            surface: Some(bloom_signer_api::legacy_local_surface()),
+            credential_authority_generation: Some(DecimalU64::new(0)),
             ceremony_kind: CeremonyKind::PolicyUpdate,
             custody_operation_id: operation_id,
             public_status: CeremonyState::Completed,
