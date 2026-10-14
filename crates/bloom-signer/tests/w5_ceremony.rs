@@ -63,6 +63,7 @@ fn signed_petal_request(
     operation_id: OperationId,
 ) -> SignRequest {
     let identity = SignOperationIdentity {
+        session_accounting_digest: None,
         operation_id: operation_id.clone(),
         approval_id: terms.approval_id().unwrap(),
         key_ref: terms.key_ref.clone(),
@@ -75,6 +76,7 @@ fn signed_petal_request(
         policy_digest: terms.policy_digest.clone(),
     };
     let mut unsigned = UnsignedSignRequest {
+        session_accounting: None,
         schema: Token::new("bloom.sign-request/1").unwrap(),
         attempt_id: digest("bf"),
         operation_id,
@@ -1121,6 +1123,7 @@ fn terms(key_ref: KeyRef) -> SealedApprovalTerms {
         // 10_300 plus maximum_lifetime_ms 20_000).
         expires_at_ms: DecimalU64::new(30_300),
         renewal_of: None,
+        session_budget: None,
     }
 }
 
@@ -1912,6 +1915,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
         not_before_ms: DecimalU64::new(10_400),
         expires_at_ms: DecimalU64::new(20_000),
         renewal_of: None,
+        session_budget: None,
     };
 
     let mut cli = scoped_terms.clone();
@@ -5993,6 +5997,7 @@ fn a_taken_over_scope_refuses_the_previous_wallets_exact_approval() {
         not_before_ms: DecimalU64::new(40_000),
         expires_at_ms: DecimalU64::new(58_000),
         renewal_of: None,
+        session_budget: None,
     };
     engine.install_approval_for_test(&recovery).unwrap();
 
@@ -6064,6 +6069,7 @@ fn exact_sign_request(
         panic!("exact_sign_request needs Exact terms");
     };
     let identity = SignOperationIdentity {
+        session_accounting_digest: None,
         operation_id: OperationId::new(operation_byte.repeat(32)).unwrap(),
         approval_id: terms.approval_id().unwrap(),
         key_ref: terms.key_ref.clone(),
@@ -6076,6 +6082,7 @@ fn exact_sign_request(
         policy_digest: terms.policy_digest.clone(),
     };
     let mut unsigned = UnsignedSignRequest {
+        session_accounting: None,
         schema: Token::new("bloom.sign-request/1").unwrap(),
         attempt_id: digest(operation_byte),
         operation_id: identity.operation_id.clone(),
@@ -6193,6 +6200,7 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
                 not_before_ms: DecimalU64::new(not_before_ms),
                 expires_at_ms: DecimalU64::new(expires_at_ms),
                 renewal_of: None,
+                session_budget: None,
             }
         };
     let reusable = || ApprovalSelector::Petal {

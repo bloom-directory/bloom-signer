@@ -15,6 +15,7 @@ mod petal_key;
 mod policy;
 mod revocation;
 mod service;
+mod session;
 mod signing;
 mod surface;
 mod wallet_seed;
@@ -31,6 +32,7 @@ pub use petal_key::*;
 pub use policy::*;
 pub use revocation::*;
 pub use service::*;
+pub use session::*;
 pub use signing::*;
 pub use surface::*;
 pub use wallet_seed::*;
@@ -49,8 +51,10 @@ pub use bloom_rpc_wire::{
 /// Version 1.6 requires exact Signer-owned surface bindings for ceremonies.
 /// Earlier peers cannot safely represent remote WebAuthn authority.
 pub const SIGNER_API_MAJOR: u16 = 1;
-pub const SIGNER_API_MINOR_MIN: u16 = 6;
-pub const SIGNER_API_MINOR_MAX: u16 = 6;
+/// Minor 1.7 adds owner-reviewed typed sessions and signed shared-budget accounting.
+/// Strict older decoders are refused before these fields or selectors can cross the edge.
+pub const SIGNER_API_MINOR_MIN: u16 = 7;
+pub const SIGNER_API_MINOR_MAX: u16 = 7;
 pub const SIGNER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(SIGNER_API_MAJOR, SIGNER_API_MINOR_MAX);
 pub const SIGNER_API_RANGE: ProtocolVersionRange =

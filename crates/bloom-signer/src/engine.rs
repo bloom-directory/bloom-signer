@@ -912,6 +912,8 @@ impl SignerEngine {
                     attempt_digest TEXT NOT NULL,
                     operation_id TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS session_uses (operation_id TEXT PRIMARY KEY, budget_id TEXT NOT NULL, record_jcs TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS recovery_blocked_session_budgets (budget_id TEXT PRIMARY KEY, wallet_id TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS operations (
                     operation_id TEXT PRIMARY KEY,
                     operation_digest TEXT NOT NULL,
@@ -1548,7 +1550,11 @@ impl SignerEngine {
             .map_err(storage)?
             .ok_or_else(|| error(ProtocolErrorCode::ApprovalNotFound, "approval not found"))?;
         let terms: SealedApprovalTerms = serde_json::from_str(&terms_jcs).map_err(malformed)?;
-        Ok(!terms.limits.operation_rate_limits.is_empty()
+        Ok(terms
+            .session_budget
+            .as_ref()
+            .is_some_and(bloom_signer_api::SessionBudget::requires_trusted_time)
+            || !terms.limits.operation_rate_limits.is_empty()
             || !terms.limits.signature_rate_limits.is_empty()
             || terms
                 .limits
@@ -1605,6 +1611,9 @@ impl SignerEngine {
         let terms_jcs = String::from_utf8(terms.canonical_bytes()?).map_err(malformed)?;
         let mut connection = self.connection.lock();
         let transaction = self.mutation_transaction(&mut connection)?;
+        if let Some(budget) = &terms.session_budget {
+            require_session_budget_recovery_ready(&transaction, &budget.budget_id()?)?;
+        }
         if let Some(receipt) = receipt {
             require_surface_at_commit(
                 &transaction,
@@ -3444,6 +3453,7 @@ impl SignerEngine {
             }
             SignAuthorization::SameOperationRetry
         } else {
+            reserve_session_budget(&transaction, request, &terms, effective_now_ms)?;
             let (next_operations, next_signatures) =
                 reserve_parser_free_limits(&transaction, request, &terms, effective_now_ms)?;
             transaction
@@ -3517,6 +3527,7 @@ impl SignerEngine {
                 "validation_receipt_digest": request.unsigned.validation_receipt_digest,
                 "broker_key_id": request.unsigned.broker_signing_key_id,
                 "broker_signature": request.broker_signature,
+                "session_accounting": request.unsigned.session_accounting,
                 "authorization": format!("{authorization:?}"),
             }),
         )?;
@@ -4894,10 +4905,41 @@ impl SignerEngine {
                         approval.approval_id.as_str(),
                         backup.wallet_id.as_str(),
                         canonical_terms,
-                        approval.active && !tombstoned,
+                        approval.active && !tombstoned && approval.terms.session_budget.is_none(),
                         approval.committed_operations.get().to_string(),
                         approval.committed_signatures.get().to_string()
                     ],
+                )
+                .map_err(storage)?;
+        }
+        // Selective backups do not authenticate the complete shared-use ledger.
+        // Block every restored/current group descriptor, including later renewals
+        // of the same terms, rather than resetting its immutable lifetime cap.
+        let grouped = {
+            let mut statement = transaction
+                .prepare("SELECT approval_id, terms_jcs FROM approvals WHERE wallet_id = ?1")
+                .map_err(storage)?;
+            let rows = statement
+                .query_map([backup.wallet_id.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(storage)?;
+            let mut grouped = Vec::new();
+            for row in rows {
+                let (approval_id, terms) = row.map_err(storage)?;
+                let terms: SealedApprovalTerms = serde_json::from_str(&terms).map_err(malformed)?;
+                if let Some(budget) = terms.session_budget {
+                    grouped.push((approval_id, budget.budget_id()?));
+                }
+            }
+            grouped
+        };
+        for (approval_id, budget_id) in grouped {
+            transaction.execute("INSERT OR IGNORE INTO recovery_blocked_session_budgets(budget_id, wallet_id) VALUES (?1, ?2)", params![budget_id.as_str(), backup.wallet_id.as_str()]).map_err(storage)?;
+            transaction
+                .execute(
+                    "UPDATE approvals SET active = 0 WHERE approval_id = ?1",
+                    [approval_id],
                 )
                 .map_err(storage)?;
         }
@@ -6454,6 +6496,47 @@ fn validate_against_approval(
         ) if ordered_payload_digests == &request.unsigned.ordered_payload_digests
             && ordered_hashes == &request.unsigned.ordered_hashes
             && request.unsigned.signature_count.get() == ordered_hashes.len() as u64 => {}
+        (ApprovalSelector::SystemSession { scope }, SelectorKind::SystemSession) => {
+            let accounting = request
+                .unsigned
+                .session_accounting
+                .as_ref()
+                .ok_or_else(|| {
+                    error(
+                        ProtocolErrorCode::SelectorMismatch,
+                        "typed session requires authenticated accounting",
+                    )
+                })?;
+            let use_ = accounting.system_use.as_ref().ok_or_else(|| {
+                error(
+                    ProtocolErrorCode::SelectorMismatch,
+                    "typed session requires a transfer projection",
+                )
+            })?;
+            scope.validate_use(use_)?;
+            if &use_.accounting(terms.session_budget.as_ref())? != accounting {
+                return Err(error(
+                    ProtocolErrorCode::SelectorMismatch,
+                    "session accounting differs from typed scope projection",
+                ));
+            }
+            let expected_suite = match use_.chain {
+                bloom_signer_api::SystemSessionChain::Evm { .. } => {
+                    bloom_signer_api::CryptoSuite::Secp256k1Keccak256Recoverable
+                }
+                bloom_signer_api::SystemSessionChain::Solana { .. } => {
+                    bloom_signer_api::CryptoSuite::Ed25519Message
+                }
+            };
+            if request.unsigned.crypto_suite != expected_suite
+                || request.unsigned.signature_count.get() != 1
+            {
+                return Err(error(
+                    ProtocolErrorCode::SelectorMismatch,
+                    "typed session signing suite/count mismatch",
+                ));
+            }
+        }
         (ApprovalSelector::Petal { .. }, SelectorKind::Petal)
             if request.unsigned.petal_use_claim_digest.is_some()
                 && request.unsigned.claim_assurance_digest.is_some() => {}
@@ -6594,7 +6677,7 @@ fn validate_petal_key_approval(
     // stays scope-bound until this validator is changed to say otherwise.
     let scope_bound = match terms.selector {
         ApprovalSelector::Exact { .. } => false,
-        ApprovalSelector::Petal { .. } => true,
+        ApprovalSelector::Petal { .. } | ApprovalSelector::SystemSession { .. } => true,
     };
     if effective_now_ms < created_at_ms
         || terms.not_before_ms.get() < created_at_ms
@@ -9035,4 +9118,99 @@ mod require_key_tests {
             "an aliased custody receipt must not commit a pending BIP-39 child"
         );
     }
+}
+
+fn require_session_budget_recovery_ready(
+    transaction: &Transaction<'_>,
+    budget_id: &Digest32,
+) -> Result<(), ProtocolError> {
+    let blocked: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM recovery_blocked_session_budgets WHERE budget_id = ?1)",
+            [budget_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if blocked {
+        return Err(error(
+            ProtocolErrorCode::ApprovalRevoked,
+            "shared budget was recovery-blocked: restore cannot recover its complete spending ledger; create a fresh owner-reviewed budget descriptor",
+        ));
+    }
+    Ok(())
+}
+
+fn reserve_session_budget(
+    transaction: &Transaction<'_>,
+    request: &SignRequest,
+    terms: &SealedApprovalTerms,
+    now: u64,
+) -> Result<(), ProtocolError> {
+    use bloom_signer_api::SessionRecordedUse;
+    let Some(budget) = &terms.session_budget else {
+        if request
+            .unsigned
+            .session_accounting
+            .as_ref()
+            .is_some_and(|a| a.budget_id.is_some())
+        {
+            return Err(error(
+                ProtocolErrorCode::SelectorMismatch,
+                "unapproved shared budget",
+            ));
+        }
+        return Ok(());
+    };
+    let accounting = request
+        .unsigned
+        .session_accounting
+        .as_ref()
+        .ok_or_else(|| {
+            error(
+                ProtocolErrorCode::SelectorMismatch,
+                "budget member requires authenticated accounting",
+            )
+        })?;
+    let id = budget.budget_id()?;
+    require_session_budget_recovery_ready(transaction, &id)?;
+    if accounting.budget_id.as_ref() != Some(&id)
+        || accounting.values
+            != bloom_signer_api::SessionAccounting::canonical_values(&accounting.values)?
+    {
+        return Err(error(
+            ProtocolErrorCode::SelectorMismatch,
+            "session budget or canonical accounting differs",
+        ));
+    }
+    let previous = {
+        let mut statement=transaction.prepare("SELECT session_uses.record_jcs FROM session_uses JOIN operations USING(operation_id) WHERE session_uses.budget_id=?1 AND operations.state!='RELEASED'").map_err(storage)?;
+        let rows = statement
+            .query_map([id.as_str()], |row| row.get::<_, String>(0))
+            .map_err(storage)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(
+                serde_json::from_str::<SessionRecordedUse>(&row.map_err(storage)?)
+                    .map_err(malformed)?,
+            );
+        }
+        records
+    };
+    let current = SessionRecordedUse {
+        accepted_at_ms: now,
+        signature_count: request.unsigned.signature_count.get(),
+        values: accounting.values.clone(),
+    };
+    budget.check_reservation(&previous, &current)?;
+    transaction
+        .execute(
+            "INSERT INTO session_uses(operation_id,budget_id,record_jcs) VALUES(?1,?2,?3)",
+            params![
+                request.unsigned.operation_id.as_str(),
+                id.as_str(),
+                serde_jcs::to_string(&current).map_err(malformed)?
+            ],
+        )
+        .map_err(storage)?;
+    Ok(())
 }

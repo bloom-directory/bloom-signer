@@ -166,6 +166,7 @@ fn bip39_terms(key_ref: KeyRef, wallet_id: &Token) -> SealedApprovalTerms {
         // synthetic clock. Keep the authority live through those ceremonies.
         expires_at_ms: DecimalU64::new(300_303),
         renewal_of: None,
+        session_budget: None,
     }
 }
 
