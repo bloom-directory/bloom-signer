@@ -64,4 +64,6 @@ jobs:
       # the workspace job fails.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
+          # Install the repository-selected toolchain inside the pinned container.
+          rust-version: stable
           command: check
