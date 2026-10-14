@@ -12,4 +12,5 @@ pub mod hpke;
 pub mod legacy_passkey;
 pub mod registry;
 pub mod service;
+mod travelers;
 pub mod webauthn;

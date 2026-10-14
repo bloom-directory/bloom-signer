@@ -123,6 +123,8 @@ struct PrivateInput {
     card: Option<CardDetails>,
     #[serde(default)]
     cvc: Option<Zeroizing<String>>,
+    #[serde(default)]
+    traveler: Option<crate::travelers::TravelerDetails>,
 }
 #[derive(Serialize)]
 struct Release<'a> {
@@ -157,6 +159,7 @@ fn initialize(db: Connection) -> Result<State, ProtocolError> {
     db.execute_batch("PRAGMA synchronous=FULL; PRAGMA journal_mode=DELETE;
       CREATE TABLE IF NOT EXISTS container (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS cards (id TEXT PRIMARY KEY, public TEXT NOT NULL, encrypted TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS travelers (id TEXT PRIMARY KEY, public TEXT NOT NULL, encrypted TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL);
       UPDATE operations SET state='failed' WHERE state='prepared';").map_err(storage)?;
     Ok(State {
@@ -201,6 +204,9 @@ fn wrap_key(
 }
 fn card_aad(container_id: &Digest32, card_id: &Token) -> Result<Vec<u8>, ProtocolError> {
     serde_jcs::to_vec(&("bloom-card-record/v1", container_id, card_id)).map_err(malformed)
+}
+fn traveler_aad(container_id: &Digest32, traveler_id: &Token) -> Result<Vec<u8>, ProtocolError> {
+    serde_jcs::to_vec(&("bloom-traveler-record/v1", container_id, traveler_id)).map_err(malformed)
 }
 impl CardCeremonies {
     pub fn new(key: SigningKey, key_id: Token, origin: String) -> Result<Self, ProtocolError> {
@@ -258,6 +264,17 @@ impl CardCeremonies {
             .query_map([], |r| r.get::<_, String>(0))
             .map_err(storage)?;
         rows.map(|s| serde_json::from_str(&s.map_err(storage)?).map_err(malformed))
+            .collect()
+    }
+    pub fn travelers(&self) -> Result<Vec<TravelerPublic>, ProtocolError> {
+        let state = self.state.lock();
+        let mut stmt = state
+            .db
+            .prepare("SELECT public FROM travelers ORDER BY id")
+            .map_err(storage)?;
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .map_err(storage)?
+            .map(|s| serde_json::from_str(&s.map_err(storage)?).map_err(malformed))
             .collect()
     }
     pub fn status(
@@ -367,7 +384,12 @@ impl CardCeremonies {
             ));
         }
         let existing = container(&state.db)?;
-        if existing.is_none() && !matches!(request.effect, CardEffect::Add { .. }) {
+        if existing.is_none()
+            && !matches!(
+                request.effect,
+                CardEffect::Add { .. } | CardEffect::SaveTraveler { .. }
+            )
+        {
             return Err(error(
                 ProtocolErrorCode::ApprovalNotFound,
                 "card container is not enrolled",
@@ -384,6 +406,24 @@ impl CardCeremonies {
                 .map_err(storage)?,
             None => true,
         };
+        if let CardEffect::FillTraveler { traveler_id, .. }
+        | CardEffect::DeleteTraveler { traveler_id } = &request.effect
+        {
+            let present: bool = state
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM travelers WHERE id=?1)",
+                    [traveler_id.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(storage)?;
+            if !present {
+                return Err(error(
+                    ProtocolErrorCode::ApprovalNotFound,
+                    "traveler not found",
+                ));
+            }
+        }
         // Adding under an existing ID replaces that card; nothing else may
         // name a missing card.
         if !present && !matches!(request.effect, CardEffect::Add { .. }) {
@@ -404,11 +444,23 @@ impl CardCeremonies {
             review_manifest_digest: digest.clone(),
             wallet_id: None,
             key_ref: None,
-            expected_input_class: Token::new("card-input-v1")?,
+            expected_input_class: Token::new(
+                if matches!(
+                    request.effect,
+                    CardEffect::SaveTraveler { .. }
+                        | CardEffect::DeleteTraveler { .. }
+                        | CardEffect::FillTraveler { .. }
+                ) {
+                    "traveler-input-v1"
+                } else {
+                    "card-input-v1"
+                },
+            )?,
             required_user_verification: true,
             hpke_recipient_key: recipient.public_key().clone(),
             browser_output_recipient_key: match &request.effect {
-                CardEffect::Checkout { recipient_key, .. } => Some(recipient_key.clone()),
+                CardEffect::Checkout { recipient_key, .. }
+                | CardEffect::FillTraveler { recipient_key, .. } => Some(recipient_key.clone()),
                 _ => None,
             },
             petal_key_scope: None,
@@ -661,6 +713,26 @@ impl CardCeremonies {
         )?;
         let input: PrivateInput =
             serde_json::from_slice(secret.expose_to_backend()).map_err(malformed)?;
+        if !matches!(pending.request.effect, CardEffect::SaveTraveler { .. })
+            && input.traveler.is_some()
+        {
+            return Err(error(
+                ProtocolErrorCode::MalformedFrame,
+                "unexpected private traveler input",
+            ));
+        }
+        if matches!(
+            pending.request.effect,
+            CardEffect::SaveTraveler { .. }
+                | CardEffect::DeleteTraveler { .. }
+                | CardEffect::FillTraveler { .. }
+        ) && (input.card.is_some() || input.cvc.is_some())
+        {
+            return Err(error(
+                ProtocolErrorCode::MalformedFrame,
+                "traveler ceremony cannot accept card input",
+            ));
+        }
         let prf = SecretBytes::new(
             URL_SAFE_NO_PAD
                 .decode(input.credential_prf.as_bytes())
@@ -688,6 +760,100 @@ impl CardCeremonies {
         let mut output = None;
         let tx = state.db.transaction().map_err(storage)?;
         match &pending.request.effect {
+            CardEffect::SaveTraveler { traveler_id, label } => {
+                let traveler = input.traveler.as_ref().ok_or_else(|| {
+                    error(
+                        ProtocolErrorCode::MalformedFrame,
+                        "traveler details required",
+                    )
+                })?;
+                traveler.validate()?;
+                let count: u32 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM travelers WHERE id<>?1",
+                        [traveler_id.as_str()],
+                        |r| r.get(0),
+                    )
+                    .map_err(storage)?;
+                if count >= 8 {
+                    return Err(error(
+                        ProtocolErrorCode::BackendInvalidRequest,
+                        "traveler limit reached",
+                    ));
+                }
+                let public = TravelerPublic {
+                    traveler_id: traveler_id.clone(),
+                    label: label.clone(),
+                    fields: traveler.fields(),
+                };
+                let plaintext = Zeroizing::new(serde_json::to_vec(traveler).map_err(malformed)?);
+                let encrypted =
+                    encrypt(&key, &plaintext, &traveler_aad(&container_id, traveler_id)?)?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO travelers VALUES (?1,?2,?3)",
+                    params![traveler_id.as_str(), json(&public)?, json(&encrypted)?],
+                )
+                .map_err(storage)?;
+            }
+            CardEffect::DeleteTraveler { traveler_id } => {
+                if tx
+                    .execute("DELETE FROM travelers WHERE id=?1", [traveler_id.as_str()])
+                    .map_err(storage)?
+                    != 1
+                {
+                    return Err(error(
+                        ProtocolErrorCode::ApprovalNotFound,
+                        "traveler not found",
+                    ));
+                }
+            }
+            CardEffect::FillTraveler {
+                traveler_id,
+                scope,
+                recipient_key,
+            } => {
+                let raw: String = tx
+                    .query_row(
+                        "SELECT encrypted FROM travelers WHERE id=?1",
+                        [traveler_id.as_str()],
+                        |r| r.get(0),
+                    )
+                    .map_err(storage)?;
+                let blob: EncryptedBlob = serde_json::from_str(&raw).map_err(malformed)?;
+                let plaintext = Zeroizing::new(decrypt(
+                    &key,
+                    &blob,
+                    &traveler_aad(&container_id, traveler_id)?,
+                )?);
+                let traveler: crate::travelers::TravelerDetails =
+                    serde_json::from_slice(&plaintext).map_err(malformed)?;
+                traveler.validate()?;
+                let mut fields = std::collections::BTreeMap::new();
+                for field in &scope.fields {
+                    let value = traveler.value(*field).ok_or_else(|| {
+                        error(
+                            ProtocolErrorCode::BackendInvalidRequest,
+                            "requested traveler field is missing",
+                        )
+                    })?;
+                    fields.insert(*field, Zeroizing::new(value.to_owned()));
+                }
+                let release = Zeroizing::new(serde_json::to_vec(&fields).map_err(malformed)?);
+                let output_aad = CustodyOutputHpkeAad {
+                    surface: pending.request.surface.clone(),
+                    ceremony_id: contribution.ceremony_id.clone(),
+                    ceremony_kind: contribution.ceremony_kind,
+                    custody_operation_id: complete.custody_operation_id.clone(),
+                    signer_contribution_digest: contribution.digest()?,
+                    public_binding_digest: digest.clone(),
+                };
+                output = Some(seal_to_recipient(
+                    recipient_key,
+                    CUSTODY_OUTPUT_INFO,
+                    &output_aad.canonical_bytes()?,
+                    &release,
+                )?);
+            }
             CardEffect::ManualCheckout { .. } | CardEffect::SiteCheckout { .. } => {
                 if input.card.is_some() || input.cvc.is_some() {
                     return Err(error(

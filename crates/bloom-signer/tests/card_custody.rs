@@ -9,6 +9,185 @@ use std::sync::Arc;
 use support::{VirtualAuthenticator, seal_hpke};
 const NOW: u64 = 1_760_000_000_000;
 
+fn traveler_input(auth: &VirtualAuthenticator, given: &str) -> serde_json::Value {
+    let mut input = private(auth, false, false);
+    input["traveler"] = serde_json::json!({"given_name":given,"family_name":"SyntheticFamily",
+        "born_on":"1992-02-29","gender":"female","nationality":"CA","email":"fixture@example.com",
+        "phone":"+12505550123","document_kind":"passport","document_number":"SYNTHETIC-DOC-123",
+        "document_country":"CA","document_expiry":"2030-12-31"});
+    input
+}
+
+fn save_traveler(op: u8, id: &str, label: &str) -> CardPrepareRequest {
+    request(
+        op,
+        CardEffect::SaveTraveler {
+            traveler_id: Token::new(id).unwrap(),
+            label: label.into(),
+        },
+    )
+}
+
+#[test]
+fn travelers_are_independent_encrypted_records_with_private_scoped_output() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("custody.sqlite3");
+    let cards = service();
+    cards.open_storage(&path).unwrap();
+    let auth = enroll(&cards);
+    for (op, id, label, name) in [
+        (2, "wife", "Wife", "SyntheticWife"),
+        (3, "self", "Me", "SyntheticSelf"),
+    ] {
+        let p = cards
+            .prepare(save_traveler(op, id, label), NOW + 2)
+            .unwrap();
+        let result = cards
+            .complete(
+                complete(&auth, &p, traveler_input(&auth, name), op.into()),
+                NOW + 3,
+            )
+            .unwrap();
+        assert!(result.encrypted_browser_result.is_none());
+    }
+    let public = serde_json::to_string(&cards.travelers().unwrap()).unwrap();
+    assert!(public.contains("Wife") && public.contains("Me"));
+    for secret in [
+        "SyntheticWife",
+        "SyntheticSelf",
+        "SyntheticFamily",
+        "1992-02-29",
+        "fixture@example.com",
+        "SYNTHETIC-DOC-123",
+    ] {
+        assert!(!public.contains(secret));
+        assert!(!String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains(secret));
+    }
+    let recipient = HpkeRecipient::generate();
+    let effect = CardEffect::FillTraveler {
+        traveler_id: Token::new("wife").unwrap(),
+        scope: TravelerFillScope {
+            origin: "https://airline.example".into(),
+            frame_origins: vec!["https://airline.example".into()],
+            document_binding: Digest32::from_bytes([33; 32]),
+            fields: vec![TravelerField::GivenName, TravelerField::FamilyName],
+        },
+        recipient_key: recipient.public_key().clone(),
+    };
+    let p = cards.prepare(request(4, effect.clone()), NOW + 4).unwrap();
+    let mut changed = effect;
+    if let CardEffect::FillTraveler { scope, .. } = &mut changed {
+        scope.origin = "https://other.example".into();
+    }
+    assert!(cards.prepare(request(4, changed), NOW + 4).is_err());
+    let completed = complete(&auth, &p, private(&auth, false, false), 4);
+    let result = cards.complete(completed.clone(), NOW + 5).unwrap();
+    assert!(cards.complete(completed, NOW + 6).is_err());
+    let aad = CustodyOutputHpkeAad {
+        surface: p.contribution.surface.clone(),
+        ceremony_id: p.contribution.ceremony_id.clone(),
+        ceremony_kind: p.contribution.ceremony_kind,
+        custody_operation_id: p.contribution.custody_operation_id.clone(),
+        signer_contribution_digest: p.contribution.digest().unwrap(),
+        public_binding_digest: p.contribution.review_manifest_digest.clone(),
+    };
+    let encrypted = result.encrypted_browser_result.as_ref().unwrap();
+    assert!(
+        HpkeRecipient::generate()
+            .open(
+                encrypted,
+                CUSTODY_OUTPUT_INFO,
+                &aad.canonical_bytes().unwrap()
+            )
+            .is_err()
+    );
+    let released = recipient
+        .open(
+            encrypted,
+            CUSTODY_OUTPUT_INFO,
+            &aad.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+    let fields: serde_json::Value = serde_json::from_slice(released.expose_to_backend()).unwrap();
+    assert_eq!(
+        fields,
+        serde_json::json!({"given_name":"SyntheticWife","family_name":"SyntheticFamily"})
+    );
+    let reopened = service();
+    reopened.open_storage(&path).unwrap();
+    assert_eq!(reopened.travelers().unwrap().len(), 2);
+    let p = reopened
+        .prepare(
+            request(
+                5,
+                CardEffect::DeleteTraveler {
+                    traveler_id: Token::new("wife").unwrap(),
+                },
+            ),
+            NOW + 7,
+        )
+        .unwrap();
+    reopened
+        .complete(
+            complete(&auth, &p, private(&auth, false, false), 5),
+            NOW + 8,
+        )
+        .unwrap();
+    assert_eq!(
+        reopened.travelers().unwrap()[0].traveler_id.as_str(),
+        "self"
+    );
+    assert_eq!(reopened.list().unwrap().len(), 1);
+}
+
+#[test]
+fn travelers_can_enroll_without_a_card_and_reject_mixed_or_invalid_input() {
+    let cards = service();
+    let auth = VirtualAuthenticator::generate();
+    let p = cards
+        .prepare(save_traveler(1, "wife", "Wife"), NOW)
+        .unwrap();
+    cards
+        .complete(
+            complete(&auth, &p, traveler_input(&auth, "SyntheticWife"), 1),
+            NOW + 1,
+        )
+        .unwrap();
+    assert!(cards.list().unwrap().is_empty());
+    let p = cards
+        .prepare(save_traveler(2, "wife", "Wife"), NOW + 2)
+        .unwrap();
+    let mut input = traveler_input(&auth, "Replacement");
+    input["cvc"] = serde_json::json!("123");
+    assert!(
+        cards
+            .complete(complete(&auth, &p, input, 2), NOW + 3)
+            .is_err()
+    );
+    let p = cards
+        .prepare(save_traveler(3, "wife", "Wife"), NOW + 4)
+        .unwrap();
+    let mut input = traveler_input(&auth, "Replacement");
+    input["traveler"]["born_on"] = serde_json::json!("1993-02-29");
+    assert!(
+        cards
+            .complete(complete(&auth, &p, input, 3), NOW + 5)
+            .is_err()
+    );
+    assert_eq!(cards.travelers().unwrap().len(), 1);
+    let p = cards
+        .prepare(save_traveler(4, "self", "Me"), NOW + 6)
+        .unwrap();
+    assert!(
+        cards
+            .complete(
+                complete(&auth, &p, traveler_input(&auth, "Late"), 4),
+                NOW + 120_007
+            )
+            .is_err()
+    );
+}
+
 #[test]
 fn manual_checkout_authorizes_view_without_release_and_rejects_cvc() {
     let cards = service();

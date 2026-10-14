@@ -391,7 +391,11 @@ impl SignerCeremonyService {
     ) -> Result<bloom_signer_api::SignerPreparedCustody, ProtocolError> {
         self.require_surface(
             &request.surface,
-            matches!(request.effect, bloom_signer_api::CardEffect::Add { .. }),
+            matches!(
+                request.effect,
+                bloom_signer_api::CardEffect::Add { .. }
+                    | bloom_signer_api::CardEffect::SaveTraveler { .. }
+            ),
         )?;
         self.cards.prepare(request, now_ms)
     }

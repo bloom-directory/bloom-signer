@@ -18,6 +18,7 @@ mod revocation;
 mod service;
 mod signing;
 mod surface;
+mod travelers;
 mod wallet_seed;
 mod webauthn;
 
@@ -35,6 +36,7 @@ pub use revocation::*;
 pub use service::*;
 pub use signing::*;
 pub use surface::*;
+pub use travelers::*;
 pub use wallet_seed::*;
 pub use webauthn::*;
 

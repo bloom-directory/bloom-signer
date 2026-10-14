@@ -39,6 +39,7 @@ macro_rules! method_enum {
 }
 
 method_enum!(BrokerSignerMethod {
+    TravelerList => "traveler.list",
     CardList => "card.list",
     CardPrepare => "card.prepare",
     CardComplete => "card.complete",
@@ -125,6 +126,7 @@ impl BrokerSignerMethod {
             | Self::CustodyResult
             | Self::CustodyStatus
             | Self::CardList
+            | Self::TravelerList
             | Self::CardStatus => true,
 
             Self::KeyDerivePrepare

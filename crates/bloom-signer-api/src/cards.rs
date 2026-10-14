@@ -83,6 +83,18 @@ impl CheckoutFacts {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CardEffect {
+    SaveTraveler {
+        traveler_id: Token,
+        label: String,
+    },
+    DeleteTraveler {
+        traveler_id: Token,
+    },
+    FillTraveler {
+        traveler_id: Token,
+        scope: crate::TravelerFillScope,
+        recipient_key: Base64UrlBytes,
+    },
     Add {
         card_id: Token,
         label: String,
@@ -114,6 +126,9 @@ pub enum CardEffect {
 impl CardEffect {
     pub fn ceremony_kind(&self) -> CeremonyKind {
         match self {
+            Self::SaveTraveler { .. } => CeremonyKind::CardAdd,
+            Self::DeleteTraveler { .. } => CeremonyKind::CardDelete,
+            Self::FillTraveler { .. } => CeremonyKind::CardCheckout,
             Self::Add { .. } => CeremonyKind::CardAdd,
             Self::Delete { .. } => CeremonyKind::CardDelete,
             Self::Checkout { .. } | Self::ManualCheckout { .. } | Self::SiteCheckout { .. } => {
@@ -127,11 +142,36 @@ impl CardEffect {
             | Self::Delete { card_id }
             | Self::Checkout { card_id, .. } => Some(card_id),
             Self::ManualCheckout { card_id, .. } => card_id.as_ref(),
-            Self::SiteCheckout { .. } => None,
+            Self::SiteCheckout { .. }
+            | Self::SaveTraveler { .. }
+            | Self::DeleteTraveler { .. }
+            | Self::FillTraveler { .. } => None,
         }
     }
     pub fn validate(&self) -> Result<(), ProtocolError> {
         match self {
+            Self::SaveTraveler { label, .. }
+                if label.is_empty() || label.len() > 64 || label.chars().any(char::is_control) =>
+            {
+                Err(ProtocolError::new(
+                    ProtocolErrorCode::MalformedFrame,
+                    "invalid traveler label",
+                ))
+            }
+            Self::FillTraveler {
+                scope,
+                recipient_key,
+                ..
+            } => {
+                scope.validate()?;
+                if recipient_key.decode().len() != 32 {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::MalformedFrame,
+                        "invalid traveler recipient",
+                    ));
+                }
+                Ok(())
+            }
             Self::Add { label, .. }
                 if label.is_empty() || label.len() > 64 || label.chars().any(char::is_control) =>
             {

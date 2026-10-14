@@ -534,6 +534,36 @@ fn signer_requests() -> Vec<BrokerSignerRequest> {
     let id = IdRequest { id: digest(46) };
     vec![
         BrokerSignerRequest::SystemHello(hello()),
+        BrokerSignerRequest::TravelerList(Empty {}),
+        BrokerSignerRequest::CardPrepare(CardPrepareRequest {
+            surface: legacy_local_surface(),
+            operation_id: operation(90),
+            effect: CardEffect::SaveTraveler {
+                traveler_id: token("wife"),
+                label: "Wife".into(),
+            },
+        }),
+        BrokerSignerRequest::CardPrepare(CardPrepareRequest {
+            surface: legacy_local_surface(),
+            operation_id: operation(91),
+            effect: CardEffect::DeleteTraveler {
+                traveler_id: token("wife"),
+            },
+        }),
+        BrokerSignerRequest::CardPrepare(CardPrepareRequest {
+            surface: legacy_local_surface(),
+            operation_id: operation(92),
+            effect: CardEffect::FillTraveler {
+                traveler_id: token("wife"),
+                scope: TravelerFillScope {
+                    origin: "https://airline.example".into(),
+                    frame_origins: vec!["https://airline.example".into()],
+                    document_binding: digest(90),
+                    fields: vec![TravelerField::GivenName, TravelerField::FamilyName],
+                },
+                recipient_key: Base64UrlBytes::from_bytes(&[8; 32]),
+            },
+        }),
         BrokerSignerRequest::CardList(Empty {}),
         BrokerSignerRequest::CardPrepare(CardPrepareRequest {
             surface: legacy_local_surface(),
@@ -720,6 +750,11 @@ fn signer_responses() -> Vec<BrokerSignerResponse> {
     };
     vec![
         BrokerSignerResponse::SystemHello(hello()),
+        BrokerSignerResponse::TravelerList(vec![TravelerPublic {
+            traveler_id: Token::new("wife").unwrap(),
+            label: "Wife".into(),
+            fields: vec![TravelerField::GivenName, TravelerField::FamilyName],
+        }]),
         BrokerSignerResponse::CardList(vec![CardPublic {
             card_id: token("card-one"),
             label: "Main card".into(),
@@ -883,12 +918,12 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer requests",
         signer_requests(),
-        "054521ebcab189895d0d09aa537d448d4ec45e7c801bd2fd8911259de56aa385",
+        "576de7bfd48a4be550074497e10b1bc05005df95dfb88603c9169e1c6bc257d4",
     );
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "4405c9db7d8ed4571857f5682fc620478396ac8137890e7a76f24a763f74a9db",
+        "07867d295000cec05dc814b985adc56120dfa975178bf7593108213f1c0e6fa4",
     );
     assert_wire_digest(
         "control requests",

@@ -314,6 +314,8 @@ pub struct CeremonyPublicStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "method", content = "body", deny_unknown_fields)]
 pub enum BrokerSignerRequest {
+    #[serde(rename = "traveler.list")]
+    TravelerList(Empty),
     #[serde(rename = "card.list")]
     CardList(Empty),
     #[serde(rename = "card.prepare")]
@@ -421,6 +423,8 @@ pub enum BrokerSignerRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "method", content = "body", deny_unknown_fields)]
 pub enum BrokerSignerResponse {
+    #[serde(rename = "traveler.list")]
+    TravelerList(Vec<crate::TravelerPublic>),
     #[serde(rename = "card.list")]
     CardList(Vec<crate::CardPublic>),
     #[serde(rename = "card.prepare")]
@@ -711,6 +715,6 @@ mod tests {
 
     #[test]
     fn typed_request_inventories_cover_every_normative_method() {
-        assert_eq!(crate::BrokerSignerMethod::ALL.len(), 51);
+        assert_eq!(crate::BrokerSignerMethod::ALL.len(), 52);
     }
 }
