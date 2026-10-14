@@ -128,9 +128,7 @@ impl SignerRpcService {
             self.clock.now_ms(false)?
         };
         match request {
-            Request::TravelerList(_) => {
-                Ok(Response::TravelerList(self.ceremony.cards.travelers()?))
-            }
+            Request::TravelerList(_) => Ok(Response::TravelerList(self.ceremony.traveler_list()?)),
             Request::CardList(_) => Ok(Response::CardList(self.ceremony.cards.list()?)),
             Request::CardPrepare(request) => Ok(Response::CardPrepare(
                 self.ceremony.prepare_card(request, now_ms)?,

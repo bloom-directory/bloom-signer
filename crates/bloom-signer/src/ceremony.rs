@@ -367,6 +367,9 @@ impl SignerCeremonyService {
     pub fn card_list(&self) -> Result<Vec<bloom_signer_api::CardPublic>, ProtocolError> {
         self.cards.list()
     }
+    pub fn traveler_list(&self) -> Result<Vec<bloom_signer_api::TravelerPublic>, ProtocolError> {
+        self.cards.travelers()
+    }
 
     pub fn card_status(
         &self,
