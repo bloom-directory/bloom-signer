@@ -1406,11 +1406,15 @@ impl RevocationControlService for CheckpointingControlService {
 }
 
 fn installed_session_startup_timeout() -> Option<Duration> {
-    #[cfg(feature = "triad-dev-harness")]
-    let developer = std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some();
-    #[cfg(not(feature = "triad-dev-harness"))]
-    let developer = false;
-    (cfg!(target_os = "macos") && !developer).then_some(Duration::from_secs(3))
+    session_startup_wait(
+        cfg!(target_os = "macos"),
+        cfg!(feature = "triad-dev-harness")
+            && std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some(),
+    )
+}
+
+fn session_startup_wait(macos: bool, developer_profile: bool) -> Option<Duration> {
+    (macos && !developer_profile).then_some(Duration::from_secs(3))
 }
 
 async fn connect_authenticated_session(
@@ -1883,6 +1887,17 @@ mod tests {
             application_key_id: Token::new("session-app").unwrap(),
             signing_key: Arc::new(SigningKey::from_bytes(&[8; 32])),
         }
+    }
+
+    #[test]
+    fn session_startup_deadline_applies_only_to_installed_macos() {
+        assert_eq!(
+            session_startup_wait(true, false),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(session_startup_wait(true, true), None);
+        assert_eq!(session_startup_wait(false, false), None);
+        assert_eq!(session_startup_wait(false, true), None);
     }
 
     #[tokio::test]
