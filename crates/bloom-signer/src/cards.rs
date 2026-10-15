@@ -465,8 +465,13 @@ impl CardCeremonies {
             },
             petal_key_scope: None,
             wallet_seed_profile: None,
-            expires_at_ms: DecimalU64::new(now_ms.saturating_add(if matches!(request.effect,
-                CardEffect::SaveTraveler { .. }) { 900_000 } else { 120_000 })),
+            expires_at_ms: DecimalU64::new(now_ms.saturating_add(
+                if matches!(request.effect, CardEffect::SaveTraveler { .. }) {
+                    900_000
+                } else {
+                    120_000
+                },
+            )),
             signer_key_id: self.key_id.clone(),
             signer_signature: Base64UrlBytes::from_bytes(&[]),
         };
