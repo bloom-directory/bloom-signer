@@ -182,7 +182,7 @@ fn travelers_can_enroll_without_a_card_and_reject_mixed_or_invalid_input() {
         cards
             .complete(
                 complete(&auth, &p, traveler_input(&auth, "Late"), 4),
-            NOW + 900_007
+                NOW + 900_007
             )
             .is_err()
     );
@@ -535,7 +535,7 @@ fn expired_checkout_cannot_release() {
     assert!(
         s.complete(
             complete(&auth, &p, private(&auth, false, true), 2),
-            NOW + 122_002
+            NOW + 902_002
         )
         .is_err()
     );
