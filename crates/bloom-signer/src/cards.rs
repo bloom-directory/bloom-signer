@@ -148,11 +148,83 @@ struct State {
     db: Connection,
     pending: HashMap<OperationId, Pending>,
 }
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    #[test]
+    fn status_evicts_all_expired_recipient_keys_and_persists_expiry() {
+        let cards = CardCeremonies::new(
+            SigningKey::from_bytes(&[7; 32]),
+            Token::new("test").unwrap(),
+            "http://localhost:28778".into(),
+        )
+        .unwrap();
+        let operation_id = OperationId::from_bytes([1; 32]);
+        let prepared = cards
+            .prepare(
+                CardPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
+                    operation_id: operation_id.clone(),
+                    effect: CardEffect::Add {
+                        card_id: Token::new("test").unwrap(),
+                        label: "Test".into(),
+                    },
+                },
+                1000,
+            )
+            .unwrap();
+        let expiry = prepared.contribution.expires_at_ms.get();
+        assert_eq!(cards.state.lock().pending.len(), 1);
+        assert_eq!(
+            cards.status(&operation_id, expiry - 1).unwrap().state,
+            CardOperationState::Prepared
+        );
+        // A status read for any operation must retire every expired private key.
+        cards
+            .status(&OperationId::from_bytes([2; 32]), expiry)
+            .unwrap();
+        assert!(cards.state.lock().pending.is_empty());
+        assert_eq!(
+            cards.status(&operation_id, expiry).unwrap().state,
+            CardOperationState::Expired
+        );
+        assert_eq!(
+            cards.status(&operation_id, expiry + 1).unwrap().state,
+            CardOperationState::Expired
+        );
+    }
+}
 pub struct CardCeremonies {
     state: Mutex<State>,
     key: SigningKey,
     key_id: Token,
     origin: String,
+}
+
+/// Bind both private release kinds to the same operation and contribution.
+fn seal_release(
+    request: &CardPrepareRequest,
+    contribution: &CustodySignerContribution,
+    complete: &CustodyCompleteRequest,
+    recipient_key: &Base64UrlBytes,
+    release: &[u8],
+) -> Result<HpkeEnvelope, ProtocolError> {
+    let aad = CustodyOutputHpkeAad {
+        surface: request.surface.clone(),
+        ceremony_id: contribution.ceremony_id.clone(),
+        ceremony_kind: contribution.ceremony_kind,
+        custody_operation_id: complete.custody_operation_id.clone(),
+        signer_contribution_digest: contribution.digest()?,
+        public_binding_digest: request.digest()?,
+    };
+    seal_to_recipient(
+        recipient_key,
+        CUSTODY_OUTPUT_INFO,
+        &aad.canonical_bytes()?,
+        release,
+    )
 }
 
 fn initialize(db: Connection) -> Result<State, ProtocolError> {
@@ -282,16 +354,26 @@ impl CardCeremonies {
         operation_id: &OperationId,
         now_ms: u64,
     ) -> Result<CardOperationStatus, ProtocolError> {
-        let state = self.state.lock();
-        if state
+        let mut state = self.state.lock();
+        let expired: Vec<_> = state
             .pending
-            .get(operation_id)
-            .is_some_and(|p| p.prepared.contribution.expires_at_ms.get() <= now_ms)
-        {
-            return Ok(CardOperationStatus {
-                operation_id: operation_id.clone(),
-                state: CardOperationState::Expired,
-            });
+            .iter()
+            .filter(|(_, p)| p.prepared.contribution.expires_at_ms.get() <= now_ms)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if !expired.is_empty() {
+            let tx = state.db.transaction().map_err(storage)?;
+            for id in &expired {
+                tx.execute(
+                    "UPDATE operations SET state='expired' WHERE id=?1 AND state='prepared'",
+                    [id.as_str()],
+                )
+                .map_err(storage)?;
+            }
+            tx.commit().map_err(storage)?;
+            for id in expired {
+                state.pending.remove(&id);
+            }
         }
         let value: Option<String> = state
             .db
@@ -840,18 +922,11 @@ impl CardCeremonies {
                     fields.insert(*field, Zeroizing::new(value.to_owned()));
                 }
                 let release = Zeroizing::new(serde_json::to_vec(&fields).map_err(malformed)?);
-                let output_aad = CustodyOutputHpkeAad {
-                    surface: pending.request.surface.clone(),
-                    ceremony_id: contribution.ceremony_id.clone(),
-                    ceremony_kind: contribution.ceremony_kind,
-                    custody_operation_id: complete.custody_operation_id.clone(),
-                    signer_contribution_digest: contribution.digest()?,
-                    public_binding_digest: digest.clone(),
-                };
-                output = Some(seal_to_recipient(
+                output = Some(seal_release(
+                    &pending.request,
+                    contribution,
+                    &complete,
                     recipient_key,
-                    CUSTODY_OUTPUT_INFO,
-                    &output_aad.canonical_bytes()?,
                     &release,
                 )?);
             }
@@ -936,18 +1011,11 @@ impl CardCeremonies {
                 let release = Zeroizing::new(
                     serde_json::to_vec(&Release { card: &card, cvc }).map_err(malformed)?,
                 );
-                let output_aad = CustodyOutputHpkeAad {
-                    surface: pending.request.surface.clone(),
-                    ceremony_id: contribution.ceremony_id.clone(),
-                    ceremony_kind: contribution.ceremony_kind,
-                    custody_operation_id: complete.custody_operation_id.clone(),
-                    signer_contribution_digest: contribution.digest()?,
-                    public_binding_digest: digest.clone(),
-                };
-                output = Some(seal_to_recipient(
+                output = Some(seal_release(
+                    &pending.request,
+                    contribution,
+                    &complete,
                     recipient_key,
-                    CUSTODY_OUTPUT_INFO,
-                    &output_aad.canonical_bytes()?,
                     &release,
                 )?);
             }

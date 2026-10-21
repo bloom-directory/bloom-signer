@@ -4612,6 +4612,88 @@ mod tests {
     use super::*;
     use bloom_signer_api::{Digest32, Token};
 
+    #[test]
+    fn complete_card_rechecks_surface_before_consuming_the_operation() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let engine = Arc::new(
+            SignerEngine::open_in_memory(
+                Token::new("broker").unwrap(),
+                key.verifying_key(),
+                key.verifying_key(),
+                Token::new("revoke").unwrap(),
+                key.clone(),
+                crate::engine::SignerAuditKeys {
+                    current_key_id: Token::new("audit").unwrap(),
+                    current_signing_key: SigningKey::from_bytes(&[14; 32]),
+                    historical_verifying_keys: BTreeMap::new(),
+                },
+                Arc::new(crate::registry::BackendRegistry::from_compiled(Vec::new()).unwrap()),
+            )
+            .unwrap(),
+        );
+        let service =
+            SignerCeremonyService::new(engine.clone(), Token::new("ceremony").unwrap(), key)
+                .unwrap();
+        let operation_id = OperationId::from_bytes([8; 32]);
+        let prepared = service
+            .prepare_card(
+                bloom_signer_api::CardPrepareRequest {
+                    operation_id: operation_id.clone(),
+                    surface: bloom_signer_api::legacy_local_surface(),
+                    effect: bloom_signer_api::CardEffect::Add {
+                        card_id: Token::new("test").unwrap(),
+                        label: "Test".into(),
+                    },
+                },
+                1000,
+            )
+            .unwrap();
+        let persisted = engine.load_surface_status().unwrap();
+        let original = service.surface_status().unwrap();
+        let mut disabled = original.clone();
+        disabled.surfaces[0].lifecycle = SurfaceLifecycle::Disabled;
+        engine
+            .commit_surface_status(persisted.as_ref(), &disabled, "test.disable")
+            .unwrap();
+        let empty = Base64UrlBytes::from_bytes(&[]);
+        let request = CustodyCompleteRequest {
+            ceremony_kind: prepared.contribution.ceremony_kind,
+            custody_operation_id: operation_id.clone(),
+            ceremony_id: prepared.contribution.ceremony_id,
+            proof: WebAuthnCeremonyProof::Assertion {
+                assertion: bloom_signer_api::WebAuthnAssertion {
+                    credential_id: empty.clone(),
+                    authenticator_data: empty.clone(),
+                    client_data_json: empty.clone(),
+                    signature: empty,
+                    user_handle: None,
+                },
+            },
+            encrypted_input: None,
+            public_binding_digest: prepared.contribution.review_manifest_digest,
+        };
+        assert_eq!(
+            service
+                .complete_card(request.clone(), 1001)
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::UnauthenticatedPeer
+        );
+        assert_eq!(
+            service.cards.status(&operation_id, 1001).unwrap().state,
+            bloom_signer_api::CardOperationState::Prepared
+        );
+        engine
+            .commit_surface_status(Some(&disabled), &original, "test.enable")
+            .unwrap();
+        // Once eligible again, the invalid proof reaches custody and consumes it.
+        assert!(service.complete_card(request, 1002).is_err());
+        assert_ne!(
+            service.cards.status(&operation_id, 1002).unwrap().state,
+            bloom_signer_api::CardOperationState::Prepared
+        );
+    }
+
     fn migration() -> bloom_signer_api::LegacyPasskeyMigrationPublic {
         bloom_signer_api::LegacyPasskeyMigrationPublic {
             schema: Token::new("bloom.legacy_passkey_migration_receipt.v1").unwrap(),
