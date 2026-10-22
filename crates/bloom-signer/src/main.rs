@@ -10,10 +10,7 @@ use std::{
     io::ErrorKind,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -174,18 +171,26 @@ async fn main() {
         eprintln!("Bloom Signer logging initialization failed");
         std::process::exit(1);
     }
-    let trusted_metadata_loaded = Arc::new(AtomicBool::new(false));
-    let result = run(trusted_metadata_loaded.clone()).await;
-    if result.is_err() {
-        if !trusted_metadata_loaded.load(Ordering::SeqCst) {
-            tracing::error!(
-                event = "service.fatal_exit",
-                service_role = "signer",
-                error_kind = "bootstrap_failure",
-                "Bloom Signer exiting after a bootstrap error"
-            );
+    let mut trusted_fatal = None;
+    match run(&mut trusted_fatal).await {
+        Ok(()) => {
+            if let Some(guard) = trusted_fatal.as_mut() {
+                guard.disarm();
+            }
         }
-        std::process::exit(1);
+        Err(cause) => {
+            match trusted_fatal.as_mut() {
+                Some(guard) => guard.record(cause),
+                None => log_fatal_exit(
+                    "bootstrap_failure",
+                    "Bloom Signer exiting after a bootstrap error",
+                    &cause,
+                ),
+            }
+            // `exit` skips destructors; drop the guard so it logs first.
+            drop(trusted_fatal);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -254,31 +259,146 @@ mod cli_tests {
 struct TrustedFatalGuard {
     span: tracing::Span,
     armed: bool,
+    cause: Option<FatalCause>,
 }
 
 impl TrustedFatalGuard {
     fn new(span: tracing::Span) -> Self {
-        Self { span, armed: true }
+        Self {
+            span,
+            armed: true,
+            cause: None,
+        }
     }
 
     fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    fn record(&mut self, cause: FatalCause) {
+        self.cause = Some(cause);
     }
 }
 
 impl Drop for TrustedFatalGuard {
     fn drop(&mut self) {
         if self.armed {
+            let cause = self.cause.take().unwrap_or_else(FatalCause::unrecorded);
             self.span.in_scope(|| {
-                tracing::error!(
-                    event = "service.fatal_exit",
-                    service_role = "signer",
-                    error_kind = "service_failure",
-                    "Bloom Signer exiting after a fatal error"
+                log_fatal_exit(
+                    "service_failure",
+                    "Bloom Signer exiting after a fatal error",
+                    &cause,
                 );
             });
         }
     }
+}
+
+/// Why the Signer is exiting, reduced to fields that are safe to log.
+///
+/// Startup error text can carry secrets: `ProtocolError` messages embed serde
+/// diagnostics for the identity and config files, which hold private seeds,
+/// and peer-supplied text. The fatal event therefore names the failed stage
+/// and the error's protocol code or I/O kind, never its `Display`. The only
+/// text kept is a literal invariant from this file, or an activation
+/// rejection, which describes endpoint paths, ownership, modes, and OS errors.
+#[derive(Debug)]
+struct FatalCause {
+    stage: &'static str,
+    reason: &'static str,
+    error_code: Option<&'static str>,
+    io_error_kind: Option<ErrorKind>,
+    os_error: Option<i32>,
+    detail: Option<String>,
+}
+
+impl FatalCause {
+    fn invariant(stage: &'static str, detail: &'static str) -> Self {
+        Self {
+            detail: Some(detail.to_owned()),
+            ..Self::bare(stage, "invariant")
+        }
+    }
+
+    fn classify(stage: &'static str, error: &(dyn std::error::Error + 'static)) -> Self {
+        if let Some(error) = error.downcast_ref::<ProtocolError>() {
+            return Self {
+                error_code: Some(error.code.as_str()),
+                ..Self::bare(stage, "protocol_error")
+            };
+        }
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            return Self::bare(stage, "io_error").with_io(error);
+        }
+        match error.downcast_ref::<bloom_service_activation::ActivationError>() {
+            Some(bloom_service_activation::ActivationError::Rejected(message)) => Self {
+                detail: Some(message.clone()),
+                ..Self::bare(stage, "activation_rejected")
+            },
+            Some(bloom_service_activation::ActivationError::Io(error)) => {
+                Self::bare(stage, "activation_io_error").with_io(error)
+            }
+            None => Self::bare(stage, "unclassified"),
+        }
+    }
+
+    fn unrecorded() -> Self {
+        let reason = if std::thread::panicking() {
+            "panic"
+        } else {
+            "unrecorded"
+        };
+        Self::bare("unrecorded", reason)
+    }
+
+    fn bare(stage: &'static str, reason: &'static str) -> Self {
+        Self {
+            stage,
+            reason,
+            error_code: None,
+            io_error_kind: None,
+            os_error: None,
+            detail: None,
+        }
+    }
+
+    fn with_io(self, error: &std::io::Error) -> Self {
+        Self {
+            io_error_kind: Some(error.kind()),
+            os_error: error.raw_os_error(),
+            ..self
+        }
+    }
+}
+
+/// Labels a fallible startup step so a fatal exit names the step that failed.
+trait AtStage<T> {
+    fn at_stage(self, stage: &'static str) -> Result<T, FatalCause>;
+}
+
+impl<T, E: Into<Box<dyn std::error::Error>>> AtStage<T> for Result<T, E> {
+    fn at_stage(self, stage: &'static str) -> Result<T, FatalCause> {
+        self.map_err(|error| {
+            let error: Box<dyn std::error::Error> = error.into();
+            FatalCause::classify(stage, error.as_ref())
+        })
+    }
+}
+
+fn log_fatal_exit(error_kind: &'static str, message: &'static str, cause: &FatalCause) {
+    tracing::error!(
+        event = "service.fatal_exit",
+        service_role = "signer",
+        error_kind,
+        stage = cause.stage,
+        reason = cause.reason,
+        error_code = cause.error_code,
+        io_error_kind = cause.io_error_kind.map(tracing::field::debug),
+        os_error = cause.os_error,
+        detail = cause.detail.as_deref(),
+        "{message}"
+    );
 }
 
 fn signer_log_output() -> Result<LogOutput, ()> {
@@ -301,7 +421,7 @@ fn required_u32_env(name: &str) -> Result<u32, ()> {
         .map_err(|_| ())
 }
 
-async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(trusted_fatal: &mut Option<TrustedFatalGuard>) -> Result<(), FatalCause> {
     let identity_path = env_path(
         "BLOOM_SIGNER_IDENTITY",
         "/var/run/bloom/signer-identity.json",
@@ -315,12 +435,15 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
             &identity_path,
             &manifest_path,
             "bloom-signer",
-        )?,
-        None => load_identity_and_manifest(&identity_path, &manifest_path, "bloom-signer")?,
+        )
+        .at_stage("load_identity_and_manifest")?,
+        None => load_identity_and_manifest(&identity_path, &manifest_path, "bloom-signer")
+            .at_stage("load_identity_and_manifest")?,
     };
     #[cfg(not(feature = "triad-dev-harness"))]
     let loaded_identity =
-        load_identity_and_manifest(&identity_path, &manifest_path, "bloom-signer")?;
+        load_identity_and_manifest(&identity_path, &manifest_path, "bloom-signer")
+            .at_stage("load_identity_and_manifest")?;
     let (identity, manifest) = loaded_identity;
     let trusted_time_source = manifest.trusted_time_source.clone();
     let signer_effective_uid = manifest.signer.effective_uid;
@@ -343,17 +466,32 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
     let session_acl = manifest
         .session
         .clone()
-        .ok_or("edge manifest has no login-session identity")?
-        .into_acl()?;
-    let broker_acl = manifest.broker.into_acl()?;
-    let revoke_client_acl = manifest.revoke_client.into_acl()?;
+        .ok_or_else(|| {
+            FatalCause::invariant(
+                "load_session_acl",
+                "edge manifest has no login-session identity",
+            )
+        })?
+        .into_acl()
+        .at_stage("load_session_acl")?;
+    let broker_acl = manifest.broker.into_acl().at_stage("load_broker_acl")?;
+    let revoke_client_acl = manifest
+        .revoke_client
+        .into_acl()
+        .at_stage("load_revoke_client_acl")?;
     if broker_acl.service_id.as_str() != "bloom-broker"
         || session_acl.service_id.as_str() != "bloom-session"
     {
-        return Err("edge manifest does not pin bloom-broker for the Signer edge".into());
+        return Err(FatalCause::invariant(
+            "verify_edge_manifest_pins",
+            "edge manifest does not pin bloom-broker for the Signer edge",
+        ));
     }
     if revoke_client_acl.service_id.as_str() != "bloom-revoke-client" {
-        return Err("edge manifest does not pin the dedicated revoke client".into());
+        return Err(FatalCause::invariant(
+            "verify_edge_manifest_pins",
+            "edge manifest does not pin the dedicated revoke client",
+        ));
     }
     #[cfg(feature = "triad-dev-harness")]
     let history_owner = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
@@ -410,24 +548,30 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
             })
         }
     };
-    let mut config = load_config(&config_path)?;
+    let mut config = load_config(&config_path).at_stage("load_signer_config")?;
     // Resolve the effective ceremony port once at startup, before opening
     // durable state or acquiring listeners, and carry it as instance state
     // from here on. An explicit file value wins over the legacy fallback;
     // an invalid explicit value fails startup here.
-    let ceremony_port = bloom_signer::webauthn::resolve_ceremony_port(config.ceremony_port)?;
-    let broker_public_key = verifying_key(&config.broker_signing_public_key_hex)?;
-    let ceremony_public_key = verifying_key(&config.ceremony_verifying_public_key_hex)?;
-    let revocation_signing_key = take_signing_key(&mut config.revocation_signing_seed_hex)?;
-    let audit_signing_key = take_signing_key(&mut config.audit_signing_seed_hex)?;
+    let ceremony_port = bloom_signer::webauthn::resolve_ceremony_port(config.ceremony_port)
+        .at_stage("resolve_ceremony_port")?;
+    let broker_public_key = verifying_key(&config.broker_signing_public_key_hex)
+        .at_stage("decode_broker_public_key")?;
+    let ceremony_public_key = verifying_key(&config.ceremony_verifying_public_key_hex)
+        .at_stage("decode_ceremony_public_key")?;
+    let revocation_signing_key = take_signing_key(&mut config.revocation_signing_seed_hex)
+        .at_stage("decode_revocation_signing_key")?;
+    let audit_signing_key = take_signing_key(&mut config.audit_signing_seed_hex)
+        .at_stage("decode_audit_signing_key")?;
     if config.audit_key_id == config.revocation_key_id
         || audit_signing_key.verifying_key() == revocation_signing_key.verifying_key()
         || audit_signing_key.verifying_key().to_bytes()
             == identity.signing_key.verifying_key().to_bytes()
     {
-        return Err(
-            "Signer audit key must be distinct from revocation and application keys".into(),
-        );
+        return Err(FatalCause::invariant(
+            "verify_audit_key_separation",
+            "Signer audit key must be distinct from revocation and application keys",
+        ));
     }
     let previous_audit_signing_key = config
         .audit_rotation_previous_key
@@ -438,14 +582,20 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
                 take_signing_key(&mut previous.signing_seed_hex)?,
             ))
         })
-        .transpose()?;
-    let ceremony_signing_key = take_signing_key(&mut config.ceremony_signing_seed_hex)?;
+        .transpose()
+        .at_stage("decode_previous_audit_signing_key")?;
+    let ceremony_signing_key = take_signing_key(&mut config.ceremony_signing_seed_hex)
+        .at_stage("decode_ceremony_signing_key")?;
     if config.audit_key_id == config.ceremony_key_id
         || audit_signing_key.verifying_key() == ceremony_signing_key.verifying_key()
     {
-        return Err("Signer audit key must be distinct from the ceremony key".into());
+        return Err(FatalCause::invariant(
+            "verify_audit_key_separation",
+            "Signer audit key must be distinct from the ceremony key",
+        ));
     }
-    let build_digest = Digest32::new(config.build_digest.clone())?;
+    let build_digest =
+        Digest32::new(config.build_digest.clone()).at_stage("decode_build_digest")?;
     let service_span = bloom_service_observability::service_span(
         "signer",
         env!("CARGO_PKG_VERSION"),
@@ -453,63 +603,86 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
         Some(session_acl.effective_uid),
         Some(build_digest.as_str()),
     );
-    trusted_metadata_loaded.store(true, Ordering::SeqCst);
-    let mut trusted_fatal = TrustedFatalGuard::new(service_span.clone());
+    *trusted_fatal = Some(TrustedFatalGuard::new(service_span.clone()));
 
     let service_span_guard = service_span.enter();
-    let compiled_backends = build_aws_backends(&mut config.aws_kms_backends)?;
-    let registry = Arc::new(BackendRegistry::from_compiled(compiled_backends)?);
-    let engine = Arc::new(open_operational_signer_engine(
-        &config.database_path,
-        Token::new(config.broker_signing_key_id.clone())?,
-        broker_public_key,
-        ceremony_public_key,
-        Token::new(config.revocation_key_id.clone())?,
-        revocation_signing_key,
-        Token::new(config.audit_key_id.clone())?,
-        audit_signing_key,
-        &config.audit_historical_public_keys,
-        previous_audit_signing_key,
-        registry,
-    )?);
+    let compiled_backends =
+        build_aws_backends(&mut config.aws_kms_backends).at_stage("build_aws_kms_backends")?;
+    let registry = Arc::new(
+        BackendRegistry::from_compiled(compiled_backends).at_stage("build_backend_registry")?,
+    );
+    let engine = Arc::new(
+        open_operational_signer_engine(
+            &config.database_path,
+            Token::new(config.broker_signing_key_id.clone())
+                .at_stage("parse_broker_signing_key_id")?,
+            broker_public_key,
+            ceremony_public_key,
+            Token::new(config.revocation_key_id.clone()).at_stage("parse_revocation_key_id")?,
+            revocation_signing_key,
+            Token::new(config.audit_key_id.clone()).at_stage("parse_audit_key_id")?,
+            audit_signing_key,
+            &config.audit_historical_public_keys,
+            previous_audit_signing_key,
+            registry,
+        )
+        .at_stage("open_signer_engine")?,
+    );
     let migration_root = config
         .database_path
         .parent()
-        .ok_or("Signer database path has no parent directory")?
+        .ok_or_else(|| {
+            FatalCause::invariant(
+                "locate_legacy_migrations",
+                "Signer database path has no parent directory",
+            )
+        })?
         .join("legacy-passkey-migrations");
-    let migration_store = Arc::new(LegacyMigrationStore::create_for_current_process(
-        migration_root,
-        signer_effective_uid,
-    )?);
+    let migration_store = Arc::new(
+        LegacyMigrationStore::create_for_current_process(migration_root, signer_effective_uid)
+            .at_stage("open_legacy_migration_store")?,
+    );
     let mut ceremony = SignerCeremonyService::new_with_ceremony_port(
         engine.clone(),
-        Token::new(config.ceremony_key_id.clone())?,
+        Token::new(config.ceremony_key_id.clone()).at_stage("parse_ceremony_key_id")?,
         ceremony_signing_key,
         ceremony_port,
-    )?
+    )
+    .at_stage("open_ceremony_service")?
     .with_legacy_migrations(migration_store);
     if let Some(ttl_ms) = config.ceremony_ttl_ms {
-        ceremony = ceremony.with_ceremony_ttl_ms(ttl_ms)?;
+        ceremony = ceremony
+            .with_ceremony_ttl_ms(ttl_ms)
+            .at_stage("apply_ceremony_ttl")?;
         tracing::warn!(
             ceremony_ttl_ms = ttl_ms,
             "Signer config overrides the ceremony window"
         );
     }
     let ceremony = Arc::new(ceremony);
-    let clock = Arc::new(SignerClock::new(
-        engine.clone(),
-        &trusted_time_source,
-        identity.boot_epoch.clone(),
-    )?);
-    if let Some(accepted_utc_ms) = clock_repair_request()? {
+    let clock = Arc::new(
+        SignerClock::new(
+            engine.clone(),
+            &trusted_time_source,
+            identity.boot_epoch.clone(),
+        )
+        .at_stage("open_signer_clock")?,
+    );
+    if let Some(accepted_utc_ms) = clock_repair_request().at_stage("parse_clock_repair_request")? {
         if !clock.uses_durable_clock_guard() {
-            return Err(
-                "clock repair is unavailable when the host wall clock is authoritative".into(),
-            );
+            return Err(FatalCause::invariant(
+                "repair_clock",
+                "clock repair is unavailable when the host wall clock is authoritative",
+            ));
         }
-        let expiring = engine.active_approvals_expiring_by(accepted_utc_ms)?;
-        require_clock_repair_confirmation(accepted_utc_ms, &expiring)?;
-        let decision = engine.repair_clock(accepted_utc_ms)?;
+        let expiring = engine
+            .active_approvals_expiring_by(accepted_utc_ms)
+            .at_stage("list_expiring_approvals")?;
+        require_clock_repair_confirmation(accepted_utc_ms, &expiring)
+            .at_stage("confirm_clock_repair")?;
+        let decision = engine
+            .repair_clock(accepted_utc_ms)
+            .at_stage("repair_clock")?;
         tracing::info!(
             event = "signer.clock_repair_committed",
             effective_utc_ms = decision.effective_now_ms,
@@ -517,7 +690,6 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
             expiring_live_approval_count = expiring.len(),
             "Signer clock repair committed"
         );
-        trusted_fatal.disarm();
         return Ok(());
     }
     let containment = config
@@ -531,9 +703,11 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
                 containment.maximum_age_ms,
             )
         })
-        .transpose()?;
+        .transpose()
+        .at_stage("open_network_containment")?;
     let initial_audit_head =
-        select_initial_self_head(engine.as_ref(), checkpoint_store.as_ref(), &identity)?;
+        select_initial_self_head(engine.as_ref(), checkpoint_store.as_ref(), &identity)
+            .at_stage("select_initial_audit_head")?;
     let journal_exchange = Arc::new(SignerJournalExchange {
         engine: engine.clone(),
         checkpoints: checkpoint_store,
@@ -547,7 +721,8 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
         .relay_receipt_public_key_hex
         .as_ref()
         .map(admin::ReceiptKeysHex::decode)
-        .transpose()?;
+        .transpose()
+        .at_stage("decode_relay_receipt_keys")?;
     let mut service = SignerRpcService::new(
         engine,
         ceremony,
@@ -565,38 +740,57 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
         journals: journal_exchange.clone(),
     });
 
-    let rpc_listener = UnixListener::from_std(acquire_unix_listener(
-        "BLOOM_SIGNER_SOCKET",
-        "BLOOM_SIGNER_ACTIVATION_NAME",
-        "signer",
-    )?)?;
-    let control_listener = UnixListener::from_std(acquire_unix_listener(
-        "BLOOM_SIGNER_CONTROL_SOCKET",
-        "BLOOM_SIGNER_CONTROL_ACTIVATION_NAME",
-        "signer-control",
-    )?)?;
+    let rpc_listener = UnixListener::from_std(
+        acquire_unix_listener(
+            "BLOOM_SIGNER_SOCKET",
+            "BLOOM_SIGNER_ACTIVATION_NAME",
+            "signer",
+        )
+        .at_stage("bind_rpc_socket")?,
+    )
+    .at_stage("bind_rpc_socket")?;
+    let control_listener = UnixListener::from_std(
+        acquire_unix_listener(
+            "BLOOM_SIGNER_CONTROL_SOCKET",
+            "BLOOM_SIGNER_CONTROL_ACTIVATION_NAME",
+            "signer-control",
+        )
+        .at_stage("bind_control_socket")?,
+    )
+    .at_stage("bind_control_socket")?;
     let admin_listener = std::env::var_os("BLOOM_SIGNER_ADMIN_SOCKET")
         .map(PathBuf::from)
         .map(|path| bloom_service_activation::bind_private_unix_listener(&path))
-        .transpose()?
+        .transpose()
+        .at_stage("bind_admin_socket")?
         .map(UnixListener::from_std)
-        .transpose()?;
-    let rpc_quota = Arc::new(EndpointQuota::new(
-        config.maximum_in_flight_mutations,
-        config.maximum_requests_per_window,
-        config.request_window_ms,
-        config.maximum_journal_admissions_per_window,
-        config.journal_window_ms,
-    )?);
-    let control_quota = Arc::new(EndpointQuota::new(
-        config.control_maximum_in_flight_mutations,
-        config.control_maximum_requests_per_window,
-        config.control_request_window_ms,
-        config.control_maximum_journal_admissions_per_window,
-        config.control_journal_window_ms,
-    )?);
+        .transpose()
+        .at_stage("bind_admin_socket")?;
+    let rpc_quota = Arc::new(
+        EndpointQuota::new(
+            config.maximum_in_flight_mutations,
+            config.maximum_requests_per_window,
+            config.request_window_ms,
+            config.maximum_journal_admissions_per_window,
+            config.journal_window_ms,
+        )
+        .at_stage("create_rpc_quota")?,
+    );
+    let control_quota = Arc::new(
+        EndpointQuota::new(
+            config.control_maximum_in_flight_mutations,
+            config.control_maximum_requests_per_window,
+            config.control_request_window_ms,
+            config.control_maximum_journal_admissions_per_window,
+            config.control_journal_window_ms,
+        )
+        .at_stage("create_control_quota")?,
+    );
     if config.maximum_connections == 0 || config.control_maximum_connections == 0 {
-        return Err("Signer connection quotas must be nonzero".into());
+        return Err(FatalCause::invariant(
+            "validate_connection_quotas",
+            "Signer connection quotas must be nonzero",
+        ));
     }
     let session_socket_path = env_path(
         "BLOOM_SESSION_SOCKET",
@@ -606,7 +800,8 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
     let mut session_stream =
         connect_authenticated_session(&session_socket_path, &identity, &session_acl)
             .instrument(service_span.clone())
-            .await?;
+            .await
+            .at_stage("connect_session_sentinel")?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut rpc_shutdown = shutdown_rx.clone();
     let mut control_shutdown = shutdown_rx;
@@ -686,9 +881,9 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
         Ok::<(), std::io::Error>(())
     }
     .instrument(service_span)
-    .await?;
+    .await
+    .at_stage("serve")?;
     expiry_task.abort();
-    trusted_fatal.disarm();
     Ok(())
 }
 
@@ -2445,6 +2640,8 @@ mod tests {
         });
         let event: serde_json::Value = serde_json::from_str(capture.text().trim()).unwrap();
         assert_eq!(event["fields"]["event"], "service.fatal_exit");
+        assert_eq!(event["fields"]["error_kind"], "service_failure");
+        assert_eq!(event["fields"]["reason"], "unrecorded");
         assert_eq!(event["spans"][0]["service_id"], "bloom-signer");
     }
 
@@ -2571,5 +2768,139 @@ mod tests {
             guard.disarm();
         });
         assert!(capture.text().is_empty());
+    }
+
+    fn captured_fatal_exit(emit: impl FnOnce(tracing::Span)) -> (serde_json::Value, String) {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            emit(bloom_service_observability::service_span(
+                "signer",
+                "test-version",
+                "bloom-signer",
+                Some(501),
+                Some("release-digest"),
+            ))
+        });
+        let output = capture.text();
+        let event = serde_json::from_str(output.trim()).unwrap();
+        (event, output)
+    }
+
+    #[test]
+    fn recorded_fatal_cause_names_the_stage_without_secret_error_text() {
+        let marker_secret = "MARKER_SIGNER_SEED_DO_NOT_LOG";
+        let mut config = ceremony_port_config_fixture(serde_json::Value::Null);
+        config["maximum_connections"] = serde_json::json!(marker_secret);
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("signer.json");
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        // The parser echoes the rejected value, so the raw error is unsafe.
+        assert!(
+            load_config(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains(marker_secret)
+        );
+        let cause = load_config(&path)
+            .at_stage("load_signer_config")
+            .err()
+            .unwrap();
+
+        let (event, output) = captured_fatal_exit(|span| {
+            TrustedFatalGuard::new(span).record(cause);
+        });
+        assert_eq!(event["fields"]["event"], "service.fatal_exit");
+        assert_eq!(event["fields"]["error_kind"], "service_failure");
+        assert_eq!(event["fields"]["stage"], "load_signer_config");
+        assert_eq!(event["fields"]["reason"], "protocol_error");
+        assert_eq!(event["fields"]["error_code"], "MALFORMED_FRAME");
+        assert!(event["fields"].get("detail").is_none(), "{output}");
+        assert_eq!(event["spans"][0]["service_id"], "bloom-signer");
+        assert!(!output.contains(marker_secret), "{output}");
+    }
+
+    #[test]
+    fn bootstrap_fatal_exit_omits_unreviewed_error_text() {
+        let marker_secret = "MARKER_IDENTITY_SEED_DO_NOT_LOG";
+        let cause = Err::<(), _>(format!("decode identity seed {marker_secret}"))
+            .at_stage("load_identity_and_manifest")
+            .unwrap_err();
+        let (event, output) = captured_fatal_exit(|_| {
+            log_fatal_exit(
+                "bootstrap_failure",
+                "Bloom Signer exiting after a bootstrap error",
+                &cause,
+            );
+        });
+        assert_eq!(event["fields"]["event"], "service.fatal_exit");
+        assert_eq!(event["fields"]["error_kind"], "bootstrap_failure");
+        assert_eq!(event["fields"]["stage"], "load_identity_and_manifest");
+        assert_eq!(event["fields"]["reason"], "unclassified");
+        assert!(!output.contains(marker_secret), "{output}");
+    }
+
+    #[test]
+    fn fatal_cause_keeps_only_reviewed_detail() {
+        let rejection = "endpoint directory /run/bloom must be a non-symlink directory owned by effective UID 0 with mode 0700";
+        let boxed: Box<dyn std::error::Error> =
+            bloom_service_activation::ActivationError::Rejected(rejection.into()).into();
+        let rejected = Err::<(), _>(boxed)
+            .at_stage("bind_admin_socket")
+            .unwrap_err();
+        assert_eq!(rejected.stage, "bind_admin_socket");
+        assert_eq!(rejected.reason, "activation_rejected");
+        assert_eq!(rejected.detail.as_deref(), Some(rejection));
+
+        let activation_io = Err::<(), _>(bloom_service_activation::ActivationError::Io(
+            std::io::Error::new(ErrorKind::AddrInUse, "socket is live"),
+        ))
+        .at_stage("bind_rpc_socket")
+        .unwrap_err();
+        assert_eq!(activation_io.reason, "activation_io_error");
+        assert_eq!(activation_io.io_error_kind, Some(ErrorKind::AddrInUse));
+        assert_eq!(activation_io.detail, None);
+
+        let (event, output) = captured_fatal_exit(|span| {
+            let cause = Err::<(), _>(std::io::Error::from_raw_os_error(13))
+                .at_stage("serve")
+                .unwrap_err();
+            TrustedFatalGuard::new(span).record(cause);
+        });
+        assert_eq!(event["fields"]["reason"], "io_error");
+        assert_eq!(event["fields"]["io_error_kind"], "PermissionDenied");
+        assert_eq!(event["fields"]["os_error"], 13);
+        assert!(event["fields"].get("detail").is_none(), "{output}");
+
+        let invariant = FatalCause::invariant(
+            "validate_connection_quotas",
+            "Signer connection quotas must be nonzero",
+        );
+        assert_eq!(invariant.reason, "invariant");
+        assert_eq!(
+            invariant.detail.as_deref(),
+            Some("Signer connection quotas must be nonzero")
+        );
+    }
+
+    #[test]
+    fn trusted_fatal_guard_reports_a_panic() {
+        let (event, _) = captured_fatal_exit(|span| {
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = TrustedFatalGuard::new(span);
+                panic!("forced Signer panic");
+            }));
+            assert!(panicked.is_err());
+        });
+        assert_eq!(event["fields"]["error_kind"], "service_failure");
+        assert_eq!(event["fields"]["reason"], "panic");
+        assert_eq!(event["spans"][0]["service_id"], "bloom-signer");
     }
 }
