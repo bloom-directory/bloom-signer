@@ -172,11 +172,23 @@ async fn main() {
         std::process::exit(1);
     }
     let mut trusted_fatal = None;
-    match run(&mut trusted_fatal).await {
+    let result = run(&mut trusted_fatal).await;
+    let code = finish_run(result, trusted_fatal);
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+/// Report how `run` ended and return the process exit code. The guard is
+/// moved in and dropped here, so its fatal event is logged before the caller
+/// exits: `std::process::exit` skips destructors.
+fn finish_run(result: Result<(), FatalCause>, mut trusted_fatal: Option<TrustedFatalGuard>) -> i32 {
+    match result {
         Ok(()) => {
             if let Some(guard) = trusted_fatal.as_mut() {
                 guard.disarm();
             }
+            0
         }
         Err(cause) => {
             match trusted_fatal.as_mut() {
@@ -187,9 +199,8 @@ async fn main() {
                     &cause,
                 ),
             }
-            // `exit` skips destructors; drop the guard so it logs first.
             drop(trusted_fatal);
-            std::process::exit(1);
+            1
         }
     }
 }
@@ -325,6 +336,14 @@ impl FatalCause {
         if let Some(error) = error.downcast_ref::<ProtocolError>() {
             return Self {
                 error_code: Some(error.code.as_str()),
+                ..Self::bare(stage, "protocol_error")
+            };
+        }
+        // Identity, manifest, ACL and token checks fail with the transport's
+        // wire error; its code is just as safe to log as a protocol code.
+        if let Some(error) = error.downcast_ref::<bloom_signer_api::WireError>() {
+            return Self {
+                error_code: Some(ProtocolError::from(error.clone()).code.as_str()),
                 ..Self::bare(stage, "protocol_error")
             };
         }
@@ -2830,7 +2849,14 @@ mod tests {
     #[test]
     fn bootstrap_fatal_exit_omits_unreviewed_error_text() {
         let marker_secret = "MARKER_IDENTITY_SEED_DO_NOT_LOG";
-        let cause = Err::<(), _>(format!("decode identity seed {marker_secret}"))
+        // Identity loading fails with the transport's wire error, whose
+        // message can echo the identity file.
+        let wire = bloom_signer_api::WireError::new(
+            bloom_signer_api::WireErrorCode::MalformedFrame,
+            format!("decode identity seed {marker_secret}"),
+        );
+        assert!(wire.to_string().contains(marker_secret));
+        let cause = Err::<(), _>(wire)
             .at_stage("load_identity_and_manifest")
             .unwrap_err();
         let (event, output) = captured_fatal_exit(|_| {
@@ -2843,8 +2869,66 @@ mod tests {
         assert_eq!(event["fields"]["event"], "service.fatal_exit");
         assert_eq!(event["fields"]["error_kind"], "bootstrap_failure");
         assert_eq!(event["fields"]["stage"], "load_identity_and_manifest");
+        assert_eq!(event["fields"]["reason"], "protocol_error");
+        assert_eq!(event["fields"]["error_code"], "MALFORMED_FRAME");
+        assert!(!output.contains(marker_secret), "{output}");
+
+        // An error of any other type is still reduced to its stage.
+        let cause = Err::<(), _>(format!("decode identity seed {marker_secret}"))
+            .at_stage("load_identity_and_manifest")
+            .unwrap_err();
+        let (event, output) = captured_fatal_exit(|_| {
+            log_fatal_exit(
+                "bootstrap_failure",
+                "Bloom Signer exiting after a bootstrap error",
+                &cause,
+            );
+        });
         assert_eq!(event["fields"]["reason"], "unclassified");
         assert!(!output.contains(marker_secret), "{output}");
+    }
+
+    /// `main` exits through `finish_run`: a failure records its cause on the
+    /// guard and logs exactly one fatal event before the exit code is
+    /// returned, and success logs nothing.
+    #[test]
+    fn finish_run_logs_one_fatal_event_before_returning_the_exit_code() {
+        let mut code = None;
+        let (event, output) = captured_fatal_exit(|span| {
+            code = Some(finish_run(
+                Err(FatalCause::invariant(
+                    "bind_rpc_socket",
+                    "socket owner mismatch",
+                )),
+                Some(TrustedFatalGuard::new(span)),
+            ));
+        });
+        assert_eq!(code, Some(1));
+        assert_eq!(event["fields"]["error_kind"], "service_failure");
+        assert_eq!(event["fields"]["stage"], "bind_rpc_socket");
+        assert_eq!(output.trim().lines().count(), 1, "{output}");
+
+        let mut code = None;
+        let (event, _) = captured_fatal_exit(|_| {
+            code = Some(finish_run(
+                Err(FatalCause::invariant("load_signer_config", "missing")),
+                None,
+            ));
+        });
+        assert_eq!(code, Some(1));
+        assert_eq!(event["fields"]["error_kind"], "bootstrap_failure");
+        assert_eq!(event["fields"]["stage"], "load_signer_config");
+
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        let code = tracing::subscriber::with_default(subscriber, || {
+            finish_run(Ok(()), Some(TrustedFatalGuard::new(tracing::Span::none())))
+        });
+        assert_eq!(code, 0);
+        assert!(capture.text().is_empty(), "{}", capture.text());
     }
 
     #[test]
