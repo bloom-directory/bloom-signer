@@ -420,10 +420,20 @@ impl CardCeremonies {
                 .map_err(storage)?
                 != 1
             {
-                return Err(error(
-                    ProtocolErrorCode::OperationIdConflict,
-                    "card operation cannot be cancelled after consumption",
-                ));
+                drop(state);
+                // Cancelling an already-closed operation is a no-op; only a
+                // consumed approval cannot be withdrawn.
+                let status = self.status(operation_id, now_ms)?;
+                if matches!(
+                    status.state,
+                    CardOperationState::Consumed | CardOperationState::Succeeded
+                ) {
+                    return Err(error(
+                        ProtocolErrorCode::OperationIdConflict,
+                        "card operation cannot be cancelled after consumption",
+                    ));
+                }
+                return Ok(status);
             }
             state.pending.remove(operation_id);
         }
@@ -679,7 +689,19 @@ impl CardCeremonies {
                 "card approval already consumed",
             ));
         }
-        self.apply(&mut state, pending, complete, now_ms)
+        let id = complete.custody_operation_id.clone();
+        let result = self.apply(&mut state, pending, complete, now_ms);
+        if result.is_err() {
+            // The consumed mark committed alone; nothing was released.
+            state
+                .db
+                .execute(
+                    "UPDATE operations SET state='failed' WHERE id=?1 AND state='consumed'",
+                    [id.as_str()],
+                )
+                .map_err(storage)?;
+        }
+        result
     }
     fn apply(
         &self,

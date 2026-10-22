@@ -571,6 +571,48 @@ fn cancellation_and_restart_close_pending_approvals() {
     assert!(s.complete(c, NOW + 4).is_err());
 }
 #[test]
+fn cancelling_a_terminal_operation_reports_its_state() {
+    let s = service();
+    let auth = enroll(&s);
+    let state = |r: Result<CardOperationStatus, ProtocolError>| r.unwrap().state;
+    let (p, _) = checkout(&s, 2);
+    let id = &p.contribution.custody_operation_id;
+    s.cancel(id, NOW + 3).unwrap();
+    assert_eq!(state(s.cancel(id, NOW + 4)), CardOperationState::Cancelled);
+    let (p, _) = checkout(&s, 3);
+    let id = &p.contribution.custody_operation_id;
+    s.status(id, NOW + 902_002).unwrap();
+    assert_eq!(
+        state(s.cancel(id, NOW + 902_003)),
+        CardOperationState::Expired
+    );
+    let missing = OperationId::from_bytes([40; 32]);
+    assert_eq!(state(s.cancel(&missing, NOW)), CardOperationState::Missing);
+    let (p, _) = checkout(&s, 4);
+    s.complete(complete(&auth, &p, private(&auth, false, true), 2), NOW + 3)
+        .unwrap();
+    let consumed = s.cancel(&p.contribution.custody_operation_id, NOW + 4);
+    assert_eq!(
+        consumed.unwrap_err().code,
+        ProtocolErrorCode::OperationIdConflict
+    );
+}
+#[test]
+fn failure_after_consumption_records_failed() {
+    let s = service();
+    let auth = enroll(&s);
+    let (p, _) = checkout(&s, 2);
+    let mut c = complete(&auth, &p, private(&auth, false, true), 2);
+    c.public_binding_digest = Digest32::from_bytes([9; 32]);
+    assert!(s.complete(c, NOW + 3).is_err());
+    assert_eq!(
+        s.status(&p.contribution.custody_operation_id, NOW + 4)
+            .unwrap()
+            .state,
+        CardOperationState::Failed
+    );
+}
+#[test]
 fn invalid_luhn_expiry_and_cvc_enrollment_are_rejected() {
     for case in 0..3 {
         let s = service();
