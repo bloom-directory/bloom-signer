@@ -77,6 +77,9 @@ fn ceremony_kind_name(kind: CeremonyKind) -> &'static str {
         CeremonyKind::PolicyUpdate => "policy_update",
         CeremonyKind::AccountAllocate => "account_allocate",
         CeremonyKind::AccountRetire => "account_retire",
+        CeremonyKind::CardAdd => "card_add",
+        CeremonyKind::CardDelete => "card_delete",
+        CeremonyKind::CardCheckout => "card_checkout",
     }
 }
 
@@ -294,6 +297,7 @@ impl Drop for ProvisionedLocalBackendRollback<'_> {
 /// destroys them and therefore fails pre-commit ceremonies closed; completed
 /// receipts remain the responsibility of the durable RPC host.
 pub struct SignerCeremonyService {
+    pub(crate) cards: crate::cards::CardCeremonies,
     engine: Arc<SignerEngine>,
     signer_key_id: Token,
     signing_key: SigningKey,
@@ -354,6 +358,62 @@ impl SignerCeremonyService {
     /// Effective ceremony port this service instance trusts.
     pub fn ceremony_port(&self) -> u16 {
         self.ceremony_port
+    }
+
+    pub fn cards_storage(&self, path: &std::path::Path) -> Result<(), ProtocolError> {
+        self.cards.open_storage(path)
+    }
+
+    pub fn card_list(&self) -> Result<Vec<bloom_signer_api::CardPublic>, ProtocolError> {
+        self.cards.list()
+    }
+    pub fn traveler_list(&self) -> Result<Vec<bloom_signer_api::TravelerPublic>, ProtocolError> {
+        self.cards.travelers()
+    }
+
+    pub fn card_status(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+    ) -> Result<bloom_signer_api::CardOperationStatus, ProtocolError> {
+        self.cards.status(operation_id, now_ms)
+    }
+
+    pub fn card_cancel(
+        &self,
+        operation_id: &OperationId,
+        now_ms: u64,
+    ) -> Result<bloom_signer_api::CardOperationStatus, ProtocolError> {
+        self.cards.cancel(operation_id, now_ms)
+    }
+
+    pub fn prepare_card(
+        &self,
+        request: bloom_signer_api::CardPrepareRequest,
+        now_ms: u64,
+    ) -> Result<bloom_signer_api::SignerPreparedCustody, ProtocolError> {
+        self.require_surface(
+            &request.surface,
+            matches!(
+                request.effect,
+                bloom_signer_api::CardEffect::Add { .. }
+                    | bloom_signer_api::CardEffect::SaveTraveler { .. }
+            ),
+        )?;
+        self.cards.prepare(request, now_ms)
+    }
+
+    /// Recheck the active surface before consuming a card approval.
+    pub fn complete_card(
+        &self,
+        request: CustodyCompleteRequest,
+        now_ms: u64,
+    ) -> Result<CustodyResult, ProtocolError> {
+        let surface = self
+            .cards
+            .operation_surface(&request.custody_operation_id)?;
+        self.require_surface(&surface, false)?;
+        self.cards.complete(request, now_ms)
     }
 
     /// Expected WebAuthn origin (`http://localhost:<port>`, or
@@ -495,6 +555,11 @@ impl SignerCeremonyService {
             })
             .collect();
         let service = Self {
+            cards: crate::cards::CardCeremonies::new(
+                signing_key.clone(),
+                signer_key_id.clone(),
+                expected_origin.clone(),
+            )?,
             engine,
             signer_key_id,
             signing_key,
@@ -1562,7 +1627,13 @@ impl SignerCeremonyService {
                     | CeremonyKind::CredentialReplace
             ),
         )?;
-        if request.ceremony_kind == CeremonyKind::SealedApproval {
+        if matches!(
+            request.ceremony_kind,
+            CeremonyKind::SealedApproval
+                | CeremonyKind::CardAdd
+                | CeremonyKind::CardDelete
+                | CeremonyKind::CardCheckout
+        ) {
             return Err(kind_mismatch());
         }
         if request.browser_output_recipient_key.is_some() {
@@ -3387,7 +3458,10 @@ impl SignerCeremonyService {
                 self.advance_counter(&verified.credential_id, verified.sign_count);
                 Ok(())
             }
-            CeremonyKind::SealedApproval => Err(kind_mismatch()),
+            CeremonyKind::SealedApproval
+            | CeremonyKind::CardAdd
+            | CeremonyKind::CardDelete
+            | CeremonyKind::CardCheckout => Err(kind_mismatch()),
         };
         effect?;
         Ok(CustodyApplyOutcome {
@@ -4537,6 +4611,88 @@ fn reject_seed_profile_with_migration(
 mod tests {
     use super::*;
     use bloom_signer_api::{Digest32, Token};
+
+    #[test]
+    fn complete_card_rechecks_surface_before_consuming_the_operation() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let engine = Arc::new(
+            SignerEngine::open_in_memory(
+                Token::new("broker").unwrap(),
+                key.verifying_key(),
+                key.verifying_key(),
+                Token::new("revoke").unwrap(),
+                key.clone(),
+                crate::engine::SignerAuditKeys {
+                    current_key_id: Token::new("audit").unwrap(),
+                    current_signing_key: SigningKey::from_bytes(&[14; 32]),
+                    historical_verifying_keys: BTreeMap::new(),
+                },
+                Arc::new(crate::registry::BackendRegistry::from_compiled(Vec::new()).unwrap()),
+            )
+            .unwrap(),
+        );
+        let service =
+            SignerCeremonyService::new(engine.clone(), Token::new("ceremony").unwrap(), key)
+                .unwrap();
+        let operation_id = OperationId::from_bytes([8; 32]);
+        let prepared = service
+            .prepare_card(
+                bloom_signer_api::CardPrepareRequest {
+                    operation_id: operation_id.clone(),
+                    surface: bloom_signer_api::legacy_local_surface(),
+                    effect: bloom_signer_api::CardEffect::Add {
+                        card_id: Token::new("test").unwrap(),
+                        label: "Test".into(),
+                    },
+                },
+                1000,
+            )
+            .unwrap();
+        let persisted = engine.load_surface_status().unwrap();
+        let original = service.surface_status().unwrap();
+        let mut disabled = original.clone();
+        disabled.surfaces[0].lifecycle = SurfaceLifecycle::Disabled;
+        engine
+            .commit_surface_status(persisted.as_ref(), &disabled, "test.disable")
+            .unwrap();
+        let empty = Base64UrlBytes::from_bytes(&[]);
+        let request = CustodyCompleteRequest {
+            ceremony_kind: prepared.contribution.ceremony_kind,
+            custody_operation_id: operation_id.clone(),
+            ceremony_id: prepared.contribution.ceremony_id,
+            proof: WebAuthnCeremonyProof::Assertion {
+                assertion: bloom_signer_api::WebAuthnAssertion {
+                    credential_id: empty.clone(),
+                    authenticator_data: empty.clone(),
+                    client_data_json: empty.clone(),
+                    signature: empty,
+                    user_handle: None,
+                },
+            },
+            encrypted_input: None,
+            public_binding_digest: prepared.contribution.review_manifest_digest,
+        };
+        assert_eq!(
+            service
+                .complete_card(request.clone(), 1001)
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::UnauthenticatedPeer
+        );
+        assert_eq!(
+            service.cards.status(&operation_id, 1001).unwrap().state,
+            bloom_signer_api::CardOperationState::Prepared
+        );
+        engine
+            .commit_surface_status(Some(&disabled), &original, "test.enable")
+            .unwrap();
+        // Once eligible again, the invalid proof reaches custody and consumes it.
+        assert!(service.complete_card(request, 1002).is_err());
+        assert_ne!(
+            service.cards.status(&operation_id, 1002).unwrap().state,
+            bloom_signer_api::CardOperationState::Prepared
+        );
+    }
 
     fn migration() -> bloom_signer_api::LegacyPasskeyMigrationPublic {
         bloom_signer_api::LegacyPasskeyMigrationPublic {
