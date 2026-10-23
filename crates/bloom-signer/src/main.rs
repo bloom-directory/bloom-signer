@@ -47,7 +47,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tokio::{
-    io::AsyncReadExt as _,
+    io::{AsyncRead, AsyncReadExt as _},
     net::{UnixListener, UnixStream},
     sync::{Semaphore, watch},
 };
@@ -308,12 +308,14 @@ impl Drop for TrustedFatalGuard {
 
 /// Why the Signer is exiting, reduced to fields that are safe to log.
 ///
-/// Startup error text can carry secrets: `ProtocolError` messages embed serde
+/// Error text can carry secrets: `ProtocolError` messages embed serde
 /// diagnostics for the identity and config files, which hold private seeds,
 /// and peer-supplied text. The fatal event therefore names the failed stage
 /// and the error's protocol code or I/O kind, never its `Display`. The only
-/// text kept is a literal invariant from this file, or an activation
-/// rejection, which describes endpoint paths, ownership, modes, and OS errors.
+/// text kept is built from literals in this file (an invariant, a serve-loop
+/// failure, or the name of a missing environment variable), or an activation
+/// rejection, which describes endpoint paths, ownership, modes, and OS
+/// errors. Peer UIDs are logged as numbers.
 #[derive(Debug)]
 struct FatalCause {
     stage: &'static str,
@@ -321,6 +323,8 @@ struct FatalCause {
     error_code: Option<&'static str>,
     io_error_kind: Option<ErrorKind>,
     os_error: Option<i32>,
+    peer_uid: Option<u32>,
+    expected_peer_uid: Option<u32>,
     detail: Option<String>,
 }
 
@@ -329,6 +333,15 @@ impl FatalCause {
         Self {
             detail: Some(detail.to_owned()),
             ..Self::bare(stage, "invariant")
+        }
+    }
+
+    /// The peer on a local socket runs as an unexpected user.
+    fn peer_uid_mismatch(stage: &'static str, peer_uid: u32, expected_peer_uid: u32) -> Self {
+        Self {
+            peer_uid: Some(peer_uid),
+            expected_peer_uid: Some(expected_peer_uid),
+            ..Self::bare(stage, "peer_uid_mismatch")
         }
     }
 
@@ -366,6 +379,12 @@ impl FatalCause {
             };
         }
         if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            if let Some(ServeInvariant(detail)) = error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<ServeInvariant>())
+            {
+                return Self::invariant(stage, detail);
+            }
             return Self::bare(stage, "io_error").with_io(error);
         }
         match error.downcast_ref::<bloom_service_activation::ActivationError>() {
@@ -396,6 +415,8 @@ impl FatalCause {
             error_code: None,
             io_error_kind: None,
             os_error: None,
+            peer_uid: None,
+            expected_peer_uid: None,
             detail: None,
         }
     }
@@ -409,7 +430,26 @@ impl FatalCause {
     }
 }
 
-/// Labels a fallible startup step so a fatal exit names the step that failed.
+/// A fixed failure message from a serve loop. It travels inside an
+/// `io::Error` so the loops keep their I/O signatures, and `classify` logs
+/// it as an invariant.
+#[derive(Debug)]
+struct ServeInvariant(&'static str);
+
+impl std::fmt::Display for ServeInvariant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ServeInvariant {}
+
+fn serve_invariant(detail: &'static str) -> std::io::Error {
+    std::io::Error::other(ServeInvariant(detail))
+}
+
+/// Labels a fallible step, during startup or while serving, so a fatal exit
+/// names the step that failed.
 trait AtStage<T> {
     fn at_stage(self, stage: &'static str) -> Result<T, FatalCause>;
 }
@@ -433,6 +473,8 @@ fn log_fatal_exit(error_kind: &'static str, message: &'static str, cause: &Fatal
         error_code = cause.error_code,
         io_error_kind = cause.io_error_kind.map(tracing::field::debug),
         os_error = cause.os_error,
+        peer_uid = cause.peer_uid,
+        expected_peer_uid = cause.expected_peer_uid,
         detail = cause.detail.as_deref(),
         "{message}"
     );
@@ -516,24 +558,7 @@ async fn run(trusted_fatal: &mut Option<TrustedFatalGuard>) -> Result<(), FatalC
         .revoke_client
         .into_acl()
         .at_stage("load_revoke_client_acl")?;
-    if broker_acl.service_id.as_str() != "bloom-broker" {
-        return Err(FatalCause::invariant(
-            "verify_edge_manifest_pins",
-            "edge manifest does not pin bloom-broker for the Signer edge",
-        ));
-    }
-    if session_acl.service_id.as_str() != "bloom-session" {
-        return Err(FatalCause::invariant(
-            "verify_edge_manifest_pins",
-            "edge manifest does not pin bloom-session for the login-session sentinel",
-        ));
-    }
-    if revoke_client_acl.service_id.as_str() != "bloom-revoke-client" {
-        return Err(FatalCause::invariant(
-            "verify_edge_manifest_pins",
-            "edge manifest does not pin the dedicated revoke client",
-        ));
-    }
+    verify_edge_manifest_pins(&broker_acl, &session_acl, &revoke_client_acl)?;
     #[cfg(feature = "triad-dev-harness")]
     let history_owner = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
         signer_effective_uid
@@ -859,48 +884,36 @@ async fn run(trusted_fatal: &mut Option<TrustedFatalGuard>) -> Result<(), FatalC
             control_endpoint = "revocation",
             "Bloom Signer ready"
         );
-        let rpc_identity = identity.clone();
-        tokio::try_join!(
-            async {
-                serve_rpc(
-                    rpc_listener,
-                    rpc_identity,
-                    broker_acl,
-                    rpc_quota,
-                    service.clone(),
-                    journal_exchange,
-                    config.maximum_connections,
-                    &mut rpc_shutdown,
-                )
-                .await
-                .at_stage("serve_rpc")
-            },
-            async {
-                serve_control(
-                    control_listener,
-                    identity,
-                    revoke_client_acl,
-                    control_quota,
-                    control_service,
-                    config.control_maximum_connections,
-                    &mut control_shutdown,
-                )
-                .await
-                .at_stage("serve_control")
-            },
-            async {
-                admin::serve(
-                    admin_listener,
-                    admin_ceremony,
-                    admin_receipt_keys,
-                    admin_peer_uid,
-                    &mut admin_shutdown,
-                )
-                .await
-                .at_stage("serve_admin")
-            },
+        serve_endpoints(
+            serve_rpc(
+                rpc_listener,
+                identity.clone(),
+                broker_acl,
+                rpc_quota,
+                service.clone(),
+                journal_exchange,
+                config.maximum_connections,
+                &mut rpc_shutdown,
+            ),
+            serve_control(
+                control_listener,
+                identity,
+                revoke_client_acl,
+                control_quota,
+                control_service,
+                config.control_maximum_connections,
+                &mut control_shutdown,
+            ),
+            admin::serve(
+                admin_listener,
+                admin_ceremony,
+                admin_receipt_keys,
+                admin_peer_uid,
+                &mut admin_shutdown,
+            ),
             monitor_session_sentinel(session_stream, shutdown_tx),
-        )?;
+        )
+        .await?;
         tracing::info!(
             event = "service.shutdown",
             service_role = "signer",
@@ -915,10 +928,54 @@ async fn run(trusted_fatal: &mut Option<TrustedFatalGuard>) -> Result<(), FatalC
     Ok(())
 }
 
+fn verify_edge_manifest_pins(
+    broker_acl: &PeerAcl,
+    session_acl: &PeerAcl,
+    revoke_client_acl: &PeerAcl,
+) -> Result<(), FatalCause> {
+    const STAGE: &str = "verify_edge_manifest_pins";
+    if broker_acl.service_id.as_str() != "bloom-broker" {
+        return Err(FatalCause::invariant(
+            STAGE,
+            "edge manifest does not pin bloom-broker for the Signer edge",
+        ));
+    }
+    if session_acl.service_id.as_str() != "bloom-session" {
+        return Err(FatalCause::invariant(
+            STAGE,
+            "edge manifest does not pin bloom-session for the login-session sentinel",
+        ));
+    }
+    if revoke_client_acl.service_id.as_str() != "bloom-revoke-client" {
+        return Err(FatalCause::invariant(
+            STAGE,
+            "edge manifest does not pin the dedicated revoke client",
+        ));
+    }
+    Ok(())
+}
+
+/// Serve every endpoint until the session ends or one of them fails, naming
+/// the endpoint that failed.
+async fn serve_endpoints(
+    rpc: impl Future<Output = std::io::Result<()>>,
+    control: impl Future<Output = std::io::Result<()>>,
+    admin: impl Future<Output = std::io::Result<()>>,
+    sentinel: impl Future<Output = Result<(), FatalCause>>,
+) -> Result<(), FatalCause> {
+    tokio::try_join!(
+        async { rpc.await.at_stage("serve_rpc") },
+        async { control.await.at_stage("serve_control") },
+        async { admin.await.at_stage("serve_admin") },
+        sentinel,
+    )?;
+    Ok(())
+}
+
 /// Signal shutdown once the login-session sentinel closes its channel. A
 /// read failure keeps its I/O kind and OS error for the fatal event.
 async fn monitor_session_sentinel(
-    mut session_stream: UnixStream,
+    mut session_stream: impl AsyncRead + Unpin,
     shutdown_tx: watch::Sender<bool>,
 ) -> Result<(), FatalCause> {
     const STAGE: &str = "monitor_session_sentinel";
@@ -1144,7 +1201,7 @@ async fn serve_rpc(
         let permit = tokio::select! {
             _ = wait_for_shutdown(shutdown) => break,
             permit = connections.clone().acquire_owned() => {
-                permit.map_err(|_| std::io::Error::other("Signer RPC connection gate closed"))?
+                permit.map_err(|_| serve_invariant("Signer RPC connection gate closed"))?
             }
         };
         let (mut stream, _) = tokio::select! {
@@ -1175,7 +1232,7 @@ async fn serve_rpc(
             .instrument(service_span),
         );
     }
-    drain_connections(connections, maximum_connections, "RPC").await
+    drain_connections(connections, maximum_connections).await
 }
 
 async fn dispatch_authenticated_rpc(
@@ -1582,7 +1639,7 @@ async fn serve_control(
         let permit = tokio::select! {
             _ = wait_for_shutdown(shutdown) => break,
             permit = connections.clone().acquire_owned() => {
-                permit.map_err(|_| std::io::Error::other("Signer control connection gate closed"))?
+                permit.map_err(|_| serve_invariant("Signer control connection gate closed"))?
             }
         };
         let (mut stream, _) = tokio::select! {
@@ -1619,7 +1676,7 @@ async fn serve_control(
             .instrument(service_span),
         );
     }
-    drain_connections(connections, maximum_connections, "control").await
+    drain_connections(connections, maximum_connections).await
 }
 
 struct CheckpointingControlService {
@@ -1650,9 +1707,20 @@ async fn connect_authenticated_session(
     identity: &LocalIdentity,
     session_acl: &PeerAcl,
 ) -> Result<UnixStream, FatalCause> {
+    const AUTHENTICATE: &str = "authenticate_session_sentinel";
     loop {
         match UnixStream::connect(path).await {
             Ok(mut stream) => {
+                // The handshake repeats this check, but reports only a code;
+                // checking first lets the fatal event name both UIDs.
+                let peer_uid = stream.peer_cred().at_stage(AUTHENTICATE)?.uid();
+                if peer_uid != session_acl.effective_uid {
+                    return Err(FatalCause::peer_uid_mismatch(
+                        AUTHENTICATE,
+                        peer_uid,
+                        session_acl.effective_uid,
+                    ));
+                }
                 bloom_triad_local_transport::authenticate_client(
                     &mut stream,
                     identity,
@@ -1661,7 +1729,7 @@ async fn connect_authenticated_session(
                     bloom_service_activation::SESSION_PROTOCOL_RANGE,
                 )
                 .await
-                .at_stage("authenticate_session_sentinel")?;
+                .at_stage(AUTHENTICATE)?;
                 return Ok(stream);
             }
             Err(error)
@@ -1688,21 +1756,16 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 async fn drain_connections(
     connections: Arc<Semaphore>,
     maximum_connections: usize,
-    endpoint: &str,
 ) -> std::io::Result<()> {
     let permits = u32::try_from(maximum_connections)
-        .map_err(|_| std::io::Error::other("Signer connection quota exceeds u32"))?;
+        .map_err(|_| serve_invariant("Signer connection quota exceeds u32"))?;
     let _drained = tokio::time::timeout(
         Duration::from_secs(35),
         connections.acquire_many_owned(permits),
     )
     .await
-    .map_err(|_| {
-        std::io::Error::other(format!(
-            "Signer {endpoint} connections did not drain within 35 seconds"
-        ))
-    })?
-    .map_err(|_| std::io::Error::other("Signer connection gate closed"))?;
+    .map_err(|_| serve_invariant("Signer connections did not drain within 35 seconds"))?
+    .map_err(|_| serve_invariant("Signer connection gate closed"))?;
     Ok(())
 }
 
@@ -2241,7 +2304,7 @@ mod tests {
     async fn logout_drain_waits_for_an_accepted_operation() {
         let connections = Arc::new(Semaphore::new(2));
         let accepted = connections.clone().acquire_owned().await.unwrap();
-        let drain = tokio::spawn(drain_connections(connections, 2, "test"));
+        let drain = tokio::spawn(drain_connections(connections, 2));
         tokio::task::yield_now().await;
         assert!(!drain.is_finished());
         drop(accepted);
@@ -3062,20 +3125,132 @@ mod tests {
     #[tokio::test]
     async fn sentinel_that_hangs_up_fails_the_handshake_stage() {
         let temporary = tempfile::tempdir().unwrap();
+        let effective_uid = fs::metadata(temporary.path()).unwrap().uid();
         let path = temporary.path().join("session.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let sentinel = tokio::spawn(async move {
             drop(listener.accept().await.unwrap());
         });
         let identity = signer_identity();
-        let cause = connect_authenticated_session(&path, &identity, &peer_acl(&identity, 0))
-            .await
-            .unwrap_err();
+        let cause =
+            connect_authenticated_session(&path, &identity, &peer_acl(&identity, effective_uid))
+                .await
+                .unwrap_err();
         sentinel.await.unwrap();
         assert_eq!(cause.stage, "authenticate_session_sentinel");
         assert_eq!(cause.reason, "protocol_error");
-        assert!(cause.error_code.is_some());
-        assert_eq!(cause.os_error, None);
+        assert_eq!(cause.error_code, Some("SERVICE_UNAVAILABLE"));
+    }
+
+    #[tokio::test]
+    async fn sentinel_running_as_another_user_names_both_uids() {
+        let temporary = tempfile::tempdir().unwrap();
+        let effective_uid = fs::metadata(temporary.path()).unwrap().uid();
+        let expected_uid = effective_uid.wrapping_add(1);
+        let path = temporary.path().join("session.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let sentinel = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let identity = signer_identity();
+        let cause =
+            connect_authenticated_session(&path, &identity, &peer_acl(&identity, expected_uid))
+                .await
+                .unwrap_err();
+        drop(sentinel.await.unwrap());
+        assert_eq!(cause.stage, "authenticate_session_sentinel");
+        assert_eq!(cause.reason, "peer_uid_mismatch");
+
+        let (event, _) = captured_fatal_exit(|span| {
+            TrustedFatalGuard::new(span).record(cause);
+        });
+        assert_eq!(event["fields"]["peer_uid"], effective_uid);
+        assert_eq!(event["fields"]["expected_peer_uid"], expected_uid);
+    }
+
+    struct FailingRead(i32);
+
+    impl AsyncRead for FailingRead {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            _buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::from_raw_os_error(self.0)))
+        }
+    }
+
+    #[tokio::test]
+    async fn session_sentinel_read_failure_keeps_its_os_error() {
+        const EIO: i32 = 5;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cause = monitor_session_sentinel(FailingRead(EIO), shutdown_tx)
+            .await
+            .unwrap_err();
+        assert_eq!(cause.stage, "monitor_session_sentinel");
+        assert_eq!(cause.reason, "io_error");
+        assert_eq!(cause.os_error, Some(EIO));
+        assert!(!*shutdown_rx.borrow());
+    }
+
+    fn acl_for(service_id: &str) -> PeerAcl {
+        PeerAcl {
+            service_id: Token::new(service_id).unwrap(),
+            ..peer_acl(&signer_identity(), 0)
+        }
+    }
+
+    #[test]
+    fn edge_manifest_pin_checks_name_the_wrong_pin() {
+        let broker = acl_for("bloom-broker");
+        let session = acl_for("bloom-session");
+        let revoke = acl_for("bloom-revoke-client");
+        let wrong = acl_for("bloom-machine");
+        assert!(verify_edge_manifest_pins(&broker, &session, &revoke).is_ok());
+        for (broker, session, revoke, pin) in [
+            (&wrong, &session, &revoke, "bloom-broker"),
+            (&broker, &wrong, &revoke, "bloom-session"),
+            (&broker, &session, &wrong, "revoke client"),
+        ] {
+            let cause = verify_edge_manifest_pins(broker, session, revoke).unwrap_err();
+            assert_eq!(cause.stage, "verify_edge_manifest_pins");
+            let detail = cause.detail.unwrap();
+            assert!(detail.contains(pin), "{detail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_endpoints_name_the_endpoint_that_failed() {
+        const EIO: i32 = 5;
+        let failed = || async { Err::<(), _>(std::io::Error::from_raw_os_error(EIO)) };
+        let open = std::future::pending::<std::io::Result<()>>;
+        let sentinel = std::future::pending::<Result<(), FatalCause>>;
+
+        let cause = serve_endpoints(failed(), open(), open(), sentinel())
+            .await
+            .unwrap_err();
+        assert_eq!((cause.stage, cause.os_error), ("serve_rpc", Some(EIO)));
+        let cause = serve_endpoints(open(), failed(), open(), sentinel())
+            .await
+            .unwrap_err();
+        assert_eq!((cause.stage, cause.os_error), ("serve_control", Some(EIO)));
+        let cause = serve_endpoints(open(), open(), failed(), sentinel())
+            .await
+            .unwrap_err();
+        assert_eq!((cause.stage, cause.os_error), ("serve_admin", Some(EIO)));
+    }
+
+    #[test]
+    fn serve_loop_failure_is_a_literal_invariant() {
+        let cause = Err::<(), _>(serve_invariant(
+            "Signer connections did not drain within 35 seconds",
+        ))
+        .at_stage("serve_control")
+        .unwrap_err();
+        assert_eq!(cause.stage, "serve_control");
+        assert_eq!(cause.reason, "invariant");
+        assert_eq!(
+            cause.detail.as_deref(),
+            Some("Signer connections did not drain within 35 seconds")
+        );
     }
 
     #[tokio::test]
