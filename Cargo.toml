@@ -14,7 +14,7 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 # Internal crates. None of these is published: they carry the Signer's key
 # handling, and an accidental `cargo publish` would put it on crates.io.
@@ -33,7 +33,8 @@ bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-r
 bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
 aws-config = { version = "=1.8.1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-credential-types = "1"
-# Exact AWS service pins preserve the workspace's declared Rust 1.85 floor.
+# Exact AWS service pins date from the old Rust 1.85 floor. Newer releases
+# fit the current 1.88 floor; moving to them is a separate dependency update.
 #
 # `default-features = false` is deliberate. These SDKs default to their
 # `rustls` feature, which despite the name selects the *legacy* TLS stack
