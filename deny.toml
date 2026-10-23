@@ -37,7 +37,7 @@ ignore = [
   #
   # This one is a genuine accepted risk, not a false positive. The fix is
   # `time` >= 0.3.47, which requires Rust 1.88 and so would raise the
-  # workspace's declared 1.85 floor (see `rust-version` and the exact AWS
+  # workspace's declared 1.87 floor (see `rust-version` and the exact AWS
   # pins that exist to hold it). Raising the floor is a maintainer decision,
   # not a dependency bump — remove this entry when it is made.
   "RUSTSEC-2026-0009",
