@@ -552,21 +552,20 @@ impl SignerRpcService {
             .approval_requires_trusted_time(&request.unsigned.approval_id)?;
         let clock = self.clock.observe(trusted_time_required)?;
         let authorization = self.engine.authorize_sign(&request, &clock)?;
-        if authorization == SignAuthorization::SameOperationRetry {
-            if let Some(stored) = self
+        if authorization == SignAuthorization::SameOperationRetry
+            && let Some(stored) = self
                 .engine
                 .stored_operation_result(&request.unsigned.operation_id)?
-            {
-                tracing::info!(
-                    event = "signer.signing_recovered",
-                    operation_id = request.unsigned.operation_id.as_str(),
-                    outcome = "stored_result",
-                    "Signer recovered an existing signing result"
-                );
-                return serde_json::from_slice(&stored.decode()).map_err(|error| {
-                    ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
-                });
-            }
+        {
+            tracing::info!(
+                event = "signer.signing_recovered",
+                operation_id = request.unsigned.operation_id.as_str(),
+                outcome = "stored_result",
+                "Signer recovered an existing signing result"
+            );
+            return serde_json::from_slice(&stored.decode()).map_err(|error| {
+                ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
+            });
         }
 
         let provider_attempt_ids = (0..request.unsigned.ordered_hashes.len())
