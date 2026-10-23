@@ -249,13 +249,16 @@ pub(super) async fn serve(
     shutdown: &mut watch::Receiver<bool>,
 ) -> io::Result<()> {
     let Some(listener) = listener else {
-        shutdown.changed().await.map_err(io::Error::other)?;
+        shutdown
+            .changed()
+            .await
+            .map_err(|_| super::serve_invariant("Signer shutdown channel closed"))?;
         return Ok(());
     };
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
-                changed.map_err(io::Error::other)?;
+                changed.map_err(|_| super::serve_invariant("Signer shutdown channel closed"))?;
                 return Ok(());
             }
             accepted = listener.accept() => {
