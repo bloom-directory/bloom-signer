@@ -115,7 +115,7 @@ pub const SLIP10_SOLANA_TERMINAL_PUBLIC_KEY_FINGERPRINT_HEX: &str =
 #[cfg(test)]
 mod tests {
     fn is_hex(value: &str) -> bool {
-        value.len().is_multiple_of(2) && value.bytes().all(|b| b.is_ascii_hexdigit())
+        value.len() % 2 == 0 && value.bytes().all(|b| b.is_ascii_hexdigit())
     }
 
     #[test]
