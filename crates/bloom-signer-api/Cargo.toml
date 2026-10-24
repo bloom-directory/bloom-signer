@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+num-bigint = "0.4"
 bloom-rpc-wire.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true

@@ -1021,6 +1021,7 @@ mod tests {
             not_before_ms: DecimalU64::new(current - 1_000),
             expires_at_ms: DecimalU64::new(current + 60_000),
             renewal_of: None,
+            session_budget: None,
         };
         engine
             .enroll_wallet_root_key(&terms.wallet_id, &terms.key_ref)
@@ -1154,6 +1155,7 @@ mod tests {
         let payloads = vec![Digest32::from_bytes([22; 32])];
         let hashes = vec![Digest32::from_bytes([33; 32])];
         let identity = SignOperationIdentity {
+            session_accounting_digest: None,
             operation_id: operation_id.clone(),
             approval_id: terms.approval_id().unwrap(),
             key_ref: terms.key_ref.clone(),
@@ -1166,6 +1168,7 @@ mod tests {
             policy_digest: terms.policy_digest.clone(),
         };
         let mut unsigned = UnsignedSignRequest {
+            session_accounting: None,
             schema: Token::new("bloom.sign-request/1").unwrap(),
             attempt_id: Digest32::from_bytes([attempt_byte; 32]),
             operation_id,
@@ -1220,6 +1223,7 @@ mod tests {
         request.unsigned.ordered_hashes = vec![digest];
         request.unsigned.ordered_messages = vec![Base64UrlBytes::from_bytes(&message)];
         request.unsigned.operation_digest = SignOperationIdentity {
+            session_accounting_digest: None,
             operation_id: request.unsigned.operation_id.clone(),
             approval_id: request.unsigned.approval_id.clone(),
             key_ref,
@@ -1346,7 +1350,9 @@ mod tests {
                 ordered_payload_digests,
                 ordered_hashes,
             } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
-            ApprovalSelector::Petal { .. } => unreachable!("fixture is exact"),
+            ApprovalSelector::Petal { .. } | ApprovalSelector::SystemSession { .. } => {
+                unreachable!("fixture is exact")
+            }
         };
         service
             .ceremony

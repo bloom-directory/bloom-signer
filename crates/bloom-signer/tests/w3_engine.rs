@@ -81,6 +81,7 @@ fn exact_terms() -> SealedApprovalTerms {
         not_before_ms: DecimalU64::new(1_000),
         expires_at_ms: DecimalU64::new(10_000),
         renewal_of: None,
+        session_budget: None,
     }
 }
 
@@ -129,6 +130,11 @@ fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> Unsign
             ordered_hashes.clone(),
             SelectorKind::Exact,
         ),
+        ApprovalSelector::SystemSession { .. } => (
+            vec![digest("22")],
+            vec![digest("33")],
+            SelectorKind::SystemSession,
+        ),
         ApprovalSelector::Petal { .. } => {
             (vec![digest("22")], vec![digest("33")], SelectorKind::Petal)
         }
@@ -138,6 +144,7 @@ fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> Unsign
     let assurance_digest =
         matches!(&terms.selector, ApprovalSelector::Petal { .. }).then(|| digest("ac"));
     let identity = SignOperationIdentity {
+        session_accounting_digest: None,
         operation_id: OperationId::new(operation_byte.repeat(32)).unwrap(),
         approval_id: terms.approval_id().unwrap(),
         key_ref: terms.key_ref.clone(),
@@ -150,6 +157,7 @@ fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> Unsign
         policy_digest: terms.policy_digest.clone(),
     };
     let mut request = UnsignedSignRequest {
+        session_accounting: None,
         schema: Token::new("bloom.sign-request/1").unwrap(),
         attempt_id: digest("88"),
         operation_id: identity.operation_id.clone(),
@@ -973,4 +981,157 @@ fn production_visible_constructor_rejects_shared_revocation_audit_key() {
         result.err().unwrap().code,
         ProtocolErrorCode::MalformedFrame
     );
+}
+
+#[test]
+fn shared_group_backstop_is_atomic_across_grants_and_retains_ambiguous_capacity() {
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let engine = new_engine(&broker);
+    let n = |s: &str| DecimalU256::parse(s).unwrap();
+    let asset = AssetId {
+        chain: Token::new("polygon").unwrap(),
+        asset: "pusd".into(),
+    };
+    let mut terms = petal_terms();
+    terms.limits.max_operations = DecimalU64::new(8);
+    terms.limits.max_signatures = DecimalU64::new(8);
+    terms.limits.value_limits = vec![ValueLimit {
+        asset: asset.clone(),
+        lifetime: n("10000000"),
+        rolling_windows: vec![],
+    }];
+    let group = SessionBudget {
+        wallet_id: terms.wallet_id.clone(),
+        policy_version: terms.policy_version.clone(),
+        policy_digest: terms.policy_digest.clone(),
+        wallet_revocation_epoch: terms.wallet_revocation_epoch.clone(),
+        member_keys: vec![terms.key_ref.clone()],
+        limits: terms.limits.clone(),
+        nominal_asset_scales: vec![SessionAssetScale {
+            asset: asset.clone(),
+            units_per_nominal_unit: n("1000000"),
+        }],
+        nominal_limits: SessionNominalLimits {
+            per_action: n("2000000"),
+            lifetime: n("3000000"),
+            rolling_windows: vec![ValueWindow {
+                maximum: n("3000000"),
+                duration_ms: DecimalU64::new(86400000),
+            }],
+        },
+        per_action_value_limits: vec![SessionValueCeiling {
+            asset: asset.clone(),
+            maximum: n("2000000"),
+        }],
+        not_before_ms: terms.not_before_ms.clone(),
+        expires_at_ms: terms.expires_at_ms.clone(),
+    };
+    terms.session_budget = Some(group.clone());
+    let mut other = terms.clone();
+    other.request_nonce = RequestNonce::from_bytes([0x67; 16]);
+    engine.install_approval_for_test(&terms).unwrap();
+    engine.install_approval_for_test(&other).unwrap();
+    let request = |terms: &SealedApprovalTerms, op: &str, attempt: &str, quantity: &str| {
+        let mut request = signed(&broker, unsigned_request(terms, op));
+        request.unsigned.attempt_id = digest(attempt);
+        request.unsigned.session_accounting = Some(SessionAccounting {
+            system_use: None,
+            values: vec![SessionAssetAmount {
+                asset: asset.clone(),
+                amount: n(quantity),
+            }],
+            budget_id: Some(group.budget_id().unwrap()),
+        });
+        resign(&broker, &mut request);
+        request
+    };
+    let first = request(&terms, "01", "88", "2000000");
+    assert_eq!(
+        engine.authorize_sign(&first, &clock(2500)).unwrap(),
+        SignAuthorization::NewOperation
+    );
+    let rejected = request(&other, "02", "89", "2000000");
+    assert_eq!(
+        engine
+            .authorize_sign(&rejected, &clock(2501))
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::LimitExceededValue
+    );
+    // The rejected transaction inserted neither its group row nor its attempt.
+    let accepted = request(&other, "02", "89", "1000000");
+    assert_eq!(
+        engine.authorize_sign(&accepted, &clock(2502)).unwrap(),
+        SignAuthorization::NewOperation
+    );
+    engine
+        .finalize_operation(
+            &first.unsigned.operation_id,
+            SignerOperationEffect::Quarantined,
+        )
+        .unwrap();
+    let next = request(&other, "03", "90", "1");
+    assert_eq!(
+        engine.authorize_sign(&next, &clock(2503)).unwrap_err().code,
+        ProtocolErrorCode::LimitExceededValue
+    );
+}
+
+#[test]
+fn restored_shared_budget_cannot_reactivate_identical_descriptor() {
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let engine = new_engine(&broker);
+    let mut terms = petal_terms();
+    terms.session_budget = Some(SessionBudget {
+        wallet_id: terms.wallet_id.clone(),
+        policy_version: terms.policy_version.clone(),
+        policy_digest: terms.policy_digest.clone(),
+        wallet_revocation_epoch: terms.wallet_revocation_epoch.clone(),
+        member_keys: vec![terms.key_ref.clone()],
+        limits: terms.limits.clone(),
+        nominal_asset_scales: vec![SessionAssetScale {
+            asset: AssetId {
+                chain: Token::new("polygon").unwrap(),
+                asset: "pusd".into(),
+            },
+            units_per_nominal_unit: DecimalU256::parse("1000000").unwrap(),
+        }],
+        nominal_limits: SessionNominalLimits {
+            per_action: DecimalU256::parse("1").unwrap(),
+            lifetime: DecimalU256::parse("1").unwrap(),
+            rolling_windows: vec![],
+        },
+        per_action_value_limits: vec![SessionValueCeiling {
+            asset: AssetId {
+                chain: Token::new("polygon").unwrap(),
+                asset: "pusd".into(),
+            },
+            maximum: DecimalU256::parse("1000000").unwrap(),
+        }],
+        not_before_ms: terms.not_before_ms.clone(),
+        expires_at_ms: terms.expires_at_ms.clone(),
+    });
+    engine.install_approval_for_test(&terms).unwrap();
+    let backup = engine
+        .export_backup(&terms.wallet_id, None, vec![])
+        .unwrap();
+    let restored = new_engine(&broker);
+    restored.restore_backup(&backup).unwrap();
+    assert_eq!(
+        restored.install_approval_for_test(&terms).unwrap_err().code,
+        ProtocolErrorCode::ApprovalRevoked
+    );
+    let mut renewed = terms.clone();
+    renewed.request_nonce = RequestNonce::from_bytes([0x79; 16]);
+    assert_eq!(
+        restored
+            .install_approval_for_test(&renewed)
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ApprovalRevoked
+    );
+    // A fresh reviewed lifetime interval is a different budget descriptor.
+    renewed.expires_at_ms = DecimalU64::new(renewed.expires_at_ms.get() + 1);
+    renewed.session_budget.as_mut().unwrap().expires_at_ms = renewed.expires_at_ms.clone();
+    restored.install_approval_for_test(&renewed).unwrap();
 }

@@ -18,6 +18,7 @@ pub const MAX_ED25519_MESSAGE_BYTES: usize = 1232;
 pub enum SelectorKind {
     Exact,
     Petal,
+    SystemSession,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -46,6 +47,8 @@ pub struct SignOperationIdentity {
     pub ordered_hashes: Vec<Digest32>,
     pub petal_use_claim_digest: Option<Digest32>,
     pub claim_assurance_digest: Option<Digest32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_accounting_digest: Option<Digest32>,
     pub policy_version: DecimalU64,
     pub policy_digest: Digest32,
 }
@@ -91,6 +94,8 @@ pub struct UnsignedSignRequest {
     pub signature_count: DecimalU64,
     pub petal_use_claim_digest: Option<Digest32>,
     pub claim_assurance_digest: Option<Digest32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_accounting: Option<crate::SessionAccounting>,
     pub policy_version: DecimalU64,
     pub policy_digest: Digest32,
     pub validation_receipt_digest: Digest32,
@@ -173,6 +178,10 @@ impl UnsignedSignRequest {
             ordered_hashes: self.ordered_hashes.clone(),
             petal_use_claim_digest: self.petal_use_claim_digest.clone(),
             claim_assurance_digest: self.claim_assurance_digest.clone(),
+            session_accounting_digest: self
+                .session_accounting
+                .as_ref()
+                .map(crate::SessionAccounting::digest),
             policy_version: self.policy_version.clone(),
             policy_digest: self.policy_digest.clone(),
         }
