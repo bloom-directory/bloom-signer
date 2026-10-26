@@ -45,6 +45,27 @@ pub struct CheckoutFacts {
     pub currency: String,
     pub installments: u16,
     pub recurring: bool,
+    /// What each later charge costs, when the page states a price today's
+    /// charge does not show: a trial or introductory offer. In the same
+    /// currency; the person approves it with the rest of the facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_minor: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_period: Option<RenewalPeriod>,
+    /// The first date that price applies, `YYYY-MM-DD`, when the page states
+    /// one unambiguously.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_starts_on: Option<String>,
+}
+
+/// How often a subscription renews.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenewalPeriod {
+    Day,
+    Week,
+    Month,
+    Year,
 }
 
 impl CheckoutFacts {
@@ -70,6 +91,17 @@ impl CheckoutFacts {
             || self.installments == 0
             || self.installments > 60
             || self.total_minor == 0
+            // A renewal price means a price and how often it recurs, on a
+            // checkout that says it recurs at all. A date without a price
+            // would be a claim the review cannot put an amount against.
+            || self.renewal_minor.is_some() != self.renewal_period.is_some()
+            || self.renewal_minor.is_some_and(|minor| minor == 0)
+            || (self.renewal_minor.is_none() && self.renewal_starts_on.is_some())
+            || (self.renewal_minor.is_some() && !self.recurring)
+            || self
+                .renewal_starts_on
+                .as_ref()
+                .is_some_and(|date| !is_calendar_date(date))
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
@@ -78,6 +110,33 @@ impl CheckoutFacts {
         }
         Ok(())
     }
+}
+
+/// `YYYY-MM-DD`, and a date that exists. The review shows this to the person
+/// as the day the renewal price starts, so "2026-02-31" must not reach it.
+fn is_calendar_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let digits = |range: std::ops::Range<usize>| -> Option<u32> {
+        value
+            .get(range)
+            .filter(|part| part.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|part| part.parse().ok())
+    };
+    let (Some(year), Some(month), Some(day)) = (digits(0..4), digits(5..7), digits(8..10)) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let length = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=length).contains(&day)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -253,6 +312,21 @@ mod tests {
             currency: "BRL".into(),
             installments: 6,
             recurring: false,
+            renewal_minor: None,
+            renewal_period: None,
+            renewal_starts_on: None,
+        }
+    }
+    fn subscription() -> CheckoutFacts {
+        CheckoutFacts {
+            total_minor: 100,
+            currency: "USD".into(),
+            installments: 1,
+            recurring: true,
+            renewal_minor: Some(1299),
+            renewal_period: Some(RenewalPeriod::Month),
+            renewal_starts_on: Some("2026-11-25".into()),
+            ..facts()
         }
     }
     fn request(facts: CheckoutFacts, key: u8) -> CardPrepareRequest {
@@ -283,6 +357,67 @@ mod tests {
                 _ => key = 3,
             }
             assert!(request(f, key).digest().unwrap() != original);
+        }
+    }
+    /// What the subscription costs later is approved, not advisory: the
+    /// person's signature covers the renewal price, how often it recurs and
+    /// the day it starts.
+    #[test]
+    fn every_renewal_term_changes_the_binding() {
+        let original = request(subscription(), 2).digest().unwrap();
+        let mut seen = std::collections::HashSet::from([original]);
+        for index in 0..4 {
+            let mut f = subscription();
+            match index {
+                0 => f.renewal_minor = Some(1399),
+                1 => f.renewal_period = Some(RenewalPeriod::Year),
+                2 => f.renewal_starts_on = Some("2026-12-25".into()),
+                _ => {
+                    f.renewal_minor = None;
+                    f.renewal_period = None;
+                    f.renewal_starts_on = None;
+                }
+            }
+            assert!(seen.insert(request(f, 2).digest().unwrap()), "{index}");
+        }
+    }
+    #[test]
+    fn a_renewal_needs_a_price_a_period_and_a_real_date() {
+        assert!(subscription().validate().is_ok());
+        let mut f = subscription();
+        f.renewal_period = None;
+        assert!(f.validate().is_err());
+        let mut f = subscription();
+        f.renewal_minor = Some(0);
+        assert!(f.validate().is_err());
+        // A date with no price it belongs to.
+        let mut f = subscription();
+        f.renewal_minor = None;
+        f.renewal_period = None;
+        assert!(f.validate().is_err());
+        // A later price on a checkout that says it does not recur.
+        let mut f = subscription();
+        f.recurring = false;
+        assert!(f.validate().is_err());
+        for date in [
+            "2026-11-5",
+            "26-11-05",
+            "2026/11/05",
+            "2026-13-01",
+            "2026-02-30",
+            "2026-00-10",
+            "2026-11-00",
+            "2026-11-05 ",
+            "two thousand",
+        ] {
+            let mut f = subscription();
+            f.renewal_starts_on = Some(date.into());
+            assert!(f.validate().is_err(), "{date}");
+        }
+        for date in ["2026-02-29", "2024-02-29", "2026-12-31", "2026-11-25"] {
+            let mut f = subscription();
+            f.renewal_starts_on = Some(date.into());
+            assert_eq!(f.validate().is_ok(), date != "2026-02-29", "{date}");
         }
     }
     #[test]
