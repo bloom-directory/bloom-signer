@@ -312,10 +312,9 @@ impl Drop for TrustedFatalGuard {
 /// diagnostics for the identity and config files, which hold private seeds,
 /// and peer-supplied text. The fatal event therefore names the failed stage
 /// and the error's protocol code or I/O kind, never its `Display`. The only
-/// text kept is built from literals in this file (an invariant, a serve-loop
-/// failure, or the name of a missing environment variable), or an activation
-/// rejection, which describes endpoint paths, ownership, modes, and OS
-/// errors. Peer UIDs are logged as numbers.
+/// text kept is built from literals in this file: an invariant, a serve-loop
+/// failure, or the name of a missing environment variable. Peer UIDs are
+/// logged as numbers.
 #[derive(Debug)]
 struct FatalCause {
     stage: &'static str,
@@ -387,11 +386,12 @@ impl FatalCause {
             }
             return Self::bare(stage, "io_error").with_io(error);
         }
+        // A rejection is an untyped `String` that can hold environment-supplied
+        // text such as activation socket names, so only its kind is logged.
         match error.downcast_ref::<bloom_service_activation::ActivationError>() {
-            Some(bloom_service_activation::ActivationError::Rejected(message)) => Self {
-                detail: Some(message.clone()),
-                ..Self::bare(stage, "activation_rejected")
-            },
+            Some(bloom_service_activation::ActivationError::Rejected(_)) => {
+                Self::bare(stage, "activation_rejected")
+            }
             Some(bloom_service_activation::ActivationError::Io(error)) => {
                 Self::bare(stage, "activation_io_error").with_io(error)
             }
@@ -3044,7 +3044,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(rejected.stage, "bind_admin_socket");
         assert_eq!(rejected.reason, "activation_rejected");
-        assert_eq!(rejected.detail.as_deref(), Some(rejection));
+        assert_eq!(rejected.detail, None);
 
         let activation_io = Err::<(), _>(bloom_service_activation::ActivationError::Io(
             std::io::Error::new(ErrorKind::AddrInUse, "socket is live"),
@@ -3075,6 +3075,27 @@ mod tests {
             invariant.detail.as_deref(),
             Some("Signer connection quotas must be nonzero")
         );
+    }
+
+    #[test]
+    fn activation_rejection_text_never_reaches_the_log() {
+        let marker_secret = "MARKER_ACTIVATION_SECRET_DO_NOT_LOG";
+        // Shaped like a real rejection built from environment-supplied
+        // activation names (`LISTEN_FDNAMES`).
+        let rejection = format!("activation socket name {marker_secret:?} is duplicated");
+        let boxed: Box<dyn std::error::Error> =
+            bloom_service_activation::ActivationError::Rejected(rejection).into();
+        assert!(boxed.to_string().contains(marker_secret));
+        let cause = Err::<(), _>(boxed).at_stage("bind_rpc_socket").unwrap_err();
+
+        let (event, output) = captured_fatal_exit(|span| {
+            TrustedFatalGuard::new(span).record(cause);
+        });
+        assert_eq!(event["fields"]["event"], "service.fatal_exit");
+        assert_eq!(event["fields"]["stage"], "bind_rpc_socket");
+        assert_eq!(event["fields"]["reason"], "activation_rejected");
+        assert!(event["fields"].get("detail").is_none(), "{output}");
+        assert!(!output.contains(marker_secret), "{output}");
     }
 
     #[test]
