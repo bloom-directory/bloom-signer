@@ -342,6 +342,18 @@ fn system_use_cannot_change_component_class_provenance_or_omit_claims() {
         engine.authorize_sign(&valid, &clock(2_500)).unwrap(),
         SignAuthorization::NewOperation
     );
+    // Native EVM has no Petal claim; Broker binds its verified native scope
+    // through the authenticated validation receipt and request identity.
+    let engine = new_engine(&broker);
+    engine.install_approval_for_test(&terms).unwrap();
+    let mut native = signed(&broker, unsigned_request(&terms, "02"));
+    native.unsigned.petal_use_claim_digest = None;
+    native.unsigned.claim_assurance_digest = None;
+    resign(&broker, &mut native);
+    assert_eq!(
+        engine.authorize_sign(&native, &clock(2_500)).unwrap(),
+        SignAuthorization::NewOperation
+    );
 }
 
 #[test]

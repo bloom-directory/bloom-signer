@@ -6467,8 +6467,10 @@ fn validate_against_approval(
         ) if component_id == request_component
             && allowed_operation_classes.contains(operation_class)
             && provenance_digest == &terms.provenance_digest
+            // EVM native uses Broker's independently verified System context;
+            // SOL additionally carries the existing opaque claim/proof digests.
             && request.unsigned.petal_use_claim_digest.is_some()
-            && request.unsigned.claim_assurance_digest.is_some() => {}
+                == request.unsigned.claim_assurance_digest.is_some() => {}
         (ApprovalSelector::Petal { .. }, SelectorKind::Petal)
             if request.unsigned.petal_use_claim_digest.is_some()
                 && request.unsigned.claim_assurance_digest.is_some() => {}
