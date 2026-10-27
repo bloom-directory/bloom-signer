@@ -138,3 +138,7 @@ The digest is bound to the accepted time and that exact approval set, so it
 cannot be reused if either changes. On success the clock condition becomes
 `REPAIRED` and a `clock.repaired` record is appended to the audit journal with
 the prior and accepted times, the anchor, and the boot epoch.
+
+Reusable permissions can explicitly use the `DecimalU64(u64::MAX)` expiry sentinel for owner-reviewed standing authority. Exact approvals reject that sentinel; ordinary finite approvals retain the compiled 90-day ceiling. Broker must require the signed wallet-policy standing opt-in. This changes validity only: local wallet locking/activation, cryptographic signing, counters, replay and revocation remain enforced. No token prices or token accounting are added to Signer.
+
+A verified passkey ceremony may rearm an unchanged, active `durable_local` standing grant. Existing approval rows and their counters are retained. Revoked grants, changed terms and finite/exact grants cannot use this path.

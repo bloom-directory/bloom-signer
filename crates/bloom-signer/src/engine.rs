@@ -1590,11 +1590,12 @@ impl SignerEngine {
         receipt: Option<&SignerActivationReceipt>,
     ) -> Result<Digest32, ProtocolError> {
         terms.validate()?;
-        if terms
-            .expires_at_ms
-            .get()
-            .saturating_sub(terms.not_before_ms.get())
-            > MAX_APPROVAL_LIFETIME_MS
+        if terms.expires_at_ms.get() != u64::MAX
+            && terms
+                .expires_at_ms
+                .get()
+                .saturating_sub(terms.not_before_ms.get())
+                > MAX_APPROVAL_LIFETIME_MS
         {
             return Err(error(
                 ProtocolErrorCode::ApprovalExpired,
@@ -1681,15 +1682,42 @@ impl SignerEngine {
                 ));
             }
         }
-        transaction
-            .execute(
-                "INSERT INTO approvals(
+        let existing: Option<(String, bool)> = transaction
+            .query_row(
+                "SELECT terms_jcs,active FROM approvals WHERE approval_id=?1",
+                [approval_id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(storage)?;
+        if let Some((stored, active)) = existing {
+            if receipt.is_none()
+                || !active
+                || stored != terms_jcs
+                || terms.expires_at_ms.get() != u64::MAX
+                || !matches!(
+                    terms.activation_mode,
+                    bloom_signer_api::ActivationMode::DurableLocal { .. }
+                )
+            {
+                return Err(error(
+                    ProtocolErrorCode::ApprovalRevoked,
+                    "only an unchanged, active standing local grant can be rearmed",
+                ));
+            }
+            // The verified passkey ceremony has reactivated the local backend.
+            // Never reinsert this row: its counters and operation history remain.
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO approvals(
                     approval_id, wallet_id, terms_jcs, active,
                     committed_operations, committed_signatures
                  ) VALUES (?1, ?2, ?3, 1, '0', '0')",
-                params![approval_id.as_str(), terms.wallet_id.as_str(), terms_jcs],
-            )
-            .map_err(storage)?;
+                    params![approval_id.as_str(), terms.wallet_id.as_str(), terms_jcs],
+                )
+                .map_err(storage)?;
+        }
         if let Some(receipt) = receipt {
             transaction
                 .execute(

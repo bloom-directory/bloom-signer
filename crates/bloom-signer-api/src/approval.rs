@@ -155,6 +155,14 @@ impl SealedApprovalTerms {
             ));
         }
 
+        if self.expires_at_ms.get() == u64::MAX
+            && matches!(self.selector, ApprovalSelector::Exact { .. })
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "exact approvals cannot be standing permissions",
+            ));
+        }
         match (&self.subject, &self.selector) {
             (
                 ApprovalSubject::System {

@@ -504,6 +504,7 @@ impl SignerRpcService {
                 .map(|method| Token::new(method.as_str()))
                 .collect::<Result<_, _>>()?,
             schemas: vec![
+                Token::new("bloom.standing-approval/1")?,
                 Token::new(RPC_ENVELOPE_SCHEMA_V1)?,
                 Token::new("bloom.sign-request/1")?,
             ],

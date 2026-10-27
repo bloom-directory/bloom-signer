@@ -1127,3 +1127,39 @@ fn production_visible_constructor_rejects_shared_revocation_audit_key() {
         ProtocolErrorCode::MalformedFrame
     );
 }
+
+#[test]
+fn standing_reusable_authority_survives_windows_but_exact_and_finite_ceilings_remain() {
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let engine = new_engine(&broker);
+    let mut terms = petal_terms();
+    terms.expires_at_ms = DecimalU64::new(u64::MAX);
+    terms.activation_mode = ActivationMode::DurableLocal {
+        provider_tier: Token::new("local-passkey").unwrap(),
+        maximum_rearm_until_ms: DecimalU64::new(u64::MAX),
+    };
+    terms.limits.max_operations = DecimalU64::new(u64::MAX);
+    terms.limits.max_signatures = DecimalU64::new(u64::MAX);
+    let id = engine.install_approval_for_test(&terms).unwrap();
+    assert_eq!(
+        engine
+            .approval_public_status(&id, 604_800_001)
+            .unwrap()
+            .state,
+        ApprovalLifecycleState::Active
+    );
+    let request = signed(&broker, unsigned_request(&terms, "91"));
+    assert!(matches!(
+        engine.authorize_sign(&request, &clock(2500)).unwrap(),
+        SignAuthorization::NewOperation
+    ));
+    let mut exact = exact_terms();
+    exact.expires_at_ms = DecimalU64::new(u64::MAX);
+    assert!(engine.install_approval_for_test(&exact).is_err());
+    let mut finite = petal_terms();
+    finite.expires_at_ms = DecimalU64::new(91 * 86400000);
+    assert_eq!(
+        engine.install_approval_for_test(&finite).unwrap_err().code,
+        ProtocolErrorCode::ApprovalExpired
+    );
+}
