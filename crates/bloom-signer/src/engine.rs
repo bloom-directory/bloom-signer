@@ -6444,7 +6444,7 @@ fn validate_against_approval(
             "payload and hash counts differ",
         ));
     }
-    match (&terms.selector, request.unsigned.selector_kind) {
+    match (&terms.selector, &request.unsigned.selector_kind) {
         (
             ApprovalSelector::Exact {
                 ordered_payload_digests,
@@ -6454,6 +6454,21 @@ fn validate_against_approval(
         ) if ordered_payload_digests == &request.unsigned.ordered_payload_digests
             && ordered_hashes == &request.unsigned.ordered_hashes
             && request.unsigned.signature_count.get() == ordered_hashes.len() as u64 => {}
+        (
+            ApprovalSelector::System {
+                component_id,
+                allowed_operation_classes,
+            },
+            SelectorKind::System {
+                component_id: request_component,
+                operation_class,
+                provenance_digest,
+            },
+        ) if component_id == request_component
+            && allowed_operation_classes.contains(operation_class)
+            && provenance_digest == &terms.provenance_digest
+            && request.unsigned.petal_use_claim_digest.is_some()
+            && request.unsigned.claim_assurance_digest.is_some() => {}
         (ApprovalSelector::Petal { .. }, SelectorKind::Petal)
             if request.unsigned.petal_use_claim_digest.is_some()
                 && request.unsigned.claim_assurance_digest.is_some() => {}
@@ -6594,7 +6609,7 @@ fn validate_petal_key_approval(
     // stays scope-bound until this validator is changed to say otherwise.
     let scope_bound = match terms.selector {
         ApprovalSelector::Exact { .. } => false,
-        ApprovalSelector::Petal { .. } => true,
+        ApprovalSelector::Petal { .. } | ApprovalSelector::System { .. } => true,
     };
     if effective_now_ms < created_at_ms
         || terms.not_before_ms.get() < created_at_ms

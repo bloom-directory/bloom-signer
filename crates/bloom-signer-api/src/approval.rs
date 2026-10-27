@@ -42,6 +42,11 @@ pub enum ApprovalSelector {
         ordered_payload_digests: Vec<Digest32>,
         ordered_hashes: Vec<Digest32>,
     },
+    /// Reusable native authority. Economic and network scope remains Broker-owned.
+    System {
+        component_id: Token,
+        allowed_operation_classes: Vec<Token>,
+    },
     Petal {
         package_hash: Digest32,
         route: String,
@@ -151,6 +156,19 @@ impl SealedApprovalTerms {
         }
 
         match (&self.subject, &self.selector) {
+            (
+                ApprovalSubject::System {
+                    component_id,
+                    operation_class,
+                },
+                ApprovalSelector::System {
+                    component_id: selector_component,
+                    allowed_operation_classes,
+                },
+            ) if component_id == selector_component
+                && classes_are_canonical(allowed_operation_classes)
+                && allowed_operation_classes.contains(operation_class)
+                && self.limits.value_limits.is_empty() => {}
             (
                 ApprovalSubject::Petal {
                     package_hash,
@@ -335,6 +353,73 @@ mod tests {
             expires_at_ms: DecimalU64::new(1_900_000_600_000),
             renewal_of: None,
         }
+    }
+
+    #[test]
+    fn system_authority_binds_component_classes_and_rejects_economic_scope() {
+        let mut terms = exact_terms(&"00".repeat(16));
+        terms.subject = ApprovalSubject::System {
+            component_id: Token::new("bloom-native").unwrap(),
+            operation_class: Token::new("native.transfer").unwrap(),
+        };
+        terms.selector = ApprovalSelector::System {
+            component_id: Token::new("bloom-native").unwrap(),
+            allowed_operation_classes: vec![Token::new("native.transfer").unwrap()],
+        };
+        terms.limits.max_operations = DecimalU64::new(10);
+        terms.limits.max_signatures = DecimalU64::new(10);
+        terms.validate().unwrap();
+        let original_digest = terms.approval_digest().unwrap();
+        let json = serde_json::to_value(&terms).unwrap();
+        let roundtrip: SealedApprovalTerms = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(roundtrip.approval_digest().unwrap(), original_digest);
+        let mut economic_selector = json;
+        economic_selector["selector"]["budget_usd"] = "100".into();
+        assert!(serde_json::from_value::<SealedApprovalTerms>(economic_selector).is_err());
+
+        let mut wrong_component = terms.clone();
+        if let ApprovalSelector::System { component_id, .. } = &mut wrong_component.selector {
+            *component_id = Token::new("another-component").unwrap();
+        }
+        assert_eq!(
+            wrong_component.validate().unwrap_err().code,
+            ProtocolErrorCode::SelectorMismatch
+        );
+        let mut wrong_class = terms.clone();
+        if let ApprovalSubject::System {
+            operation_class, ..
+        } = &mut wrong_class.subject
+        {
+            *operation_class = Token::new("unapproved.transfer").unwrap();
+        }
+        assert_eq!(
+            wrong_class.validate().unwrap_err().code,
+            ProtocolErrorCode::SelectorMismatch
+        );
+        let mut noncanonical = terms.clone();
+        if let ApprovalSelector::System {
+            allowed_operation_classes,
+            ..
+        } = &mut noncanonical.selector
+        {
+            allowed_operation_classes.push(allowed_operation_classes[0].clone());
+        }
+        assert_eq!(
+            noncanonical.validate().unwrap_err().code,
+            ProtocolErrorCode::SelectorMismatch
+        );
+        terms.limits.value_limits.push(ValueLimit {
+            asset: AssetId {
+                chain: Token::new("evm-137").unwrap(),
+                asset: "native".into(),
+            },
+            lifetime: DecimalU256::parse("1").unwrap(),
+            rolling_windows: vec![],
+        });
+        assert_eq!(
+            terms.validate().unwrap_err().code,
+            ProtocolErrorCode::SelectorMismatch
+        );
     }
 
     #[test]
