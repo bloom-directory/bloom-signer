@@ -90,7 +90,11 @@ impl CheckoutFacts {
             || !self.currency.bytes().all(|b| b.is_ascii_uppercase())
             || self.installments == 0
             || self.installments > 60
-            || self.total_minor == 0
+            // A checkout with nothing to charge today is only meaningful as a
+            // subscription that starts later: the person is approving the
+            // renewal terms, not a payment. Without them there is no amount
+            // to approve at all.
+            || (self.total_minor == 0 && self.renewal_minor.is_none())
             // A renewal price means a price and how often it recurs, on a
             // checkout that says it recurs at all. A date without a price
             // would be a claim the review cannot put an amount against.
@@ -381,6 +385,34 @@ mod tests {
             assert!(seen.insert(request(f, 2).digest().unwrap()), "{index}");
         }
     }
+    /// Spotify's headline offer charges nothing today and $12.99 a month from
+    /// a stated date. That is approvable: the renewal terms are the whole
+    /// substance of it, and they are bound into the operation.
+    #[test]
+    fn a_free_trial_is_approvable_only_with_its_renewal_terms() {
+        let mut trial = subscription();
+        trial.total_minor = 0;
+        assert!(trial.validate().is_ok());
+        // The same page without readable renewal terms has no amount at all.
+        let mut empty = trial.clone();
+        empty.renewal_minor = None;
+        empty.renewal_period = None;
+        empty.renewal_starts_on = None;
+        assert!(empty.validate().is_err());
+        // Nothing today and nothing later is not a subscription either.
+        let mut free_forever = trial.clone();
+        free_forever.renewal_minor = Some(0);
+        assert!(free_forever.validate().is_err());
+        // The trial's terms stay bound: a different later price is a
+        // different operation.
+        let mut dearer = trial.clone();
+        dearer.renewal_minor = Some(1999);
+        assert_ne!(
+            request(trial, 2).digest().unwrap(),
+            request(dearer, 2).digest().unwrap()
+        );
+    }
+
     #[test]
     fn a_renewal_needs_a_price_a_period_and_a_real_date() {
         assert!(subscription().validate().is_ok());
