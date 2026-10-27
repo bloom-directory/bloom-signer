@@ -1399,6 +1399,19 @@ impl SignerCeremonyService {
     ) -> Result<PreparedApprovalCeremony, ProtocolError> {
         self.require_surface(&request.surface, false)?;
         request.terms.validate()?;
+        if request.terms.expires_at_ms.get() == u64::MAX
+            && let ActivationMode::DurableLocal {
+                maximum_rearm_until_ms,
+                ..
+            } = &request.terms.activation_mode
+            && now_ms >= maximum_rearm_until_ms.get()
+        {
+            return Err(protocol(
+                ProtocolErrorCode::ApprovalExpired,
+                "standing permission rearm window has ended",
+            ));
+        }
+
         self.engine
             .validate_petal_scope_for_approval(&request.terms, now_ms)?;
         if request.terms.approval_digest()? != request.terms.approval_id()? {
@@ -2099,6 +2112,18 @@ impl SignerCeremonyService {
             true,
         )?;
 
+        if prepare.terms.expires_at_ms.get() == u64::MAX
+            && let ActivationMode::DurableLocal {
+                maximum_rearm_until_ms,
+                ..
+            } = &prepare.terms.activation_mode
+            && now_ms >= maximum_rearm_until_ms.get()
+        {
+            return Err(protocol(
+                ProtocolErrorCode::ApprovalExpired,
+                "standing permission rearm window ended before completion",
+            ));
+        }
         if !matches!(
             &prepare.terms.activation_mode,
             ActivationMode::BackendManaged
