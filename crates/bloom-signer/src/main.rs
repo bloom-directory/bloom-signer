@@ -603,10 +603,25 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
         "/var/run/bloom/session/session.sock",
     );
     drop(service_span_guard);
-    let mut session_stream =
-        connect_authenticated_session(&session_socket_path, &identity, &session_acl)
-            .instrument(service_span.clone())
-            .await?;
+    let Some(mut session_stream) = connect_authenticated_session(
+        &session_socket_path,
+        &identity,
+        &session_acl,
+        installed_session_startup_deadline(),
+    )
+    .instrument(service_span.clone())
+    .await?
+    else {
+        let _span = service_span.enter();
+        tracing::info!(
+            event = "service.shutdown",
+            service_role = "signer",
+            reason = "session_absent_at_startup",
+            "Bloom Signer stopped before accepting operations"
+        );
+        trusted_fatal.disarm();
+        return Ok(());
+    };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut rpc_shutdown = shutdown_rx.clone();
     let mut control_shutdown = shutdown_rx;
@@ -1390,23 +1405,59 @@ impl RevocationControlService for CheckpointingControlService {
     }
 }
 
+fn installed_session_startup_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now()
+        + session_startup_wait(
+            cfg!(target_os = "macos"),
+            cfg!(feature = "triad-dev-harness")
+                && std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some(),
+        )
+}
+
+/// Installed macOS Signer gives up after three seconds without a login
+/// session; elsewhere the wait is effectively unbounded.
+fn session_startup_wait(macos: bool, developer_profile: bool) -> Duration {
+    if macos && !developer_profile {
+        Duration::from_secs(3)
+    } else {
+        Duration::from_secs(30 * 365 * 24 * 60 * 60)
+    }
+}
+
+/// Returns `None` only when the session socket stayed absent or refused until
+/// `deadline`. A connected peer must authenticate before the deadline; a
+/// stalled or untrusted handshake is fatal rather than mistaken for logout.
 async fn connect_authenticated_session(
     path: &Path,
     identity: &LocalIdentity,
     session_acl: &PeerAcl,
-) -> Result<UnixStream, ProtocolError> {
+    deadline: tokio::time::Instant,
+) -> Result<Option<UnixStream>, ProtocolError> {
+    let timed_out = |_| {
+        ProtocolError::new(
+            ProtocolErrorCode::ServiceUnavailable,
+            "login-session handshake timed out during startup",
+        )
+    };
     loop {
-        match UnixStream::connect(path).await {
+        match tokio::time::timeout_at(deadline, UnixStream::connect(path))
+            .await
+            .map_err(timed_out)?
+        {
             Ok(mut stream) => {
-                bloom_triad_local_transport::authenticate_client(
-                    &mut stream,
-                    identity,
-                    session_acl,
-                    bloom_service_activation::SESSION_PROTOCOL_CURRENT,
-                    bloom_service_activation::SESSION_PROTOCOL_RANGE,
+                tokio::time::timeout_at(
+                    deadline,
+                    bloom_triad_local_transport::authenticate_client(
+                        &mut stream,
+                        identity,
+                        session_acl,
+                        bloom_service_activation::SESSION_PROTOCOL_CURRENT,
+                        bloom_service_activation::SESSION_PROTOCOL_RANGE,
+                    ),
                 )
-                .await?;
-                return Ok(stream);
+                .await
+                .map_err(timed_out)??;
+                return Ok(Some(stream));
             }
             Err(error)
                 if matches!(
@@ -1414,7 +1465,11 @@ async fn connect_authenticated_session(
                     ErrorKind::NotFound | ErrorKind::ConnectionRefused
                 ) =>
             {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Ok(None);
+                }
+                tokio::time::sleep_until(deadline.min(now + Duration::from_millis(500))).await;
             }
             Err(error) => {
                 return Err(ProtocolError::new(
@@ -1810,6 +1865,72 @@ mod tests {
             application_key_id: identity.application_key_id.clone(),
             application_public_key: identity.signing_key.verifying_key().to_bytes(),
         }
+    }
+
+    fn session_identity() -> LocalIdentity {
+        LocalIdentity {
+            service_id: Token::new("bloom-session").unwrap(),
+            boot_epoch: BootEpoch::new("02".repeat(16)).unwrap(),
+            application_key_id: Token::new("session-app").unwrap(),
+            signing_key: Arc::new(SigningKey::from_bytes(&[8; 32])),
+        }
+    }
+
+    #[test]
+    fn session_startup_deadline_applies_only_to_installed_macos() {
+        assert_eq!(session_startup_wait(true, false), Duration::from_secs(3));
+        for (macos, developer) in [(true, true), (false, false), (false, true)] {
+            assert!(session_startup_wait(macos, developer) > Duration::from_secs(86_400));
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_session_absence_and_refusal_exit_cleanly() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("session.sock");
+        let uid = fs::metadata(temporary.path()).unwrap().uid();
+        let signer = signer_identity();
+        let session_acl = peer_acl(&session_identity(), uid);
+        for refused in [false, true] {
+            if refused {
+                drop(UnixListener::bind(&path).unwrap());
+            }
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                connect_authenticated_session(
+                    &path,
+                    &signer,
+                    &session_acl,
+                    tokio::time::Instant::now() + Duration::from_millis(30),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(result.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_session_connected_handshake_timeout_is_fatal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("session.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let uid = fs::metadata(temporary.path()).unwrap().uid();
+        let signer = signer_identity();
+        let acl = peer_acl(&session_identity(), uid);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(stream);
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(30);
+        let error = connect_authenticated_session(&path, &signer, &acl, deadline)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+        assert!(error.message.contains("handshake timed out"));
+        server.abort();
     }
 
     #[tokio::test]
