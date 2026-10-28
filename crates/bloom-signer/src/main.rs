@@ -884,36 +884,48 @@ async fn run(trusted_fatal: &mut Option<TrustedFatalGuard>) -> Result<(), FatalC
             control_endpoint = "revocation",
             "Bloom Signer ready"
         );
-        serve_endpoints(
-            serve_rpc(
-                rpc_listener,
-                identity.clone(),
-                broker_acl,
-                rpc_quota,
-                service.clone(),
-                journal_exchange,
-                config.maximum_connections,
-                &mut rpc_shutdown,
-            ),
-            serve_control(
-                control_listener,
-                identity,
-                revoke_client_acl,
-                control_quota,
-                control_service,
-                config.control_maximum_connections,
-                &mut control_shutdown,
-            ),
-            admin::serve(
-                admin_listener,
-                admin_ceremony,
-                admin_receipt_keys,
-                admin_peer_uid,
-                &mut admin_shutdown,
-            ),
+        let rpc_identity = identity.clone();
+        tokio::try_join!(
+            async {
+                serve_rpc(
+                    rpc_listener,
+                    rpc_identity,
+                    broker_acl,
+                    rpc_quota,
+                    service.clone(),
+                    journal_exchange,
+                    config.maximum_connections,
+                    &mut rpc_shutdown,
+                )
+                .await
+                .at_stage("serve_rpc")
+            },
+            async {
+                serve_control(
+                    control_listener,
+                    identity,
+                    revoke_client_acl,
+                    control_quota,
+                    control_service,
+                    config.control_maximum_connections,
+                    &mut control_shutdown,
+                )
+                .await
+                .at_stage("serve_control")
+            },
+            async {
+                admin::serve(
+                    admin_listener,
+                    admin_ceremony,
+                    admin_receipt_keys,
+                    admin_peer_uid,
+                    &mut admin_shutdown,
+                )
+                .await
+                .at_stage("serve_admin")
+            },
             monitor_session_sentinel(session_stream, shutdown_tx),
-        )
-        .await?;
+        )?;
         tracing::info!(
             event = "service.shutdown",
             service_role = "signer",
@@ -952,23 +964,6 @@ fn verify_edge_manifest_pins(
             "edge manifest does not pin the dedicated revoke client",
         ));
     }
-    Ok(())
-}
-
-/// Serve every endpoint until the session ends or one of them fails, naming
-/// the endpoint that failed.
-async fn serve_endpoints(
-    rpc: impl Future<Output = std::io::Result<()>>,
-    control: impl Future<Output = std::io::Result<()>>,
-    admin: impl Future<Output = std::io::Result<()>>,
-    sentinel: impl Future<Output = Result<(), FatalCause>>,
-) -> Result<(), FatalCause> {
-    tokio::try_join!(
-        async { rpc.await.at_stage("serve_rpc") },
-        async { control.await.at_stage("serve_control") },
-        async { admin.await.at_stage("serve_admin") },
-        sentinel,
-    )?;
     Ok(())
 }
 
@@ -3236,27 +3231,6 @@ mod tests {
             let detail = cause.detail.unwrap();
             assert!(detail.contains(pin), "{detail}");
         }
-    }
-
-    #[tokio::test]
-    async fn serve_endpoints_name_the_endpoint_that_failed() {
-        const EIO: i32 = 5;
-        let failed = || async { Err::<(), _>(std::io::Error::from_raw_os_error(EIO)) };
-        let open = std::future::pending::<std::io::Result<()>>;
-        let sentinel = std::future::pending::<Result<(), FatalCause>>;
-
-        let cause = serve_endpoints(failed(), open(), open(), sentinel())
-            .await
-            .unwrap_err();
-        assert_eq!((cause.stage, cause.os_error), ("serve_rpc", Some(EIO)));
-        let cause = serve_endpoints(open(), failed(), open(), sentinel())
-            .await
-            .unwrap_err();
-        assert_eq!((cause.stage, cause.os_error), ("serve_control", Some(EIO)));
-        let cause = serve_endpoints(open(), open(), failed(), sentinel())
-            .await
-            .unwrap_err();
-        assert_eq!((cause.stage, cause.os_error), ("serve_admin", Some(EIO)));
     }
 
     #[test]
