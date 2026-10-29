@@ -24,13 +24,13 @@ publish = false
 bloom-signer-api = { path = "crates/bloom-signer-api" }
 bloom-signer-derive = { path = "crates/bloom-signer-derive" }
 bloom-signer-process-hardening = { path = "crates/bloom-signer-process-hardening" }
-bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "df5dfcb2514f29b98613d215f07c378ccbf6decf" }
-bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "df5dfcb2514f29b98613d215f07c378ccbf6decf" }
-bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "df5dfcb2514f29b98613d215f07c378ccbf6decf" }
-bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "df5dfcb2514f29b98613d215f07c378ccbf6decf" }
-bloom-service-observability = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "df5dfcb2514f29b98613d215f07c378ccbf6decf" }
+bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
+bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
+bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
+bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
+bloom-service-observability = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
 bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "df5dfcb2514f29b98613d215f07c378ccbf6decf" }
-bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "df5dfcb2514f29b98613d215f07c378ccbf6decf" }
+bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
 aws-config = { version = "=1.8.1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-credential-types = "1"
 # Exact AWS service pins preserve the workspace's declared Rust 1.85 floor.
