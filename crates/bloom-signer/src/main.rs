@@ -312,9 +312,9 @@ impl Drop for TrustedFatalGuard {
 /// diagnostics for the identity and config files, which hold private seeds,
 /// and peer-supplied text. The fatal event therefore names the failed stage
 /// and the error's protocol code or I/O kind, never its `Display`. The only
-/// text kept is built from literals in this file: an invariant, a serve-loop
-/// failure, or the name of a missing environment variable. Peer UIDs are
-/// logged as numbers.
+/// text kept is built from string literals in this binary (`main.rs` and
+/// `admin.rs`): an invariant, a serve-loop failure, or the name of a missing
+/// environment variable. Peer UIDs are logged as numbers.
 #[derive(Debug)]
 struct FatalCause {
     stage: &'static str,
@@ -386,8 +386,10 @@ impl FatalCause {
             }
             return Self::bare(stage, "io_error").with_io(error);
         }
-        // A rejection is an untyped `String` that can hold environment-supplied
-        // text such as activation socket names, so only its kind is logged.
+        // A rejection is an untyped `String` that embeds environment-supplied
+        // text: the endpoint path from its `BLOOM_SIGNER_*_SOCKET` variable
+        // and, for a socket it can't prove stale, an I/O error's message. Only
+        // its kind is logged.
         match error.downcast_ref::<bloom_service_activation::ActivationError>() {
             Some(bloom_service_activation::ActivationError::Rejected(_)) => {
                 Self::bare(stage, "activation_rejected")
@@ -3201,9 +3203,9 @@ mod tests {
     #[test]
     fn activation_rejection_text_never_reaches_the_log() {
         let marker_secret = "MARKER_ACTIVATION_SECRET_DO_NOT_LOG";
-        // Shaped like a real rejection built from environment-supplied
-        // activation names (`LISTEN_FDNAMES`).
-        let rejection = format!("activation socket name {marker_secret:?} is duplicated");
+        // Shaped like a real bind rejection, which embeds the endpoint path
+        // taken from the environment.
+        let rejection = format!("existing endpoint /run/{marker_secret}/signer.sock is live");
         let boxed: Box<dyn std::error::Error> =
             bloom_service_activation::ActivationError::Rejected(rejection).into();
         assert!(boxed.to_string().contains(marker_secret));
