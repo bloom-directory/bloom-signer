@@ -33,6 +33,8 @@ use tokio::{
 use uuid::Uuid;
 use zeroize::{Zeroize as _, Zeroizing};
 
+use super::AtStage as _;
+
 const MAX_FRAME: usize = 16 * 1024;
 const ADMIN_IDENTITY_FILE: &str = "relay-admin-seed.hex";
 
@@ -247,22 +249,26 @@ pub(super) async fn serve(
     receipt_keys: Option<Vec<[u8; 32]>>,
     admin_peer_uid: u32,
     shutdown: &mut watch::Receiver<bool>,
-) -> io::Result<()> {
+) -> Result<(), super::FatalCause> {
+    const STAGE: &str = "serve_admin";
     let Some(listener) = listener else {
         shutdown
             .changed()
             .await
-            .map_err(|_| super::serve_invariant("Signer shutdown channel closed"))?;
+            .map_err(|_| super::serve_invariant("Signer shutdown channel closed"))
+            .at_stage(STAGE)?;
         return Ok(());
     };
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
-                changed.map_err(|_| super::serve_invariant("Signer shutdown channel closed"))?;
+                changed
+                    .map_err(|_| super::serve_invariant("Signer shutdown channel closed"))
+                    .at_stage(STAGE)?;
                 return Ok(());
             }
             accepted = listener.accept() => {
-                let (mut stream, _) = accepted?;
+                let (mut stream, _) = accepted.at_stage(STAGE)?;
                 if require_local_admin_peer(&stream, admin_peer_uid).is_err() {
                     continue;
                 }
