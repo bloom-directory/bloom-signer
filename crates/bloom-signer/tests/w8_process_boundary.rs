@@ -166,6 +166,7 @@ fn bip39_terms(key_ref: KeyRef, wallet_id: &Token) -> SealedApprovalTerms {
         // synthetic clock. Keep the authority live through those ceremonies.
         expires_at_ms: DecimalU64::new(300_303),
         renewal_of: None,
+        session_budget: None,
     }
 }
 
@@ -183,7 +184,9 @@ fn complete_local_approval(
             ordered_payload_digests,
             ordered_hashes,
         } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
-        ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
+        ApprovalSelector::Petal { .. } | ApprovalSelector::SystemSession { .. } => {
+            (Vec::new(), Vec::new())
+        }
     };
     let prepared = service
         .prepare_approval(

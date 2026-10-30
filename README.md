@@ -138,3 +138,67 @@ The digest is bound to the accepted time and that exact approval set, so it
 cannot be reused if either changes. On success the clock condition becomes
 `REPAIRED` and a `clock.repaired` record is appended to the audit journal with
 the prior and accepted times, the anchor, and the boot epoch.
+
+
+## Owner-reviewed session authority
+
+The session extension uses Machine–Broker protocol 1.8 and Broker–Signer
+protocol 1.7. It reuses Sealed Approval activation and the existing custody
+backend. An onboarding label or local `under_policy` choice creates no signing
+authority. Every member grant requires an owner passkey activation.
+
+A typed System session currently supports canonical legacy/EIP-1559 EVM
+native transfers and ERC-20 `transfer(address,uint256)` only. Broker decodes the
+complete unsigned preimage at signing, binds numeric chain ID (`evm-N`), token,
+recipient, amount and maximum gas fee, and refuses arbitrary calldata,
+approvals and contract creation. Token contract effects are not proved by an
+ABI decoder. Reusable native Solana authority is refused until trusted cluster
+and freshness observations are available; the existing exact Solana path is
+unchanged.
+
+A signed `session_budget` descriptor binds wallet, policy snapshot, epoch,
+member keys, asset conversion scales, per-action/lifetime/rolling/count/rate
+caps and validity. Its ID is the SHA-256 domain-separated canonical descriptor,
+not a caller-selected alias. Every child approval shares its ledger. Broker
+and Signer reserve within their existing SQLite write transactions; pending,
+committed and ambiguous uses consume capacity, and only definitively released
+uses stop counting. Per-action split quantities are coalesced before checking.
+
+Nominal stablecoin collateral units use owner-reviewed integer conversion
+scales, conservatively rounded upward to micro-units. These are not mutable
+Machine price hints, current USD prices or a guarantee against depegging.
+Unknown assets are refused. Native fees or transfers require separately stated
+raw-unit caps and are not silently converted into nominal dollars. Existing
+Petal selectors can join a group, but their claim assurance remains explicit:
+`machine_asserted` trusts the installed Petal/Machine economic projection and
+does not independently decode arbitrary payload effects. Grouped monetary
+Petal actions with no positive debit are refused.
+
+The existing limit-state RPC exposes group usage, including reservations and
+ambiguous outcomes, at a trusted observation time. If the clock cannot supply
+that observation, group usage is unavailable; clients must not invent remaining
+capacity. Policy changes, expiry and revocation continue to invalidate new use.
+An identical completed session operation can retrieve its original result
+without a new reservation or signature; altered bytes, keys, claims or
+provenance cannot retrieve that result.
+
+Boot-bound grants stop signing after Signer logout/restart. The current persona
+workflow does not rearm an orphaned grant: end it and review a new session with
+its separately reviewed budget. Retaining old accounting records is not an
+automatic rearm or a global cap across newly owner-approved budgets.
+
+Adoption requires the matching Signer commit first, then Broker's API, test
+fixture and locked dependency pins, then Machine's Broker/Signer/runtime pins.
+The new accounted Polymarket package must also be built, reviewed and registered
+with its immutable hash; older zero-debit packages remain exact-approval-only.
+Local sibling patches used for verification are not release pins. No release
+or service deployment is implied by this work.
+
+Selective Signer backup recovery does not restore a complete shared session spending
+ledger. Restore therefore deactivates grouped approvals and durably blocks their
+canonical budget descriptors from activation or new reservations. A nonce-only
+renewal cannot recreate their lifetime capacity. Recovery requires newly reviewed
+terms with a fresh budget descriptor; cached completed results remain recoverable.
+Reusable native EVM sessions currently support Ethereum (1), Polygon (137), and
+local development (31337) only. Other chains, including OP Stack networks whose
+L1 fees are absent from the typed fee projection, require exact approval.

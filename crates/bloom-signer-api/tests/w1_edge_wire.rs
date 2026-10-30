@@ -57,6 +57,7 @@ fn approval_terms() -> SealedApprovalTerms {
         not_before_ms: DecimalU64::new(10),
         expires_at_ms: DecimalU64::new(20),
         renewal_of: None,
+        session_budget: None,
     }
 }
 
@@ -242,6 +243,7 @@ fn signing_result() -> SigningResult {
 fn sign_request() -> SignRequest {
     SignRequest {
         unsigned: UnsignedSignRequest {
+            session_accounting: None,
             schema: token("bloom.sign-request/1"),
             attempt_id: digest(37),
             operation_id: operation(30),
@@ -533,7 +535,7 @@ fn signer_requests() -> Vec<BrokerSignerRequest> {
     };
     let id = IdRequest { id: digest(46) };
     vec![
-        BrokerSignerRequest::SystemHello(hello()),
+        BrokerSignerRequest::SystemHello(historical_hello()),
         BrokerSignerRequest::SignerReadiness(Empty {}),
         BrokerSignerRequest::SignerCapabilities(Empty {}),
         BrokerSignerRequest::SurfaceStatus(Empty {}),
@@ -667,9 +669,9 @@ fn signer_responses() -> Vec<BrokerSignerResponse> {
         error: None,
     };
     vec![
-        BrokerSignerResponse::SystemHello(hello()),
+        BrokerSignerResponse::SystemHello(historical_hello()),
         BrokerSignerResponse::SignerReadiness(readiness()),
-        BrokerSignerResponse::SignerCapabilities(capabilities()),
+        BrokerSignerResponse::SignerCapabilities(historical_capabilities()),
         BrokerSignerResponse::SurfaceStatus(surface_status()),
         BrokerSignerResponse::SurfaceReportEffective(surface_status()),
         BrokerSignerResponse::CrossSurfacePairStart(cross_pairing()),
@@ -901,4 +903,18 @@ fn pre_surface_signed_receipts_keep_their_original_canonical_bytes() {
         )
         .unwrap();
     assert_eq!(restored.surface, None);
+}
+
+// Freeze the historical vectors separately from current strict negotiation.
+// Optional session fields must remain omitted to preserve old signed bytes.
+fn historical_hello() -> HelloChallenge {
+    let mut hello = hello();
+    hello.protocol.minor = 6;
+    hello
+}
+fn historical_capabilities() -> ServiceCapabilities {
+    let mut capabilities = capabilities();
+    capabilities.protocol_minor_min = 6;
+    capabilities.protocol_minor_max = 6;
+    capabilities
 }

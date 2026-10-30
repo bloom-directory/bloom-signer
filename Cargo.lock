@@ -885,6 +885,7 @@ dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek 3.0.0",
  "hex",
+ "num-bigint",
  "rand 0.10.2",
  "serde",
  "serde_jcs",
