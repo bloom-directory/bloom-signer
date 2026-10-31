@@ -832,6 +832,7 @@ dependencies = [
 name = "bloom-signer"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "bloom-audit-checkpoint",
  "bloom-platform-containment",
@@ -891,6 +892,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.20",
+ "url",
 ]
 
 [[package]]
