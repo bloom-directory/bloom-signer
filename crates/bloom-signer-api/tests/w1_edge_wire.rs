@@ -794,21 +794,21 @@ where
 
 #[test]
 fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
-    // The v1.6 signer frame sets include exact surface status and the four
+    // The v1.8 signer frame sets include exact surface status and the four
     // cross-surface operations. These digests freeze every authority variant
-    // together with the strict v1.6 protocol range. Pair start includes the
+    // together with the strict v1.8 protocol range. Pair start includes the
     // original ceremony deadline, prepared terms name the destination's existing
     // passkeys, and `cross_surface.already_registered` ends a pairing without
     // enrollment; the pre-release callers must be repinned together.
     assert_wire_digest(
         "signer requests",
         signer_requests(),
-        "3edaca63e8f8caba354d37d3b23b3d2a4793746d8d792a02cc956214aa227738",
+        "66a46d2c57484db3cb125b5b18b3c2c7e865bb4e61bc21aac90f0624978fb8c1",
     );
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "73bdb9219df193c792666873948c9ccd5adc99ff2e682265238bcceb9af899ca",
+        "0a1bd63bf400d24923a1f6f0b5ce9a0e5de76a5b027293957e540d6b983fdd09",
     );
     assert_wire_digest(
         "control requests",

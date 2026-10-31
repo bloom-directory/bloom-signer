@@ -13,11 +13,17 @@ const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
 /// before it crosses the backend boundary.
 pub const MAX_ED25519_MESSAGE_BYTES: usize = 1232;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SelectorKind {
     Exact,
     Petal,
+    /// Authenticated structural native-use binding; contains no economic scope.
+    System {
+        component_id: Token,
+        operation_class: Token,
+        provenance_digest: Digest32,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

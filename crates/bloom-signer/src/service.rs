@@ -504,6 +504,7 @@ impl SignerRpcService {
                 .map(|method| Token::new(method.as_str()))
                 .collect::<Result<_, _>>()?,
             schemas: vec![
+                Token::new("bloom.standing-approval/1")?,
                 Token::new(RPC_ENVELOPE_SCHEMA_V1)?,
                 Token::new("bloom.sign-request/1")?,
             ],
@@ -1389,7 +1390,9 @@ mod tests {
                 ordered_payload_digests,
                 ordered_hashes,
             } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
-            ApprovalSelector::Petal { .. } => unreachable!("fixture is exact"),
+            ApprovalSelector::Petal { .. } | ApprovalSelector::System { .. } => {
+                unreachable!("fixture is exact")
+            }
         };
         service
             .ceremony

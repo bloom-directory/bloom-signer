@@ -1157,7 +1157,9 @@ fn try_complete_local_approval(
             ordered_payload_digests,
             ordered_hashes,
         } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
-        ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
+        ApprovalSelector::Petal { .. } | ApprovalSelector::System { .. } => {
+            (Vec::new(), Vec::new())
+        }
     };
     let prepared = service.prepare_approval(
         CeremonyPrepareRequest {
@@ -6164,7 +6166,7 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
             // terms carry a budget.
             let (max_operations, max_signatures) = match &selector {
                 ApprovalSelector::Exact { ordered_hashes, .. } => (1, ordered_hashes.len() as u64),
-                ApprovalSelector::Petal { .. } => (4, 4),
+                ApprovalSelector::Petal { .. } | ApprovalSelector::System { .. } => (4, 4),
             };
             SealedApprovalTerms {
                 subject: ApprovalSubject::Petal {
@@ -6351,4 +6353,37 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
         )
         .unwrap();
     assert!(!prepared.challenges.is_empty());
+}
+
+#[test]
+fn expired_standing_rearm_window_is_rejected_before_a_passkey_prompt() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, key, _, _) = service(&authenticator);
+    let mut approval = terms(key);
+    approval.subject = ApprovalSubject::System {
+        component_id: Token::new("bloom-machine").unwrap(),
+        operation_class: Token::new("native.transfer").unwrap(),
+    };
+    approval.selector = ApprovalSelector::System {
+        component_id: Token::new("bloom-machine").unwrap(),
+        allowed_operation_classes: vec![Token::new("native.transfer").unwrap()],
+    };
+    approval.expires_at_ms = DecimalU64::new(u64::MAX);
+    approval.activation_mode = ActivationMode::DurableLocal {
+        provider_tier: Token::new("local-passkey").unwrap(),
+        maximum_rearm_until_ms: DecimalU64::new(2000),
+    };
+    let request = CeremonyPrepareRequest {
+        surface: bloom_signer_api::legacy_local_surface(),
+        activation_operation_id: operation("fa"),
+        terms: approval,
+        review_manifest_digest: digest("fa"),
+        exact_ordered_payload_digests: vec![],
+        exact_ordered_hashes: vec![],
+        replacement_approval_id: None,
+    };
+    assert_eq!(
+        service.prepare_approval(request, 2000).unwrap_err().code,
+        ProtocolErrorCode::ApprovalExpired
+    );
 }
