@@ -10,10 +10,7 @@ use std::{
     io::ErrorKind,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -50,7 +47,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tokio::{
-    io::AsyncReadExt as _,
+    io::{AsyncRead, AsyncReadExt as _},
     net::{UnixListener, UnixStream},
     sync::{Semaphore, watch},
 };
@@ -174,19 +171,63 @@ async fn main() {
         eprintln!("Bloom Signer logging initialization failed");
         std::process::exit(1);
     }
-    let trusted_metadata_loaded = Arc::new(AtomicBool::new(false));
-    let result = run(trusted_metadata_loaded.clone()).await;
-    if result.is_err() {
-        if !trusted_metadata_loaded.load(Ordering::SeqCst) {
-            tracing::error!(
-                event = "service.fatal_exit",
-                service_role = "signer",
-                error_kind = "bootstrap_failure",
-                "Bloom Signer exiting after a bootstrap error"
-            );
-        }
-        std::process::exit(1);
+    let mut trusted_fatal = None;
+    let result = run(&mut trusted_fatal).await;
+    let code = finish_run(result, trusted_fatal);
+    if code != 0 {
+        std::process::exit(code);
     }
+}
+
+/// Report how `run` ended and return the process exit code. The guard is
+/// moved in and dropped here, so its fatal event is logged before the caller
+/// exits: `std::process::exit` skips destructors.
+fn finish_run(result: Result<(), FatalCause>, mut trusted_fatal: Option<TrustedFatalGuard>) -> i32 {
+    match result {
+        Ok(()) => {
+            if let Some(guard) = trusted_fatal.as_mut() {
+                guard.disarm();
+            }
+            0
+        }
+        Err(cause) => {
+            match trusted_fatal.as_mut() {
+                Some(guard) => guard.record(cause),
+                None => log_fatal_exit(
+                    "bootstrap_failure",
+                    "Bloom Signer exiting after a bootstrap error",
+                    &cause,
+                ),
+            }
+            drop(trusted_fatal);
+            1
+        }
+    }
+}
+
+/// Arm the trusted fatal guard once trusted metadata has loaded, and return
+/// the span it reports in. From here on a failure is a `service_failure`
+/// logged with the service's identity, not a `bootstrap_failure`.
+fn arm_trusted_fatal(
+    slot: &mut Option<TrustedFatalGuard>,
+    service_span: tracing::Span,
+) -> tracing::Span {
+    *slot = Some(TrustedFatalGuard::new(service_span.clone()));
+    service_span
+}
+
+/// Stop before accepting operations because no login session appeared by
+/// the startup deadline. This is a clean exit: returning `Ok` lets
+/// `finish_run` disarm the guard, so no fatal event is logged.
+fn stop_without_session(service_span: &tracing::Span) -> Result<(), FatalCause> {
+    let _span = service_span.enter();
+    tracing::info!(
+        event = "service.shutdown",
+        service_role = "signer",
+        reason = "session_absent_at_startup",
+        "Bloom Signer stopped before accepting operations"
+    );
+    Ok(())
 }
 
 /// Bloom key-custody service and administrative client.
@@ -254,31 +295,355 @@ mod cli_tests {
 struct TrustedFatalGuard {
     span: tracing::Span,
     armed: bool,
+    cause: Option<FatalCause>,
 }
 
 impl TrustedFatalGuard {
     fn new(span: tracing::Span) -> Self {
-        Self { span, armed: true }
+        Self {
+            span,
+            armed: true,
+            cause: None,
+        }
     }
 
     fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    fn record(&mut self, cause: FatalCause) {
+        self.cause = Some(cause);
     }
 }
 
 impl Drop for TrustedFatalGuard {
     fn drop(&mut self) {
         if self.armed {
+            let cause = self.cause.take().unwrap_or_else(FatalCause::unrecorded);
             self.span.in_scope(|| {
-                tracing::error!(
-                    event = "service.fatal_exit",
-                    service_role = "signer",
-                    error_kind = "service_failure",
-                    "Bloom Signer exiting after a fatal error"
+                log_fatal_exit(
+                    "service_failure",
+                    "Bloom Signer exiting after a fatal error",
+                    &cause,
                 );
             });
         }
     }
+}
+
+/// Why the Signer is exiting, reduced to fields that are safe to log.
+///
+/// Error text can carry secrets: `ProtocolError` messages embed serde
+/// diagnostics for the identity and config files, which hold private seeds,
+/// and peer-supplied text. The fatal event therefore names the failed stage
+/// and the error's protocol code or I/O kind, never its `Display`. The only
+/// text kept is built from string literals in this binary (`main.rs` and
+/// `admin.rs`): an invariant, a serve-loop failure, or the name of a missing
+/// environment variable. Peer UIDs and what a failed endpoint bind found on
+/// disk are logged as numbers and fixed labels.
+#[derive(Debug)]
+struct FatalCause {
+    stage: &'static str,
+    reason: &'static str,
+    error_code: Option<&'static str>,
+    io_error_kind: Option<ErrorKind>,
+    os_error: Option<i32>,
+    peer_uid: Option<u32>,
+    expected_peer_uid: Option<u32>,
+    endpoint: Option<Box<EndpointFacts>>,
+    detail: Option<String>,
+}
+
+impl FatalCause {
+    fn invariant(stage: &'static str, detail: &'static str) -> Self {
+        Self {
+            detail: Some(detail.to_owned()),
+            ..Self::bare(stage, "invariant")
+        }
+    }
+
+    /// The peer on a local socket runs as an unexpected user.
+    fn peer_uid_mismatch(stage: &'static str, peer_uid: u32, expected_peer_uid: u32) -> Self {
+        Self {
+            peer_uid: Some(peer_uid),
+            expected_peer_uid: Some(expected_peer_uid),
+            ..Self::bare(stage, "peer_uid_mismatch")
+        }
+    }
+
+    /// A required environment variable is unset. The detail names the
+    /// variable, a literal from this file; it never holds a value.
+    fn missing_variable(
+        stage: &'static str,
+        variable: &'static str,
+        profile: &'static str,
+    ) -> Self {
+        Self {
+            detail: Some(format!(
+                "{variable} is required by the {profile} service profile"
+            )),
+            ..Self::bare(stage, "invariant")
+        }
+    }
+
+    fn classify(stage: &'static str, error: &(dyn std::error::Error + 'static)) -> Self {
+        if let Some(error) = error.downcast_ref::<ProtocolError>() {
+            return Self {
+                error_code: Some(error.code.as_str()),
+                ..Self::bare(stage, "protocol_error")
+            };
+        }
+        // Identity, manifest, ACL and token checks fail with the transport's
+        // wire error; its code is just as safe to log as a protocol code.
+        // Map the code alone so the message, which can echo secret input, is
+        // never copied.
+        if let Some(error) = error.downcast_ref::<bloom_signer_api::WireError>() {
+            let code = bloom_signer_api::WireError::new(error.code, String::new());
+            return Self {
+                error_code: Some(ProtocolError::from(code).code.as_str()),
+                ..Self::bare(stage, "protocol_error")
+            };
+        }
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            if let Some(ServeInvariant(detail)) = error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<ServeInvariant>())
+            {
+                return Self::invariant(stage, detail);
+            }
+            return Self::bare(stage, "io_error").with_io(error);
+        }
+        // A rejection is an untyped `String` that embeds environment-supplied
+        // text: the endpoint path from its `BLOOM_SIGNER_*_SOCKET` variable
+        // and, for a socket it can't prove stale, an I/O error's message. Only
+        // its kind is logged; `bind_endpoint` adds what it found on disk.
+        match error.downcast_ref::<bloom_service_activation::ActivationError>() {
+            Some(bloom_service_activation::ActivationError::Rejected(_)) => {
+                Self::bare(stage, "activation_rejected")
+            }
+            Some(bloom_service_activation::ActivationError::Io(error)) => {
+                Self::bare(stage, "activation_io_error").with_io(error)
+            }
+            None => Self::bare(stage, "unclassified"),
+        }
+    }
+
+    fn unrecorded() -> Self {
+        let reason = if std::thread::panicking() {
+            "panic"
+        } else {
+            "unrecorded"
+        };
+        Self::bare("unrecorded", reason)
+    }
+
+    fn bare(stage: &'static str, reason: &'static str) -> Self {
+        Self {
+            stage,
+            reason,
+            error_code: None,
+            io_error_kind: None,
+            os_error: None,
+            peer_uid: None,
+            expected_peer_uid: None,
+            endpoint: None,
+            detail: None,
+        }
+    }
+
+    fn with_io(self, error: &std::io::Error) -> Self {
+        Self {
+            io_error_kind: Some(error.kind()),
+            os_error: error.raw_os_error(),
+            ..self
+        }
+    }
+
+    fn with_endpoint(self, endpoint: EndpointFacts) -> Self {
+        Self {
+            endpoint: Some(Box::new(endpoint)),
+            ..self
+        }
+    }
+}
+
+/// A fixed failure message from a serve loop. It travels inside an
+/// `io::Error` so it shares a type with the loops' I/O steps, and `classify`
+/// logs it as an invariant. Each loop labels its failures with its own stage.
+#[derive(Debug)]
+struct ServeInvariant(&'static str);
+
+impl std::fmt::Display for ServeInvariant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ServeInvariant {}
+
+fn serve_invariant(detail: &'static str) -> std::io::Error {
+    std::io::Error::other(ServeInvariant(detail))
+}
+
+/// Directory modes the activation crate requires for an endpoint's parent:
+/// `bind_owned_unix_listener` for the RPC and control sockets, and
+/// `bind_private_unix_listener` for the admin socket.
+const OWNED_ENDPOINT_DIRECTORY_MODE: u32 = 0o710;
+const PRIVATE_ENDPOINT_DIRECTORY_MODE: u32 = 0o700;
+
+/// What a failed endpoint bind found on disk, as numbers and fixed labels.
+///
+/// The bind's own error text is not logged, so these facts say which check
+/// failed: the parent must be a real directory owned by the Signer's
+/// effective UID with an exact mode, and an existing endpoint must be a
+/// singly-linked socket owned by that UID. No path is recorded; the stage
+/// names the endpoint.
+#[derive(Debug, Clone, Copy)]
+struct EndpointFacts {
+    expected_uid: u32,
+    expected_directory_mode: u32,
+    path_absolute: bool,
+    directory: PathFacts,
+    endpoint: PathFacts,
+}
+
+impl EndpointFacts {
+    fn observe(endpoint: &Path, expected_directory_mode: u32) -> Self {
+        let directory = match endpoint.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => PathFacts::observe(parent),
+            _ => PathFacts::unobserved("none", None),
+        };
+        Self {
+            expected_uid: bloom_signer_process_hardening::effective_uid(),
+            expected_directory_mode,
+            path_absolute: endpoint.is_absolute(),
+            directory,
+            endpoint: PathFacts::observe(endpoint),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathFacts {
+    kind: &'static str,
+    uid: Option<u32>,
+    mode: Option<u32>,
+    links: Option<u64>,
+    os_error: Option<i32>,
+}
+
+impl PathFacts {
+    fn observe(path: &Path) -> Self {
+        use std::os::unix::fs::FileTypeExt as _;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                let kind = if file_type.is_symlink() {
+                    "symlink"
+                } else if file_type.is_dir() {
+                    "directory"
+                } else if file_type.is_socket() {
+                    "socket"
+                } else {
+                    "other"
+                };
+                Self {
+                    kind,
+                    uid: Some(metadata.uid()),
+                    mode: Some(metadata.mode() & 0o7777),
+                    links: Some(metadata.nlink()),
+                    os_error: None,
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => Self::unobserved("missing", None),
+            Err(error) => Self::unobserved("unreadable", error.raw_os_error()),
+        }
+    }
+
+    fn unobserved(kind: &'static str, os_error: Option<i32>) -> Self {
+        Self {
+            kind,
+            uid: None,
+            mode: None,
+            links: None,
+            os_error,
+        }
+    }
+}
+
+/// A permission mode, logged in octal as `ls` and the unit files write it.
+struct OctalMode(u32);
+
+impl std::fmt::Display for OctalMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:04o}", self.0)
+    }
+}
+
+/// Bind an endpoint socket. If the bind fails, the fatal cause carries what
+/// was on disk, which the rejection itself is not allowed to report.
+fn bind_endpoint(
+    stage: &'static str,
+    path: &Path,
+    expected_directory_mode: u32,
+    bind: fn(
+        &Path,
+    )
+        -> Result<std::os::unix::net::UnixListener, bloom_service_activation::ActivationError>,
+) -> Result<std::os::unix::net::UnixListener, FatalCause> {
+    bind(path).map_err(|error| {
+        FatalCause::classify(stage, &error)
+            .with_endpoint(EndpointFacts::observe(path, expected_directory_mode))
+    })
+}
+
+/// Labels a fallible step, during startup or while serving, so a fatal exit
+/// names the step that failed.
+trait AtStage<T> {
+    fn at_stage(self, stage: &'static str) -> Result<T, FatalCause>;
+}
+
+impl<T, E: Into<Box<dyn std::error::Error>>> AtStage<T> for Result<T, E> {
+    fn at_stage(self, stage: &'static str) -> Result<T, FatalCause> {
+        self.map_err(|error| {
+            let error: Box<dyn std::error::Error> = error.into();
+            FatalCause::classify(stage, error.as_ref())
+        })
+    }
+}
+
+fn log_fatal_exit(error_kind: &'static str, message: &'static str, cause: &FatalCause) {
+    let endpoint = cause.endpoint.as_deref();
+    let directory = endpoint.map(|facts| &facts.directory);
+    let socket = endpoint.map(|facts| &facts.endpoint);
+    let mode = |mode: Option<u32>| mode.map(|mode| tracing::field::display(OctalMode(mode)));
+    tracing::error!(
+        event = "service.fatal_exit",
+        service_role = "signer",
+        error_kind,
+        stage = cause.stage,
+        reason = cause.reason,
+        error_code = cause.error_code,
+        io_error_kind = cause.io_error_kind.map(tracing::field::debug),
+        os_error = cause.os_error,
+        peer_uid = cause.peer_uid,
+        expected_peer_uid = cause.expected_peer_uid,
+        endpoint_expected_uid = endpoint.map(|facts| facts.expected_uid),
+        endpoint_expected_directory_mode =
+            mode(endpoint.map(|facts| facts.expected_directory_mode)),
+        endpoint_path_absolute = endpoint.map(|facts| facts.path_absolute),
+        endpoint_directory_kind = directory.map(|facts| facts.kind),
+        endpoint_directory_uid = directory.and_then(|facts| facts.uid),
+        endpoint_directory_mode = mode(directory.and_then(|facts| facts.mode)),
+        endpoint_directory_os_error = directory.and_then(|facts| facts.os_error),
+        endpoint_kind = socket.map(|facts| facts.kind),
+        endpoint_uid = socket.and_then(|facts| facts.uid),
+        endpoint_mode = mode(socket.and_then(|facts| facts.mode)),
+        endpoint_links = socket.and_then(|facts| facts.links),
+        endpoint_os_error = socket.and_then(|facts| facts.os_error),
+        detail = cause.detail.as_deref(),
+        "{message}"
+    );
 }
 
 fn signer_log_output() -> Result<LogOutput, ()> {
@@ -301,7 +666,7 @@ fn required_u32_env(name: &str) -> Result<u32, ()> {
         .map_err(|_| ())
 }
 
-async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(trusted_fatal: &mut Option<TrustedFatalGuard>) -> Result<(), FatalCause> {
     let identity_path = env_path(
         "BLOOM_SIGNER_IDENTITY",
         "/var/run/bloom/signer-identity.json",
@@ -315,12 +680,15 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
             &identity_path,
             &manifest_path,
             "bloom-signer",
-        )?,
-        None => load_identity_and_manifest(&identity_path, &manifest_path, "bloom-signer")?,
+        )
+        .at_stage("load_identity_and_manifest")?,
+        None => load_identity_and_manifest(&identity_path, &manifest_path, "bloom-signer")
+            .at_stage("load_identity_and_manifest")?,
     };
     #[cfg(not(feature = "triad-dev-harness"))]
     let loaded_identity =
-        load_identity_and_manifest(&identity_path, &manifest_path, "bloom-signer")?;
+        load_identity_and_manifest(&identity_path, &manifest_path, "bloom-signer")
+            .at_stage("load_identity_and_manifest")?;
     let (identity, manifest) = loaded_identity;
     let trusted_time_source = manifest.trusted_time_source.clone();
     let signer_effective_uid = manifest.signer.effective_uid;
@@ -343,18 +711,20 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
     let session_acl = manifest
         .session
         .clone()
-        .ok_or("edge manifest has no login-session identity")?
-        .into_acl()?;
-    let broker_acl = manifest.broker.into_acl()?;
-    let revoke_client_acl = manifest.revoke_client.into_acl()?;
-    if broker_acl.service_id.as_str() != "bloom-broker"
-        || session_acl.service_id.as_str() != "bloom-session"
-    {
-        return Err("edge manifest does not pin bloom-broker for the Signer edge".into());
-    }
-    if revoke_client_acl.service_id.as_str() != "bloom-revoke-client" {
-        return Err("edge manifest does not pin the dedicated revoke client".into());
-    }
+        .ok_or_else(|| {
+            FatalCause::invariant(
+                "load_session_acl",
+                "edge manifest has no login-session identity",
+            )
+        })?
+        .into_acl()
+        .at_stage("load_session_acl")?;
+    let broker_acl = manifest.broker.into_acl().at_stage("load_broker_acl")?;
+    let revoke_client_acl = manifest
+        .revoke_client
+        .into_acl()
+        .at_stage("load_revoke_client_acl")?;
+    verify_edge_manifest_pins(&broker_acl, &session_acl, &revoke_client_acl)?;
     #[cfg(feature = "triad-dev-harness")]
     let history_owner = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
         signer_effective_uid
@@ -410,24 +780,30 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
             })
         }
     };
-    let mut config = load_config(&config_path)?;
+    let mut config = load_config(&config_path).at_stage("load_signer_config")?;
     // Resolve the effective ceremony port once at startup, before opening
     // durable state or acquiring listeners, and carry it as instance state
     // from here on. An explicit file value wins over the legacy fallback;
     // an invalid explicit value fails startup here.
-    let ceremony_port = bloom_signer::webauthn::resolve_ceremony_port(config.ceremony_port)?;
-    let broker_public_key = verifying_key(&config.broker_signing_public_key_hex)?;
-    let ceremony_public_key = verifying_key(&config.ceremony_verifying_public_key_hex)?;
-    let revocation_signing_key = take_signing_key(&mut config.revocation_signing_seed_hex)?;
-    let audit_signing_key = take_signing_key(&mut config.audit_signing_seed_hex)?;
+    let ceremony_port = bloom_signer::webauthn::resolve_ceremony_port(config.ceremony_port)
+        .at_stage("resolve_ceremony_port")?;
+    let broker_public_key = verifying_key(&config.broker_signing_public_key_hex)
+        .at_stage("decode_broker_public_key")?;
+    let ceremony_public_key = verifying_key(&config.ceremony_verifying_public_key_hex)
+        .at_stage("decode_ceremony_public_key")?;
+    let revocation_signing_key = take_signing_key(&mut config.revocation_signing_seed_hex)
+        .at_stage("decode_revocation_signing_key")?;
+    let audit_signing_key = take_signing_key(&mut config.audit_signing_seed_hex)
+        .at_stage("decode_audit_signing_key")?;
     if config.audit_key_id == config.revocation_key_id
         || audit_signing_key.verifying_key() == revocation_signing_key.verifying_key()
         || audit_signing_key.verifying_key().to_bytes()
             == identity.signing_key.verifying_key().to_bytes()
     {
-        return Err(
-            "Signer audit key must be distinct from revocation and application keys".into(),
-        );
+        return Err(FatalCause::invariant(
+            "verify_audit_key_separation",
+            "Signer audit key must be distinct from revocation and application keys",
+        ));
     }
     let previous_audit_signing_key = config
         .audit_rotation_previous_key
@@ -438,78 +814,108 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
                 take_signing_key(&mut previous.signing_seed_hex)?,
             ))
         })
-        .transpose()?;
-    let ceremony_signing_key = take_signing_key(&mut config.ceremony_signing_seed_hex)?;
+        .transpose()
+        .at_stage("decode_previous_audit_signing_key")?;
+    let ceremony_signing_key = take_signing_key(&mut config.ceremony_signing_seed_hex)
+        .at_stage("decode_ceremony_signing_key")?;
     if config.audit_key_id == config.ceremony_key_id
         || audit_signing_key.verifying_key() == ceremony_signing_key.verifying_key()
     {
-        return Err("Signer audit key must be distinct from the ceremony key".into());
+        return Err(FatalCause::invariant(
+            "verify_audit_key_separation",
+            "Signer audit key must be distinct from the ceremony key",
+        ));
     }
-    let build_digest = Digest32::new(config.build_digest.clone())?;
-    let service_span = bloom_service_observability::service_span(
-        "signer",
-        env!("CARGO_PKG_VERSION"),
-        identity.service_id.as_str(),
-        Some(session_acl.effective_uid),
-        Some(build_digest.as_str()),
+    let build_digest =
+        Digest32::new(config.build_digest.clone()).at_stage("decode_build_digest")?;
+    let service_span = arm_trusted_fatal(
+        trusted_fatal,
+        bloom_service_observability::service_span(
+            "signer",
+            env!("CARGO_PKG_VERSION"),
+            identity.service_id.as_str(),
+            Some(session_acl.effective_uid),
+            Some(build_digest.as_str()),
+        ),
     );
-    trusted_metadata_loaded.store(true, Ordering::SeqCst);
-    let mut trusted_fatal = TrustedFatalGuard::new(service_span.clone());
 
     let service_span_guard = service_span.enter();
-    let compiled_backends = build_aws_backends(&mut config.aws_kms_backends)?;
-    let registry = Arc::new(BackendRegistry::from_compiled(compiled_backends)?);
-    let engine = Arc::new(open_operational_signer_engine(
-        &config.database_path,
-        Token::new(config.broker_signing_key_id.clone())?,
-        broker_public_key,
-        ceremony_public_key,
-        Token::new(config.revocation_key_id.clone())?,
-        revocation_signing_key,
-        Token::new(config.audit_key_id.clone())?,
-        audit_signing_key,
-        &config.audit_historical_public_keys,
-        previous_audit_signing_key,
-        registry,
-    )?);
+    let compiled_backends =
+        build_aws_backends(&mut config.aws_kms_backends).at_stage("build_aws_kms_backends")?;
+    let registry = Arc::new(
+        BackendRegistry::from_compiled(compiled_backends).at_stage("build_backend_registry")?,
+    );
+    let engine = Arc::new(
+        open_operational_signer_engine(
+            &config.database_path,
+            Token::new(config.broker_signing_key_id.clone())
+                .at_stage("parse_broker_signing_key_id")?,
+            broker_public_key,
+            ceremony_public_key,
+            Token::new(config.revocation_key_id.clone()).at_stage("parse_revocation_key_id")?,
+            revocation_signing_key,
+            Token::new(config.audit_key_id.clone()).at_stage("parse_audit_key_id")?,
+            audit_signing_key,
+            &config.audit_historical_public_keys,
+            previous_audit_signing_key,
+            registry,
+        )
+        .at_stage("open_signer_engine")?,
+    );
     let migration_root = config
         .database_path
         .parent()
-        .ok_or("Signer database path has no parent directory")?
+        .ok_or_else(|| {
+            FatalCause::invariant(
+                "locate_legacy_migrations",
+                "Signer database path has no parent directory",
+            )
+        })?
         .join("legacy-passkey-migrations");
-    let migration_store = Arc::new(LegacyMigrationStore::create_for_current_process(
-        migration_root,
-        signer_effective_uid,
-    )?);
+    let migration_store = Arc::new(
+        LegacyMigrationStore::create_for_current_process(migration_root, signer_effective_uid)
+            .at_stage("open_legacy_migration_store")?,
+    );
     let mut ceremony = SignerCeremonyService::new_with_ceremony_port(
         engine.clone(),
-        Token::new(config.ceremony_key_id.clone())?,
+        Token::new(config.ceremony_key_id.clone()).at_stage("parse_ceremony_key_id")?,
         ceremony_signing_key,
         ceremony_port,
-    )?
+    )
+    .at_stage("open_ceremony_service")?
     .with_legacy_migrations(migration_store);
     if let Some(ttl_ms) = config.ceremony_ttl_ms {
-        ceremony = ceremony.with_ceremony_ttl_ms(ttl_ms)?;
+        ceremony = ceremony
+            .with_ceremony_ttl_ms(ttl_ms)
+            .at_stage("apply_ceremony_ttl")?;
         tracing::warn!(
             ceremony_ttl_ms = ttl_ms,
             "Signer config overrides the ceremony window"
         );
     }
     let ceremony = Arc::new(ceremony);
-    let clock = Arc::new(SignerClock::new(
-        engine.clone(),
-        &trusted_time_source,
-        identity.boot_epoch.clone(),
-    )?);
+    let clock = Arc::new(
+        SignerClock::new(
+            engine.clone(),
+            &trusted_time_source,
+            identity.boot_epoch.clone(),
+        )
+        .at_stage("open_signer_clock")?,
+    );
     if let Some(accepted_utc_ms) = clock_repair_request()? {
         if !clock.uses_durable_clock_guard() {
-            return Err(
-                "clock repair is unavailable when the host wall clock is authoritative".into(),
-            );
+            return Err(FatalCause::invariant(
+                "repair_clock",
+                "clock repair is unavailable when the host wall clock is authoritative",
+            ));
         }
-        let expiring = engine.active_approvals_expiring_by(accepted_utc_ms)?;
+        let expiring = engine
+            .active_approvals_expiring_by(accepted_utc_ms)
+            .at_stage("list_expiring_approvals")?;
         require_clock_repair_confirmation(accepted_utc_ms, &expiring)?;
-        let decision = engine.repair_clock(accepted_utc_ms)?;
+        let decision = engine
+            .repair_clock(accepted_utc_ms)
+            .at_stage("repair_clock")?;
         tracing::info!(
             event = "signer.clock_repair_committed",
             effective_utc_ms = decision.effective_now_ms,
@@ -517,7 +923,6 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
             expiring_live_approval_count = expiring.len(),
             "Signer clock repair committed"
         );
-        trusted_fatal.disarm();
         return Ok(());
     }
     let containment = config
@@ -531,9 +936,11 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
                 containment.maximum_age_ms,
             )
         })
-        .transpose()?;
+        .transpose()
+        .at_stage("open_network_containment")?;
     let initial_audit_head =
-        select_initial_self_head(engine.as_ref(), checkpoint_store.as_ref(), &identity)?;
+        select_initial_self_head(engine.as_ref(), checkpoint_store.as_ref(), &identity)
+            .at_stage("select_initial_audit_head")?;
     let journal_exchange = Arc::new(SignerJournalExchange {
         engine: engine.clone(),
         checkpoints: checkpoint_store,
@@ -547,7 +954,8 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
         .relay_receipt_public_key_hex
         .as_ref()
         .map(admin::ReceiptKeysHex::decode)
-        .transpose()?;
+        .transpose()
+        .at_stage("decode_relay_receipt_keys")?;
     let mut service = SignerRpcService::new(
         engine,
         ceremony,
@@ -566,44 +974,65 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
     });
 
     let rpc_listener = UnixListener::from_std(acquire_unix_listener(
+        "bind_rpc_socket",
         "BLOOM_SIGNER_SOCKET",
         "BLOOM_SIGNER_ACTIVATION_NAME",
         "signer",
-    )?)?;
+    )?)
+    .at_stage("bind_rpc_socket")?;
     let control_listener = UnixListener::from_std(acquire_unix_listener(
+        "bind_control_socket",
         "BLOOM_SIGNER_CONTROL_SOCKET",
         "BLOOM_SIGNER_CONTROL_ACTIVATION_NAME",
         "signer-control",
-    )?)?;
+    )?)
+    .at_stage("bind_control_socket")?;
     let admin_listener = std::env::var_os("BLOOM_SIGNER_ADMIN_SOCKET")
         .map(PathBuf::from)
-        .map(|path| bloom_service_activation::bind_private_unix_listener(&path))
+        .map(|path| {
+            bind_endpoint(
+                "bind_admin_socket",
+                &path,
+                PRIVATE_ENDPOINT_DIRECTORY_MODE,
+                bloom_service_activation::bind_private_unix_listener,
+            )
+        })
         .transpose()?
         .map(UnixListener::from_std)
-        .transpose()?;
-    let rpc_quota = Arc::new(EndpointQuota::new(
-        config.maximum_in_flight_mutations,
-        config.maximum_requests_per_window,
-        config.request_window_ms,
-        config.maximum_journal_admissions_per_window,
-        config.journal_window_ms,
-    )?);
-    let control_quota = Arc::new(EndpointQuota::new(
-        config.control_maximum_in_flight_mutations,
-        config.control_maximum_requests_per_window,
-        config.control_request_window_ms,
-        config.control_maximum_journal_admissions_per_window,
-        config.control_journal_window_ms,
-    )?);
+        .transpose()
+        .at_stage("bind_admin_socket")?;
+    let rpc_quota = Arc::new(
+        EndpointQuota::new(
+            config.maximum_in_flight_mutations,
+            config.maximum_requests_per_window,
+            config.request_window_ms,
+            config.maximum_journal_admissions_per_window,
+            config.journal_window_ms,
+        )
+        .at_stage("create_rpc_quota")?,
+    );
+    let control_quota = Arc::new(
+        EndpointQuota::new(
+            config.control_maximum_in_flight_mutations,
+            config.control_maximum_requests_per_window,
+            config.control_request_window_ms,
+            config.control_maximum_journal_admissions_per_window,
+            config.control_journal_window_ms,
+        )
+        .at_stage("create_control_quota")?,
+    );
     if config.maximum_connections == 0 || config.control_maximum_connections == 0 {
-        return Err("Signer connection quotas must be nonzero".into());
+        return Err(FatalCause::invariant(
+            "validate_connection_quotas",
+            "Signer connection quotas must be nonzero",
+        ));
     }
     let session_socket_path = env_path(
         "BLOOM_SESSION_SOCKET",
         "/var/run/bloom/session/session.sock",
     );
     drop(service_span_guard);
-    let Some(mut session_stream) = connect_authenticated_session(
+    let Some(session_stream) = connect_authenticated_session(
         &session_socket_path,
         &identity,
         &session_acl,
@@ -612,15 +1041,7 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
     .instrument(service_span.clone())
     .await?
     else {
-        let _span = service_span.enter();
-        tracing::info!(
-            event = "service.shutdown",
-            service_role = "signer",
-            reason = "session_absent_at_startup",
-            "Bloom Signer stopped before accepting operations"
-        );
-        trusted_fatal.disarm();
-        return Ok(());
+        return stop_without_session(&service_span);
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut rpc_shutdown = shutdown_rx.clone();
@@ -644,10 +1065,11 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
             control_endpoint = "revocation",
             "Bloom Signer ready"
         );
+        let rpc_identity = identity.clone();
         tokio::try_join!(
             serve_rpc(
                 rpc_listener,
-                identity.clone(),
+                rpc_identity,
                 broker_acl,
                 rpc_quota,
                 service.clone(),
@@ -669,28 +1091,9 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
                 admin_ceremony,
                 admin_receipt_keys,
                 admin_peer_uid,
-                &mut admin_shutdown
+                &mut admin_shutdown,
             ),
-            async move {
-                let mut unexpected = [0_u8; 1];
-                match session_stream.read(&mut unexpected).await {
-                    Ok(0) => shutdown_tx.send(true).map_err(|_| {
-                        std::io::Error::other("Signer shutdown receivers disappeared")
-                    }),
-                    Err(error) if is_session_disconnect(&error) => {
-                        shutdown_tx.send(true).map_err(|_| {
-                            std::io::Error::other("Signer shutdown receivers disappeared")
-                        })
-                    }
-                    Ok(_) => Err(std::io::Error::other(
-                        "session sentinel sent unexpected channel data",
-                    )),
-                    Err(error) => Err(std::io::Error::new(
-                        error.kind(),
-                        format!("monitor login-session sentinel: {error}"),
-                    )),
-                }
-            },
+            monitor_session_sentinel(session_stream, shutdown_tx),
         )?;
         tracing::info!(
             event = "service.shutdown",
@@ -698,13 +1101,63 @@ async fn run(trusted_metadata_loaded: Arc<AtomicBool>) -> Result<(), Box<dyn std
             reason = "session_ended",
             "Bloom Signer stopped"
         );
-        Ok::<(), std::io::Error>(())
+        Ok::<(), FatalCause>(())
     }
     .instrument(service_span)
     .await?;
     expiry_task.abort();
-    trusted_fatal.disarm();
     Ok(())
+}
+
+fn verify_edge_manifest_pins(
+    broker_acl: &PeerAcl,
+    session_acl: &PeerAcl,
+    revoke_client_acl: &PeerAcl,
+) -> Result<(), FatalCause> {
+    const STAGE: &str = "verify_edge_manifest_pins";
+    if broker_acl.service_id.as_str() != "bloom-broker" {
+        return Err(FatalCause::invariant(
+            STAGE,
+            "edge manifest does not pin bloom-broker for the Signer edge",
+        ));
+    }
+    if session_acl.service_id.as_str() != "bloom-session" {
+        return Err(FatalCause::invariant(
+            STAGE,
+            "edge manifest does not pin bloom-session for the login-session sentinel",
+        ));
+    }
+    if revoke_client_acl.service_id.as_str() != "bloom-revoke-client" {
+        return Err(FatalCause::invariant(
+            STAGE,
+            "edge manifest does not pin the dedicated revoke client",
+        ));
+    }
+    Ok(())
+}
+
+/// Signal shutdown once the login-session sentinel closes its channel. A
+/// read failure keeps its I/O kind and OS error for the fatal event.
+async fn monitor_session_sentinel(
+    mut session_stream: impl AsyncRead + Unpin,
+    shutdown_tx: watch::Sender<bool>,
+) -> Result<(), FatalCause> {
+    const STAGE: &str = "monitor_session_sentinel";
+    let mut unexpected = [0_u8; 1];
+    match session_stream.read(&mut unexpected).await {
+        Ok(0) => {}
+        Err(error) if is_session_disconnect(&error) => {}
+        Ok(_) => {
+            return Err(FatalCause::invariant(
+                STAGE,
+                "session sentinel sent unexpected channel data",
+            ));
+        }
+        Err(error) => return Err(error).at_stage(STAGE),
+    }
+    shutdown_tx
+        .send(true)
+        .map_err(|_| FatalCause::invariant(STAGE, "Signer shutdown receivers disappeared"))
 }
 
 fn is_session_disconnect(error: &std::io::Error) -> bool {
@@ -718,41 +1171,39 @@ fn is_session_disconnect(error: &std::io::Error) -> bool {
     )
 }
 
-#[cfg(target_os = "macos")]
 fn acquire_unix_listener(
-    path_variable: &str,
+    stage: &'static str,
+    path_variable: &'static str,
     _activation_variable: &str,
     _default_activation_name: &str,
-) -> Result<std::os::unix::net::UnixListener, Box<dyn std::error::Error>> {
+) -> Result<std::os::unix::net::UnixListener, FatalCause> {
+    let profile = if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "Linux"
+    };
     let path = std::env::var_os(path_variable)
         .map(PathBuf::from)
-        .ok_or_else(|| format!("{path_variable} is required by the macOS service profile"))?;
-    Ok(bloom_service_activation::bind_owned_unix_listener(&path)?)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn acquire_unix_listener(
-    path_variable: &str,
-    _activation_variable: &str,
-    _default_activation_name: &str,
-) -> Result<std::os::unix::net::UnixListener, Box<dyn std::error::Error>> {
-    let path = std::env::var_os(path_variable)
-        .map(PathBuf::from)
-        .ok_or_else(|| format!("{path_variable} is required by the Linux service profile"))?;
-    Ok(bloom_service_activation::bind_owned_unix_listener(&path)?)
+        .ok_or_else(|| FatalCause::missing_variable(stage, path_variable, profile))?;
+    bind_endpoint(
+        stage,
+        &path,
+        OWNED_ENDPOINT_DIRECTORY_MODE,
+        bloom_service_activation::bind_owned_unix_listener,
+    )
 }
 
 fn require_clock_repair_confirmation(
     accepted_utc_ms: u64,
     expiring: &[Digest32],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), FatalCause> {
     if expiring.is_empty() {
         return Ok(());
     }
     let mut hasher = Sha256::new();
     hasher.update(b"bloom-clock-repair-confirmation/v1");
     hasher.update(accepted_utc_ms.to_be_bytes());
-    hasher.update(serde_jcs::to_vec(expiring)?);
+    hasher.update(serde_jcs::to_vec(expiring).at_stage("confirm_clock_repair")?);
     let expected = Digest32::from_bytes(hasher.finalize().into());
     // Approval IDs are public operational digests: showing each exact ID is
     // what makes this destructive confirmation informed without exposing the
@@ -767,10 +1218,10 @@ fn require_clock_repair_confirmation(
             confirmation_digest = expected.as_str(),
             "Signer clock repair requires operator confirmation"
         );
-        return Err(
-            "clock repair not committed; set BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST to the reported digest"
-                .into(),
-        );
+        return Err(FatalCause::invariant(
+            "confirm_clock_repair",
+            "clock repair not committed; set BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST to the reported digest",
+        ));
     }
     Ok(())
 }
@@ -791,12 +1242,15 @@ fn log_clock_repair_expiring_approvals(
     }
 }
 
-fn clock_repair_request() -> Result<Option<u64>, Box<dyn std::error::Error>> {
+fn clock_repair_request() -> Result<Option<u64>, FatalCause> {
     std::env::var("BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS")
         .ok()
         .map(|value| {
-            value.parse::<u64>().map_err(|error| {
-                format!("invalid BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS: {error}").into()
+            value.parse::<u64>().map_err(|_| {
+                FatalCause::invariant(
+                    "parse_clock_repair_request",
+                    "BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS must be a whole number of UTC milliseconds",
+                )
             })
         })
         .transpose()
@@ -901,18 +1355,21 @@ async fn serve_rpc(
     journals: Arc<SignerJournalExchange>,
     maximum_connections: usize,
     shutdown: &mut watch::Receiver<bool>,
-) -> std::io::Result<()> {
+) -> Result<(), FatalCause> {
+    const STAGE: &str = "serve_rpc";
     let connections = Arc::new(Semaphore::new(maximum_connections));
     loop {
         let permit = tokio::select! {
             _ = wait_for_shutdown(shutdown) => break,
             permit = connections.clone().acquire_owned() => {
-                permit.map_err(|_| std::io::Error::other("Signer RPC connection gate closed"))?
+                permit
+                    .map_err(|_| serve_invariant("Signer RPC connection gate closed"))
+                    .at_stage(STAGE)?
             }
         };
         let (mut stream, _) = tokio::select! {
             _ = wait_for_shutdown(shutdown) => break,
-            accepted = listener.accept() => accepted?,
+            accepted = listener.accept() => accepted.at_stage(STAGE)?,
         };
         let identity = identity.clone();
         let broker_acl = broker_acl.clone();
@@ -938,7 +1395,9 @@ async fn serve_rpc(
             .instrument(service_span),
         );
     }
-    drain_connections(connections, maximum_connections, "RPC").await
+    drain_connections(connections, maximum_connections)
+        .await
+        .at_stage(STAGE)
 }
 
 async fn dispatch_authenticated_rpc(
@@ -1339,18 +1798,21 @@ async fn serve_control(
     service: Arc<CheckpointingControlService>,
     maximum_connections: usize,
     shutdown: &mut watch::Receiver<bool>,
-) -> std::io::Result<()> {
+) -> Result<(), FatalCause> {
+    const STAGE: &str = "serve_control";
     let connections = Arc::new(Semaphore::new(maximum_connections));
     loop {
         let permit = tokio::select! {
             _ = wait_for_shutdown(shutdown) => break,
             permit = connections.clone().acquire_owned() => {
-                permit.map_err(|_| std::io::Error::other("Signer control connection gate closed"))?
+                permit
+                    .map_err(|_| serve_invariant("Signer control connection gate closed"))
+                    .at_stage(STAGE)?
             }
         };
         let (mut stream, _) = tokio::select! {
             _ = wait_for_shutdown(shutdown) => break,
-            accepted = listener.accept() => accepted?,
+            accepted = listener.accept() => accepted.at_stage(STAGE)?,
         };
         let identity = identity.clone();
         let revoke_client_acl = revoke_client_acl.clone();
@@ -1382,7 +1844,9 @@ async fn serve_control(
             .instrument(service_span),
         );
     }
-    drain_connections(connections, maximum_connections, "control").await
+    drain_connections(connections, maximum_connections)
+        .await
+        .at_stage(STAGE)
 }
 
 struct CheckpointingControlService {
@@ -1424,27 +1888,60 @@ fn session_startup_wait(macos: bool, developer_profile: bool) -> Duration {
     }
 }
 
+/// Connect to the login-session sentinel and authenticate before `deadline`.
+///
 /// Returns `None` only when the session socket stayed absent or refused until
 /// `deadline`. A connected peer must authenticate before the deadline; a
 /// stalled or untrusted handshake is fatal rather than mistaken for logout.
+/// A socket failure and a rejected handshake are separate stages, so the
+/// fatal event tells a permissions problem (with its OS error) from a
+/// sentinel that refused us.
 async fn connect_authenticated_session(
     path: &Path,
     identity: &LocalIdentity,
     session_acl: &PeerAcl,
     deadline: tokio::time::Instant,
-) -> Result<Option<UnixStream>, ProtocolError> {
-    let timed_out = |_| {
-        ProtocolError::new(
-            ProtocolErrorCode::ServiceUnavailable,
-            "login-session handshake timed out during startup",
-        )
-    };
+) -> Result<Option<UnixStream>, FatalCause> {
+    connect_session_with(
+        || UnixStream::connect(path),
+        identity,
+        session_acl,
+        deadline,
+    )
+    .await
+}
+
+/// [`connect_authenticated_session`] with its connect step supplied, so tests
+/// can stall or fail the connection itself.
+async fn connect_session_with<Connect, Connecting>(
+    mut connect: Connect,
+    identity: &LocalIdentity,
+    session_acl: &PeerAcl,
+    deadline: tokio::time::Instant,
+) -> Result<Option<UnixStream>, FatalCause>
+where
+    Connect: FnMut() -> Connecting,
+    Connecting: std::future::Future<Output = std::io::Result<UnixStream>>,
+{
+    const CONNECT: &str = "connect_session_sentinel";
+    const AUTHENTICATE: &str = "authenticate_session_sentinel";
     loop {
-        match tokio::time::timeout_at(deadline, UnixStream::connect(path))
+        match tokio::time::timeout_at(deadline, connect())
             .await
-            .map_err(timed_out)?
-        {
+            .map_err(|_| {
+                FatalCause::invariant(CONNECT, "login-session connect timed out during startup")
+            })? {
             Ok(mut stream) => {
+                // The handshake repeats this check, but reports only a code;
+                // checking first lets the fatal event name both UIDs.
+                let peer_uid = stream.peer_cred().at_stage(AUTHENTICATE)?.uid();
+                if peer_uid != session_acl.effective_uid {
+                    return Err(FatalCause::peer_uid_mismatch(
+                        AUTHENTICATE,
+                        peer_uid,
+                        session_acl.effective_uid,
+                    ));
+                }
                 tokio::time::timeout_at(
                     deadline,
                     bloom_triad_local_transport::authenticate_client(
@@ -1456,7 +1953,13 @@ async fn connect_authenticated_session(
                     ),
                 )
                 .await
-                .map_err(timed_out)??;
+                .map_err(|_| {
+                    FatalCause::invariant(
+                        AUTHENTICATE,
+                        "login-session handshake timed out during startup",
+                    )
+                })?
+                .at_stage(AUTHENTICATE)?;
                 return Ok(Some(stream));
             }
             Err(error)
@@ -1471,12 +1974,7 @@ async fn connect_authenticated_session(
                 }
                 tokio::time::sleep_until(deadline.min(now + Duration::from_millis(500))).await;
             }
-            Err(error) => {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::ServiceUnavailable,
-                    format!("connect login-session sentinel {}: {error}", path.display()),
-                ));
-            }
+            Err(error) => return Err(error).at_stage(CONNECT),
         }
     }
 }
@@ -1492,21 +1990,16 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 async fn drain_connections(
     connections: Arc<Semaphore>,
     maximum_connections: usize,
-    endpoint: &str,
 ) -> std::io::Result<()> {
     let permits = u32::try_from(maximum_connections)
-        .map_err(|_| std::io::Error::other("Signer connection quota exceeds u32"))?;
+        .map_err(|_| serve_invariant("Signer connection quota exceeds u32"))?;
     let _drained = tokio::time::timeout(
         Duration::from_secs(35),
         connections.acquire_many_owned(permits),
     )
     .await
-    .map_err(|_| {
-        std::io::Error::other(format!(
-            "Signer {endpoint} connections did not drain within 35 seconds"
-        ))
-    })?
-    .map_err(|_| std::io::Error::other("Signer connection gate closed"))?;
+    .map_err(|_| serve_invariant("Signer connections did not drain within 35 seconds"))?
+    .map_err(|_| serve_invariant("Signer connection gate closed"))?;
     Ok(())
 }
 
@@ -1928,8 +2421,10 @@ mod tests {
         let error = connect_authenticated_session(&path, &signer, &acl, deadline)
             .await
             .unwrap_err();
-        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
-        assert!(error.message.contains("handshake timed out"));
+        assert_eq!(error.stage, "authenticate_session_sentinel");
+        assert_eq!(error.reason, "invariant");
+        let detail = error.detail.unwrap();
+        assert!(detail.contains("handshake timed out"), "{detail}");
         server.abort();
     }
 
@@ -2111,7 +2606,7 @@ mod tests {
     async fn logout_drain_waits_for_an_accepted_operation() {
         let connections = Arc::new(Semaphore::new(2));
         let accepted = connections.clone().acquire_owned().await.unwrap();
-        let drain = tokio::spawn(drain_connections(connections, 2, "test"));
+        let drain = tokio::spawn(drain_connections(connections, 2));
         tokio::task::yield_now().await;
         assert!(!drain.is_finished());
         drop(accepted);
@@ -2566,6 +3061,8 @@ mod tests {
         });
         let event: serde_json::Value = serde_json::from_str(capture.text().trim()).unwrap();
         assert_eq!(event["fields"]["event"], "service.fatal_exit");
+        assert_eq!(event["fields"]["error_kind"], "service_failure");
+        assert_eq!(event["fields"]["reason"], "unrecorded");
         assert_eq!(event["spans"][0]["service_id"], "bloom-signer");
     }
 
@@ -2692,5 +3189,673 @@ mod tests {
             guard.disarm();
         });
         assert!(capture.text().is_empty());
+    }
+
+    fn captured_fatal_exit(emit: impl FnOnce(tracing::Span)) -> (serde_json::Value, String) {
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            emit(bloom_service_observability::service_span(
+                "signer",
+                "test-version",
+                "bloom-signer",
+                Some(501),
+                Some("release-digest"),
+            ))
+        });
+        let output = capture.text();
+        let event = serde_json::from_str(output.trim()).unwrap();
+        (event, output)
+    }
+
+    #[test]
+    fn recorded_fatal_cause_names_the_stage_without_secret_error_text() {
+        let marker_secret = "MARKER_SIGNER_SEED_DO_NOT_LOG";
+        let mut config = ceremony_port_config_fixture(serde_json::Value::Null);
+        config["maximum_connections"] = serde_json::json!(marker_secret);
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("signer.json");
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        // The parser echoes the rejected value, so the raw error is unsafe.
+        assert!(
+            load_config(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains(marker_secret)
+        );
+        let cause = load_config(&path)
+            .at_stage("load_signer_config")
+            .err()
+            .unwrap();
+
+        let (event, output) = captured_fatal_exit(|span| {
+            TrustedFatalGuard::new(span).record(cause);
+        });
+        assert_eq!(event["fields"]["event"], "service.fatal_exit");
+        assert_eq!(event["fields"]["error_kind"], "service_failure");
+        assert_eq!(event["fields"]["stage"], "load_signer_config");
+        assert_eq!(event["fields"]["reason"], "protocol_error");
+        assert_eq!(event["fields"]["error_code"], "MALFORMED_FRAME");
+        assert!(event["fields"].get("detail").is_none(), "{output}");
+        assert_eq!(event["spans"][0]["service_id"], "bloom-signer");
+        assert!(!output.contains(marker_secret), "{output}");
+    }
+
+    #[test]
+    fn bootstrap_fatal_exit_omits_unreviewed_error_text() {
+        let marker_secret = "MARKER_IDENTITY_SEED_DO_NOT_LOG";
+        // Identity loading fails with the transport's wire error, whose
+        // message can echo the identity file.
+        let wire = bloom_signer_api::WireError::new(
+            bloom_signer_api::WireErrorCode::MalformedFrame,
+            format!("decode identity seed {marker_secret}"),
+        );
+        assert!(wire.to_string().contains(marker_secret));
+        let cause = Err::<(), _>(wire)
+            .at_stage("load_identity_and_manifest")
+            .unwrap_err();
+        let (event, output) = captured_fatal_exit(|_| {
+            log_fatal_exit(
+                "bootstrap_failure",
+                "Bloom Signer exiting after a bootstrap error",
+                &cause,
+            );
+        });
+        assert_eq!(event["fields"]["event"], "service.fatal_exit");
+        assert_eq!(event["fields"]["error_kind"], "bootstrap_failure");
+        assert_eq!(event["fields"]["stage"], "load_identity_and_manifest");
+        assert_eq!(event["fields"]["reason"], "protocol_error");
+        assert_eq!(event["fields"]["error_code"], "MALFORMED_FRAME");
+        assert!(!output.contains(marker_secret), "{output}");
+
+        // An error of any other type is still reduced to its stage.
+        let cause = Err::<(), _>(format!("decode identity seed {marker_secret}"))
+            .at_stage("load_identity_and_manifest")
+            .unwrap_err();
+        let (event, output) = captured_fatal_exit(|_| {
+            log_fatal_exit(
+                "bootstrap_failure",
+                "Bloom Signer exiting after a bootstrap error",
+                &cause,
+            );
+        });
+        assert_eq!(event["fields"]["reason"], "unclassified");
+        assert!(!output.contains(marker_secret), "{output}");
+    }
+
+    /// `main` exits through `finish_run`: a failure records its cause on the
+    /// guard and logs exactly one fatal event before the exit code is
+    /// returned, and success logs nothing.
+    #[test]
+    fn finish_run_logs_one_fatal_event_before_returning_the_exit_code() {
+        let mut code = None;
+        let (event, output) = captured_fatal_exit(|span| {
+            code = Some(finish_run(
+                Err(FatalCause::invariant(
+                    "bind_rpc_socket",
+                    "socket owner mismatch",
+                )),
+                Some(TrustedFatalGuard::new(span)),
+            ));
+        });
+        assert_eq!(code, Some(1));
+        assert_eq!(event["fields"]["error_kind"], "service_failure");
+        assert_eq!(event["fields"]["stage"], "bind_rpc_socket");
+        // The trusted failure is logged by the guard, inside the service span.
+        assert_eq!(event["spans"][0]["service_id"], "bloom-signer", "{output}");
+        assert_eq!(event["spans"][0]["release_digest"], "release-digest");
+        assert_eq!(output.trim().lines().count(), 1, "{output}");
+
+        let mut code = None;
+        let (event, _) = captured_fatal_exit(|_| {
+            code = Some(finish_run(
+                Err(FatalCause::invariant("load_signer_config", "missing")),
+                None,
+            ));
+        });
+        assert_eq!(code, Some(1));
+        assert_eq!(event["fields"]["error_kind"], "bootstrap_failure");
+        assert_eq!(event["fields"]["stage"], "load_signer_config");
+
+        let capture = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
+        let code = tracing::subscriber::with_default(subscriber, || {
+            finish_run(Ok(()), Some(TrustedFatalGuard::new(tracing::Span::none())))
+        });
+        assert_eq!(code, 0);
+        assert!(capture.text().is_empty(), "{}", capture.text());
+    }
+
+    #[test]
+    fn fatal_cause_keeps_only_reviewed_detail() {
+        let rejection = "endpoint directory /run/bloom must be a non-symlink directory owned by effective UID 0 with mode 0700";
+        let boxed: Box<dyn std::error::Error> =
+            bloom_service_activation::ActivationError::Rejected(rejection.into()).into();
+        let rejected = Err::<(), _>(boxed)
+            .at_stage("bind_admin_socket")
+            .unwrap_err();
+        assert_eq!(rejected.stage, "bind_admin_socket");
+        assert_eq!(rejected.reason, "activation_rejected");
+        assert_eq!(rejected.detail, None);
+
+        let activation_io = Err::<(), _>(bloom_service_activation::ActivationError::Io(
+            std::io::Error::new(ErrorKind::AddrInUse, "socket is live"),
+        ))
+        .at_stage("bind_rpc_socket")
+        .unwrap_err();
+        assert_eq!(activation_io.reason, "activation_io_error");
+        assert_eq!(activation_io.io_error_kind, Some(ErrorKind::AddrInUse));
+        assert_eq!(activation_io.detail, None);
+
+        let (event, output) = captured_fatal_exit(|span| {
+            let cause = Err::<(), _>(std::io::Error::from_raw_os_error(13))
+                .at_stage("serve_rpc")
+                .unwrap_err();
+            TrustedFatalGuard::new(span).record(cause);
+        });
+        assert_eq!(event["fields"]["reason"], "io_error");
+        assert_eq!(event["fields"]["io_error_kind"], "PermissionDenied");
+        assert_eq!(event["fields"]["os_error"], 13);
+        assert!(event["fields"].get("detail").is_none(), "{output}");
+
+        let invariant = FatalCause::invariant(
+            "validate_connection_quotas",
+            "Signer connection quotas must be nonzero",
+        );
+        assert_eq!(invariant.reason, "invariant");
+        assert_eq!(
+            invariant.detail.as_deref(),
+            Some("Signer connection quotas must be nonzero")
+        );
+    }
+
+    #[test]
+    fn activation_rejection_text_never_reaches_the_log() {
+        let marker_secret = "MARKER_ACTIVATION_SECRET_DO_NOT_LOG";
+        // Shaped like a real bind rejection, which embeds the endpoint path
+        // taken from the environment.
+        let rejection = format!("existing endpoint /run/{marker_secret}/signer.sock is live");
+        let boxed: Box<dyn std::error::Error> =
+            bloom_service_activation::ActivationError::Rejected(rejection).into();
+        assert!(boxed.to_string().contains(marker_secret));
+        let cause = Err::<(), _>(boxed).at_stage("bind_rpc_socket").unwrap_err();
+
+        let (event, output) = captured_fatal_exit(|span| {
+            TrustedFatalGuard::new(span).record(cause);
+        });
+        assert_eq!(event["fields"]["event"], "service.fatal_exit");
+        assert_eq!(event["fields"]["stage"], "bind_rpc_socket");
+        assert_eq!(event["fields"]["reason"], "activation_rejected");
+        assert!(event["fields"].get("detail").is_none(), "{output}");
+        assert!(!output.contains(marker_secret), "{output}");
+    }
+
+    #[test]
+    fn trusted_fatal_guard_reports_a_panic() {
+        let (event, _) = captured_fatal_exit(|span| {
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = TrustedFatalGuard::new(span);
+                panic!("forced Signer panic");
+            }));
+            assert!(panicked.is_err());
+        });
+        assert_eq!(event["fields"]["error_kind"], "service_failure");
+        assert_eq!(event["fields"]["reason"], "panic");
+        assert_eq!(event["spans"][0]["service_id"], "bloom-signer");
+    }
+
+    #[test]
+    fn missing_socket_variable_is_a_named_invariant() {
+        let variable = "BLOOM_SIGNER_TEST_SOCKET_THAT_IS_NEVER_SET";
+        assert!(std::env::var_os(variable).is_none());
+        let cause =
+            acquire_unix_listener("bind_rpc_socket", variable, "UNUSED", "unused").unwrap_err();
+        assert_eq!(cause.stage, "bind_rpc_socket");
+        assert_eq!(cause.reason, "invariant");
+        let profile = if cfg!(target_os = "macos") {
+            "macOS"
+        } else {
+            "Linux"
+        };
+        assert_eq!(
+            cause.detail.as_deref(),
+            Some(format!("{variable} is required by the {profile} service profile").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn sentinel_socket_failure_keeps_its_os_error() {
+        let temporary = tempfile::tempdir().unwrap();
+        let not_a_directory = temporary.path().join("file");
+        fs::write(&not_a_directory, b"").unwrap();
+        let identity = signer_identity();
+        let cause = connect_authenticated_session(
+            &not_a_directory.join("session.sock"),
+            &identity,
+            &peer_acl(&identity, 0),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(cause.stage, "connect_session_sentinel");
+        assert_eq!(cause.reason, "io_error");
+        assert_eq!(cause.io_error_kind, Some(ErrorKind::NotADirectory));
+        assert!(cause.os_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn sentinel_that_hangs_up_fails_the_handshake_stage() {
+        let temporary = tempfile::tempdir().unwrap();
+        let effective_uid = fs::metadata(temporary.path()).unwrap().uid();
+        let path = temporary.path().join("session.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let sentinel = tokio::spawn(async move {
+            drop(listener.accept().await.unwrap());
+        });
+        let identity = signer_identity();
+        let cause = connect_authenticated_session(
+            &path,
+            &identity,
+            &peer_acl(&identity, effective_uid),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        sentinel.await.unwrap();
+        assert_eq!(cause.stage, "authenticate_session_sentinel");
+        assert_eq!(cause.reason, "protocol_error");
+        assert_eq!(cause.error_code, Some("SERVICE_UNAVAILABLE"));
+    }
+
+    #[tokio::test]
+    async fn sentinel_running_as_another_user_names_both_uids() {
+        let temporary = tempfile::tempdir().unwrap();
+        let effective_uid = fs::metadata(temporary.path()).unwrap().uid();
+        let expected_uid = effective_uid.wrapping_add(1);
+        let path = temporary.path().join("session.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let sentinel = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let identity = signer_identity();
+        let cause = connect_authenticated_session(
+            &path,
+            &identity,
+            &peer_acl(&identity, expected_uid),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        drop(sentinel.await.unwrap());
+        assert_eq!(cause.stage, "authenticate_session_sentinel");
+        assert_eq!(cause.reason, "peer_uid_mismatch");
+
+        let (event, _) = captured_fatal_exit(|span| {
+            TrustedFatalGuard::new(span).record(cause);
+        });
+        assert_eq!(event["fields"]["peer_uid"], effective_uid);
+        assert_eq!(event["fields"]["expected_peer_uid"], expected_uid);
+    }
+
+    struct FailingRead(i32);
+
+    impl AsyncRead for FailingRead {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            _buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::from_raw_os_error(self.0)))
+        }
+    }
+
+    #[tokio::test]
+    async fn session_sentinel_read_failure_keeps_its_os_error() {
+        const EIO: i32 = 5;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cause = monitor_session_sentinel(FailingRead(EIO), shutdown_tx)
+            .await
+            .unwrap_err();
+        assert_eq!(cause.stage, "monitor_session_sentinel");
+        assert_eq!(cause.reason, "io_error");
+        assert_eq!(cause.os_error, Some(EIO));
+        assert!(!*shutdown_rx.borrow());
+    }
+
+    fn acl_for(service_id: &str) -> PeerAcl {
+        PeerAcl {
+            service_id: Token::new(service_id).unwrap(),
+            ..peer_acl(&signer_identity(), 0)
+        }
+    }
+
+    #[test]
+    fn edge_manifest_pin_checks_name_the_wrong_pin() {
+        let broker = acl_for("bloom-broker");
+        let session = acl_for("bloom-session");
+        let revoke = acl_for("bloom-revoke-client");
+        let wrong = acl_for("bloom-machine");
+        assert!(verify_edge_manifest_pins(&broker, &session, &revoke).is_ok());
+        for (broker, session, revoke, pin) in [
+            (&wrong, &session, &revoke, "bloom-broker"),
+            (&broker, &wrong, &revoke, "bloom-session"),
+            (&broker, &session, &wrong, "revoke client"),
+        ] {
+            let cause = verify_edge_manifest_pins(broker, session, revoke).unwrap_err();
+            assert_eq!(cause.stage, "verify_edge_manifest_pins");
+            let detail = cause.detail.unwrap();
+            assert!(detail.contains(pin), "{detail}");
+        }
+    }
+
+    #[test]
+    fn serve_loop_failure_is_a_literal_invariant() {
+        let cause = Err::<(), _>(serve_invariant(
+            "Signer connections did not drain within 35 seconds",
+        ))
+        .at_stage("serve_control")
+        .unwrap_err();
+        assert_eq!(cause.stage, "serve_control");
+        assert_eq!(cause.reason, "invariant");
+        assert_eq!(
+            cause.detail.as_deref(),
+            Some("Signer connections did not drain within 35 seconds")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_sentinel_monitor_tells_a_close_from_unexpected_data() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (sentinel, signer) = UnixStream::pair().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        drop(sentinel);
+        monitor_session_sentinel(signer, shutdown_tx).await.unwrap();
+        assert!(*shutdown_rx.borrow());
+
+        let (mut sentinel, signer) = UnixStream::pair().unwrap();
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        sentinel.write_all(b"x").await.unwrap();
+        let cause = monitor_session_sentinel(signer, shutdown_tx)
+            .await
+            .unwrap_err();
+        assert_eq!(cause.stage, "monitor_session_sentinel");
+        assert_eq!(
+            cause.detail.as_deref(),
+            Some("session sentinel sent unexpected channel data")
+        );
+    }
+
+    #[test]
+    fn refused_endpoint_bind_records_what_was_on_disk() {
+        let temporary = tempfile::tempdir().unwrap();
+        let uid = bloom_signer_process_hardening::effective_uid();
+        let directory = temporary.path().join("rpc");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("signer.sock");
+        let bind = |path: &Path| {
+            bind_endpoint(
+                "bind_rpc_socket",
+                path,
+                OWNED_ENDPOINT_DIRECTORY_MODE,
+                bloom_service_activation::bind_owned_unix_listener,
+            )
+        };
+
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        let cause = bind(&path).unwrap_err();
+        assert_eq!(cause.stage, "bind_rpc_socket");
+        assert_eq!(cause.reason, "activation_rejected");
+        let facts = cause.endpoint.unwrap();
+        assert_eq!(facts.expected_uid, uid);
+        assert_eq!(facts.expected_directory_mode, 0o710);
+        assert!(facts.path_absolute);
+        assert_eq!(facts.directory.kind, "directory");
+        assert_eq!(facts.directory.uid, Some(uid));
+        assert_eq!(facts.directory.mode, Some(0o755));
+        assert_eq!(facts.endpoint.kind, "missing");
+
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o710)).unwrap();
+        fs::write(&path, b"not a socket").unwrap();
+        let facts = bind(&path).unwrap_err().endpoint.unwrap();
+        assert_eq!(facts.directory.mode, Some(0o710));
+        assert_eq!(facts.endpoint.kind, "other");
+        assert_eq!(facts.endpoint.uid, Some(uid));
+        assert_eq!(facts.endpoint.links, Some(1));
+
+        let absent = temporary.path().join("absent").join("signer.sock");
+        let cause = bind(&absent).unwrap_err();
+        assert_eq!(cause.reason, "activation_io_error");
+        assert_eq!(cause.io_error_kind, Some(ErrorKind::NotFound));
+        assert_eq!(cause.endpoint.unwrap().directory.kind, "missing");
+
+        fs::remove_file(&path).unwrap();
+        bind(&path).unwrap();
+    }
+
+    #[test]
+    fn endpoint_facts_are_logged_as_numbers_without_the_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("MARKER_ENDPOINT_PATH_DO_NOT_LOG");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o750)).unwrap();
+        let cause = bind_endpoint(
+            "bind_admin_socket",
+            &directory.join("admin.sock"),
+            PRIVATE_ENDPOINT_DIRECTORY_MODE,
+            bloom_service_activation::bind_private_unix_listener,
+        )
+        .unwrap_err();
+        let (event, output) = captured_fatal_exit(|span| {
+            TrustedFatalGuard::new(span).record(cause);
+        });
+        let fields = &event["fields"];
+        let uid = bloom_signer_process_hardening::effective_uid();
+        assert_eq!(fields["stage"], "bind_admin_socket");
+        assert_eq!(fields["reason"], "activation_rejected");
+        assert_eq!(fields["endpoint_expected_uid"], uid);
+        assert_eq!(fields["endpoint_expected_directory_mode"], "0700");
+        assert_eq!(fields["endpoint_directory_kind"], "directory");
+        assert_eq!(fields["endpoint_directory_uid"], uid);
+        assert_eq!(fields["endpoint_directory_mode"], "0750");
+        assert_eq!(fields["endpoint_kind"], "missing");
+        assert!(
+            !output.contains("MARKER_ENDPOINT_PATH_DO_NOT_LOG"),
+            "{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_session_connect_that_outlasts_the_deadline_is_fatal() {
+        let signer = signer_identity();
+        let acl = peer_acl(&session_identity(), 501);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(30);
+        let cause = tokio::time::timeout(
+            Duration::from_secs(1),
+            connect_session_with(
+                std::future::pending::<std::io::Result<UnixStream>>,
+                &signer,
+                &acl,
+                deadline,
+            ),
+        )
+        .await
+        .expect("the startup deadline must end a stalled connect")
+        .unwrap_err();
+        assert_eq!(cause.stage, "connect_session_sentinel");
+        assert_eq!(cause.reason, "invariant");
+        let detail = cause.detail.unwrap();
+        assert!(detail.contains("connect timed out"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn startup_session_permission_failure_is_fatal_without_retrying() {
+        let signer = signer_identity();
+        let acl = peer_acl(&session_identity(), 501);
+        // Outside installed macOS the startup wait is effectively unbounded,
+        // so retrying a permission failure would hang startup silently.
+        let deadline = tokio::time::Instant::now() + session_startup_wait(false, false);
+        let cause = tokio::time::timeout(
+            Duration::from_secs(1),
+            connect_session_with(
+                || async { Err(std::io::Error::from_raw_os_error(libc::EACCES)) },
+                &signer,
+                &acl,
+                deadline,
+            ),
+        )
+        .await
+        .expect("a permission failure must not be retried")
+        .unwrap_err();
+        assert_eq!(cause.stage, "connect_session_sentinel");
+        assert_eq!(cause.reason, "io_error");
+        assert_eq!(cause.io_error_kind, Some(ErrorKind::PermissionDenied));
+        assert_eq!(cause.os_error, Some(libc::EACCES));
+    }
+
+    #[test]
+    fn trusted_metadata_arms_the_guard_for_later_failures() {
+        let mut code = None;
+        let (event, output) = captured_fatal_exit(|span| {
+            let mut slot = None;
+            let id = span.id();
+            let armed = arm_trusted_fatal(&mut slot, span);
+            assert!(id.is_some());
+            assert_eq!(armed.id(), id);
+            code = Some(finish_run(
+                Err(FatalCause::invariant(
+                    "bind_rpc_socket",
+                    "socket owner mismatch",
+                )),
+                slot,
+            ));
+        });
+        assert_eq!(code, Some(1));
+        assert_eq!(event["fields"]["error_kind"], "service_failure");
+        assert_eq!(
+            event["spans"][0]["release_digest"], "release-digest",
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn absent_session_at_startup_stops_without_a_fatal_event() {
+        let mut code = None;
+        let (event, output) = captured_fatal_exit(|span| {
+            let mut slot = None;
+            let span = arm_trusted_fatal(&mut slot, span);
+            code = Some(finish_run(stop_without_session(&span), slot));
+        });
+        assert_eq!(code, Some(0));
+        assert_eq!(output.trim().lines().count(), 1, "{output}");
+        assert_eq!(event["fields"]["event"], "service.shutdown");
+        assert_eq!(event["fields"]["reason"], "session_absent_at_startup");
+        assert_eq!(event["spans"][0]["service_id"], "bloom-signer", "{output}");
+    }
+
+    fn rpc_service(
+        engine: Arc<SignerEngine>,
+    ) -> (Arc<SignerRpcService>, Arc<SignerCeremonyService>) {
+        let ceremony = Arc::new(
+            SignerCeremonyService::new(
+                engine.clone(),
+                Token::new("signer-ceremony-key").unwrap(),
+                SigningKey::from_bytes(&[8; 32]),
+            )
+            .unwrap(),
+        );
+        #[cfg(target_os = "macos")]
+        let source = "macos-managed-timed";
+        #[cfg(not(target_os = "macos"))]
+        let source = "linux-system-clock";
+        let clock = Arc::new(
+            SignerClock::new(engine.clone(), source, BootEpoch::from_bytes([3; 16])).unwrap(),
+        );
+        let service = Arc::new(SignerRpcService::new(
+            engine,
+            ceremony.clone(),
+            clock,
+            BootEpoch::from_bytes([3; 16]),
+            Digest32::from_bytes([2; 32]),
+            "test",
+        ));
+        (service, ceremony)
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[tokio::test]
+    async fn each_serve_loop_names_itself_when_it_fails() {
+        // A quota above `u32::MAX` makes the shutdown drain fail with a fixed
+        // invariant, so each loop fails without a real accept error.
+        let oversized = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        let engine = test_engine();
+        let (service, ceremony) = rpc_service(engine.clone());
+        let journals = Arc::new(SignerJournalExchange {
+            engine,
+            checkpoints: Arc::new(FailingCheckpointSink),
+            identity: signer_identity(),
+            last_verified_head: Mutex::new(None),
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let uid = fs::metadata(temporary.path()).unwrap().uid();
+        let quota = || Arc::new(EndpointQuota::new(1, 10, 1_000, 10, 1_000).unwrap());
+        let (_shutdown_tx, mut shutdown) = watch::channel(true);
+
+        let cause = serve_rpc(
+            UnixListener::bind(temporary.path().join("rpc.sock")).unwrap(),
+            signer_identity(),
+            peer_acl(&signer_identity(), uid),
+            quota(),
+            service.clone(),
+            journals.clone(),
+            oversized,
+            &mut shutdown,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(cause.stage, "serve_rpc");
+        assert_eq!(
+            cause.detail.as_deref(),
+            Some("Signer connection quota exceeds u32")
+        );
+
+        let cause = serve_control(
+            UnixListener::bind(temporary.path().join("control.sock")).unwrap(),
+            signer_identity(),
+            peer_acl(&signer_identity(), uid),
+            quota(),
+            Arc::new(CheckpointingControlService {
+                inner: service,
+                journals,
+            }),
+            oversized,
+            &mut shutdown,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(cause.stage, "serve_control");
+        assert_eq!(
+            cause.detail.as_deref(),
+            Some("Signer connection quota exceeds u32")
+        );
+
+        let (admin_shutdown_tx, mut admin_shutdown) = watch::channel(false);
+        drop(admin_shutdown_tx);
+        let cause = admin::serve(None, ceremony, None, 0, &mut admin_shutdown)
+            .await
+            .unwrap_err();
+        assert_eq!(cause.stage, "serve_admin");
+        assert_eq!(
+            cause.detail.as_deref(),
+            Some("Signer shutdown channel closed")
+        );
     }
 }

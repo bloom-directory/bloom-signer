@@ -454,15 +454,14 @@ impl LocalSignerBackend {
             .clone()
             .ok_or(BackendError::DefinitiveRejected)?;
         if next.derivation_registry.iter().any(|key| key == &key_ref) {
-            if let Some(description) = description {
-                if !next
+            if let Some(description) = description
+                && !next
                     .public_descriptions
                     .iter()
                     .any(|pinned| pinned.key_ref == key_ref)
-                {
-                    next.public_descriptions.push(description);
-                    commit_backup(&mut state, next)?;
-                }
+            {
+                next.public_descriptions.push(description);
+                commit_backup(&mut state, next)?;
             }
             return Ok(());
         }
