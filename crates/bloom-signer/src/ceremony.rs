@@ -1191,12 +1191,12 @@ impl SignerCeremonyService {
             ExposureMode::RemoteEnabled => {
                 if report.remote_closed || !report.remote_tls_ready || !report.remote_routing_ready
                 {
-                    if let Some(descriptor) = remote {
-                        if descriptor.lifecycle != SurfaceLifecycle::Disabled {
-                            descriptor.lifecycle = SurfaceLifecycle::Disabled;
-                            descriptor.lifecycle_revision =
-                                DecimalU64::new(descriptor.lifecycle_revision.get() + 1);
-                        }
+                    if let Some(descriptor) = remote
+                        && descriptor.lifecycle != SurfaceLifecycle::Disabled
+                    {
+                        descriptor.lifecycle = SurfaceLifecycle::Disabled;
+                        descriptor.lifecycle_revision =
+                            DecimalU64::new(descriptor.lifecycle_revision.get() + 1);
                     }
                     next.effective_mode = ExposureMode::LocalhostOnly;
                 } else {
@@ -1608,10 +1608,10 @@ impl SignerCeremonyService {
             return Err(kind_mismatch());
         }
         self.require_unopened_operation_id(&request.custody_operation_id)?;
-        if let Some(wallet_id) = &request.wallet_id {
-            if request.ceremony_kind != CeremonyKind::WalletRecovery {
-                self.require_no_live_wallet_session(wallet_id)?;
-            }
+        if let Some(wallet_id) = &request.wallet_id
+            && request.ceremony_kind != CeremonyKind::WalletRecovery
+        {
+            self.require_no_live_wallet_session(wallet_id)?;
         }
 
         let ceremony_id = random_digest();
@@ -2704,14 +2704,13 @@ impl SignerCeremonyService {
         now_ms: u64,
     ) -> Result<SignerCeremonyStatus, ProtocolError> {
         let status = self.status(operation_id)?;
-        if let SignerCeremonyStatus::CompletedCustody(result) = &status {
-            if result.ceremony_kind == CeremonyKind::WalletRecovery
-                && !self
-                    .engine
-                    .recovery_result_delivery_valid(operation_id, now_ms)?
-            {
-                return Ok(SignerCeremonyStatus::Terminal(CeremonyState::Succeeded));
-            }
+        if let SignerCeremonyStatus::CompletedCustody(result) = &status
+            && result.ceremony_kind == CeremonyKind::WalletRecovery
+            && !self
+                .engine
+                .recovery_result_delivery_valid(operation_id, now_ms)?
+        {
+            return Ok(SignerCeremonyStatus::Terminal(CeremonyState::Succeeded));
         }
         Ok(status)
     }

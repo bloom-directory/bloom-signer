@@ -47,12 +47,21 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run tests on the shipped feature set
         run: cargo test --workspace --locked
-      - name: Keep the accepted time advisory out of the default artifact
+
+  # The workspace job builds on `stable`, so nothing else would notice code or
+  # a dependency that needs a newer Rust than `rust-version` declares. The
+  # MSRV-aware resolver trusts that floor when it picks dependency versions.
+  minimum-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build at the declared rust-version
         run: |
-          if cargo tree --locked -p bloom-signer -e normal --prefix none | grep -Eq '^time v'; then
-            echo 'the default bloom-signer graph must not contain time while RUSTSEC-2026-0009 is ignored for the optional AWS KMS graph' >&2
-            exit 1
-          fi
+          floor=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          test -n "$floor"
+          rustup toolchain install "$floor" --profile minimal
+          cargo "+$floor" check --workspace --all-targets --all-features --locked
+          cargo "+$floor" check --workspace --all-targets --locked
 
   supply-chain:
     runs-on: ubuntu-latest

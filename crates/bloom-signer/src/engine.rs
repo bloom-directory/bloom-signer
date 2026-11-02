@@ -7382,13 +7382,13 @@ fn insert_trusted_audit_key(
     key_id: Token,
     key: VerifyingKey,
 ) -> Result<(), ProtocolError> {
-    if let Some(existing) = keys.insert(key_id.clone(), key) {
-        if existing != key {
-            return Err(error(
-                ProtocolErrorCode::MalformedFrame,
-                format!("Signer audit key ID {key_id} has conflicting public keys"),
-            ));
-        }
+    if let Some(existing) = keys.insert(key_id.clone(), key)
+        && existing != key
+    {
+        return Err(error(
+            ProtocolErrorCode::MalformedFrame,
+            format!("Signer audit key ID {key_id} has conflicting public keys"),
+        ));
     }
     Ok(())
 }
