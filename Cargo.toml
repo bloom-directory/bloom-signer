@@ -33,8 +33,10 @@ bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-r
 bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
 aws-config = { version = "=1.8.1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-credential-types = "1"
-# Exact AWS service pins date from the old Rust 1.85 floor. Newer releases
-# fit the current 1.88 floor; moving to them is a separate dependency update.
+# Exact AWS service pins date from the old Rust 1.85 floor. Some newer
+# releases also fit the current 1.88 floor (up to aws-config 1.8.13,
+# aws-sdk-kms 1.99 and aws-sdk-sts 1.97); later ones need Rust 1.91 or newer.
+# Moving to them is a separate dependency update.
 #
 # `default-features = false` is deliberate. These SDKs default to their
 # `rustls` feature, which despite the name selects the *legacy* TLS stack

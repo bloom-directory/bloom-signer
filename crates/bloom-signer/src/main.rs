@@ -499,12 +499,15 @@ const PRIVATE_ENDPOINT_DIRECTORY_MODE: u32 = 0o700;
 /// checks: the parent must be a real directory owned by the Signer's
 /// effective UID with an exact mode, and an existing endpoint must be a
 /// singly-linked socket owned by that UID. When both look healthy, a later
-/// check failed and left nothing here to see: an existing endpoint that is
+/// step failed and left nothing here to see: an existing endpoint that is
 /// live or can't be proven stale, a non-UTF-8 file name, a leftover temporary
-/// socket, or the new socket's group, mode or owner. A path without a file
-/// name, such as one ending in `..`, is rejected too, and its facts describe
-/// the wrong entries. The facts are read after the bind fails. No path or
-/// group is recorded; the stage names the endpoint.
+/// entry, the new socket's type, owner, group, mode or link count, or an I/O
+/// failure on the way, which keeps its I/O kind. A relative path is refused
+/// first, and only `path_absolute` shows it. A path without a file name, such
+/// as one ending in `..`, is refused too, and its facts describe the wrong
+/// entries. The facts are read after the bind fails, so a stale socket it
+/// already removed shows as missing. No path or group is recorded; the stage
+/// names the endpoint.
 #[derive(Debug, Clone, Copy)]
 struct EndpointFacts {
     expected_uid: u32,
@@ -3713,22 +3716,22 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_facts_keep_the_directory_setgid_bit() {
-        // The activation crate compares all twelve mode bits, so a setgid
-        // directory is refused, and its facts must show the bit that differs.
+    fn endpoint_facts_keep_the_directory_special_mode_bits() {
+        // The activation crate compares all twelve mode bits, so a directory
+        // with a special bit is refused, and its facts must show that bit. The
+        // sticky bit stands in for setgid: an owner can always set it, while
+        // setgid is cleared unless the user is in the directory's group, as
+        // under macOS `/tmp`.
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("rpc");
         fs::create_dir(&directory).unwrap();
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o2710)).unwrap();
-        assert_eq!(
-            fs::symlink_metadata(&directory).unwrap().mode() & 0o7777,
-            0o2710,
-            "this platform cleared the setgid bit"
-        );
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o1710)).unwrap();
+        let mode = fs::symlink_metadata(&directory).unwrap().mode() & 0o7777;
+        assert_eq!(mode, 0o1710, "the directory's mode is {mode:04o}, not 1710");
         let cause =
             bind_owned_endpoint("bind_rpc_socket", &directory.join("signer.sock")).unwrap_err();
         assert_eq!(cause.reason, "activation_rejected");
-        assert_eq!(cause.endpoint.unwrap().directory.mode, Some(0o2710));
+        assert_eq!(cause.endpoint.unwrap().directory.mode, Some(0o1710));
     }
 
     #[test]
@@ -3742,14 +3745,19 @@ mod tests {
         assert!(!facts.path_absolute);
         assert_eq!(facts.directory.kind, "none");
 
-        // Owners are read from each entry, not assumed: `/` belongs to root.
+        // Owners are read from each entry, not assumed to be the Signer's
+        // user. `/` belongs to another user (usually root) almost everywhere,
+        // and its bind is refused before anything is created.
         let facts = bind_owned_endpoint("bind_rpc_socket", Path::new("/signer-facts-test.sock"))
             .unwrap_err()
             .endpoint
             .unwrap();
         assert!(facts.path_absolute);
         assert_eq!(facts.directory.kind, "directory");
-        assert_eq!(facts.directory.uid, Some(0));
+        assert_eq!(
+            facts.directory.uid,
+            Some(fs::symlink_metadata("/").unwrap().uid())
+        );
     }
 
     #[test]
