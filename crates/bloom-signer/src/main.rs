@@ -3217,8 +3217,11 @@ mod tests {
 
     fn captured_fatal_exit(emit: impl FnOnce(tracing::Span)) -> (serde_json::Value, String) {
         let capture = bloom_service_observability::CapturedWriter::default();
+        // Record every level: production logs debug lines under
+        // `RUST_LOG=debug`, so a leak there must fail these tests too.
         let subscriber = tracing_subscriber::fmt()
             .json()
+            .with_max_level(tracing::Level::TRACE)
             .with_current_span(true)
             .with_span_list(true)
             .with_writer(capture.clone())
@@ -3710,13 +3713,53 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_facts_keep_the_directory_setgid_bit() {
+        // The activation crate compares all twelve mode bits, so a setgid
+        // directory is refused, and its facts must show the bit that differs.
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("rpc");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o2710)).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&directory).unwrap().mode() & 0o7777,
+            0o2710,
+            "this platform cleared the setgid bit"
+        );
+        let cause =
+            bind_owned_endpoint("bind_rpc_socket", &directory.join("signer.sock")).unwrap_err();
+        assert_eq!(cause.reason, "activation_rejected");
+        assert_eq!(cause.endpoint.unwrap().directory.mode, Some(0o2710));
+    }
+
+    #[test]
+    fn endpoint_facts_flag_a_relative_path_and_read_owners_from_disk() {
+        // A relative path is refused first, and its entries may look healthy,
+        // so `path_absolute` is the clue.
+        let cause =
+            bind_owned_endpoint("bind_rpc_socket", Path::new("relative-signer.sock")).unwrap_err();
+        assert_eq!(cause.reason, "activation_rejected");
+        let facts = cause.endpoint.unwrap();
+        assert!(!facts.path_absolute);
+        assert_eq!(facts.directory.kind, "none");
+
+        // Owners are read from each entry, not assumed: `/` belongs to root.
+        let facts = bind_owned_endpoint("bind_rpc_socket", Path::new("/signer-facts-test.sock"))
+            .unwrap_err()
+            .endpoint
+            .unwrap();
+        assert!(facts.path_absolute);
+        assert_eq!(facts.directory.kind, "directory");
+        assert_eq!(facts.directory.uid, Some(0));
+    }
+
+    #[test]
     fn endpoint_facts_are_logged_as_numbers_without_the_path() {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("MARKER_ENDPOINT_PATH_DO_NOT_LOG");
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o750)).unwrap();
-        // Bind inside the capture, so a log line written by the bind itself
-        // would show up here too.
+        // Bind inside the capture, so a line the bind logs at any level would
+        // show up here too.
         let (event, output) = captured_fatal_exit(|span| {
             let cause = bind_private_endpoint("bind_admin_socket", &directory.join("admin.sock"))
                 .unwrap_err();
