@@ -30,7 +30,7 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-aws-smithy-runtime = { version = "=1.9.4", features = ["test-util"] }
+aws-smithy-runtime = { version = "=1.10.0", features = ["test-util"] }
 http = "1"
 tempfile = "3"
 tokio = { workspace = true, features = ["macros"] }
