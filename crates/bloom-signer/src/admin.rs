@@ -250,25 +250,34 @@ pub(super) async fn serve(
     admin_peer_uid: u32,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), super::FatalCause> {
-    const STAGE: &str = "serve_admin";
+    // One label for every failure path, so none can name another endpoint.
+    serve_connections(listener, ceremony, receipt_keys, admin_peer_uid, shutdown)
+        .await
+        .at_stage("serve_admin")
+}
+
+async fn serve_connections(
+    listener: Option<UnixListener>,
+    ceremony: Arc<SignerCeremonyService>,
+    receipt_keys: Option<Vec<[u8; 32]>>,
+    admin_peer_uid: u32,
+    shutdown: &mut watch::Receiver<bool>,
+) -> io::Result<()> {
     let Some(listener) = listener else {
         shutdown
             .changed()
             .await
-            .map_err(|_| super::serve_invariant("Signer shutdown channel closed"))
-            .at_stage(STAGE)?;
+            .map_err(|_| super::serve_invariant("Signer shutdown channel closed"))?;
         return Ok(());
     };
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
-                changed
-                    .map_err(|_| super::serve_invariant("Signer shutdown channel closed"))
-                    .at_stage(STAGE)?;
+                changed.map_err(|_| super::serve_invariant("Signer shutdown channel closed"))?;
                 return Ok(());
             }
             accepted = listener.accept() => {
-                let (mut stream, _) = accepted.at_stage(STAGE)?;
+                let (mut stream, _) = accepted?;
                 if require_local_admin_peer(&stream, admin_peer_uid).is_err() {
                     continue;
                 }

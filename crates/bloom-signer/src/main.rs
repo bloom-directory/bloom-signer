@@ -414,9 +414,10 @@ impl FatalCause {
             return Self::bare(stage, "io_error").with_io(error);
         }
         // A rejection is an untyped `String` that embeds environment-supplied
-        // text: the endpoint path from its `BLOOM_SIGNER_*_SOCKET` variable
-        // and, for a socket it can't prove stale, an I/O error's message. Only
-        // its kind is logged; `bind_endpoint` adds what it found on disk.
+        // text: the endpoint path from `BLOOM_SIGNER_SOCKET`,
+        // `BLOOM_SIGNER_CONTROL_SOCKET` or `BLOOM_SIGNER_ADMIN_SOCKET` and, for
+        // a socket it can't prove stale, an I/O error's message. Only its kind
+        // is logged; `bind_endpoint` adds what it found on disk.
         match error.downcast_ref::<bloom_service_activation::ActivationError>() {
             Some(bloom_service_activation::ActivationError::Rejected(_)) => {
                 Self::bare(stage, "activation_rejected")
@@ -469,7 +470,8 @@ impl FatalCause {
 
 /// A fixed failure message from a serve loop. It travels inside an
 /// `io::Error` so it shares a type with the loops' I/O steps, and `classify`
-/// logs it as an invariant. Each loop labels its failures with its own stage.
+/// logs it as an invariant. Each loop labels all its failures once, at its
+/// end, with its own stage.
 #[derive(Debug)]
 struct ServeInvariant(&'static str);
 
@@ -493,11 +495,16 @@ const PRIVATE_ENDPOINT_DIRECTORY_MODE: u32 = 0o700;
 
 /// What a failed endpoint bind found on disk, as numbers and fixed labels.
 ///
-/// The bind's own error text is not logged, so these facts say which check
-/// failed: the parent must be a real directory owned by the Signer's
+/// The bind's own error text is not logged. These facts cover its first
+/// checks: the parent must be a real directory owned by the Signer's
 /// effective UID with an exact mode, and an existing endpoint must be a
-/// singly-linked socket owned by that UID. No path is recorded; the stage
-/// names the endpoint.
+/// singly-linked socket owned by that UID. When both look healthy, a later
+/// check failed and left nothing here to see: an existing endpoint that is
+/// live or can't be proven stale, a non-UTF-8 file name, a leftover temporary
+/// socket, or the new socket's group, mode or owner. A path without a file
+/// name, such as one ending in `..`, is rejected too, and its facts describe
+/// the wrong entries. The facts are read after the bind fails. No path or
+/// group is recorded; the stage names the endpoint.
 #[derive(Debug, Clone, Copy)]
 struct EndpointFacts {
     expected_uid: u32,
@@ -595,6 +602,35 @@ fn bind_endpoint(
         FatalCause::classify(stage, &error)
             .with_endpoint(EndpointFacts::observe(path, expected_directory_mode))
     })
+}
+
+/// Bind the RPC or control socket: a `0710` directory and a `0660` socket
+/// that the directory's group can reach. The mode and the bind are paired
+/// here so a caller can't mix them up.
+fn bind_owned_endpoint(
+    stage: &'static str,
+    path: &Path,
+) -> Result<std::os::unix::net::UnixListener, FatalCause> {
+    bind_endpoint(
+        stage,
+        path,
+        OWNED_ENDPOINT_DIRECTORY_MODE,
+        bloom_service_activation::bind_owned_unix_listener,
+    )
+}
+
+/// Bind the admin socket: a `0700` directory and a `0600` socket that only
+/// the Signer's user can reach.
+fn bind_private_endpoint(
+    stage: &'static str,
+    path: &Path,
+) -> Result<std::os::unix::net::UnixListener, FatalCause> {
+    bind_endpoint(
+        stage,
+        path,
+        PRIVATE_ENDPOINT_DIRECTORY_MODE,
+        bloom_service_activation::bind_private_unix_listener,
+    )
 }
 
 /// Labels a fallible step, during startup or while serving, so a fatal exit
@@ -989,14 +1025,7 @@ async fn run(trusted_fatal: &mut Option<TrustedFatalGuard>) -> Result<(), FatalC
     .at_stage("bind_control_socket")?;
     let admin_listener = std::env::var_os("BLOOM_SIGNER_ADMIN_SOCKET")
         .map(PathBuf::from)
-        .map(|path| {
-            bind_endpoint(
-                "bind_admin_socket",
-                &path,
-                PRIVATE_ENDPOINT_DIRECTORY_MODE,
-                bloom_service_activation::bind_private_unix_listener,
-            )
-        })
+        .map(|path| bind_private_endpoint("bind_admin_socket", &path))
         .transpose()?
         .map(UnixListener::from_std)
         .transpose()
@@ -1185,12 +1214,7 @@ fn acquire_unix_listener(
     let path = std::env::var_os(path_variable)
         .map(PathBuf::from)
         .ok_or_else(|| FatalCause::missing_variable(stage, path_variable, profile))?;
-    bind_endpoint(
-        stage,
-        &path,
-        OWNED_ENDPOINT_DIRECTORY_MODE,
-        bloom_service_activation::bind_owned_unix_listener,
-    )
+    bind_owned_endpoint(stage, &path)
 }
 
 fn require_clock_repair_confirmation(
@@ -1356,48 +1380,48 @@ async fn serve_rpc(
     maximum_connections: usize,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), FatalCause> {
-    const STAGE: &str = "serve_rpc";
-    let connections = Arc::new(Semaphore::new(maximum_connections));
-    loop {
-        let permit = tokio::select! {
-            _ = wait_for_shutdown(shutdown) => break,
-            permit = connections.clone().acquire_owned() => {
-                permit
-                    .map_err(|_| serve_invariant("Signer RPC connection gate closed"))
-                    .at_stage(STAGE)?
-            }
-        };
-        let (mut stream, _) = tokio::select! {
-            _ = wait_for_shutdown(shutdown) => break,
-            accepted = listener.accept() => accepted.at_stage(STAGE)?,
-        };
-        let identity = identity.clone();
-        let broker_acl = broker_acl.clone();
-        let quota = quota.clone();
-        let service = service.clone();
-        let journals = journals.clone();
-        let service_span = tracing::Span::current();
-        tokio::spawn(
-            async move {
-                let _permit = permit;
-                let _ = dispatch_authority_connection(
-                    &mut stream,
-                    &identity,
-                    &broker_acl,
-                    &quota,
-                    journals.as_ref(),
-                    |request, context| {
-                        dispatch_authenticated_rpc(service.as_ref(), request, context)
-                    },
-                )
-                .await;
-            }
-            .instrument(service_span),
-        );
+    // One label for every failure path, so none can name another endpoint.
+    async {
+        let connections = Arc::new(Semaphore::new(maximum_connections));
+        loop {
+            let permit = tokio::select! {
+                _ = wait_for_shutdown(shutdown) => break,
+                permit = connections.clone().acquire_owned() => {
+                    permit.map_err(|_| serve_invariant("Signer RPC connection gate closed"))?
+                }
+            };
+            let (mut stream, _) = tokio::select! {
+                _ = wait_for_shutdown(shutdown) => break,
+                accepted = listener.accept() => accepted?,
+            };
+            let identity = identity.clone();
+            let broker_acl = broker_acl.clone();
+            let quota = quota.clone();
+            let service = service.clone();
+            let journals = journals.clone();
+            let service_span = tracing::Span::current();
+            tokio::spawn(
+                async move {
+                    let _permit = permit;
+                    let _ = dispatch_authority_connection(
+                        &mut stream,
+                        &identity,
+                        &broker_acl,
+                        &quota,
+                        journals.as_ref(),
+                        |request, context| {
+                            dispatch_authenticated_rpc(service.as_ref(), request, context)
+                        },
+                    )
+                    .await;
+                }
+                .instrument(service_span),
+            );
+        }
+        drain_connections(connections, maximum_connections).await
     }
-    drain_connections(connections, maximum_connections)
-        .await
-        .at_stage(STAGE)
+    .await
+    .at_stage("serve_rpc")
 }
 
 async fn dispatch_authenticated_rpc(
@@ -1799,54 +1823,54 @@ async fn serve_control(
     maximum_connections: usize,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), FatalCause> {
-    const STAGE: &str = "serve_control";
-    let connections = Arc::new(Semaphore::new(maximum_connections));
-    loop {
-        let permit = tokio::select! {
-            _ = wait_for_shutdown(shutdown) => break,
-            permit = connections.clone().acquire_owned() => {
-                permit
-                    .map_err(|_| serve_invariant("Signer control connection gate closed"))
-                    .at_stage(STAGE)?
-            }
-        };
-        let (mut stream, _) = tokio::select! {
-            _ = wait_for_shutdown(shutdown) => break,
-            accepted = listener.accept() => accepted.at_stage(STAGE)?,
-        };
-        let identity = identity.clone();
-        let revoke_client_acl = revoke_client_acl.clone();
-        let quota = quota.clone();
-        let service = service.clone();
-        let service_span = tracing::Span::current();
-        tokio::spawn(
-            async move {
-                let _permit = permit;
-                let _ = bloom_triad_local_transport::dispatch_connection_with_context::<
-                    ControlRequest,
-                    ControlResponse,
-                    ProtocolError,
-                    _,
-                    _,
-                >(
-                    &mut stream,
-                    &identity,
-                    &revoke_client_acl,
-                    bloom_signer_api::SIGNER_CONTROL_CURRENT,
-                    bloom_signer_api::SIGNER_CONTROL_RANGE,
-                    &quota,
-                    |request, context| {
-                        dispatch_authenticated_control(service.as_ref(), request, context)
-                    },
-                )
-                .await;
-            }
-            .instrument(service_span),
-        );
+    // One label for every failure path, so none can name another endpoint.
+    async {
+        let connections = Arc::new(Semaphore::new(maximum_connections));
+        loop {
+            let permit = tokio::select! {
+                _ = wait_for_shutdown(shutdown) => break,
+                permit = connections.clone().acquire_owned() => {
+                    permit.map_err(|_| serve_invariant("Signer control connection gate closed"))?
+                }
+            };
+            let (mut stream, _) = tokio::select! {
+                _ = wait_for_shutdown(shutdown) => break,
+                accepted = listener.accept() => accepted?,
+            };
+            let identity = identity.clone();
+            let revoke_client_acl = revoke_client_acl.clone();
+            let quota = quota.clone();
+            let service = service.clone();
+            let service_span = tracing::Span::current();
+            tokio::spawn(
+                async move {
+                    let _permit = permit;
+                    let _ = bloom_triad_local_transport::dispatch_connection_with_context::<
+                        ControlRequest,
+                        ControlResponse,
+                        ProtocolError,
+                        _,
+                        _,
+                    >(
+                        &mut stream,
+                        &identity,
+                        &revoke_client_acl,
+                        bloom_signer_api::SIGNER_CONTROL_CURRENT,
+                        bloom_signer_api::SIGNER_CONTROL_RANGE,
+                        &quota,
+                        |request, context| {
+                            dispatch_authenticated_control(service.as_ref(), request, context)
+                        },
+                    )
+                    .await;
+                }
+                .instrument(service_span),
+            );
+        }
+        drain_connections(connections, maximum_connections).await
     }
-    drain_connections(connections, maximum_connections)
-        .await
-        .at_stage(STAGE)
+    .await
+    .at_stage("serve_control")
 }
 
 struct CheckpointingControlService {
@@ -3601,14 +3625,7 @@ mod tests {
         let directory = temporary.path().join("rpc");
         fs::create_dir(&directory).unwrap();
         let path = directory.join("signer.sock");
-        let bind = |path: &Path| {
-            bind_endpoint(
-                "bind_rpc_socket",
-                path,
-                OWNED_ENDPOINT_DIRECTORY_MODE,
-                bloom_service_activation::bind_owned_unix_listener,
-            )
-        };
+        let bind = |path: &Path| bind_owned_endpoint("bind_rpc_socket", path);
 
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
         let cause = bind(&path).unwrap_err();
@@ -3639,6 +3656,57 @@ mod tests {
 
         fs::remove_file(&path).unwrap();
         bind(&path).unwrap();
+        let socket = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(socket.mode() & 0o7777, 0o660);
+    }
+
+    #[test]
+    fn private_endpoint_bind_requires_a_0700_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("admin");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("admin.sock");
+
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o710)).unwrap();
+        let cause = bind_private_endpoint("bind_admin_socket", &path).unwrap_err();
+        assert_eq!(cause.reason, "activation_rejected");
+        let facts = cause.endpoint.unwrap();
+        assert_eq!(facts.expected_directory_mode, 0o700);
+        assert_eq!(facts.directory.mode, Some(0o710));
+
+        // The activation crate accepts exactly the mode the facts expect.
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        bind_private_endpoint("bind_admin_socket", &path).unwrap();
+        let socket = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(socket.mode() & 0o7777, 0o600);
+    }
+
+    #[test]
+    fn endpoint_facts_report_symlinks_without_following_them() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("rpc");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o710)).unwrap();
+
+        // A parent that links to a correct directory is still refused, and the
+        // facts show the link rather than the healthy directory behind it.
+        let linked_directory = temporary.path().join("linked-rpc");
+        std::os::unix::fs::symlink(&directory, &linked_directory).unwrap();
+        let facts = bind_owned_endpoint("bind_rpc_socket", &linked_directory.join("signer.sock"))
+            .unwrap_err()
+            .endpoint
+            .unwrap();
+        assert_eq!(facts.directory.kind, "symlink");
+
+        // A dangling link at the endpoint is a link, not a missing endpoint.
+        let path = directory.join("signer.sock");
+        std::os::unix::fs::symlink(temporary.path().join("nowhere"), &path).unwrap();
+        let facts = bind_owned_endpoint("bind_rpc_socket", &path)
+            .unwrap_err()
+            .endpoint
+            .unwrap();
+        assert_eq!(facts.directory.kind, "directory");
+        assert_eq!(facts.endpoint.kind, "symlink");
     }
 
     #[test]
@@ -3647,14 +3715,11 @@ mod tests {
         let directory = temporary.path().join("MARKER_ENDPOINT_PATH_DO_NOT_LOG");
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o750)).unwrap();
-        let cause = bind_endpoint(
-            "bind_admin_socket",
-            &directory.join("admin.sock"),
-            PRIVATE_ENDPOINT_DIRECTORY_MODE,
-            bloom_service_activation::bind_private_unix_listener,
-        )
-        .unwrap_err();
+        // Bind inside the capture, so a log line written by the bind itself
+        // would show up here too.
         let (event, output) = captured_fatal_exit(|span| {
+            let cause = bind_private_endpoint("bind_admin_socket", &directory.join("admin.sock"))
+                .unwrap_err();
             TrustedFatalGuard::new(span).record(cause);
         });
         let fields = &event["fields"];
