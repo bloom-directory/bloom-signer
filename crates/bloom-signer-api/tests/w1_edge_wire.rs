@@ -781,10 +781,26 @@ fn signer_responses() -> Vec<BrokerSignerResponse> {
         BrokerSignerResponse::CardStatus(CardOperationStatus {
             operation_id: operation(98),
             state: CardOperationState::Consumed,
+            receipt: None,
+            output_aad: None,
+        }),
+        BrokerSignerResponse::CardStatus(CardOperationStatus {
+            operation_id: operation(98),
+            state: CardOperationState::Succeeded,
+            receipt: Some(Box::new({
+                let mut c = custody_result();
+                c.ceremony_kind = CeremonyKind::CardCheckout;
+                c.wallet_id = None;
+                c.public_key_refs = vec![];
+                c
+            })),
+            output_aad: None,
         }),
         BrokerSignerResponse::CardCancel(CardOperationStatus {
             operation_id: operation(98),
             state: CardOperationState::Cancelled,
+            receipt: None,
+            output_aad: None,
         }),
         BrokerSignerResponse::SignerReadiness(readiness()),
         BrokerSignerResponse::SignerCapabilities(capabilities()),
@@ -926,7 +942,7 @@ fn every_edge_request_and_response_variant_matches_frozen_v1_frames() {
     assert_wire_digest(
         "signer responses",
         signer_responses(),
-        "07867d295000cec05dc814b985adc56120dfa975178bf7593108213f1c0e6fa4",
+        "2e962bfe2eb6ae52298c6faf24ff3f1f9f08dd38fb5be7ddd3b08c1dcafc583c",
     );
     assert_wire_digest(
         "control requests",

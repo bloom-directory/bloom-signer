@@ -19,6 +19,7 @@ use std::{
     fs::OpenOptions,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
+    sync::Arc,
 };
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -201,7 +202,15 @@ pub struct CardCeremonies {
     key: SigningKey,
     key_id: Token,
     origin: String,
+    /// The Signer engine whose signed audit chain and mutation latch govern
+    /// card mutations. Production always attaches it.
+    audit: Option<Arc<crate::engine::SignerEngine>>,
 }
+
+/// How long Signer keeps a completed operation's signed, recipient-encrypted
+/// result so a caller that lost the response can fetch it again. The result
+/// holds no plaintext: only the checkout's ephemeral key can open it.
+const RESULT_REPLAY_MS: u64 = 3_600_000;
 
 /// Bind both private release kinds to the same operation and contribution.
 fn seal_release(
@@ -232,8 +241,30 @@ fn initialize(db: Connection) -> Result<State, ProtocolError> {
       CREATE TABLE IF NOT EXISTS container (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS cards (id TEXT PRIMARY KEY, public TEXT NOT NULL, encrypted TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS travelers (id TEXT PRIMARY KEY, public TEXT NOT NULL, encrypted TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL);
-      UPDATE operations SET state='failed' WHERE state='prepared';").map_err(storage)?;
+      CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL);").map_err(storage)?;
+    // Completed results are kept briefly for replay after a lost response.
+    let has_result: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('operations') WHERE name='result')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(storage)?;
+    if !has_result {
+        db.execute_batch(
+            "ALTER TABLE operations ADD COLUMN result TEXT;
+             ALTER TABLE operations ADD COLUMN output_aad TEXT;
+             ALTER TABLE operations ADD COLUMN completed_ms INTEGER;",
+        )
+        .map_err(storage)?;
+    }
+    // A restart destroys every pending recipient key. `consumed` without
+    // `succeeded` means the effect transaction never committed, because the
+    // effect and `succeeded` commit together.
+    db.execute_batch(
+        "UPDATE operations SET state='failed' WHERE state IN ('prepared','consumed');",
+    )
+    .map_err(storage)?;
     Ok(State {
         db,
         pending: HashMap::new(),
@@ -287,7 +318,21 @@ impl CardCeremonies {
             key,
             key_id,
             origin,
+            audit: None,
         })
+    }
+    /// Govern card mutations by this engine's audit chain and mutation latch.
+    pub fn with_audit(mut self, engine: Arc<crate::engine::SignerEngine>) -> Self {
+        self.audit = Some(engine);
+        self
+    }
+    /// Refuse while Signer is degraded read-only and record the mutation in
+    /// the signed audit chain before the card database changes.
+    fn audit(&self, event: &str, payload: serde_json::Value) -> Result<(), ProtocolError> {
+        match &self.audit {
+            Some(engine) => engine.audit_card_mutation(event, &payload),
+            None => Ok(()),
+        }
     }
     pub fn open_storage(&self, path: &Path) -> Result<(), ProtocolError> {
         let file = OpenOptions::new()
@@ -375,15 +420,27 @@ impl CardCeremonies {
                 state.pending.remove(&id);
             }
         }
-        let value: Option<String> = state
+        // Housekeeping, not a custody mutation: it only forgets ciphertext.
+        state
+            .db
+            .execute(
+                "UPDATE operations SET result=NULL, output_aad=NULL WHERE completed_ms<=?1",
+                [now_ms.saturating_sub(RESULT_REPLAY_MS) as i64],
+            )
+            .map_err(storage)?;
+        let row: Option<(String, Option<String>, Option<String>)> = state
             .db
             .query_row(
-                "SELECT state FROM operations WHERE id=?1",
+                "SELECT state, result, output_aad FROM operations WHERE id=?1",
                 [operation_id.as_str()],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .map_err(storage)?;
+        let (value, receipt, output_aad) = match row {
+            Some((state, receipt, aad)) => (Some(state), receipt, aad),
+            None => (None, None, None),
+        };
         let status = match value.as_deref() {
             Some("prepared") => CardOperationState::Prepared,
             Some("consumed") => CardOperationState::Consumed,
@@ -402,6 +459,12 @@ impl CardCeremonies {
         Ok(CardOperationStatus {
             operation_id: operation_id.clone(),
             state: status,
+            receipt: receipt
+                .map(|s| serde_json::from_str(&s).map_err(malformed))
+                .transpose()?,
+            output_aad: output_aad
+                .map(|s| serde_json::from_str(&s).map_err(malformed))
+                .transpose()?,
         })
     }
     pub fn cancel(
@@ -411,6 +474,20 @@ impl CardCeremonies {
     ) -> Result<CardOperationStatus, ProtocolError> {
         {
             let mut state = self.state.lock();
+            let prepared: bool = state
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1 AND state='prepared')",
+                    [operation_id.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(storage)?;
+            if prepared {
+                self.audit(
+                    "card.cancel",
+                    serde_json::json!({"operation_id": operation_id}),
+                )?;
+            }
             if state
                 .db
                 .execute(
@@ -614,10 +691,18 @@ impl CardCeremonies {
             },
             verification_credentials: existing.map(|c| vec![c.credential]).unwrap_or_default(),
         };
+        self.audit(
+            "card.prepare",
+            serde_json::json!({
+                "operation_id": request.operation_id,
+                "ceremony_kind": prepared.contribution.ceremony_kind,
+                "public_binding_digest": digest,
+            }),
+        )?;
         state
             .db
             .execute(
-                "INSERT INTO operations VALUES (?1,?2,'prepared')",
+                "INSERT INTO operations (id, digest, state) VALUES (?1,?2,'prepared')",
                 params![request.operation_id.as_str(), digest.as_str()],
             )
             .map_err(storage)?;
@@ -653,43 +738,54 @@ impl CardCeremonies {
         now_ms: u64,
     ) -> Result<CustodyResult, ProtocolError> {
         let mut state = self.state.lock();
-        let pending = state
-            .pending
-            .remove(&complete.custody_operation_id)
-            .ok_or_else(|| {
-                error(
-                    ProtocolErrorCode::OperationIdConflict,
-                    "card approval is no longer usable",
-                )
-            })?;
+        let id = complete.custody_operation_id.clone();
+        // A caller that lost the response reads the committed result back
+        // through `status`; completion itself stays single-use.
+        let pending = state.pending.get(&id).ok_or_else(|| {
+            error(
+                ProtocolErrorCode::OperationIdConflict,
+                "card approval is no longer usable",
+            )
+        })?;
         if pending.prepared.contribution.expires_at_ms.get() <= now_ms {
             state
                 .db
                 .execute(
                     "UPDATE operations SET state='expired' WHERE id=?1 AND state='prepared'",
-                    [complete.custody_operation_id.as_str()],
+                    [id.as_str()],
                 )
                 .map_err(storage)?;
+            state.pending.remove(&id);
             return Err(error(
                 ProtocolErrorCode::ApprovalExpired,
                 "card approval expired",
             ));
         }
-        // FULL synchronous commit precedes opening any private input or releasing card data.
+        self.audit(
+            "card.consume",
+            serde_json::json!({
+                "operation_id": id,
+                "ceremony_kind": pending.prepared.contribution.ceremony_kind,
+                "public_binding_digest": pending.prepared.contribution.review_manifest_digest,
+            }),
+        )?;
+        // FULL synchronous commit precedes opening any private input or
+        // releasing card data. The pending authority stays until it lands,
+        // so a storage error leaves an operation that can still be retried.
         let changed = state
             .db
             .execute(
                 "UPDATE operations SET state='consumed' WHERE id=?1 AND state='prepared'",
-                [complete.custody_operation_id.as_str()],
+                [id.as_str()],
             )
             .map_err(storage)?;
+        let pending = state.pending.remove(&id).expect("checked above");
         if changed != 1 {
             return Err(error(
                 ProtocolErrorCode::OperationIdConflict,
                 "card approval already consumed",
             ));
         }
-        let id = complete.custody_operation_id.clone();
         let result = self.apply(&mut state, pending, complete, now_ms);
         if result.is_err() {
             // The consumed mark committed alone; nothing was released.
@@ -1061,17 +1157,11 @@ impl CardCeremonies {
             [json(&new_container)?],
         )
         .map_err(storage)?;
-        tx.execute(
-            "UPDATE operations SET state='succeeded' WHERE id=?1",
-            [complete.custody_operation_id.as_str()],
-        )
-        .map_err(storage)?;
-        tx.commit().map_err(storage)?;
         let mut result = CustodyResult {
-            surface: Some(pending.request.surface),
+            surface: Some(pending.request.surface.clone()),
             credential_authority_generation: Some(DecimalU64::new(1)),
             ceremony_kind: contribution.ceremony_kind,
-            custody_operation_id: complete.custody_operation_id,
+            custody_operation_id: complete.custody_operation_id.clone(),
             public_status: CeremonyState::Succeeded,
             wallet_id: None,
             public_key_refs: vec![],
@@ -1085,6 +1175,26 @@ impl CardCeremonies {
         let mut bytes = b"bloom-signer-ceremony-receipt/v1".to_vec();
         bytes.extend(result.unsigned_canonical_bytes()?);
         result.signer_signature = Base64UrlBytes::from_bytes(&self.key.sign(&bytes).to_bytes());
+        let output_aad = CustodyOutputHpkeAad {
+            surface: pending.request.surface.clone(),
+            ceremony_id: contribution.ceremony_id.clone(),
+            ceremony_kind: contribution.ceremony_kind,
+            custody_operation_id: complete.custody_operation_id.clone(),
+            signer_contribution_digest: contribution.digest()?,
+            public_binding_digest: result.receipt_digest.clone(),
+        };
+        // The effect, its success and its replayable result commit together.
+        tx.execute(
+            "UPDATE operations SET state='succeeded', result=?2, output_aad=?3, completed_ms=?4 WHERE id=?1",
+            params![
+                complete.custody_operation_id.as_str(),
+                json(&result)?,
+                json(&output_aad)?,
+                now_ms as i64
+            ],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)?;
         Ok(result)
     }
 }

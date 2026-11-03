@@ -32,6 +32,14 @@ pub enum CardOperationState {
 pub struct CardOperationStatus {
     pub operation_id: OperationId,
     pub state: CardOperationState,
+    /// A succeeded operation's signed result, kept for an hour so a caller
+    /// that lost the completion response can still deliver it. Any private
+    /// output inside is sealed to the checkout's recipient key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Box<crate::CustodyResult>>,
+    /// The AAD that opens `receipt`'s private output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_aad: Option<crate::CustodyOutputHpkeAad>,
 }
 
 /// Supplied by the authenticated checkout principal, then independently bound
@@ -102,6 +110,10 @@ impl CheckoutFacts {
             || self.renewal_minor.is_some_and(|minor| minor == 0)
             || (self.renewal_minor.is_none() && self.renewal_starts_on.is_some())
             || (self.renewal_minor.is_some() && !self.recurring)
+            // A recurring charge the person cannot see the price and period
+            // of is not an exact fact to approve. Checkout must read them or
+            // hand the payment to the person instead.
+            || (self.recurring && self.renewal_minor.is_none())
             || self
                 .renewal_starts_on
                 .as_ref()
@@ -357,7 +369,11 @@ mod tests {
                 2 => f.total_minor += 1,
                 3 => f.currency = "USD".into(),
                 4 => f.installments += 1,
-                5 => f.recurring = true,
+                5 => {
+                    f.recurring = true;
+                    f.renewal_minor = Some(f.total_minor);
+                    f.renewal_period = Some(RenewalPeriod::Month);
+                }
                 _ => key = 3,
             }
             assert!(request(f, key).digest().unwrap() != original);
@@ -376,11 +392,7 @@ mod tests {
                 0 => f.renewal_minor = Some(1399),
                 1 => f.renewal_period = Some(RenewalPeriod::Year),
                 2 => f.renewal_starts_on = Some("2026-12-25".into()),
-                _ => {
-                    f.renewal_minor = None;
-                    f.renewal_period = None;
-                    f.renewal_starts_on = None;
-                }
+                _ => f.renewal_starts_on = None,
             }
             assert!(seen.insert(request(f, 2).digest().unwrap()), "{index}");
         }
@@ -411,6 +423,19 @@ mod tests {
             request(trial, 2).digest().unwrap(),
             request(dearer, 2).digest().unwrap()
         );
+    }
+
+    /// A charge that recurs at a price nobody read cannot be approved as an
+    /// exact fact, even when today's charge is known.
+    #[test]
+    fn a_recurring_charge_needs_its_renewal_price_and_period() {
+        let mut f = subscription();
+        f.renewal_minor = None;
+        f.renewal_period = None;
+        f.renewal_starts_on = None;
+        assert!(f.validate().is_err());
+        f.recurring = false;
+        assert!(f.validate().is_ok());
     }
 
     #[test]

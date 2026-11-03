@@ -1140,6 +1140,21 @@ impl SignerEngine {
         connection.transaction().map_err(storage)
     }
 
+    /// Card custody keeps its records in a sibling database, so a card
+    /// mutation cannot share this database's transaction. Record it in the
+    /// signed audit chain before the card database changes, and refuse it
+    /// while mutations are latched closed, exactly as for wallet custody.
+    pub(crate) fn audit_card_mutation(
+        &self,
+        event_type: &str,
+        payload: &impl Serialize,
+    ) -> Result<(), ProtocolError> {
+        let mut connection = self.connection.lock();
+        let transaction = self.mutation_transaction(&mut connection)?;
+        self.append_audit(&transaction, event_type, payload)?;
+        transaction.commit().map_err(storage)
+    }
+
     fn append_audit(
         &self,
         transaction: &Transaction<'_>,

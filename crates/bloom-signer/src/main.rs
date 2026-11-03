@@ -923,14 +923,21 @@ async fn run(trusted_fatal: &mut Option<TrustedFatalGuard>) -> Result<(), FatalC
     )
     .at_stage("open_ceremony_service")?
     .with_legacy_migrations(migration_store);
-    ceremony.cards_storage(
-        config
-            .database_path
-            .parent()
-            .ok_or("Signer state directory missing")?
-            .join("cards.sqlite3")
-            .as_path(),
-    )?;
+    ceremony
+        .cards_storage(
+            config
+                .database_path
+                .parent()
+                .ok_or_else(|| {
+                    FatalCause::invariant(
+                        "locate_card_storage",
+                        "Signer database path has no parent directory",
+                    )
+                })?
+                .join("cards.sqlite3")
+                .as_path(),
+        )
+        .at_stage("open_card_storage")?;
     if let Some(ttl_ms) = config.ceremony_ttl_ms {
         ceremony = ceremony
             .with_ceremony_ttl_ms(ttl_ms)

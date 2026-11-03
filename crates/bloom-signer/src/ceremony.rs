@@ -559,7 +559,8 @@ impl SignerCeremonyService {
                 signing_key.clone(),
                 signer_key_id.clone(),
                 expected_origin.clone(),
-            )?,
+            )?
+            .with_audit(engine.clone()),
             engine,
             signer_key_id,
             signing_key,

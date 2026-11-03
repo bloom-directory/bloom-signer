@@ -720,7 +720,131 @@ fn interrupted_storage_write_does_not_mutate_cards_or_reuse_approval() {
     assert!(s.complete(c.clone(), NOW + 3).is_err());
     blocker.execute_batch("ROLLBACK").unwrap();
     assert!(s.list().unwrap().len() == 1);
-    assert!(s.complete(c, NOW + 4).is_err());
+    // Nothing was consumed, so status stays truthful and the same approval
+    // completes once when storage recovers.
+    let id = &p.contribution.custody_operation_id;
+    assert_eq!(
+        s.status(id, NOW + 4).unwrap().state,
+        CardOperationState::Prepared
+    );
+    s.complete(c.clone(), NOW + 4).unwrap();
+    assert!(s.complete(c, NOW + 5).is_err());
+}
+
+#[test]
+fn a_lost_release_response_is_recoverable_from_status_across_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("cards.sqlite3");
+    let s = service();
+    s.open_storage(&path).unwrap();
+    let auth = enroll(&s);
+    let (p, recipient) = checkout(&s, 2);
+    let id = p.contribution.custody_operation_id.clone();
+    let delivered = s
+        .complete(complete(&auth, &p, private(&auth, false, true), 2), NOW + 3)
+        .unwrap();
+    drop(s);
+    // The response never arrived and the caller restarted.
+    let reopened = service();
+    reopened.open_storage(&path).unwrap();
+    let status = reopened.status(&id, NOW + 4).unwrap();
+    assert_eq!(status.state, CardOperationState::Succeeded);
+    let receipt = status.receipt.unwrap();
+    assert_eq!(*receipt, delivered);
+    let aad = status.output_aad.unwrap();
+    assert_eq!(aad.ceremony_id, p.contribution.ceremony_id);
+    let plaintext = recipient
+        .open(
+            receipt.encrypted_browser_result.as_ref().unwrap(),
+            CUSTODY_OUTPUT_INFO,
+            &aad.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(plaintext.expose_to_backend()).unwrap();
+    assert_eq!(value["number"], "4242424242424242");
+    // The ciphertext is not kept indefinitely.
+    let later = reopened.status(&id, NOW + 3 + 3_600_000).unwrap();
+    assert_eq!(later.state, CardOperationState::Succeeded);
+    assert!(later.receipt.is_none() && later.output_aad.is_none());
+}
+
+#[test]
+fn degraded_audit_refuses_every_card_mutation_and_healthy_ones_are_audited() {
+    use bloom_signer::{
+        engine::{SignerAuditKeys, SignerEngine},
+        registry::BackendRegistry,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Arc::new(
+        SignerEngine::open(
+            temp.path().join("signer.sqlite3"),
+            Token::new("broker-app-1").unwrap(),
+            SigningKey::from_bytes(&[7; 32]).verifying_key(),
+            SigningKey::from_bytes(&[9; 32]).verifying_key(),
+            Token::new("signer-revocation-key").unwrap(),
+            SigningKey::from_bytes(&[4; 32]),
+            SignerAuditKeys {
+                current_key_id: Token::new("signer-audit-key").unwrap(),
+                current_signing_key: SigningKey::from_bytes(&[14; 32]),
+                historical_verifying_keys: Default::default(),
+            },
+            Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap()),
+        )
+        .unwrap(),
+    );
+    let audit = rusqlite::Connection::open(temp.path().join("signer.sqlite3")).unwrap();
+    let events = || -> Vec<String> {
+        let mut stmt = audit
+            .prepare("SELECT event_type FROM audit_chain WHERE event_type LIKE 'card.%' ORDER BY sequence")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let cards_path = temp.path().join("cards.sqlite3");
+    let s = service().with_audit(engine.clone());
+    s.open_storage(&cards_path).unwrap();
+    let auth = enroll(&s);
+    let (p, _) = checkout(&s, 2);
+    let (cancelled, _) = checkout(&s, 3);
+    s.cancel(&cancelled.contribution.custody_operation_id, NOW + 3)
+        .unwrap();
+    assert_eq!(
+        events(),
+        [
+            "card.prepare",
+            "card.consume",
+            "card.prepare",
+            "card.prepare",
+            "card.cancel"
+        ]
+    );
+
+    engine.latch_audit_degraded();
+    let id = p.contribution.custody_operation_id.clone();
+    let card_rows = || std::fs::read(&cards_path).unwrap();
+    let before = card_rows();
+    let degraded = |result: Result<(), ProtocolError>| {
+        assert_eq!(
+            result.unwrap_err().code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
+    };
+    degraded(s.prepare(add(4, "card-two"), NOW + 4).map(|_| ()));
+    degraded(
+        s.complete(complete(&auth, &p, private(&auth, false, true), 2), NOW + 4)
+            .map(|_| ()),
+    );
+    degraded(s.cancel(&id, NOW + 4).map(|_| ()));
+    assert_eq!(card_rows(), before);
+    assert_eq!(events().len(), 5);
+    // Reads and status stay available, and the approval was not consumed.
+    assert_eq!(s.list().unwrap().len(), 1);
+    assert_eq!(
+        s.status(&id, NOW + 4).unwrap().state,
+        CardOperationState::Prepared
+    );
 }
 #[test]
 fn adding_under_an_existing_id_replaces_that_card() {
