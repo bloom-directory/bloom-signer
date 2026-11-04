@@ -132,11 +132,34 @@ fn unsigned_request(terms: &SealedApprovalTerms, operation_byte: &str) -> Unsign
         ApprovalSelector::Petal { .. } => {
             (vec![digest("22")], vec![digest("33")], SelectorKind::Petal)
         }
+        ApprovalSelector::System { component_id, .. } => {
+            let ApprovalSubject::System {
+                operation_class, ..
+            } = &terms.subject
+            else {
+                panic!("System selector requires System subject");
+            };
+            (
+                vec![digest("22")],
+                vec![digest("33")],
+                SelectorKind::System {
+                    component_id: component_id.clone(),
+                    operation_class: operation_class.clone(),
+                    provenance_digest: terms.provenance_digest.clone(),
+                },
+            )
+        }
     };
-    let claim_digest =
-        matches!(&terms.selector, ApprovalSelector::Petal { .. }).then(|| digest("ab"));
-    let assurance_digest =
-        matches!(&terms.selector, ApprovalSelector::Petal { .. }).then(|| digest("ac"));
+    let claim_digest = matches!(
+        &terms.selector,
+        ApprovalSelector::Petal { .. } | ApprovalSelector::System { .. }
+    )
+    .then(|| digest("ab"));
+    let assurance_digest = matches!(
+        &terms.selector,
+        ApprovalSelector::Petal { .. } | ApprovalSelector::System { .. }
+    )
+    .then(|| digest("ac"));
     let identity = SignOperationIdentity {
         operation_id: OperationId::new(operation_byte.repeat(32)).unwrap(),
         approval_id: terms.approval_id().unwrap(),
@@ -200,6 +223,136 @@ fn resign(broker: &SigningKey, request: &mut SignRequest) {
         &broker
             .sign(&hex::decode(request.unsigned.attempt_digest.as_str()).unwrap())
             .to_bytes(),
+    );
+}
+
+fn system_terms() -> SealedApprovalTerms {
+    let mut terms = exact_terms();
+    terms.subject = ApprovalSubject::System {
+        component_id: Token::new("bloom-native").unwrap(),
+        operation_class: Token::new("native.transfer").unwrap(),
+    };
+    terms.selector = ApprovalSelector::System {
+        component_id: Token::new("bloom-native").unwrap(),
+        allowed_operation_classes: vec![Token::new("native.transfer").unwrap()],
+    };
+    terms
+}
+
+#[test]
+fn system_structural_authority_keeps_counters_replay_and_revocation() {
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let terms = system_terms();
+    let engine = new_engine(&broker);
+    let approval_id = engine.install_approval_for_test(&terms).unwrap();
+    let request = signed(&broker, unsigned_request(&terms, "01"));
+    assert_eq!(
+        engine.authorize_sign(&request, &clock(2_500)).unwrap(),
+        SignAuthorization::NewOperation
+    );
+    assert_eq!(
+        engine
+            .authorize_sign(&request, &clock(2_500))
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::CeremonyReplay
+    );
+    let mut retry = request.clone();
+    retry.unsigned.attempt_id = digest("89");
+    resign(&broker, &mut retry);
+    assert_eq!(
+        engine.authorize_sign(&retry, &clock(2_500)).unwrap(),
+        SignAuthorization::SameOperationRetry
+    );
+    let mut excess = signed(&broker, unsigned_request(&terms, "02"));
+    excess.unsigned.attempt_id = digest("90");
+    resign(&broker, &mut excess);
+    assert_eq!(
+        engine
+            .authorize_sign(&excess, &clock(2_500))
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::LimitExceededOperations
+    );
+    engine
+        .revoke_approval(
+            &approval_id,
+            "stop pool".into(),
+            OperationId::new("f1".repeat(32)).unwrap(),
+            2_600,
+        )
+        .unwrap();
+    assert_eq!(
+        engine
+            .authorize_sign(&excess, &clock(2_700))
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::ApprovalRevoked
+    );
+}
+
+#[test]
+fn system_use_cannot_change_component_class_provenance_or_omit_claims() {
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let terms = system_terms();
+    let engine = new_engine(&broker);
+    engine.install_approval_for_test(&terms).unwrap();
+    for mutation in 0..6 {
+        let mut request = signed(&broker, unsigned_request(&terms, "01"));
+        match mutation {
+            0 => {
+                if let SelectorKind::System { component_id, .. } =
+                    &mut request.unsigned.selector_kind
+                {
+                    *component_id = Token::new("wrong-component").unwrap();
+                }
+            }
+            1 => {
+                if let SelectorKind::System {
+                    operation_class, ..
+                } = &mut request.unsigned.selector_kind
+                {
+                    *operation_class = Token::new("wrong-class").unwrap();
+                }
+            }
+            2 => {
+                if let SelectorKind::System {
+                    provenance_digest, ..
+                } = &mut request.unsigned.selector_kind
+                {
+                    *provenance_digest = digest("ee");
+                }
+            }
+            3 => request.unsigned.petal_use_claim_digest = None,
+            4 => request.unsigned.claim_assurance_digest = None,
+            _ => request.unsigned.selector_kind = SelectorKind::Petal,
+        }
+        resign(&broker, &mut request);
+        assert_eq!(
+            engine
+                .authorize_sign(&request, &clock(2_500))
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::SelectorMismatch,
+            "mutation {mutation}"
+        );
+    }
+    let valid = signed(&broker, unsigned_request(&terms, "01"));
+    assert_eq!(
+        engine.authorize_sign(&valid, &clock(2_500)).unwrap(),
+        SignAuthorization::NewOperation
+    );
+    // Native EVM has no Petal claim; Broker binds its verified native scope
+    // through the authenticated validation receipt and request identity.
+    let engine = new_engine(&broker);
+    engine.install_approval_for_test(&terms).unwrap();
+    let mut native = signed(&broker, unsigned_request(&terms, "02"));
+    native.unsigned.petal_use_claim_digest = None;
+    native.unsigned.claim_assurance_digest = None;
+    resign(&broker, &mut native);
+    assert_eq!(
+        engine.authorize_sign(&native, &clock(2_500)).unwrap(),
+        SignAuthorization::NewOperation
     );
 }
 
@@ -972,5 +1125,41 @@ fn production_visible_constructor_rejects_shared_revocation_audit_key() {
     assert_eq!(
         result.err().unwrap().code,
         ProtocolErrorCode::MalformedFrame
+    );
+}
+
+#[test]
+fn standing_reusable_authority_survives_windows_but_exact_and_finite_ceilings_remain() {
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let engine = new_engine(&broker);
+    let mut terms = petal_terms();
+    terms.expires_at_ms = DecimalU64::new(u64::MAX);
+    terms.activation_mode = ActivationMode::DurableLocal {
+        provider_tier: Token::new("local-passkey").unwrap(),
+        maximum_rearm_until_ms: DecimalU64::new(u64::MAX),
+    };
+    terms.limits.max_operations = DecimalU64::new(u64::MAX);
+    terms.limits.max_signatures = DecimalU64::new(u64::MAX);
+    let id = engine.install_approval_for_test(&terms).unwrap();
+    assert_eq!(
+        engine
+            .approval_public_status(&id, 604_800_001)
+            .unwrap()
+            .state,
+        ApprovalLifecycleState::Active
+    );
+    let request = signed(&broker, unsigned_request(&terms, "91"));
+    assert!(matches!(
+        engine.authorize_sign(&request, &clock(2500)).unwrap(),
+        SignAuthorization::NewOperation
+    ));
+    let mut exact = exact_terms();
+    exact.expires_at_ms = DecimalU64::new(u64::MAX);
+    assert!(engine.install_approval_for_test(&exact).is_err());
+    let mut finite = petal_terms();
+    finite.expires_at_ms = DecimalU64::new(91 * 86400000);
+    assert_eq!(
+        engine.install_approval_for_test(&finite).unwrap_err().code,
+        ProtocolErrorCode::ApprovalExpired
     );
 }

@@ -46,11 +46,12 @@ pub use bloom_rpc_wire::{
 
 /// Broker-to-Signer authority contract.
 ///
-/// Version 1.6 requires exact Signer-owned surface bindings for ceremonies.
-/// Earlier peers cannot safely represent remote WebAuthn authority.
+/// Version 1.8 adds structural-only reusable System authority. Version 1.7
+/// was allocated to an incompatible economic draft and is not accepted.
+/// Exact Signer-owned ceremony surface bindings from 1.6 remain mandatory.
 pub const SIGNER_API_MAJOR: u16 = 1;
-pub const SIGNER_API_MINOR_MIN: u16 = 6;
-pub const SIGNER_API_MINOR_MAX: u16 = 6;
+pub const SIGNER_API_MINOR_MIN: u16 = 8;
+pub const SIGNER_API_MINOR_MAX: u16 = 8;
 pub const SIGNER_API_CURRENT: ProtocolVersion =
     ProtocolVersion::new(SIGNER_API_MAJOR, SIGNER_API_MINOR_MAX);
 pub const SIGNER_API_RANGE: ProtocolVersionRange =
