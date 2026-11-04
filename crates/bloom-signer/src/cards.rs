@@ -85,7 +85,7 @@ impl CardDetails {
         if !(12..=19).contains(&digits.len())
             || !digits.iter().all(u8::is_ascii_digit)
             || digits.iter().all(|b| *b == b'0')
-            || sum % 10 != 0
+            || !sum.is_multiple_of(10)
             || !(1..=12).contains(&self.expiry_month)
             || (i64::from(self.expiry_year), i64::from(self.expiry_month)) < (year, month)
             || i64::from(self.expiry_year) > year + 30
