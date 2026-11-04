@@ -33,6 +33,8 @@ use tokio::{
 use uuid::Uuid;
 use zeroize::{Zeroize as _, Zeroizing};
 
+use super::AtStage as _;
+
 const MAX_FRAME: usize = 16 * 1024;
 const ADMIN_IDENTITY_FILE: &str = "relay-admin-seed.hex";
 
@@ -247,15 +249,31 @@ pub(super) async fn serve(
     receipt_keys: Option<Vec<[u8; 32]>>,
     admin_peer_uid: u32,
     shutdown: &mut watch::Receiver<bool>,
+) -> Result<(), super::FatalCause> {
+    // One label for every failure path, so none can name another endpoint.
+    serve_connections(listener, ceremony, receipt_keys, admin_peer_uid, shutdown)
+        .await
+        .at_stage("serve_admin")
+}
+
+async fn serve_connections(
+    listener: Option<UnixListener>,
+    ceremony: Arc<SignerCeremonyService>,
+    receipt_keys: Option<Vec<[u8; 32]>>,
+    admin_peer_uid: u32,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> io::Result<()> {
     let Some(listener) = listener else {
-        shutdown.changed().await.map_err(io::Error::other)?;
+        shutdown
+            .changed()
+            .await
+            .map_err(|_| super::serve_invariant("Signer shutdown channel closed"))?;
         return Ok(());
     };
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
-                changed.map_err(io::Error::other)?;
+                changed.map_err(|_| super::serve_invariant("Signer shutdown channel closed"))?;
                 return Ok(());
             }
             accepted = listener.accept() => {
