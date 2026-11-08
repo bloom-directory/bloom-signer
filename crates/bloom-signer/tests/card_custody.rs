@@ -548,6 +548,36 @@ fn expired_checkout_cannot_release() {
 }
 
 #[test]
+fn removed_card_is_reported_when_pending_checkout_completes() {
+    let s = service();
+    let auth = enroll(&s);
+    let (pending, _) = checkout(&s, 2);
+    let deletion = s
+        .prepare(
+            request(
+                3,
+                CardEffect::Delete {
+                    card_id: Token::new("card-one").unwrap(),
+                },
+            ),
+            NOW + 2,
+        )
+        .unwrap();
+    s.complete(
+        complete(&auth, &deletion, private(&auth, false, false), 2),
+        NOW + 3,
+    )
+    .unwrap();
+    let err = s
+        .complete(
+            complete(&auth, &pending, private(&auth, false, true), 3),
+            NOW + 4,
+        )
+        .unwrap_err();
+    assert_eq!(err.code, ProtocolErrorCode::ApprovalNotFound);
+}
+
+#[test]
 fn cancellation_and_restart_close_pending_approvals() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("cards.sqlite3");

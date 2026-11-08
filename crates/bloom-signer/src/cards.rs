@@ -1019,7 +1019,11 @@ impl CardCeremonies {
                         [traveler_id.as_str()],
                         |r| r.get(0),
                     )
-                    .map_err(storage)?;
+                    .optional()
+                    .map_err(storage)?
+                    .ok_or_else(|| {
+                        error(ProtocolErrorCode::ApprovalNotFound, "traveler not found")
+                    })?;
                 let blob: EncryptedBlob = serde_json::from_str(&raw).map_err(malformed)?;
                 let plaintext = Zeroizing::new(decrypt(
                     &key,
@@ -1120,7 +1124,9 @@ impl CardCeremonies {
                         [card_id.as_str()],
                         |r| r.get(0),
                     )
-                    .map_err(storage)?;
+                    .optional()
+                    .map_err(storage)?
+                    .ok_or_else(|| error(ProtocolErrorCode::ApprovalNotFound, "card not found"))?;
                 let blob: EncryptedBlob = serde_json::from_str(&raw).map_err(malformed)?;
                 let plaintext =
                     Zeroizing::new(decrypt(&key, &blob, &card_aad(&container_id, card_id)?)?);
