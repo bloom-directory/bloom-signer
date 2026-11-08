@@ -207,9 +207,8 @@ pub struct CardCeremonies {
     audit: Option<Arc<crate::engine::SignerEngine>>,
 }
 
-/// How long Signer keeps a completed operation's signed, recipient-encrypted
-/// result so a caller that lost the response can fetch it again. The result
-/// holds no plaintext: only the checkout's ephemeral key can open it.
+/// Retention for public receipts and encrypted traveler output. Checkout
+/// receipts never retain the card/CVC envelope.
 const RESULT_REPLAY_MS: u64 = 3_600_000;
 
 /// Bind both private release kinds to the same operation and contribution.
@@ -528,6 +527,8 @@ impl CardCeremonies {
             ));
         }
         let digest = request.digest()?;
+        // Retire expired approvals before admitting another custody operation.
+        self.status(&request.operation_id, now_ms)?;
         let mut state = self.state.lock();
         if let Some(pending) = state.pending.get(&request.operation_id) {
             if pending.request.digest()? != digest {
@@ -552,11 +553,22 @@ impl CardCeremonies {
                 "card operation already used",
             ));
         }
+        // A reviewed record must remain unchanged until its approval closes.
+        // Completion holds this same mutex through the durable mutation.
+        if !state.pending.is_empty() {
+            return Err(error(
+                ProtocolErrorCode::OperationIdConflict,
+                "finish or cancel the active card or traveler approval first",
+            ));
+        }
         let existing = container(&state.db)?;
         if existing.is_none()
             && !matches!(
                 request.effect,
-                CardEffect::Add { .. } | CardEffect::SaveTraveler { .. }
+                CardEffect::Add { .. }
+                    | CardEffect::SaveTraveler { .. }
+                    | CardEffect::ManualCheckout { card_id: None, .. }
+                    | CardEffect::SiteCheckout { .. }
             )
         {
             return Err(error(
@@ -1189,12 +1201,21 @@ impl CardCeremonies {
             signer_contribution_digest: contribution.digest()?,
             public_binding_digest: result.receipt_digest.clone(),
         };
-        // The effect, its success and its replayable result commit together.
+        // Checkout ciphertext contains a one-use CVC. Return it once, but
+        // persist only a separately signed public receipt for reconciliation.
+        let mut retained = result.clone();
+        if matches!(pending.request.effect, CardEffect::Checkout { .. }) {
+            retained.encrypted_browser_result = None;
+            let mut bytes = b"bloom-signer-ceremony-receipt/v1".to_vec();
+            bytes.extend(retained.unsigned_canonical_bytes()?);
+            retained.signer_signature =
+                Base64UrlBytes::from_bytes(&self.key.sign(&bytes).to_bytes());
+        }
         tx.execute(
             "UPDATE operations SET state='succeeded', result=?2, output_aad=?3, completed_ms=?4 WHERE id=?1",
             params![
                 complete.custody_operation_id.as_str(),
-                json(&result)?,
+                json(&retained)?,
                 json(&output_aad)?,
                 now_ms as i64
             ],

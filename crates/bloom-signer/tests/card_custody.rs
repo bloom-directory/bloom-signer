@@ -233,6 +233,126 @@ fn manual_checkout_authorizes_view_without_release_and_rejects_cvc() {
 }
 
 #[test]
+fn custody_reservation_prevents_replacing_reviewed_records() {
+    let cards = service();
+    let auth = enroll(&cards);
+    let (p, _) = checkout(&cards, 2);
+    assert!(cards.prepare(add(3, "card-one"), NOW + 3).is_err());
+    assert!(
+        cards
+            .prepare(save_traveler(3, "wife", "Wife"), NOW + 3)
+            .is_err()
+    );
+    cards
+        .cancel(&p.contribution.custody_operation_id, NOW + 4)
+        .unwrap();
+    let p = cards
+        .prepare(save_traveler(3, "wife", "Wife"), NOW + 5)
+        .unwrap();
+    cards
+        .complete(
+            complete(&auth, &p, traveler_input(&auth, "Original"), 3),
+            NOW + 6,
+        )
+        .unwrap();
+    let recipient = HpkeRecipient::generate();
+    for (op, effect) in [
+        (
+            4,
+            CardEffect::FillTraveler {
+                traveler_id: Token::new("wife").unwrap(),
+                scope: TravelerFillScope {
+                    origin: "https://airline.example".into(),
+                    frame_origins: vec!["https://airline.example".into()],
+                    document_binding: Digest32::from_bytes([33; 32]),
+                    fields: vec![TravelerField::GivenName],
+                },
+                recipient_key: recipient.public_key().clone(),
+            },
+        ),
+        (
+            5,
+            CardEffect::DeleteTraveler {
+                traveler_id: Token::new("wife").unwrap(),
+            },
+        ),
+        (
+            6,
+            CardEffect::Delete {
+                card_id: Token::new("card-one").unwrap(),
+            },
+        ),
+    ] {
+        let request = request(op, effect);
+        let prepared = cards.prepare(request.clone(), NOW + 7).unwrap();
+        assert_eq!(cards.prepare(request, NOW + 8).unwrap(), prepared);
+        assert!(
+            cards
+                .prepare(save_traveler(7, "wife", "Replacement"), NOW + 8)
+                .is_err()
+        );
+        assert!(cards.prepare(add(8, "card-one"), NOW + 8).is_err());
+        cards
+            .cancel(&prepared.contribution.custody_operation_id, NOW + 9)
+            .unwrap();
+    }
+    assert!(cards.prepare(add(8, "card-one"), NOW + 10).is_ok());
+}
+
+#[test]
+fn first_cardless_approval_enrolls_without_storing_a_card() {
+    let effects = [
+        CardEffect::ManualCheckout {
+            card_id: None,
+            agent_description: "Review shop".into(),
+        },
+        CardEffect::SiteCheckout {
+            facts: CheckoutFacts {
+                origin: "https://shop.example".into(),
+                payment_frame_origins: vec![],
+                total_minor: 199,
+                currency: "USD".into(),
+                installments: 1,
+                recurring: false,
+                renewal_minor: None,
+                renewal_period: None,
+                renewal_starts_on: None,
+            },
+            agent_description: "Review purchase".into(),
+        },
+    ];
+    for effect in effects {
+        let cards = service();
+        let prepared = cards.prepare(request(1, effect), NOW).unwrap();
+        let auth = VirtualAuthenticator::generate_with_user_handle(
+            &prepared
+                .webauthn_options
+                .registration_user_handle
+                .as_ref()
+                .unwrap()
+                .decode(),
+        );
+        let receipt = cards
+            .complete(
+                complete(&auth, &prepared, private(&auth, false, false), 1),
+                NOW + 1,
+            )
+            .unwrap();
+        assert!(receipt.encrypted_browser_result.is_none());
+        assert!(cards.list().unwrap().is_empty());
+        assert!(cards.travelers().unwrap().is_empty());
+        assert!(
+            cards
+                .prepare(add(2, "later-card"), NOW + 2)
+                .unwrap()
+                .webauthn_options
+                .registration_user_handle
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn takeover_and_site_checkout_release_nothing_and_reject_card_input() {
     let cards = service();
     let auth = enroll(&cards);
@@ -560,11 +680,11 @@ fn expired_checkout_cannot_release() {
 }
 
 #[test]
-fn removed_card_is_reported_when_pending_checkout_completes() {
+fn pending_checkout_prevents_card_deletion() {
     let s = service();
     let auth = enroll(&s);
     let (pending, _) = checkout(&s, 2);
-    let deletion = s
+    let err = s
         .prepare(
             request(
                 3,
@@ -574,19 +694,15 @@ fn removed_card_is_reported_when_pending_checkout_completes() {
             ),
             NOW + 2,
         )
-        .unwrap();
-    s.complete(
-        complete(&auth, &deletion, private(&auth, false, false), 2),
-        NOW + 3,
-    )
-    .unwrap();
-    let err = s
-        .complete(
-            complete(&auth, &pending, private(&auth, false, true), 3),
-            NOW + 4,
-        )
         .unwrap_err();
-    assert_eq!(err.code, ProtocolErrorCode::ApprovalNotFound);
+    assert_eq!(err.code, ProtocolErrorCode::OperationIdConflict);
+    assert!(
+        s.complete(
+            complete(&auth, &pending, private(&auth, false, true), 2),
+            NOW + 4
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -774,13 +890,13 @@ fn interrupted_storage_write_does_not_mutate_cards_or_reuse_approval() {
 }
 
 #[test]
-fn a_lost_release_response_is_recoverable_from_status_across_restart() {
+fn checkout_cvc_is_returned_once_and_never_retained_across_restart() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("cards.sqlite3");
     let s = service();
     s.open_storage(&path).unwrap();
     let auth = enroll(&s);
-    let (p, recipient) = checkout(&s, 2);
+    let (p, _) = checkout(&s, 2);
     let id = p.contribution.custody_operation_id.clone();
     let delivered = s
         .complete(complete(&auth, &p, private(&auth, false, true), 2), NOW + 3)
@@ -792,18 +908,23 @@ fn a_lost_release_response_is_recoverable_from_status_across_restart() {
     let status = reopened.status(&id, NOW + 4).unwrap();
     assert_eq!(status.state, CardOperationState::Succeeded);
     let receipt = status.receipt.unwrap();
-    assert_eq!(*receipt, delivered);
+    assert!(delivered.encrypted_browser_result.is_some());
+    assert!(receipt.encrypted_browser_result.is_none());
+    assert_eq!(receipt.receipt_digest, delivered.receipt_digest);
+    assert_ne!(receipt.signer_signature, delivered.signer_signature);
     let aad = status.output_aad.unwrap();
     assert_eq!(aad.ceremony_id, p.contribution.ceremony_id);
-    let plaintext = recipient
-        .open(
-            receipt.encrypted_browser_result.as_ref().unwrap(),
-            CUSTODY_OUTPUT_INFO,
-            &aad.canonical_bytes().unwrap(),
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let stored: String = db
+        .query_row(
+            "SELECT result FROM operations WHERE id=?1",
+            [id.as_str()],
+            |r| r.get(0),
         )
         .unwrap();
-    let value: serde_json::Value = serde_json::from_slice(plaintext.expose_to_backend()).unwrap();
-    assert_eq!(value["number"], "4242424242424242");
+    assert!(!stored.contains(
+        &serde_json::to_string(delivered.encrypted_browser_result.as_ref().unwrap()).unwrap()
+    ));
     // The ciphertext is not kept indefinitely.
     let later = reopened.status(&id, NOW + 3 + 3_600_000).unwrap();
     assert_eq!(later.state, CardOperationState::Succeeded);
@@ -848,18 +969,18 @@ fn degraded_audit_refuses_every_card_mutation_and_healthy_ones_are_audited() {
     let s = service().with_audit(engine.clone());
     s.open_storage(&cards_path).unwrap();
     let auth = enroll(&s);
-    let (p, _) = checkout(&s, 2);
     let (cancelled, _) = checkout(&s, 3);
     s.cancel(&cancelled.contribution.custody_operation_id, NOW + 3)
         .unwrap();
+    let (p, _) = checkout(&s, 2);
     assert_eq!(
         events(),
         [
             "card.prepare",
             "card.consume",
             "card.prepare",
-            "card.prepare",
-            "card.cancel"
+            "card.cancel",
+            "card.prepare"
         ]
     );
 
@@ -873,7 +994,7 @@ fn degraded_audit_refuses_every_card_mutation_and_healthy_ones_are_audited() {
             ProtocolErrorCode::ServiceUnavailable
         );
     };
-    degraded(s.prepare(add(4, "card-two"), NOW + 4).map(|_| ()));
+    assert!(s.prepare(add(4, "card-two"), NOW + 4).is_err());
     degraded(
         s.complete(complete(&auth, &p, private(&auth, false, true), 2), NOW + 4)
             .map(|_| ()),
