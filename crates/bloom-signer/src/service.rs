@@ -129,7 +129,7 @@ impl SignerRpcService {
         };
         match request {
             Request::TravelerList(_) => Ok(Response::TravelerList(self.ceremony.traveler_list()?)),
-            Request::CardList(_) => Ok(Response::CardList(self.ceremony.cards.list()?)),
+            Request::CardList(_) => Ok(Response::CardList(self.ceremony.card_list()?)),
             Request::CardPrepare(request) => Ok(Response::CardPrepare(
                 self.ceremony.prepare_card(request, now_ms)?,
             )),
@@ -137,10 +137,10 @@ impl SignerRpcService {
                 self.ceremony.complete_card(request, now_ms)?,
             )),
             Request::CardStatus(request) => Ok(Response::CardStatus(
-                self.ceremony.cards.status(&request.operation_id, now_ms)?,
+                self.ceremony.card_status(&request.operation_id, now_ms)?,
             )),
             Request::CardCancel(request) => Ok(Response::CardCancel(
-                self.ceremony.cards.cancel(&request.operation_id, now_ms)?,
+                self.ceremony.card_cancel(&request.operation_id, now_ms)?,
             )),
             Request::SystemHello(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::UnknownMethod,
