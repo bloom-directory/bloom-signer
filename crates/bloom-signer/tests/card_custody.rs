@@ -308,8 +308,9 @@ fn prepare_released_rollback_fixture() {
         Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap()),
     )
     .unwrap();
+    let engine = Arc::new(engine);
     let _ceremony = SignerCeremonyService::new(
-        Arc::new(engine),
+        engine.clone(),
         Token::new("signer-ceremony-key").unwrap(),
         SigningKey::from_bytes(&[9; 32]),
     )
@@ -322,7 +323,7 @@ fn prepare_released_rollback_fixture() {
             |r| r.get(0),
         )
         .unwrap();
-    let cards = service();
+    let cards = service().with_audit(engine);
     cards.open_storage(&root.join("cards.sqlite3")).unwrap();
     let auth = enroll(&cards);
     let (prepared, _) = checkout(&cards, 2);
@@ -333,6 +334,17 @@ fn prepare_released_rollback_fixture() {
         )
         .unwrap();
     assert!(cards.list().unwrap().len() == 1);
+    let card_events: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM audit_chain WHERE event_type LIKE 'card.%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        card_events > 0,
+        "rollback fixture must contain card audit rows"
+    );
     let after: String = db
         .query_row(
             "SELECT custody_jcs FROM ceremony_wallets WHERE wallet_id='rollback-wallet'",

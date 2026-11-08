@@ -1,4 +1,4 @@
-//! Run as an integration test against exactly the Signer shipped in v0.3.2.
+//! Run against the Signer shipped in v0.4.2 or v0.5.0.
 //! Generate the released wallet here, add a card with the candidate Signer,
 //! then reopen the same wallet with the exact released revision.
 mod support;
