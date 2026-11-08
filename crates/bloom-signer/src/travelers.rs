@@ -20,32 +20,10 @@ pub(crate) struct TravelerDetails {
 }
 
 fn valid_date(s: &str) -> bool {
-    if s.len() != 10
-        || !s.is_ascii()
-        || &s[4..5] != "-"
-        || &s[7..8] != "-"
-        || !s
-            .bytes()
-            .enumerate()
-            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
-    {
-        return false;
-    }
-    let (Ok(y), Ok(m), Ok(d)) = (
-        s[..4].parse::<u32>(),
-        s[5..7].parse::<u32>(),
-        s[8..].parse::<u32>(),
-    ) else {
-        return false;
-    };
-    let days = match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) => 29,
-        2 => 28,
-        _ => 0,
-    };
-    y >= 1900 && (1..=days).contains(&d)
+    bloom_signer_api::is_calendar_date(s)
+        && s.get(..4)
+            .and_then(|year| year.parse::<u32>().ok())
+            .is_some_and(|year| year >= 1900)
 }
 
 impl TravelerDetails {

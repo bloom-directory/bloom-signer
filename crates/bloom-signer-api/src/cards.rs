@@ -130,7 +130,7 @@ impl CheckoutFacts {
 
 /// `YYYY-MM-DD`, and a date that exists. The review shows this to the person
 /// as the day the renewal price starts, so "2026-02-31" must not reach it.
-fn is_calendar_date(value: &str) -> bool {
+pub fn is_calendar_date(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return false;
