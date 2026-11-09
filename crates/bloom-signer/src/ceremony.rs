@@ -396,6 +396,7 @@ impl SignerCeremonyService {
                     "system clock exceeds the supported millisecond range",
                 )
             })?;
+        engine.recover_deleted_wallet_backends(&signing_key.verifying_key())?;
         engine.recover_incomplete_bip39_allocations(recovery_now_ms)?;
         #[cfg(feature = "local")]
         for enrollment in engine.load_ceremony_backend_enrollments()? {
@@ -2472,6 +2473,14 @@ impl SignerCeremonyService {
                 now_ms,
                 error,
             ));
+        }
+        #[cfg(feature = "local")]
+        if result.ceremony_kind == CeremonyKind::WalletDelete
+            && let Some(wallet_id) = &result.wallet_id
+        {
+            self.engine
+                .backend_registry()
+                .remove_local_wallet_backend_instance(wallet_id);
         }
         for derived in &apply_outcome.derived_keys {
             #[cfg(feature = "local")]

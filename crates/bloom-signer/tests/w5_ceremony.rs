@@ -6352,3 +6352,199 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
         .unwrap();
     assert!(!prepared.challenges.is_empty());
 }
+
+#[test]
+fn deleting_bip39_wallet_does_not_prevent_signer_restart() {
+    deleted_wallet_restart(None);
+}
+
+#[test]
+fn legacy_deleted_bip39_backend_is_recovered_from_signed_receipt() {
+    deleted_wallet_restart(Some("SUCCEEDED"));
+}
+
+#[test]
+fn legacy_completed_wallet_deletion_is_recovered_from_signed_receipt() {
+    deleted_wallet_restart(Some("COMPLETED"));
+}
+
+#[test]
+fn deleted_backend_recovery_rejects_tampered_receipt() {
+    deleted_wallet_restart(Some("tampered"));
+}
+
+#[test]
+fn missing_custody_without_deletion_receipt_still_fails_closed() {
+    deleted_wallet_restart(Some("no_receipt"));
+}
+
+fn deleted_wallet_restart(legacy: Option<&str>) {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
+    let open = || {
+        let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+        let engine = Arc::new(
+            SignerEngine::open(
+                &database,
+                Token::new("broker-app-1").unwrap(),
+                broker.verifying_key(),
+                ceremony_key.verifying_key(),
+                Token::new("signer-revocation-key").unwrap(),
+                SigningKey::from_bytes(&[4; 32]),
+                audit_keys(),
+                registry.clone(),
+            )
+            .unwrap(),
+        );
+        let service = SignerCeremonyService::new(
+            engine.clone(),
+            Token::new("signer-ceremony-key").unwrap(),
+            ceremony_key.clone(),
+        );
+        (engine, registry, service)
+    };
+    let deleted = Token::new("deleted-wallet").unwrap();
+    let live = Token::new("live-wallet").unwrap();
+    let deleted_authenticator = VirtualAuthenticator::generate();
+    let live_authenticator = VirtualAuthenticator::generate();
+    let (engine, registry, service) = open();
+    let service = service.unwrap();
+    let deleted_registration = complete_bip39_registration(
+        &service,
+        &deleted_authenticator,
+        &deleted,
+        &operation("d1"),
+        10_000,
+    );
+    let live_registration = complete_bip39_registration(
+        &service,
+        &live_authenticator,
+        &live,
+        &operation("d2"),
+        11_000,
+    );
+    let stale_enrollment: String = rusqlite::Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT enrollment_jcs FROM ceremony_backend_enrollments WHERE backend_instance = ?1",
+            [deleted.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (receipt, _) = complete_generic(
+        &service,
+        &deleted_authenticator,
+        &deleted,
+        None,
+        (
+            CeremonyKind::WalletDelete,
+            operation("d3"),
+            serde_json::json!({"kind":"wallet_delete"}),
+        ),
+        None,
+        12_000,
+    )
+    .unwrap();
+    assert_eq!(receipt.public_status, CeremonyState::Succeeded);
+    assert!(
+        engine
+            .derived_account_descriptors(&deleted)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(engine.policy_snapshot(&deleted).is_err());
+    for key in &deleted_registration.public_key_refs {
+        assert!(registry.get(&key.backend, &key.backend_instance).is_err());
+    }
+    drop(service);
+    drop(engine);
+    drop(registry);
+    if let Some(legacy) = legacy {
+        // Reproduce the durable leftovers written by the released deletion
+        // path, using only this test's disposable database.
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO ceremony_backend_enrollments VALUES (?1, ?2)",
+                rusqlite::params![deleted.as_str(), stale_enrollment],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE enrolled_keys SET available = 1 WHERE wallet_id = ?1",
+                [deleted.as_str()],
+            )
+            .unwrap();
+        if legacy == "no_receipt" {
+            connection
+                .execute(
+                    "DELETE FROM ceremony_receipts WHERE operation_id = ?1",
+                    [operation("d3").as_str()],
+                )
+                .unwrap();
+        } else if legacy != "SUCCEEDED" {
+            let mut historical = receipt.clone();
+            if legacy == "COMPLETED" {
+                historical.public_status = CeremonyState::Completed;
+                historical.signer_signature = Base64UrlBytes::from_bytes(
+                    &ceremony_key
+                        .sign(
+                            &[
+                                b"bloom-signer-ceremony-receipt/v1".as_slice(),
+                                historical.unsigned_canonical_bytes().unwrap().as_slice(),
+                            ]
+                            .concat(),
+                        )
+                        .to_bytes(),
+                );
+            } else {
+                historical.signer_signature = Base64UrlBytes::from_bytes(&[0; 64]);
+            }
+            connection
+                .execute(
+                    "UPDATE ceremony_receipts SET receipt_jcs = ?2 WHERE operation_id = ?1",
+                    rusqlite::params![
+                        operation("d3").as_str(),
+                        serde_jcs::to_string(&historical).unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+    }
+    let (engine, registry, restarted) = open();
+    if matches!(legacy, Some("tampered" | "no_receipt")) {
+        assert!(
+            restarted.is_err(),
+            "unproven deletion must not be recovered"
+        );
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM ceremony_backend_enrollments WHERE backend_instance = ?1",
+                    [deleted.as_str()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        return;
+    }
+    let restarted = restarted.expect("a completed wallet deletion must survive a process restart");
+    assert!(
+        engine
+            .derived_account_descriptors(&deleted)
+            .unwrap()
+            .is_empty()
+    );
+    for key in &deleted_registration.public_key_refs {
+        assert!(registry.get(&key.backend, &key.backend_instance).is_err());
+    }
+    assert_eq!(engine.derived_account_descriptors(&live).unwrap().len(), 2);
+    for key in &live_registration.public_key_refs {
+        assert!(registry.key_is_registered(key).unwrap());
+    }
+    assert!(restarted.surface_status().is_ok());
+}
