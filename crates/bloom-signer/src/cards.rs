@@ -236,7 +236,7 @@ fn seal_release(
 }
 
 fn initialize(db: Connection) -> Result<State, ProtocolError> {
-    db.execute_batch("PRAGMA synchronous=FULL; PRAGMA journal_mode=DELETE;
+    db.execute_batch("PRAGMA synchronous=FULL; PRAGMA journal_mode=DELETE; PRAGMA secure_delete=ON;
       CREATE TABLE IF NOT EXISTS container (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS cards (id TEXT PRIMARY KEY, public TEXT NOT NULL, encrypted TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS travelers (id TEXT PRIMARY KEY, public TEXT NOT NULL, encrypted TEXT NOT NULL);
@@ -257,6 +257,15 @@ fn initialize(db: Connection) -> Result<State, ProtocolError> {
         )
         .map_err(storage)?;
     }
+    // Older candidates persisted card/CVC envelopes without recording the
+    // release kind. Retire all encrypted replay on restart rather than
+    // treating an old card envelope as a recoverable traveler release.
+    // Terminal states and non-secret receipts remain available.
+    db.execute_batch(
+        "UPDATE operations SET result=NULL, output_aad=NULL
+         WHERE json_type(result, '$.encrypted_browser_result')='object';",
+    )
+    .map_err(storage)?;
     // A restart destroys every pending recipient key. `consumed` without
     // `succeeded` means the effect transaction never committed, because the
     // effect and `succeeded` commit together.

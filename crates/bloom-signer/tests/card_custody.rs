@@ -929,6 +929,18 @@ fn checkout_cvc_is_returned_once_and_never_retained_across_restart() {
     let later = reopened.status(&id, NOW + 3 + 3_600_000).unwrap();
     assert_eq!(later.state, CardOperationState::Succeeded);
     assert!(later.receipt.is_none() && later.output_aad.is_none());
+    // Upgrade from a candidate that persisted the original sealed payload.
+    db.execute(
+        "UPDATE operations SET result=?2 WHERE id=?1",
+        rusqlite::params![id.as_str(), serde_json::to_string(&delivered).unwrap()],
+    )
+    .unwrap();
+    drop(reopened);
+    let upgraded = service();
+    upgraded.open_storage(&path).unwrap();
+    let status = upgraded.status(&id, NOW + 5).unwrap();
+    assert_eq!(status.state, CardOperationState::Succeeded);
+    assert!(status.receipt.is_none() && status.output_aad.is_none());
 }
 
 #[test]
