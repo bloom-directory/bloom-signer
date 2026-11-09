@@ -482,6 +482,20 @@ impl CardCeremonies {
     ) -> Result<CardOperationStatus, ProtocolError> {
         {
             let mut state = self.state.lock();
+            if state
+                .pending
+                .get(operation_id)
+                .is_some_and(|pending| pending.prepared.contribution.expires_at_ms.get() <= now_ms)
+            {
+                state
+                    .db
+                    .execute(
+                        "UPDATE operations SET state='expired' WHERE id=?1 AND state='prepared'",
+                        [operation_id.as_str()],
+                    )
+                    .map_err(storage)?;
+                state.pending.remove(operation_id);
+            }
             let prepared: bool = state
                 .db
                 .query_row(

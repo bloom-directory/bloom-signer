@@ -745,9 +745,8 @@ fn cancelling_a_terminal_operation_reports_its_state() {
     assert_eq!(state(s.cancel(id, NOW + 4)), CardOperationState::Cancelled);
     let (p, _) = checkout(&s, 3);
     let id = &p.contribution.custody_operation_id;
-    s.status(id, NOW + 902_002).unwrap();
     assert_eq!(
-        state(s.cancel(id, NOW + 902_003)),
+        state(s.cancel(id, p.contribution.expires_at_ms.get())),
         CardOperationState::Expired
     );
     let missing = OperationId::from_bytes([40; 32]);

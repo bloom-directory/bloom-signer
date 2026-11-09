@@ -98,11 +98,16 @@ impl CheckoutFacts {
             || !self.currency.bytes().all(|b| b.is_ascii_uppercase())
             || self.installments == 0
             || self.installments > 60
+            // Broker receives JSON numbers; every approved minor unit must
+            // survive JavaScript parsing exactly.
+            || self.total_minor > 9_007_199_254_740_991
+            || self.renewal_minor.is_some_and(|minor| minor > 9_007_199_254_740_991)
             // A checkout with nothing to charge today is only meaningful as a
             // subscription that starts later: the person is approving the
             // renewal terms, not a payment. Without them there is no amount
             // to approve at all.
-            || (self.total_minor == 0 && self.renewal_minor.is_none())
+            || (self.total_minor == 0
+                && (self.renewal_minor.is_none() || self.renewal_starts_on.is_none()))
             // A renewal price means a price and how often it recurs, on a
             // checkout that says it recurs at all. A date without a price
             // would be a claim the review cannot put an amount against.
@@ -405,6 +410,9 @@ mod tests {
         let mut trial = subscription();
         trial.total_minor = 0;
         assert!(trial.validate().is_ok());
+        let mut undated = trial.clone();
+        undated.renewal_starts_on = None;
+        assert!(undated.validate().is_err());
         // The same page without readable renewal terms has no amount at all.
         let mut empty = trial.clone();
         empty.renewal_minor = None;
@@ -436,6 +444,18 @@ mod tests {
         assert!(f.validate().is_err());
         f.recurring = false;
         assert!(f.validate().is_ok());
+    }
+
+    #[test]
+    fn approved_amounts_survive_browser_json_parsing() {
+        for amount in [9_007_199_254_740_991, 9_007_199_254_740_992, u64::MAX] {
+            let mut facts = subscription();
+            facts.total_minor = amount;
+            assert_eq!(facts.validate().is_ok(), amount == 9_007_199_254_740_991);
+            facts.total_minor = 100;
+            facts.renewal_minor = Some(amount);
+            assert_eq!(facts.validate().is_ok(), amount == 9_007_199_254_740_991);
+        }
     }
 
     #[test]
