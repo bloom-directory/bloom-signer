@@ -1011,7 +1011,7 @@ impl CardCeremonies {
                         |r| r.get(0),
                     )
                     .map_err(storage)?;
-                if count >= 8 {
+                if count >= 12 {
                     return Err(error(
                         ProtocolErrorCode::BackendInvalidRequest,
                         "traveler limit reached",
@@ -1150,9 +1150,6 @@ impl CardCeremonies {
                     .cvc
                     .as_deref()
                     .ok_or_else(|| error(ProtocolErrorCode::MalformedFrame, "CVC required"))?;
-                if !(3..=4).contains(&cvc.len()) || !cvc.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err(error(ProtocolErrorCode::MalformedFrame, "invalid CVC"));
-                }
                 let raw: String = tx
                     .query_row(
                         "SELECT encrypted FROM cards WHERE id=?1",
@@ -1167,6 +1164,14 @@ impl CardCeremonies {
                     Zeroizing::new(decrypt(&key, &blob, &card_aad(&container_id, card_id)?)?);
                 let card: CardDetails = serde_json::from_slice(&plaintext).map_err(malformed)?;
                 card.validate(now_ms)?;
+                let lengths = match card_brand(&card.number) {
+                    "Amex" => 4..=4,
+                    "Card" => 3..=4,
+                    _ => 3..=3,
+                };
+                if !lengths.contains(&cvc.len()) || !cvc.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(error(ProtocolErrorCode::MalformedFrame, "invalid CVC"));
+                }
                 let release = Zeroizing::new(
                     serde_json::to_vec(&Release { card: &card, cvc }).map_err(malformed)?,
                 );

@@ -1035,3 +1035,52 @@ fn adding_under_an_existing_id_replaces_that_card() {
         ("Mastercard", "4444")
     );
 }
+#[test]
+fn twelve_travelers_fit_and_replacing_at_the_cap_is_allowed() {
+    let s = service();
+    let auth = enroll(&s);
+    let mut count = 1;
+    let mut save = |op: u8, id: &str| {
+        let p = s.prepare(save_traveler(op, id, id), NOW + 2).unwrap();
+        count += 1;
+        let result = s.complete(
+            complete(&auth, &p, traveler_input(&auth, "Synthetic"), count),
+            NOW + 3,
+        );
+        if result.is_err() {
+            s.cancel(&p.contribution.custody_operation_id, NOW + 3)
+                .unwrap();
+        }
+        result.is_ok()
+    };
+    for n in 0..12u8 {
+        assert!(save(10 + n, &format!("traveler-{n}")), "traveler {n}");
+    }
+    assert!(!save(30, "traveler-12"));
+    assert!(save(31, "traveler-0"));
+    assert_eq!(s.travelers().unwrap().len(), 12);
+}
+#[test]
+fn checkout_cvc_length_follows_the_saved_card_brand() {
+    let s = service();
+    let p = s.prepare(add(1, "card-one"), NOW).unwrap();
+    let auth = VirtualAuthenticator::generate_with_user_handle(
+        &p.webauthn_options
+            .registration_user_handle
+            .as_ref()
+            .unwrap()
+            .decode(),
+    );
+    let mut input = private(&auth, true, false);
+    input["card"]["number"] = serde_json::json!("378282246310005");
+    s.complete(complete(&auth, &p, input, 1), NOW + 1).unwrap();
+    let (p, _) = checkout(&s, 2);
+    let mut input = private(&auth, false, true);
+    let refused = s
+        .complete(complete(&auth, &p, input.clone(), 2), NOW + 3)
+        .unwrap_err();
+    assert_eq!(refused.message, "invalid CVC");
+    let (p, _) = checkout(&s, 3);
+    input["cvc"] = serde_json::json!("1234");
+    s.complete(complete(&auth, &p, input, 3), NOW + 4).unwrap();
+}
