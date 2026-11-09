@@ -14,7 +14,7 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 # Internal crates. None of these is published: they carry the Signer's key
 # handling, and an accidental `cargo publish` would put it on crates.io.
@@ -34,7 +34,7 @@ bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-s
 aws-config = { version = "=1.8.1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-credential-types = "1"
 # Exact AWS service pins date from the old Rust 1.85 floor. Some newer
-# releases also fit the current 1.88 floor (up to aws-config 1.8.13,
+# releases also fit the current 1.89 floor (up to aws-config 1.8.13,
 # aws-sdk-kms 1.99 and aws-sdk-sts 1.97); later ones need Rust 1.91 or newer.
 # Moving to them is a separate dependency update.
 #
