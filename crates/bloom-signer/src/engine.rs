@@ -1921,6 +1921,8 @@ impl SignerEngine {
     /// Older deletions removed custody but retained the encrypted backend and
     /// its public keys. Recover only an absent wallet with a verified successful
     /// deletion receipt; unexplained missing custody must still fail closed.
+    /// Receipts are append-only, so the deletion must be the wallet's latest
+    /// custody receipt: a later one (re-registration) is a newer enrollment.
     pub(crate) fn recover_deleted_wallet_backends(
         &self,
         ceremony_key: &VerifyingKey,
@@ -1936,7 +1938,12 @@ impl SignerEngine {
                    AND json_extract(r.receipt_jcs, '$.ceremony_kind') = 'wallet_delete'
                    AND json_extract(r.receipt_jcs, '$.public_status') IN ('SUCCEEDED', 'COMPLETED')
                    AND NOT EXISTS (SELECT 1 FROM ceremony_wallets w
-                                   WHERE w.wallet_id = b.backend_instance)",
+                                   WHERE w.wallet_id = b.backend_instance)
+                   AND NOT EXISTS (SELECT 1 FROM ceremony_receipts later
+                                   WHERE later.receipt_kind = 'custody'
+                                     AND json_extract(later.receipt_jcs, '$.wallet_id')
+                                         = b.backend_instance
+                                     AND later.rowid > r.rowid)",
                 )
                 .map_err(storage)?;
             statement
