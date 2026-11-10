@@ -6378,6 +6378,98 @@ fn missing_custody_without_deletion_receipt_still_fails_closed() {
     deleted_wallet_restart(Some("no_receipt"));
 }
 
+#[test]
+fn old_deletion_receipt_does_not_retire_a_new_wallet_incarnation() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
+    let open = || {
+        let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+        let engine = Arc::new(
+            SignerEngine::open(
+                &database,
+                Token::new("broker-app-1").unwrap(),
+                broker.verifying_key(),
+                ceremony_key.verifying_key(),
+                Token::new("signer-revocation-key").unwrap(),
+                SigningKey::from_bytes(&[4; 32]),
+                audit_keys(),
+                registry,
+            )
+            .unwrap(),
+        );
+        SignerCeremonyService::new(
+            engine,
+            Token::new("signer-ceremony-key").unwrap(),
+            ceremony_key.clone(),
+        )
+        .unwrap()
+    };
+    let wallet = Token::new("reused-wallet").unwrap();
+    let first_authenticator = VirtualAuthenticator::generate();
+    let service = open();
+    complete_bip39_registration(
+        &service,
+        &first_authenticator,
+        &wallet,
+        &operation("e1"),
+        10_000,
+    );
+    complete_generic(
+        &service,
+        &first_authenticator,
+        &wallet,
+        None,
+        (
+            CeremonyKind::WalletDelete,
+            operation("e2"),
+            serde_json::json!({"kind":"wallet_delete"}),
+        ),
+        None,
+        11_000,
+    )
+    .unwrap();
+    drop(service);
+
+    let second_authenticator = VirtualAuthenticator::generate();
+    let service = open();
+    complete_bip39_registration(
+        &service,
+        &second_authenticator,
+        &wallet,
+        &operation("e3"),
+        12_000,
+    );
+    drop(service);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "DELETE FROM ceremony_wallets WHERE wallet_id = ?1",
+            [wallet.as_str()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let restarted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(open));
+    assert!(
+        restarted.is_err(),
+        "missing custody for a new incarnation must fail closed despite an old receipt"
+    );
+    assert_eq!(
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM ceremony_backend_enrollments WHERE backend_instance = ?1",
+                [wallet.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "startup must preserve the new encrypted enrollment"
+    );
+}
+
 fn deleted_wallet_restart(legacy: Option<&str>) {
     let temp = tempfile::tempdir().unwrap();
     let database = temp.path().join("signer.sqlite");
