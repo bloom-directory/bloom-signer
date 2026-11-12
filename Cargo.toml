@@ -44,8 +44,8 @@ aws-credential-types = "1"
 # rustls 0.21 and h2 0.3). `default-https-client` selects the current one
 # (rustls 0.23 + aws-lc-rs). Both reach the same endpoints; only the second
 # is still maintained.
-aws-sdk-kms = { version = "=1.77.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-sts = { version = "=1.76.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-kms = { version = "=1.96.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sts = { version = "=1.94.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
 aws-types = "1"
