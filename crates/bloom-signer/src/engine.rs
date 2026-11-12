@@ -2061,14 +2061,35 @@ impl SignerEngine {
             }),
         };
         for wallet in wallets {
-            let stored: Option<String> = transaction
-                .query_row(
-                    "SELECT generation FROM credential_authority_state WHERE wallet_id = ?1",
-                    [wallet.wallet_id.as_str()],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(storage)?;
+            // Registration/import of a name with no custody starts a new
+            // incarnation, as Broker treats it. A fence left by a deleted
+            // incarnation must not make its generation-0 custody look stale.
+            let new_incarnation = matches!(
+                result.ceremony_kind,
+                bloom_signer_api::CeremonyKind::WalletRegistration
+                    | bloom_signer_api::CeremonyKind::WalletImport
+            ) && result.wallet_id.as_ref() == Some(&wallet.wallet_id)
+                && transaction
+                    .query_row(
+                        "SELECT 1 FROM ceremony_wallets WHERE wallet_id = ?1",
+                        [wallet.wallet_id.as_str()],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(storage)?
+                    .is_none();
+            let stored: Option<String> = if new_incarnation {
+                None
+            } else {
+                transaction
+                    .query_row(
+                        "SELECT generation FROM credential_authority_state WHERE wallet_id = ?1",
+                        [wallet.wallet_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(storage)?
+            };
             let previous = stored
                 .as_deref()
                 .unwrap_or("0")
