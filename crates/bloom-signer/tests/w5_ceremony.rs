@@ -6354,6 +6354,177 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
 }
 
 #[test]
+fn recovered_then_deleted_wallet_name_can_be_registered_or_imported_again() {
+    for kind in [CeremonyKind::WalletRegistration, CeremonyKind::WalletImport] {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("signer.sqlite");
+        let open = || {
+            let engine = Arc::new(
+                SignerEngine::open(
+                    &database,
+                    Token::new("broker-app-1").unwrap(),
+                    SigningKey::from_bytes(&[7; 32]).verifying_key(),
+                    SigningKey::from_bytes(&[9; 32]).verifying_key(),
+                    Token::new("signer-revocation-key").unwrap(),
+                    SigningKey::from_bytes(&[4; 32]),
+                    audit_keys(),
+                    Arc::new(BackendRegistry::from_compiled(vec![]).unwrap()),
+                )
+                .unwrap(),
+            );
+            SignerCeremonyService::new(
+                engine,
+                Token::new("signer-ceremony-key").unwrap(),
+                SigningKey::from_bytes(&[9; 32]),
+            )
+        };
+        let original = VirtualAuthenticator::generate();
+        let replacement = VirtualAuthenticator::generate();
+        let service = open().unwrap();
+        let output_recipient = HpkeRecipient::generate();
+        let registration_operation = operation("a1");
+        let (registration, contribution) = complete_new_wallet(
+            &service,
+            &original,
+            CeremonyKind::WalletRegistration,
+            registration_operation.clone(),
+            None,
+            Some(&output_recipient),
+            10_000,
+        );
+        let wallet_id = registration.wallet_id.clone().unwrap();
+        let recovery: serde_json::Value = serde_json::from_slice(
+            output_recipient
+                .open(
+                    registration.encrypted_browser_result.as_ref().unwrap(),
+                    CUSTODY_OUTPUT_INFO,
+                    &CustodyOutputHpkeAad {
+                        surface: bloom_signer_api::legacy_local_surface(),
+                        ceremony_id: contribution.ceremony_id.clone(),
+                        ceremony_kind: CeremonyKind::WalletRegistration,
+                        custody_operation_id: registration_operation,
+                        signer_contribution_digest: contribution.digest().unwrap(),
+                        public_binding_digest: digest("d1"),
+                    }
+                    .canonical_bytes()
+                    .unwrap(),
+                )
+                .unwrap()
+                .expose_to_backend(),
+        )
+        .unwrap();
+
+        let recovery_operation = operation("a2");
+        service
+            .prepare_custody(
+                CustodyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
+                    ceremony_kind: CeremonyKind::WalletRecovery,
+                    custody_operation_id: recovery_operation.clone(),
+                    wallet_id: Some(wallet_id.clone()),
+                    key_ref: None,
+                    exact_terms_digest: digest("d2"),
+                    expected_input_class: Token::new("recovery-factor-v1").unwrap(),
+                    browser_output_recipient_key: None,
+                    petal_key_scope: None,
+                    legacy_passkey_migration: None,
+                    derivation_requests: Vec::new(),
+                    wallet_seed_profile: None,
+                },
+                11_000,
+            )
+            .unwrap();
+        let prepared = service
+            .bind_custody_output_recipient(
+                &recovery_operation,
+                HpkeRecipient::generate().public_key().clone(),
+                11_001,
+            )
+            .unwrap();
+        let attestation =
+            replacement.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
+        let prf_assertion =
+            replacement.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
+        let aad = CustodyHpkeAad {
+            surface: bloom_signer_api::legacy_local_surface(),
+            ceremony_id: prepared.contribution.ceremony_id.clone(),
+            ceremony_kind: CeremonyKind::WalletRecovery,
+            custody_operation_id: recovery_operation.clone(),
+            signer_nonce: prepared.contribution.signer_nonce.clone(),
+            signer_contribution_digest: prepared.contribution.digest().unwrap(),
+            wallet_id: Some(wallet_id.clone()),
+            key_ref: None,
+            credential_id: Some(attestation.credential_id.clone()),
+            expected_input_class: Token::new("recovery-factor-v1").unwrap(),
+        }
+        .canonical_bytes()
+        .unwrap();
+        let recovery_input = serde_jcs::to_vec(&serde_json::json!({
+            "recovery_id": recovery["recovery_id"],
+            "recovery_secret": recovery["recovery_secret"],
+            "new_credential_prf": Base64UrlBytes::from_bytes(&replacement.deterministic_prf()),
+        }))
+        .unwrap();
+        let recovered = service
+            .complete_custody(
+                CustodyCompleteRequest {
+                    ceremony_kind: CeremonyKind::WalletRecovery,
+                    custody_operation_id: recovery_operation,
+                    ceremony_id: prepared.contribution.ceremony_id.clone(),
+                    proof: WebAuthnCeremonyProof::RecoveryCredentialChange {
+                        new_credential_attestation: attestation,
+                        new_credential_prf_assertion: Some(prf_assertion),
+                    },
+                    encrypted_input: Some(
+                        seal_hpke(
+                            &prepared.contribution.hpke_recipient_key,
+                            b"bloom-custody-input/v1",
+                            &aad,
+                            &recovery_input,
+                        )
+                        .unwrap(),
+                    ),
+                    public_binding_digest: digest("d2"),
+                },
+                11_100,
+            )
+            .unwrap();
+        assert_eq!(recovered.credential_authority_generation.unwrap().get(), 1);
+        let (deletion, _) = complete_generic(
+            &service,
+            &replacement,
+            &wallet_id,
+            None,
+            (
+                CeremonyKind::WalletDelete,
+                operation("a3"),
+                serde_json::json!({"kind":"wallet_delete"}),
+            ),
+            None,
+            12_000,
+        )
+        .unwrap();
+        assert_eq!(deletion.public_status, CeremonyState::Succeeded);
+
+        // `complete_new_wallet` names the wallet from the operation prefix.
+        let same_name = OperationId::new(format!("{}{}", "a1".repeat(6), "b4".repeat(26))).unwrap();
+        let (recreated, _) = complete_new_wallet(
+            &service,
+            &VirtualAuthenticator::generate(),
+            kind,
+            same_name,
+            Some(&[7; 32]),
+            None,
+            13_000,
+        );
+        assert_eq!(recreated.wallet_id.as_ref(), Some(&wallet_id));
+        assert_eq!(recreated.credential_authority_generation.unwrap().get(), 0);
+        drop(service);
+        open().expect("a new same-name incarnation must survive a Signer restart");
+    }
+}
+
+#[test]
 fn deleting_bip39_wallet_does_not_prevent_signer_restart() {
     deleted_wallet_restart(None);
 }
@@ -6461,6 +6632,18 @@ fn deleted_wallet_restart(legacy: Option<&str>) {
     drop(service);
     drop(engine);
     drop(registry);
+    let genuine_receipt: Vec<rusqlite::types::Value> = rusqlite::Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT * FROM ceremony_receipts WHERE operation_id = ?1",
+            [operation("d3").as_str()],
+            |row| {
+                (0..row.as_ref().column_count())
+                    .map(|i| row.get(i))
+                    .collect()
+            },
+        )
+        .unwrap();
     if let Some(legacy) = legacy {
         // Reproduce the durable leftovers written by the released deletion
         // path, using only this test's disposable database.
@@ -6513,12 +6696,23 @@ fn deleted_wallet_restart(legacy: Option<&str>) {
                 .unwrap();
         }
     }
-    let (engine, registry, restarted) = open();
-    if matches!(legacy, Some("tampered" | "no_receipt")) {
-        assert!(
-            restarted.is_err(),
-            "unproven deletion must not be recovered"
-        );
+    let (mut engine, mut registry, mut restarted) = open();
+    if let Some(unproven @ ("tampered" | "no_receipt")) = legacy {
+        let failure = restarted
+            .err()
+            .expect("unproven deletion must not be recovered");
+        let expected = if unproven == "tampered" {
+            (
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "wallet deletion receipt signature is invalid",
+            )
+        } else {
+            (
+                ProtocolErrorCode::KeyrefMismatch,
+                "no custody record for this BIP-39 wallet",
+            )
+        };
+        assert_eq!((failure.code, failure.message.as_str()), expected);
         let connection = rusqlite::Connection::open(&database).unwrap();
         assert_eq!(
             connection
@@ -6530,7 +6724,17 @@ fn deleted_wallet_restart(legacy: Option<&str>) {
                 .unwrap(),
             1
         );
-        return;
+        // Control: the same leftovers recover once the genuine receipt is back,
+        // so the failure above is the receipt check, not missing recovery.
+        let placeholders = vec!["?"; genuine_receipt.len()].join(",");
+        connection
+            .execute(
+                &format!("INSERT OR REPLACE INTO ceremony_receipts VALUES ({placeholders})"),
+                rusqlite::params_from_iter(&genuine_receipt),
+            )
+            .unwrap();
+        drop((engine, registry));
+        (engine, registry, restarted) = open();
     }
     let restarted = restarted.expect("a completed wallet deletion must survive a process restart");
     assert!(
