@@ -6256,6 +6256,16 @@ fn retire_deleted_wallet_backend(
             [wallet_id.as_str()],
         )
         .map_err(storage)?;
+    // A ceremony-approved update that was never committed is bound only to a
+    // baseline version and digest. A later wallet under the same ID can start
+    // at that same baseline, so the authorization must die with its wallet.
+    transaction
+        .execute(
+            "DELETE FROM policy_authorizations
+             WHERE json_extract(request_jcs, '$.update.wallet_id') = ?1",
+            [wallet_id.as_str()],
+        )
+        .map_err(storage)?;
     Ok(())
 }
 

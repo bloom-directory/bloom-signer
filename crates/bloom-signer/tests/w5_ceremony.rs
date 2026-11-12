@@ -3939,6 +3939,68 @@ fn generic_custody_export_policy_and_delete_apply_exact_typed_effects() {
 }
 
 #[test]
+fn wallet_deletion_discards_uncommitted_policy_authorizations() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, engine, _) = service(&authenticator);
+    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("e1"), 5_000);
+    let baseline = engine.policy_snapshot(&wallet_id).unwrap();
+    let mut proposed_policy: CanonicalWalletPolicy =
+        serde_json::from_slice(&baseline.canonical_policy.decode()).unwrap();
+    proposed_policy.maximum_approval_lifetime_ms += 1;
+    let proposed = Base64UrlBytes::from_bytes(&serde_jcs::to_vec(&proposed_policy).unwrap());
+    let update = PolicyUpdateRequest {
+        operation_id: operation("e2"),
+        wallet_id: wallet_id.clone(),
+        baseline_version: baseline.version.clone(),
+        baseline_digest: baseline.policy_digest.clone(),
+        proposed_canonical_policy: proposed.clone(),
+        proposed_policy_digest: Digest32::from_bytes(
+            sha2::Sha256::digest(proposed.decode()).into(),
+        ),
+        authority_diff_digest: digest("c1"),
+        assurance_level: Token::new("user_verified").unwrap(),
+    };
+    // Approve the update but never commit it.
+    let (policy_result, prepared) =
+        complete_policy_update(&service, &authenticator, &wallet_id, update, 6_000).unwrap();
+    let stale = PolicyCompareAndSwapRequest {
+        update: prepared.update,
+        ceremony_receipt: policy_result,
+        broker_validation_receipt: prepared.broker_validation_receipt,
+    };
+    complete_generic(
+        &service,
+        &authenticator,
+        &wallet_id,
+        None,
+        (
+            CeremonyKind::WalletDelete,
+            operation("e3"),
+            serde_json::json!({"kind": "wallet_delete"}),
+        ),
+        None,
+        7_000,
+    )
+    .unwrap();
+
+    // Recreate the same wallet ID with the same initial policy baseline.
+    let same_name = OperationId::new(format!("{}{}", "e1".repeat(6), "e4".repeat(26))).unwrap();
+    let (recreated, _) = register_wallet(&service, &authenticator, same_name, 8_000);
+    assert_eq!(recreated, wallet_id);
+    let fresh = engine.policy_snapshot(&wallet_id).unwrap();
+    assert_eq!(
+        (&fresh.version, &fresh.policy_digest),
+        (&baseline.version, &baseline.policy_digest),
+        "the new incarnation must share the stale update's baseline for this test to bite"
+    );
+
+    let refused = engine.compare_and_swap_policy(&stale).unwrap_err();
+    assert_eq!(refused.code, ProtocolErrorCode::PolicyBaselineStale);
+    assert_eq!(refused.message, "policy ceremony has not completed");
+    assert_eq!(engine.policy_snapshot(&wallet_id).unwrap(), fresh);
+}
+
+#[test]
 fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
     // Staging a key-derive ceremony must not require an already activated
     // backend. Completing that very ceremony is what activates it, so
