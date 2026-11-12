@@ -1918,6 +1918,83 @@ impl SignerEngine {
             .collect()
     }
 
+    /// Older deletions removed custody but retained the encrypted backend and
+    /// its public keys. Recover only an absent wallet with a verified successful
+    /// deletion receipt; unexplained missing custody must still fail closed.
+    /// Receipts are append-only, so the deletion must be the wallet's latest
+    /// custody receipt: a later one (re-registration) is a newer enrollment.
+    pub(crate) fn recover_deleted_wallet_backends(
+        &self,
+        ceremony_key: &VerifyingKey,
+    ) -> Result<(), ProtocolError> {
+        let mut connection = self.connection.lock();
+        let receipts = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT r.receipt_jcs FROM ceremony_receipts r
+                 JOIN ceremony_backend_enrollments b
+                   ON b.backend_instance = json_extract(r.receipt_jcs, '$.wallet_id')
+                 WHERE r.receipt_kind = 'custody'
+                   AND json_extract(r.receipt_jcs, '$.ceremony_kind') = 'wallet_delete'
+                   AND json_extract(r.receipt_jcs, '$.public_status') IN ('SUCCEEDED', 'COMPLETED')
+                   AND NOT EXISTS (SELECT 1 FROM ceremony_wallets w
+                                   WHERE w.wallet_id = b.backend_instance)
+                   AND NOT EXISTS (SELECT 1 FROM ceremony_receipts later
+                                   WHERE later.receipt_kind = 'custody'
+                                     AND json_extract(later.receipt_jcs, '$.wallet_id')
+                                         = b.backend_instance
+                                     AND later.rowid > r.rowid)",
+                )
+                .map_err(storage)?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage)?
+        };
+        if receipts.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.mutation_transaction(&mut connection)?;
+        for encoded in receipts {
+            let receipt: CustodyResult = serde_json::from_str(&encoded).map_err(malformed)?;
+            let signature =
+                Signature::from_slice(&receipt.signer_signature.decode()).map_err(malformed)?;
+            ceremony_key
+                .verify(
+                    &[
+                        b"bloom-signer-ceremony-receipt/v1".as_slice(),
+                        receipt.unsigned_canonical_bytes()?.as_slice(),
+                    ]
+                    .concat(),
+                    &signature,
+                )
+                .map_err(|_| {
+                    error(
+                        ProtocolErrorCode::UnauthenticatedPeer,
+                        "wallet deletion receipt signature is invalid",
+                    )
+                })?;
+            let wallet_id = receipt.wallet_id.as_ref().ok_or_else(|| {
+                error(
+                    ProtocolErrorCode::MalformedFrame,
+                    "wallet deletion receipt has no wallet",
+                )
+            })?;
+            retire_deleted_wallet_backend(&transaction, wallet_id)?;
+            self.append_audit(
+                &transaction,
+                "wallet.deleted_backend_recovered",
+                &serde_json::json!({
+                    "wallet_id": wallet_id,
+                    "custody_operation_id": receipt.custody_operation_id,
+                    "receipt_digest": receipt.receipt_digest,
+                }),
+            )?;
+        }
+        transaction.commit().map_err(storage)
+    }
+
     pub(crate) fn commit_custody_snapshot_with_effect(
         &self,
         commit: CustodySnapshotCommit<'_>,
@@ -1984,14 +2061,35 @@ impl SignerEngine {
             }),
         };
         for wallet in wallets {
-            let stored: Option<String> = transaction
-                .query_row(
-                    "SELECT generation FROM credential_authority_state WHERE wallet_id = ?1",
-                    [wallet.wallet_id.as_str()],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(storage)?;
+            // Registration/import of a name with no custody starts a new
+            // incarnation, as Broker treats it. A fence left by a deleted
+            // incarnation must not make its generation-0 custody look stale.
+            let new_incarnation = matches!(
+                result.ceremony_kind,
+                bloom_signer_api::CeremonyKind::WalletRegistration
+                    | bloom_signer_api::CeremonyKind::WalletImport
+            ) && result.wallet_id.as_ref() == Some(&wallet.wallet_id)
+                && transaction
+                    .query_row(
+                        "SELECT 1 FROM ceremony_wallets WHERE wallet_id = ?1",
+                        [wallet.wallet_id.as_str()],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(storage)?
+                    .is_none();
+            let stored: Option<String> = if new_incarnation {
+                None
+            } else {
+                transaction
+                    .query_row(
+                        "SELECT generation FROM credential_authority_state WHERE wallet_id = ?1",
+                        [wallet.wallet_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(storage)?
+            };
             let previous = stored
                 .as_deref()
                 .unwrap_or("0")
@@ -2054,6 +2152,15 @@ impl SignerEngine {
                     ],
                 )
                 .map_err(storage)?;
+        }
+        if result.ceremony_kind == bloom_signer_api::CeremonyKind::WalletDelete {
+            let wallet_id = result.wallet_id.as_ref().ok_or_else(|| {
+                error(
+                    ProtocolErrorCode::MalformedFrame,
+                    "wallet deletion receipt has no wallet",
+                )
+            })?;
+            retire_deleted_wallet_backend(&transaction, wallet_id)?;
         }
         transaction
             .execute("DELETE FROM webauthn_credentials", [])
@@ -6116,6 +6223,50 @@ fn verify_wallet_tombstone(
     let signature = signature_bytes(&unsigned.signature)?;
     unsigned.signature = Base64UrlBytes::from_bytes(&[]);
     verify_revocation_signature(key, WALLET_TOMBSTONE_DOMAIN, &unsigned, &signature)
+}
+
+fn retire_deleted_wallet_backend(
+    transaction: &Transaction<'_>,
+    wallet_id: &Token,
+) -> Result<(), ProtocolError> {
+    // Keep derivation history and key fingerprints so deletion cannot make an
+    // exposed child path reusable. Remove the secret-bearing enrollment and
+    // disable the authority that depended on that custody.
+    transaction
+        .execute(
+            "DELETE FROM ceremony_backend_enrollments WHERE backend_instance = ?1",
+            [wallet_id.as_str()],
+        )
+        .map_err(storage)?;
+    transaction
+        .execute(
+            "UPDATE enrolled_keys SET available = 0 WHERE wallet_id = ?1",
+            [wallet_id.as_str()],
+        )
+        .map_err(storage)?;
+    transaction
+        .execute(
+            "UPDATE approvals SET active = 0 WHERE wallet_id = ?1",
+            [wallet_id.as_str()],
+        )
+        .map_err(storage)?;
+    transaction
+        .execute(
+            "DELETE FROM policies WHERE wallet_id = ?1",
+            [wallet_id.as_str()],
+        )
+        .map_err(storage)?;
+    // A ceremony-approved update that was never committed is bound only to a
+    // baseline version and digest. A later wallet under the same ID can start
+    // at that same baseline, so the authorization must die with its wallet.
+    transaction
+        .execute(
+            "DELETE FROM policy_authorizations
+             WHERE json_extract(request_jcs, '$.update.wallet_id') = ?1",
+            [wallet_id.as_str()],
+        )
+        .map_err(storage)?;
+    Ok(())
 }
 
 fn signature_bytes(value: &Base64UrlBytes) -> Result<[u8; 64], ProtocolError> {
