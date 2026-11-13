@@ -7,8 +7,6 @@ use std::{collections::BTreeMap, sync::Arc};
 pub enum CompiledBackend {
     #[cfg(feature = "local")]
     Local(Arc<bloom_signer_backend_local::LocalSignerBackend>),
-    #[cfg(feature = "aws-kms")]
-    AwsKms(Arc<bloom_signer_backend_aws_kms::AwsKmsSignerBackend>),
     /// A fault-injecting stand-in for in-crate service tests: it wraps a real
     /// local backend and only changes what `sign` returns. It never exists in
     /// a production build, so no production path can reach it.
@@ -21,8 +19,6 @@ impl CompiledBackend {
         match self {
             #[cfg(feature = "local")]
             Self::Local(backend) => backend.clone(),
-            #[cfg(feature = "aws-kms")]
-            Self::AwsKms(backend) => backend.clone(),
             #[cfg(all(test, feature = "local"))]
             Self::Test(backend) => backend.clone(),
         }
@@ -135,9 +131,8 @@ pub(crate) mod test_fault {
 }
 
 #[cfg(feature = "local")]
-const DERIVED_KEY_REFUSALS: [&str; 3] = [
+const DERIVED_KEY_REFUSALS: [&str; 2] = [
     "derivation backend is not compiled into this Signer",
-    "AWS KMS does not support derived keys",
     "the fault-injection test backend does not manage derived keys",
 ];
 
@@ -219,24 +214,19 @@ impl BackendRegistry {
     }
 
     /// The local backend serving `key_ref`. `messages` are the refusals when
-    /// it is missing, AWS KMS, or the fault-injection test backend.
+    /// it is missing or the fault-injection test backend.
     #[cfg(feature = "local")]
     fn local_backend(
         &self,
         key_ref: &KeyRef,
-        messages: [&str; 3],
+        messages: [&str; 2],
     ) -> Result<Arc<bloom_signer_backend_local::LocalSignerBackend>, ProtocolError> {
         match self.lookup(key_ref, messages[0])? {
             CompiledBackend::Local(local) => Ok(local),
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                messages[1],
-            )),
             #[cfg(all(test, feature = "local"))]
             CompiledBackend::Test(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
-                messages[2],
+                messages[1],
             )),
         }
     }
@@ -253,8 +243,6 @@ impl BackendRegistry {
                     format!("local backend key availability failed: {error:?}"),
                 )
             }),
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(aws) => Ok(aws.key_is_available(key_ref)),
             #[cfg(all(test, feature = "local"))]
             CompiledBackend::Test(backend) => backend.key_is_available(key_ref),
         }
@@ -267,8 +255,6 @@ impl BackendRegistry {
         match self.lookup_compiled(key_ref)? {
             #[cfg(feature = "local")]
             CompiledBackend::Local(local) => Ok(local.key_is_registered(key_ref)),
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(aws) => Ok(aws.key_is_registered(key_ref)),
             #[cfg(all(test, feature = "local"))]
             CompiledBackend::Test(backend) => backend.key_is_registered(key_ref),
         }
@@ -278,8 +264,7 @@ impl BackendRegistry {
     ///
     /// That path holds `parking_lot` guards, whose guards are not `Send`, so it
     /// cannot use `activate_key`. Both entry points funnel into the same backend
-    /// body, and this one keeps the AWS-KMS rejection so nothing widens what is
-    /// activatable.
+    /// body.
     pub fn activate_key_blocking(
         &self,
         key_ref: &bloom_signer_api::KeyRef,
@@ -296,11 +281,6 @@ impl BackendRegistry {
                     format!("local backend activation failed: {cause:?}"),
                 )
             }),
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "AWS KMS keys do not use Signer activation",
-            )),
             #[cfg(all(test, feature = "local"))]
             CompiledBackend::Test(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
@@ -327,11 +307,6 @@ impl BackendRegistry {
                     )
                 })
             }
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "AWS KMS keys do not use Signer activation",
-            )),
             #[cfg(all(test, feature = "local"))]
             CompiledBackend::Test(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
@@ -355,11 +330,6 @@ impl BackendRegistry {
                     format!("local backend deactivation failed: {cause:?}"),
                 )
             }),
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "AWS KMS keys do not use Signer activation",
-            )),
             #[cfg(all(test, feature = "local"))]
             CompiledBackend::Test(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
@@ -609,11 +579,6 @@ impl BackendRegistry {
                         format!("local bip39 child registration failed: {error:?}"),
                     )
                 }),
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "AWS KMS does not support bip39 child registration",
-            )),
             #[cfg(all(test, feature = "local"))]
             CompiledBackend::Test(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
@@ -644,11 +609,6 @@ impl BackendRegistry {
                     format!("local bip39 child retirement failed: {error:?}"),
                 )
             }),
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "AWS KMS does not support bip39 child retirement",
-            )),
             #[cfg(all(test, feature = "local"))]
             CompiledBackend::Test(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
@@ -737,7 +697,6 @@ impl BackendRegistry {
             root,
             [
                 "local derivation backend is not compiled into this Signer",
-                "AWS KMS does not expose local custody backups",
                 "the fault-injection test backend does not expose custody backups",
             ],
         )?;
@@ -837,8 +796,6 @@ impl BackendRegistry {
             .values()
             .flat_map(|backend| match backend {
                 CompiledBackend::Local(local) => local.pending_derivations(),
-                #[cfg(feature = "aws-kms")]
-                CompiledBackend::AwsKms(_) => Vec::new(),
                 #[cfg(all(test, feature = "local"))]
                 CompiledBackend::Test(_) => Vec::new(),
             })

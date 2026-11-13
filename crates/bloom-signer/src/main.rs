@@ -26,7 +26,6 @@ use bloom_signer::{
     engine::{AuditDegradation, SignerAuditKeys, SignerEngine},
     legacy_passkey::LegacyMigrationStore,
     registry::BackendRegistry,
-    registry::CompiledBackend,
     service::SignerRpcService,
 };
 use bloom_signer_api::{
@@ -34,8 +33,6 @@ use bloom_signer_api::{
     ControlResponse, Digest32, ProtocolError, ProtocolErrorCode, RevocationControlService,
     ServiceFuture, SignedJournalHead, Token, TypedRequestMethod, is_read_only_method,
 };
-#[cfg(feature = "aws-kms")]
-use bloom_signer_backend_api::SecretBytes;
 #[cfg(feature = "triad-dev-harness")]
 use bloom_triad_local_transport::load_developer_identity_and_manifest;
 use bloom_triad_local_transport::{
@@ -85,7 +82,9 @@ struct SignerConfig {
     control_request_window_ms: u64,
     control_maximum_journal_admissions_per_window: usize,
     control_journal_window_ms: u64,
-    aws_kms_backends: Vec<AwsKmsBackendConfig>,
+    /// Installed configs carry `"aws_kms_backends": []`; the key stays
+    /// required, and any entry is refused at startup (no AWS KMS backend).
+    aws_kms_backends: Vec<serde::de::IgnoredAny>,
     /// Ceremony window override; production templates omit it and keep the
     /// five-minute default. The developer harness sets thirty minutes.
     #[serde(default)]
@@ -125,13 +124,6 @@ struct NetworkContainmentConfig {
     maximum_age_ms: u64,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AwsKmsBackendConfig {
-    config: serde_json::Value,
-    state_authentication_key_hex: String,
-}
-
 impl Drop for SignerConfig {
     fn drop(&mut self) {
         self.revocation_signing_seed_hex.zeroize();
@@ -140,9 +132,6 @@ impl Drop for SignerConfig {
             previous.signing_seed_hex.zeroize();
         }
         self.ceremony_signing_seed_hex.zeroize();
-        for backend in &mut self.aws_kms_backends {
-            backend.state_authentication_key_hex.zeroize();
-        }
     }
 }
 
@@ -879,11 +868,9 @@ async fn run(trusted_fatal: &mut Option<TrustedFatalGuard>) -> Result<(), FatalC
     );
 
     let service_span_guard = service_span.enter();
-    let compiled_backends =
-        build_aws_backends(&mut config.aws_kms_backends).at_stage("build_aws_kms_backends")?;
-    let registry = Arc::new(
-        BackendRegistry::from_compiled(compiled_backends).at_stage("build_backend_registry")?,
-    );
+    refuse_aws_kms_backends(&config.aws_kms_backends).at_stage("build_aws_kms_backends")?;
+    let registry =
+        Arc::new(BackendRegistry::from_compiled(Vec::new()).at_stage("build_backend_registry")?);
     let engine = Arc::new(
         open_operational_signer_engine(
             &config.database_path,
@@ -2192,58 +2179,10 @@ fn take_signing_key(encoded: &mut String) -> Result<SigningKey, ProtocolError> {
     Ok(key)
 }
 
-#[cfg(feature = "aws-kms")]
-fn take_secret(encoded: &mut String, expected_bytes: usize) -> Result<SecretBytes, ProtocolError> {
-    let mut bytes =
-        hex::decode(encoded.as_bytes()).map_err(|_| invalid_key("secret must be hexadecimal"))?;
-    encoded.zeroize();
-    if bytes.len() != expected_bytes {
-        bytes.zeroize();
-        return Err(invalid_key("secret has the wrong length"));
-    }
-    let secret = SecretBytes::new(bytes.clone());
-    bytes.zeroize();
-    Ok(secret)
-}
-
-#[cfg(feature = "aws-kms")]
-fn build_aws_backends(
-    backends: &mut [AwsKmsBackendConfig],
-) -> Result<Vec<CompiledBackend>, ProtocolError> {
-    let mut compiled = Vec::with_capacity(backends.len());
-    for backend in backends {
-        let backend_config: bloom_signer_backend_aws_kms::AwsKmsInstanceConfig =
-            serde_json::from_value(backend.config.clone()).map_err(|error| {
-                ProtocolError::new(
-                    ProtocolErrorCode::BackendInvalidRequest,
-                    format!("invalid AWS KMS backend config: {error}"),
-                )
-            })?;
-        let authentication_key = take_secret(&mut backend.state_authentication_key_hex, 32)?;
-        let signer = bloom_signer_backend_aws_kms::AwsKmsSignerBackend::from_aws_sdk(
-            backend_config,
-            authentication_key,
-        )
-        .map_err(|error| {
-            ProtocolError::new(
-                ProtocolErrorCode::BackendInvalidRequest,
-                format!("construct AWS KMS backend: {error}"),
-            )
-        })?;
-        compiled.push(CompiledBackend::AwsKms(Arc::new(signer)));
-    }
-    Ok(compiled)
-}
-
-#[cfg(not(feature = "aws-kms"))]
-fn build_aws_backends(
-    backends: &mut [AwsKmsBackendConfig],
-) -> Result<Vec<CompiledBackend>, ProtocolError> {
-    for backend in backends.iter() {
-        let _ = &backend.config;
-    }
+/// This Signer has no AWS KMS backend; refuse a config that asks for one.
+fn refuse_aws_kms_backends(backends: &[serde::de::IgnoredAny]) -> Result<(), ProtocolError> {
     if backends.is_empty() {
-        Ok(Vec::new())
+        Ok(())
     } else {
         Err(ProtocolError::new(
             ProtocolErrorCode::BackendUnsupported,
