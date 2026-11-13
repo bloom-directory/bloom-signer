@@ -148,38 +148,6 @@ impl SecretBytes {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
-pub struct ProvisionedSecret {
-    pub private_material: SecretBytes,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct EncryptedExport {
-    pub format: Token,
-    pub ciphertext: Base64UrlBytes,
-}
-
-pub trait SignerBackendProvisioning: Send + Sync {
-    fn generate<'a>(
-        &'a self,
-        key_spec: KeySpec,
-    ) -> BackendFuture<'a, Result<KeyDescription, BackendError>>;
-
-    fn import<'a>(
-        &'a self,
-        key_spec: KeySpec,
-        secret: SecretBytes,
-    ) -> BackendFuture<'a, Result<KeyDescription, BackendError>>;
-
-    fn delete<'a>(&'a self, key: &'a KeyRef) -> BackendFuture<'a, Result<(), BackendError>>;
-
-    fn export_encrypted<'a>(
-        &'a self,
-        key: &'a KeyRef,
-    ) -> BackendFuture<'a, Result<EncryptedExport, BackendError>>;
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivationStatus {
