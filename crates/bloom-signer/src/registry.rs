@@ -1,5 +1,5 @@
 use bloom_signer_api::{Base64UrlBytes, KeyRef, ProtocolError, ProtocolErrorCode, Token};
-use bloom_signer_backend_api::{SecretBytes, SignerBackend};
+use bloom_signer_backend_api::{SecretBytes, SignerBackend, SignerBackendActivation};
 use parking_lot::RwLock;
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -152,7 +152,8 @@ impl BackendRegistry {
     /// Activate without awaiting, for the synchronous custody-apply path.
     ///
     /// That path holds `parking_lot` guards, whose guards are not `Send`, so it
-    /// cannot use `activate_key`, which delegates here.
+    /// cannot use `activate_key`. Both entry points funnel into the same backend
+    /// body.
     pub fn activate_key_blocking(
         &self,
         key_ref: &bloom_signer_api::KeyRef,
@@ -181,7 +182,24 @@ impl BackendRegistry {
         key_ref: &bloom_signer_api::KeyRef,
         secret: SecretBytes,
     ) -> Result<(), ProtocolError> {
-        self.activate_key_blocking(key_ref, secret)
+        match self.lookup(
+            key_ref,
+            "activation backend is not compiled into this Signer",
+        )? {
+            CompiledBackend::Local(local) => {
+                local.activate(key_ref, secret).await.map_err(|cause| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::BackendInvalidRequest,
+                        format!("local backend activation failed: {cause:?}"),
+                    )
+                })
+            }
+            #[cfg(test)]
+            CompiledBackend::Test(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                "the fault-injection test backend does not manage activation",
+            )),
+        }
     }
 
     pub async fn deactivate_key(
@@ -192,10 +210,12 @@ impl BackendRegistry {
             key_ref,
             "activation backend is not compiled into this Signer",
         )? {
-            CompiledBackend::Local(local) => {
-                local.deactivate();
-                Ok(())
-            }
+            CompiledBackend::Local(local) => local.deactivate(key_ref).await.map_err(|cause| {
+                ProtocolError::new(
+                    ProtocolErrorCode::BackendInvalidRequest,
+                    format!("local backend deactivation failed: {cause:?}"),
+                )
+            }),
             #[cfg(test)]
             CompiledBackend::Test(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,

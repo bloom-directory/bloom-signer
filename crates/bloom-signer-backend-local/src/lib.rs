@@ -7,9 +7,10 @@ use bloom_signer_api::{
     KeySpec, OperationId, SignatureEncoding, Token,
 };
 use bloom_signer_backend_api::{
-    BackendCapabilities, BackendError, BackendFuture, BackendInput, BackendSignRequest,
-    BackendSignature, DerivationCapability, KeyDescription, ProviderIdempotency, SecretBytes,
-    SignerBackend,
+    ActivationStatus, BackendCapabilities, BackendError, BackendFuture, BackendInput,
+    BackendSignRequest, BackendSignature, DerivationCapability, KeyDescription,
+    ProviderIdempotency, SecretBytes, SignerBackend, SignerBackendActivation,
+    SignerBackendDerivation,
 };
 use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
@@ -369,8 +370,10 @@ impl LocalSignerBackend {
             || self.state.read().registry.get(&key_ref.locator) == Some(key_ref)
     }
 
-    /// Synchronous so Signer's custody-apply path, which holds `parking_lot`
-    /// guards and so cannot await, can call it.
+    /// Activation body shared by the async `SignerBackendActivation::activate`
+    /// and by callers on Signer's synchronous custody-apply path, which holds
+    /// `parking_lot` guards and so cannot await. Keeping one body ensures the
+    /// two entry points cannot drift apart.
     pub fn activate_blocking(&self, secret: SecretBytes) -> Result<(), BackendError> {
         if secret.expose_to_backend().len() != 32 {
             return Err(BackendError::InvalidRequest);
@@ -385,10 +388,6 @@ impl LocalSignerBackend {
             return Err(BackendError::DefinitiveRejected);
         }
         Ok(())
-    }
-
-    pub fn deactivate(&self) {
-        self.state.write().active_kek = None;
     }
 
     pub fn key_is_available(&self, key_ref: &KeyRef) -> Result<bool, BackendError> {
@@ -1307,6 +1306,81 @@ impl SignerBackend for LocalSignerBackend {
                 }
             }
         })
+    }
+}
+
+impl SignerBackendActivation for LocalSignerBackend {
+    fn prepare<'a>(&'a self, _key: &'a KeyRef) -> BackendFuture<'a, Result<Token, BackendError>> {
+        Box::pin(async { Token::new("local-kek-v1").map_err(|_| BackendError::InvalidRequest) })
+    }
+
+    fn activate<'a>(
+        &'a self,
+        _key: &'a KeyRef,
+        secret: SecretBytes,
+    ) -> BackendFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move { self.activate_blocking(secret) })
+    }
+
+    fn deactivate<'a>(&'a self, _key: &'a KeyRef) -> BackendFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.state.write().active_kek = None;
+            Ok(())
+        })
+    }
+
+    fn activation_status<'a>(
+        &'a self,
+        _key: &'a KeyRef,
+    ) -> BackendFuture<'a, Result<ActivationStatus, BackendError>> {
+        Box::pin(async move {
+            Ok(if self.state.read().active_kek.is_some() {
+                ActivationStatus::Active
+            } else {
+                ActivationStatus::Inactive
+            })
+        })
+    }
+}
+
+impl SignerBackendDerivation for LocalSignerBackend {
+    fn supported_derivation_schemes(&self) -> Vec<DerivationCapability> {
+        self.capabilities().supported_derivation
+    }
+
+    fn derive_public<'a>(
+        &'a self,
+        root: &'a KeyRef,
+        canonical_path: &'a str,
+    ) -> BackendFuture<'a, Result<KeyDescription, BackendError>> {
+        Box::pin(async move {
+            if self.root_key_ref()? != *root {
+                return Err(BackendError::InvalidRequest);
+            }
+            let key = self
+                .state
+                .read()
+                .registry
+                .values()
+                .find(|key| {
+                    matches!(
+                        &key.derivation,
+                        Some(DerivationRef::Bip32Secp256k1 { path, .. })
+                            if path == canonical_path
+                    )
+                })
+                .cloned()
+                .ok_or(BackendError::InvalidRequest)?;
+            self.describe_key(&key).await
+        })
+    }
+
+    fn register_derived_key<'a>(
+        &'a self,
+        _root: &'a KeyRef,
+        _canonical_path: &'a str,
+    ) -> BackendFuture<'a, Result<KeyDescription, BackendError>> {
+        Box::pin(async { Err(BackendError::InvalidRequest) })
     }
 }
 

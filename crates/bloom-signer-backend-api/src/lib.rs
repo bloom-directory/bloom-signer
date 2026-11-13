@@ -4,6 +4,8 @@
 //! types here contain no Sealed Approval, Petal, policy, asset, or budget
 //! concepts.
 
+pub mod conformance;
+
 use bloom_signer_api::{
     Base64UrlBytes, CryptoInputKind, CryptoSuite, DecimalU64, Digest32, KeyRef, KeySpec,
     SignatureEncoding, Token,
@@ -144,6 +146,46 @@ impl SecretBytes {
     pub fn expose_to_backend(&self) -> &[u8] {
         &self.0
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationStatus {
+    Inactive,
+    Active,
+}
+
+pub trait SignerBackendActivation: Send + Sync {
+    fn prepare<'a>(&'a self, key: &'a KeyRef) -> BackendFuture<'a, Result<Token, BackendError>>;
+
+    fn activate<'a>(
+        &'a self,
+        key: &'a KeyRef,
+        secret: SecretBytes,
+    ) -> BackendFuture<'a, Result<(), BackendError>>;
+
+    fn deactivate<'a>(&'a self, key: &'a KeyRef) -> BackendFuture<'a, Result<(), BackendError>>;
+
+    fn activation_status<'a>(
+        &'a self,
+        key: &'a KeyRef,
+    ) -> BackendFuture<'a, Result<ActivationStatus, BackendError>>;
+}
+
+pub trait SignerBackendDerivation: Send + Sync {
+    fn supported_derivation_schemes(&self) -> Vec<DerivationCapability>;
+
+    fn derive_public<'a>(
+        &'a self,
+        root: &'a KeyRef,
+        canonical_path: &'a str,
+    ) -> BackendFuture<'a, Result<KeyDescription, BackendError>>;
+
+    fn register_derived_key<'a>(
+        &'a self,
+        root: &'a KeyRef,
+        canonical_path: &'a str,
+    ) -> BackendFuture<'a, Result<KeyDescription, BackendError>>;
 }
 
 #[cfg(test)]
