@@ -24,7 +24,6 @@ use bloom_signer::{
     ceremony::SignerCeremonyService,
     clock::SignerClock,
     engine::{AuditDegradation, SignerAuditKeys, SignerEngine},
-    legacy_passkey::LegacyMigrationStore,
     registry::BackendRegistry,
     registry::CompiledBackend,
     service::SignerRpcService,
@@ -901,28 +900,13 @@ async fn run(trusted_fatal: &mut Option<TrustedFatalGuard>) -> Result<(), FatalC
         )
         .at_stage("open_signer_engine")?,
     );
-    let migration_root = config
-        .database_path
-        .parent()
-        .ok_or_else(|| {
-            FatalCause::invariant(
-                "locate_legacy_migrations",
-                "Signer database path has no parent directory",
-            )
-        })?
-        .join("legacy-passkey-migrations");
-    let migration_store = Arc::new(
-        LegacyMigrationStore::create_for_current_process(migration_root, signer_effective_uid)
-            .at_stage("open_legacy_migration_store")?,
-    );
     let mut ceremony = SignerCeremonyService::new_with_ceremony_port(
         engine.clone(),
         Token::new(config.ceremony_key_id.clone()).at_stage("parse_ceremony_key_id")?,
         ceremony_signing_key,
         ceremony_port,
     )
-    .at_stage("open_ceremony_service")?
-    .with_legacy_migrations(migration_store);
+    .at_stage("open_ceremony_service")?;
     if let Some(ttl_ms) = config.ceremony_ttl_ms {
         ceremony = ceremony
             .with_ceremony_ttl_ms(ttl_ms)

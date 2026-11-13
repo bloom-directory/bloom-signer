@@ -7,24 +7,18 @@ use bloom_signer::webauthn::{
 use bloom_signer::{
     ceremony::{PreparedCustodyCeremony, SignerCeremonyService},
     clock::{ClockCondition, ClockDecision},
-    engine::{BackendEnrollmentBackup, SignerAuditKeys, SignerEngine},
+    engine::{BackendEnrollmentBackup, SignerEngine},
     hpke::{CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO},
-    legacy_passkey::{LEGACY_PASSKEY_INPUT_CLASS, LegacyMigrationStore, stage_legacy_wallet},
     registry::{BackendRegistry, CompiledBackend},
 };
 use bloom_signer_api::*;
 use bloom_signer_backend_api::{BackendInput, BackendSignRequest, SecretBytes};
 use bloom_signer_backend_local::LocalSignerBackend;
-use chacha20poly1305::{
-    ChaCha20Poly1305, Key, Nonce,
-    aead::{Aead as _, KeyInit as _, Payload},
-};
 use ed25519_dalek::{Signer as _, SigningKey};
 use k256::pkcs8::EncodePublicKey as _;
-use k256::{SecretKey as Secp256k1Secret, elliptic_curve::sec1::ToSec1Point as _};
 use sha2::Digest as _;
-use std::{collections::BTreeMap, os::unix::fs::MetadataExt as _, sync::Arc};
-use support::{VirtualAuthenticator, seal_hpke};
+use std::sync::Arc;
+use support::*;
 
 #[test]
 fn digit_leading_remote_rp_id_verifies_attestation_and_assertion() {
@@ -111,14 +105,6 @@ fn signed_petal_request(
     }
 }
 
-fn audit_keys() -> SignerAuditKeys {
-    SignerAuditKeys {
-        current_key_id: Token::new("signer-audit-key").unwrap(),
-        current_signing_key: SigningKey::from_bytes(&[14; 32]),
-        historical_verifying_keys: BTreeMap::new(),
-    }
-}
-
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HpkeVector {
@@ -129,10 +115,6 @@ struct HpkeVector {
     aad: Base64UrlBytes,
     plaintext: Base64UrlBytes,
     envelope: HpkeEnvelope,
-}
-
-fn digest(byte: &str) -> Digest32 {
-    Digest32::new(byte.repeat(32)).unwrap()
 }
 
 fn cross_aad(prepared: &CrossSurfaceSourcePrepared, phase: &str) -> Vec<u8> {
@@ -979,12 +961,7 @@ fn signer_restart_fences_stale_remote_readiness_until_broker_reconciles() {
     );
     drop(service);
 
-    let restarted = SignerCeremonyService::new(
-        engine,
-        Token::new("signer-ceremony-key").unwrap(),
-        SigningKey::from_bytes(&[9; 32]),
-    )
-    .unwrap();
+    let restarted = ceremony_service(engine).unwrap();
     let fenced = restarted.surface_status().unwrap();
     assert_eq!(fenced.desired_mode, ExposureMode::RemoteEnabled);
     assert_eq!(fenced.effective_mode, ExposureMode::LocalhostOnly);
@@ -996,10 +973,6 @@ fn signer_restart_fences_stale_remote_readiness_until_broker_reconciles() {
             .any(|surface| surface.identity.surface_id.as_str() == "remote"
                 && surface.lifecycle == SurfaceLifecycle::Disabled)
     );
-}
-
-fn operation(byte: &str) -> OperationId {
-    OperationId::new(byte.repeat(32)).unwrap()
 }
 
 fn backend(kek: [u8; 32]) -> (Arc<LocalSignerBackend>, KeyRef) {
@@ -1026,29 +999,7 @@ fn service(
     Arc<SignerEngine>,
     Arc<BackendRegistry>,
 ) {
-    let (backend, key_ref) = backend(authenticator.deterministic_prf());
-    let registry =
-        Arc::new(BackendRegistry::from_compiled(vec![CompiledBackend::Local(backend)]).unwrap());
-    let engine = Arc::new(
-        SignerEngine::open_in_memory(
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[9; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            audit_keys(),
-            registry.clone(),
-        )
-        .unwrap(),
-    );
-    engine.enroll_key(&key_ref).unwrap();
-    let service = SignerCeremonyService::new(
-        engine.clone(),
-        Token::new("signer-ceremony-key").unwrap(),
-        SigningKey::from_bytes(&[9; 32]),
-    )
-    .unwrap();
-    (service, key_ref, engine, registry)
+    service_on_port(authenticator, None)
 }
 
 fn service_with_port(
@@ -1060,156 +1011,35 @@ fn service_with_port(
     Arc<SignerEngine>,
     Arc<BackendRegistry>,
 ) {
+    service_on_port(authenticator, Some(ceremony_port))
+}
+
+/// An in-memory service with one enrolled local imported-scalar backend.
+fn service_on_port(
+    authenticator: &VirtualAuthenticator,
+    ceremony_port: Option<u16>,
+) -> (
+    SignerCeremonyService,
+    KeyRef,
+    Arc<SignerEngine>,
+    Arc<BackendRegistry>,
+) {
     let (backend, key_ref) = backend(authenticator.deterministic_prf());
     let registry =
         Arc::new(BackendRegistry::from_compiled(vec![CompiledBackend::Local(backend)]).unwrap());
-    let engine = Arc::new(
-        SignerEngine::open_in_memory(
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[9; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            audit_keys(),
-            registry.clone(),
-        )
-        .unwrap(),
-    );
+    let engine = open_engine(None, registry.clone());
     engine.enroll_key(&key_ref).unwrap();
-    let service = SignerCeremonyService::new_with_ceremony_port(
-        engine.clone(),
-        Token::new("signer-ceremony-key").unwrap(),
-        SigningKey::from_bytes(&[9; 32]),
-        ceremony_port,
-    )
+    let service = match ceremony_port {
+        None => ceremony_service(engine.clone()),
+        Some(port) => SignerCeremonyService::new_with_ceremony_port(
+            engine.clone(),
+            Token::new("signer-ceremony-key").unwrap(),
+            SigningKey::from_bytes(&[9; 32]),
+            port,
+        ),
+    }
     .unwrap();
     (service, key_ref, engine, registry)
-}
-
-fn terms(key_ref: KeyRef) -> SealedApprovalTerms {
-    SealedApprovalTerms {
-        subject: ApprovalSubject::Cli {
-            client_id: Token::new("bloom-cli").unwrap(),
-            command_class: Token::new("wallet.sign").unwrap(),
-        },
-        wallet_id: Token::new("wallet-1").unwrap(),
-        key_ref,
-        allowed_crypto_suites: vec![
-            CryptoSuite::Secp256k1Sha256Recoverable,
-            CryptoSuite::Secp256k1Keccak256Recoverable,
-        ],
-        selector: ApprovalSelector::Exact {
-            ordered_payload_digests: vec![digest("22")],
-            ordered_hashes: vec![digest("33")],
-        },
-        limits: ApprovalLimits {
-            max_operations: DecimalU64::new(1),
-            max_signatures: DecimalU64::new(1),
-            operation_rate_limits: vec![],
-            signature_rate_limits: vec![],
-            value_limits: vec![],
-        },
-        activation_mode: ActivationMode::BootBound,
-        wallet_revocation_epoch: DecimalU64::new(1),
-        policy_version: DecimalU64::new(1),
-        policy_digest: digest("44"),
-        provenance_digest: digest("55"),
-        request_nonce: RequestNonce::new("66".repeat(16)).unwrap(),
-        issued_at_ms: DecimalU64::new(1_000),
-        not_before_ms: DecimalU64::new(1_000),
-        // Exactly the persisted child-scope boundary (derivation committed at
-        // 10_300 plus maximum_lifetime_ms 20_000).
-        expires_at_ms: DecimalU64::new(30_300),
-        renewal_of: None,
-    }
-}
-
-fn complete_local_approval(
-    service: &SignerCeremonyService,
-    authenticator: &VirtualAuthenticator,
-    terms: SealedApprovalTerms,
-    activation_operation_id: OperationId,
-    sign_count: u32,
-    now_ms: u64,
-) -> SignerActivationReceipt {
-    try_complete_local_approval(
-        service,
-        authenticator,
-        terms,
-        activation_operation_id,
-        sign_count,
-        now_ms,
-    )
-    .unwrap()
-}
-
-fn try_complete_local_approval(
-    service: &SignerCeremonyService,
-    authenticator: &VirtualAuthenticator,
-    terms: SealedApprovalTerms,
-    activation_operation_id: OperationId,
-    sign_count: u32,
-    now_ms: u64,
-) -> Result<SignerActivationReceipt, ProtocolError> {
-    let review_manifest_digest = digest("76");
-    let (exact_ordered_payload_digests, exact_ordered_hashes) = match &terms.selector {
-        ApprovalSelector::Exact {
-            ordered_payload_digests,
-            ordered_hashes,
-        } => (ordered_payload_digests.clone(), ordered_hashes.clone()),
-        ApprovalSelector::Petal { .. } => (Vec::new(), Vec::new()),
-    };
-    let prepared = service.prepare_approval(
-        CeremonyPrepareRequest {
-            surface: bloom_signer_api::legacy_local_surface(),
-            activation_operation_id: activation_operation_id.clone(),
-            terms: terms.clone(),
-            review_manifest_digest: review_manifest_digest.clone(),
-            exact_ordered_payload_digests,
-            exact_ordered_hashes,
-            replacement_approval_id: None,
-        },
-        now_ms,
-    )?;
-    let assertion = authenticator.assertion(
-        &prepared.challenges[0].canonical_bytes().unwrap(),
-        sign_count,
-    );
-    let aad = LocalPrfHpkeAad {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_id: prepared.contribution.ceremony_id.clone(),
-        signer_nonce: prepared.contribution.signer_nonce.clone(),
-        approval_id: terms.approval_id().unwrap(),
-        approval_digest: terms.approval_digest().unwrap(),
-        review_manifest_digest,
-        key_ref: terms.key_ref.clone(),
-        allowed_crypto_suites: terms.allowed_crypto_suites.clone(),
-        credential_id: assertion.credential_id.clone(),
-        activation_mode: terms.activation_mode.clone(),
-        wallet_revocation_epoch: terms.wallet_revocation_epoch.clone(),
-    }
-    .canonical_bytes()
-    .unwrap();
-    let encrypted_local_prf = seal_hpke(
-        prepared
-            .contribution
-            .ephemeral_encryption_public_key
-            .as_ref()
-            .unwrap(),
-        LOCAL_PRF_INFO,
-        &aad,
-        &authenticator.deterministic_prf(),
-    )
-    .unwrap();
-    futures::executor::block_on(service.complete_approval(
-        CeremonyCompleteRequest {
-            activation_operation_id,
-            proof: WebAuthnCeremonyProof::Assertion { assertion },
-            contribution: prepared.contribution,
-            encrypted_local_prf: Some(encrypted_local_prf),
-        },
-        now_ms + 1,
-    ))
 }
 
 fn register_wallet(
@@ -1219,63 +1049,17 @@ fn register_wallet(
     now_ms: u64,
 ) -> (Token, WebAuthnCredential) {
     let wallet_id = Token::new(format!("wallet-{}", &operation_id.as_str()[..12])).unwrap();
-    let prepare = CustodyPrepareRequest {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_kind: CeremonyKind::WalletRegistration,
-        custody_operation_id: operation_id.clone(),
-        wallet_id: Some(wallet_id.clone()),
-        key_ref: None,
-        exact_terms_digest: digest("a1"),
-        expected_input_class: Token::new("passkey-prf").unwrap(),
-        browser_output_recipient_key: None,
-        petal_key_scope: None,
-        legacy_passkey_migration: None,
-        wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
-        derivation_requests: Vec::new(),
-    };
-    let prepared = service.prepare_custody(prepare, now_ms).unwrap();
-    let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
     let credential = authenticator.credential(0);
-    let prf_assertion =
-        authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
-    let aad = CustodyHpkeAad {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_id: prepared.contribution.ceremony_id.clone(),
-        ceremony_kind: CeremonyKind::WalletRegistration,
-        custody_operation_id: operation_id.clone(),
-        signer_nonce: prepared.contribution.signer_nonce.clone(),
-        signer_contribution_digest: prepared.contribution.digest().unwrap(),
-        wallet_id: prepared.contribution.wallet_id.clone(),
-        key_ref: None,
-        credential_id: Some(attestation.credential_id.clone()),
-        expected_input_class: Token::new("passkey-prf").unwrap(),
-    }
-    .canonical_bytes()
-    .unwrap();
-    let encrypted_input = seal_hpke(
-        &prepared.contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
+    let (_, contribution) = registration_custody(
+        service,
+        authenticator,
+        bip39_registration_request(&wallet_id, &operation_id),
         &authenticator.deterministic_prf(),
+        None,
+        now_ms,
     )
     .unwrap();
-    assert_eq!(prepared.contribution.wallet_id.as_ref(), Some(&wallet_id));
-    service
-        .complete_custody(
-            CustodyCompleteRequest {
-                ceremony_kind: CeremonyKind::WalletRegistration,
-                custody_operation_id: operation_id,
-                ceremony_id: prepared.contribution.ceremony_id,
-                proof: WebAuthnCeremonyProof::Registration {
-                    attestation,
-                    prf_assertion: Some(prf_assertion),
-                },
-                encrypted_input: Some(encrypted_input),
-                public_binding_digest: digest("a1"),
-            },
-            now_ms + 100,
-        )
-        .unwrap();
+    assert_eq!(contribution.wallet_id.as_ref(), Some(&wallet_id));
     (wallet_id, credential)
 }
 
@@ -1289,48 +1073,27 @@ fn complete_new_wallet(
     now_ms: u64,
 ) -> (CustodyResult, CustodySignerContribution) {
     let wallet_id = Token::new(format!("wallet-{}", &operation_id.as_str()[..12])).unwrap();
-    let expected_input_class = if kind == CeremonyKind::WalletImport {
-        Token::new("raw-private-key-v1").unwrap()
-    } else {
-        Token::new("passkey-prf").unwrap()
-    };
-    let wallet_seed_profile = if kind == CeremonyKind::WalletImport {
-        Some(WalletSeedProfile::ImportedSecp256k1Scalar)
-    } else {
-        Some(WalletSeedProfile::Bip39MulticurveV1)
-    };
-    let mut prepared = service
-        .prepare_custody(
-            CustodyPrepareRequest {
-                surface: bloom_signer_api::legacy_local_surface(),
-                ceremony_kind: kind,
-                custody_operation_id: operation_id.clone(),
-                wallet_id: Some(wallet_id.clone()),
-                key_ref: None,
-                exact_terms_digest: digest("d1"),
-                expected_input_class: expected_input_class.clone(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-                derivation_requests: Vec::new(),
-                wallet_seed_profile,
+    let import = kind == CeremonyKind::WalletImport;
+    let request = CustodyPrepareRequest {
+        wallet_seed_profile: Some(if import {
+            WalletSeedProfile::ImportedSecp256k1Scalar
+        } else {
+            WalletSeedProfile::Bip39MulticurveV1
+        }),
+        ..custody_prepare(
+            kind,
+            &operation_id,
+            &wallet_id,
+            None,
+            digest("d1"),
+            if import {
+                "raw-private-key-v1"
+            } else {
+                "passkey-prf"
             },
-            now_ms,
         )
-        .unwrap();
-    if let Some(recipient) = output_recipient {
-        prepared = service
-            .bind_custody_output_recipient(
-                &operation_id,
-                recipient.public_key().clone(),
-                now_ms + 1,
-            )
-            .unwrap();
-    }
-    let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
-    let prf_assertion =
-        authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
-    let plaintext = if kind == CeremonyKind::WalletImport {
+    };
+    let plaintext = if import {
         serde_jcs::to_vec(&serde_json::json!({
             "raw_private_key": Base64UrlBytes::from_bytes(raw_private_key.unwrap()),
             "credential_prf": Base64UrlBytes::from_bytes(
@@ -1341,44 +1104,15 @@ fn complete_new_wallet(
     } else {
         authenticator.deterministic_prf().to_vec()
     };
-    let aad = CustodyHpkeAad {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_id: prepared.contribution.ceremony_id.clone(),
-        ceremony_kind: kind,
-        custody_operation_id: operation_id.clone(),
-        signer_nonce: prepared.contribution.signer_nonce.clone(),
-        signer_contribution_digest: prepared.contribution.digest().unwrap(),
-        wallet_id: prepared.contribution.wallet_id.clone(),
-        key_ref: None,
-        credential_id: Some(attestation.credential_id.clone()),
-        expected_input_class,
-    }
-    .canonical_bytes()
-    .unwrap();
-    let encrypted_input = seal_hpke(
-        &prepared.contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
+    registration_custody(
+        service,
+        authenticator,
+        request,
         &plaintext,
+        output_recipient,
+        now_ms,
     )
-    .unwrap();
-    let result = service
-        .complete_custody(
-            CustodyCompleteRequest {
-                ceremony_kind: kind,
-                custody_operation_id: operation_id,
-                ceremony_id: prepared.contribution.ceremony_id.clone(),
-                proof: WebAuthnCeremonyProof::Registration {
-                    attestation,
-                    prf_assertion: Some(prf_assertion),
-                },
-                encrypted_input: Some(encrypted_input),
-                public_binding_digest: digest("d1"),
-            },
-            now_ms + 100,
-        )
-        .unwrap();
-    (result, prepared.contribution)
+    .unwrap()
 }
 
 fn complete_generic(
@@ -1391,71 +1125,15 @@ fn complete_generic(
     now_ms: u64,
 ) -> Result<(CustodyResult, CustodySignerContribution), ProtocolError> {
     let (kind, operation_id, effect) = workflow;
-    let exact_terms_digest =
-        Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&effect).unwrap()).into());
-    let mut prepared = service.prepare_custody(
-        CustodyPrepareRequest {
-            surface: bloom_signer_api::legacy_local_surface(),
-            ceremony_kind: kind,
-            custody_operation_id: operation_id.clone(),
-            wallet_id: Some(wallet_id.clone()),
-            key_ref: key_ref.clone(),
-            exact_terms_digest: exact_terms_digest.clone(),
-            expected_input_class: Token::new("generic-custody-v1").unwrap(),
-            browser_output_recipient_key: None,
-            petal_key_scope: None,
-            legacy_passkey_migration: None,
-            derivation_requests: Vec::new(),
-            wallet_seed_profile: None,
-        },
+    let request = generic_prepare(kind, &operation_id, wallet_id, key_ref, &effect);
+    assertion_custody(
+        service,
+        authenticator,
+        request,
+        effect,
+        output_recipient,
         now_ms,
-    )?;
-    if let Some(recipient) = output_recipient {
-        prepared = service.bind_custody_output_recipient(
-            &operation_id,
-            recipient.public_key().clone(),
-            now_ms + 1,
-        )?;
-    }
-    let assertion =
-        authenticator.assertion(&prepared.challenges[0].canonical_bytes()?, now_ms as u32);
-    let aad = CustodyHpkeAad {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_id: prepared.contribution.ceremony_id.clone(),
-        ceremony_kind: kind,
-        custody_operation_id: operation_id.clone(),
-        signer_nonce: prepared.contribution.signer_nonce.clone(),
-        signer_contribution_digest: prepared.contribution.digest()?,
-        wallet_id: Some(wallet_id.clone()),
-        key_ref,
-        credential_id: Some(assertion.credential_id.clone()),
-        expected_input_class: Token::new("generic-custody-v1").unwrap(),
-    }
-    .canonical_bytes()?;
-    let plaintext = serde_jcs::to_vec(&serde_json::json!({
-        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-        "effect": effect,
-    }))
-    .unwrap();
-    let encrypted_input = seal_hpke(
-        &prepared.contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
-        &plaintext,
     )
-    .unwrap();
-    let result = service.complete_custody(
-        CustodyCompleteRequest {
-            ceremony_kind: kind,
-            custody_operation_id: operation_id,
-            ceremony_id: prepared.contribution.ceremony_id.clone(),
-            proof: WebAuthnCeremonyProof::Assertion { assertion },
-            encrypted_input: Some(encrypted_input),
-            public_binding_digest: exact_terms_digest,
-        },
-        now_ms + 100,
-    )?;
-    Ok((result, prepared.contribution))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1724,27 +1402,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     let database = temp.path().join("signer.sqlite");
     let authenticator = VirtualAuthenticator::generate();
     let broker = SigningKey::from_bytes(&[7; 32]);
-    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
-    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
-    let engine = Arc::new(
-        SignerEngine::open(
-            &database,
-            Token::new("broker-app-1").unwrap(),
-            broker.verifying_key(),
-            ceremony_key.verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            audit_keys(),
-            registry,
-        )
-        .unwrap(),
-    );
-    let service = SignerCeremonyService::new(
-        engine.clone(),
-        Token::new("signer-ceremony-key").unwrap(),
-        ceremony_key.clone(),
-    )
-    .unwrap();
+    let (service, engine, _) = bip39_service(&database);
     let (wallet_id, _) = register_wallet(&service, &authenticator, operation("b1"), 10_000);
     // A BIP-39 wallet's root is a non-signable seed. Registration allocates both
     // families and the primary EVM child is the canonical Petal parent.
@@ -1857,26 +1515,7 @@ fn petal_subkeys_are_signer_owned_scoped_restart_safe_and_never_cross_principals
     // A fresh engine and empty registry restore both custody and the derived
     // key from Signer's durable records. The scope remains an independent
     // authorization boundary after restart.
-    let restarted_registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
-    let restarted_engine = Arc::new(
-        SignerEngine::open(
-            &database,
-            Token::new("broker-app-1").unwrap(),
-            broker.verifying_key(),
-            ceremony_key.verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            audit_keys(),
-            restarted_registry.clone(),
-        )
-        .unwrap(),
-    );
-    let restarted_service = SignerCeremonyService::new(
-        restarted_engine.clone(),
-        Token::new("signer-ceremony-key").unwrap(),
-        ceremony_key,
-    )
-    .unwrap();
+    let (restarted_service, restarted_engine, _) = bip39_service(&database);
     let policy = restarted_engine.policy_snapshot(&wallet_id).unwrap();
     let epoch = restarted_engine
         .revocation_state(&wallet_id, 10_400)
@@ -2504,12 +2143,7 @@ fn approval_completion_verifies_raw_proof_decrypts_prf_and_is_idempotent() {
     assert_eq!(receipt.allowed_crypto_suites, terms.allowed_crypto_suites);
 
     drop(service);
-    let restarted = SignerCeremonyService::new(
-        engine,
-        Token::new("signer-ceremony-key").unwrap(),
-        SigningKey::from_bytes(&[9; 32]),
-    )
-    .unwrap();
+    let restarted = ceremony_service(engine).unwrap();
     let recovered =
         futures::executor::block_on(restarted.complete_approval(complete, 2_700)).unwrap();
     assert_eq!(receipt, recovered);
@@ -2675,12 +2309,7 @@ fn stale_webauthn_counter_fails_closed_into_a_durable_terminal_ceremony() {
 
     // Restart destroys the in-process ceremony state; the terminal remains.
     drop(service);
-    let restarted = SignerCeremonyService::new(
-        engine,
-        Token::new("signer-ceremony-key").unwrap(),
-        SigningKey::from_bytes(&[9; 32]),
-    )
-    .unwrap();
+    let restarted = ceremony_service(engine).unwrap();
     assert!(matches!(
         restarted.status(&operation("41")).unwrap(),
         bloom_signer::ceremony::SignerCeremonyStatus::Terminal(CeremonyState::Failed)
@@ -2866,12 +2495,7 @@ fn custody_registration_restart_and_passkey_add_are_atomic_and_kind_bound() {
             .is_err()
     );
     let engine_after_restart = engine.clone();
-    let restarted = SignerCeremonyService::new(
-        engine,
-        Token::new("signer-ceremony-key").unwrap(),
-        SigningKey::from_bytes(&[9; 32]),
-    )
-    .unwrap();
+    let restarted = ceremony_service(engine).unwrap();
     assert!(!registry.key_is_available(&registered_root).unwrap());
     let restarted_accounts = engine_after_restart
         .derived_account_descriptors(&registered_wallet_id)
@@ -3077,162 +2701,6 @@ fn registration_requires_and_reserves_the_requested_wallet_id() {
         )
         .unwrap_err();
     assert_eq!(duplicate.code, ProtocolErrorCode::OperationIdConflict);
-}
-
-#[test]
-fn legacy_passkey_import_converts_existing_credential_into_current_custody() {
-    let temporary = tempfile::tempdir().unwrap();
-    let wallet_name = "legacy-wallet";
-    let hash = blake3::hash(wallet_name.as_bytes());
-    let mut user_handle = [0_u8; 16];
-    user_handle.copy_from_slice(&hash.as_bytes()[..16]);
-    user_handle[6] = (user_handle[6] & 0x0f) | 0x50;
-    user_handle[8] = (user_handle[8] & 0x3f) | 0x80;
-    let authenticator = VirtualAuthenticator::generate_with_user_handle(&user_handle);
-    let (service, _, _, _) = service(&authenticator);
-
-    let source = temporary.path().join(wallet_name);
-    std::fs::create_dir(&source).unwrap();
-    let metadata = std::fs::metadata(&source).unwrap();
-    let private = [11_u8; 32];
-    let secret = Secp256k1Secret::from_slice(&private).unwrap();
-    let public = secret.public_key().to_sec1_point(false);
-    let address_hash = sha3::Keccak256::digest(&public.as_bytes()[1..]);
-    let address = format!("0x{}", hex::encode(&address_hash[12..]));
-    let prf = authenticator.deterministic_prf();
-    let nonce = [12_u8; 12];
-    let wrap = blake3::derive_key("bloom passkey wrap key", &prf);
-    let key: &Key = wrap.as_slice().try_into().unwrap();
-    let nonce_ref: &Nonce = nonce.as_slice().try_into().unwrap();
-    let ciphertext = ChaCha20Poly1305::new(key)
-        .encrypt(
-            nonce_ref,
-            Payload {
-                msg: &private,
-                aad: b"bloom-keystore-passkey",
-            },
-        )
-        .unwrap();
-    std::fs::write(source.join("kind"), "passkey").unwrap();
-    std::fs::write(source.join("address"), &address).unwrap();
-    std::fs::write(source.join("pubkey"), hex::encode(public.as_bytes())).unwrap();
-    std::fs::write(
-        source.join("prf.salt"),
-        hex::encode(authenticator.credential(0).prf_salt.decode()),
-    )
-    .unwrap();
-    std::fs::write(
-        source.join("encrypted.key"),
-        serde_json::to_vec(&serde_json::json!({
-            "v": 1,
-            "nonce_hex": hex::encode(nonce),
-            "ciphertext_hex": hex::encode(ciphertext)
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    std::fs::write(
-        source.join("passkey.json"),
-        serde_json::to_vec(&authenticator.legacy_passkey_json(0)).unwrap(),
-    )
-    .unwrap();
-
-    let migration_root = temporary.path().join("migration-store");
-    let receipt = stage_legacy_wallet(
-        &source,
-        &migration_root,
-        metadata.uid(),
-        metadata.uid(),
-        metadata.gid(),
-    )
-    .unwrap();
-    let store = Arc::new(LegacyMigrationStore::open(&migration_root, metadata.uid()).unwrap());
-    let service = service.with_legacy_migrations(store.clone());
-    let request = CustodyPrepareRequest {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_kind: CeremonyKind::WalletImport,
-        custody_operation_id: receipt.operation_id.clone(),
-        wallet_id: None,
-        key_ref: None,
-        exact_terms_digest: receipt.exact_terms_digest.clone(),
-        expected_input_class: Token::new(LEGACY_PASSKEY_INPUT_CLASS).unwrap(),
-        browser_output_recipient_key: None,
-        petal_key_scope: None,
-        legacy_passkey_migration: Some(receipt.public_terms().unwrap()),
-        wallet_seed_profile: None,
-        derivation_requests: Vec::new(),
-    };
-    let initially_prepared = service.prepare_custody(request, 40_000).unwrap();
-    let output_recipient = HpkeRecipient::generate();
-    let prepared = service
-        .bind_custody_output_recipient(
-            &receipt.operation_id,
-            output_recipient.public_key().clone(),
-            40_000,
-        )
-        .unwrap();
-    assert_eq!(
-        initially_prepared.contribution.ceremony_id,
-        prepared.contribution.ceremony_id
-    );
-    assert_eq!(
-        prepared.contribution.wallet_id.as_ref().unwrap().as_str(),
-        wallet_name
-    );
-    assert_eq!(prepared.challenges.len(), 1);
-    assert_eq!(prepared.verification_credentials.len(), 1);
-    assert!(prepared.webauthn_options.registration_user_handle.is_none());
-    let assertion = authenticator.assertion(&prepared.challenges[0].canonical_bytes().unwrap(), 1);
-    let plaintext = serde_jcs::to_vec(&serde_json::json!({
-        "credential_prf": Base64UrlBytes::from_bytes(&prf)
-    }))
-    .unwrap();
-    let aad = CustodyHpkeAad {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_id: prepared.contribution.ceremony_id.clone(),
-        ceremony_kind: CeremonyKind::WalletImport,
-        custody_operation_id: receipt.operation_id.clone(),
-        signer_nonce: prepared.contribution.signer_nonce.clone(),
-        signer_contribution_digest: prepared.contribution.digest().unwrap(),
-        wallet_id: prepared.contribution.wallet_id.clone(),
-        key_ref: None,
-        credential_id: Some(assertion.credential_id.clone()),
-        expected_input_class: Token::new(LEGACY_PASSKEY_INPUT_CLASS).unwrap(),
-    }
-    .canonical_bytes()
-    .unwrap();
-    let encrypted_input = seal_hpke(
-        &prepared.contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
-        &plaintext,
-    )
-    .unwrap();
-    let result = service
-        .complete_custody(
-            CustodyCompleteRequest {
-                ceremony_kind: CeremonyKind::WalletImport,
-                custody_operation_id: receipt.operation_id.clone(),
-                ceremony_id: prepared.contribution.ceremony_id,
-                proof: WebAuthnCeremonyProof::Assertion { assertion },
-                encrypted_input: Some(encrypted_input),
-                public_binding_digest: receipt.exact_terms_digest,
-            },
-            40_001,
-        )
-        .unwrap();
-    assert_eq!(result.public_status, CeremonyState::Succeeded);
-    assert_eq!(result.wallet_id.as_ref().unwrap().as_str(), wallet_name);
-    assert_eq!(result.public_key_refs.len(), 1);
-    assert_eq!(result.credential_summaries.len(), 1);
-    assert!(result.encrypted_browser_result.is_some());
-    assert!(store.load(&receipt.operation_id).is_err());
-    match service.status(&receipt.operation_id).unwrap() {
-        bloom_signer::ceremony::SignerCeremonyStatus::CompletedCustody(stored) => {
-            assert_eq!(*stored, result)
-        }
-        _ => panic!("legacy migration result was not durable"),
-    }
 }
 
 #[test]
@@ -4011,28 +3479,7 @@ fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
     let temp = tempfile::tempdir().unwrap();
     let database = temp.path().join("signer.sqlite");
     let authenticator = VirtualAuthenticator::generate();
-    let broker = SigningKey::from_bytes(&[7; 32]);
-    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
-    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
-    let engine = Arc::new(
-        SignerEngine::open(
-            &database,
-            Token::new("broker-app-1").unwrap(),
-            broker.verifying_key(),
-            ceremony_key.verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            audit_keys(),
-            registry.clone(),
-        )
-        .unwrap(),
-    );
-    let service = SignerCeremonyService::new(
-        engine.clone(),
-        Token::new("signer-ceremony-key").unwrap(),
-        ceremony_key.clone(),
-    )
-    .unwrap();
+    let (service, _engine, registry) = bip39_service(&database);
     let wallet_id = Token::new("petal-staging-wallet").unwrap();
     let registration = complete_bip39_registration(
         &service,
@@ -4101,28 +3548,7 @@ fn key_derive_activates_the_local_backend_from_its_own_ceremony() {
     let temp = tempfile::tempdir().unwrap();
     let database = temp.path().join("signer.sqlite");
     let authenticator = VirtualAuthenticator::generate();
-    let broker = SigningKey::from_bytes(&[7; 32]);
-    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
-    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
-    let engine = Arc::new(
-        SignerEngine::open(
-            &database,
-            Token::new("broker-app-1").unwrap(),
-            broker.verifying_key(),
-            ceremony_key.verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            audit_keys(),
-            registry.clone(),
-        )
-        .unwrap(),
-    );
-    let service = SignerCeremonyService::new(
-        engine.clone(),
-        Token::new("signer-ceremony-key").unwrap(),
-        ceremony_key.clone(),
-    )
-    .unwrap();
+    let (service, _engine, registry) = bip39_service(&database);
     let wallet_id = Token::new("petal-activation-wallet").unwrap();
     let registration = complete_bip39_registration(
         &service,
@@ -4194,272 +3620,6 @@ fn only_petal_key_derivation_arms_the_backend() {
 // through the real SignerCeremonyService dispatch.
 // ============================================================================
 
-fn bip39_service(
-    authenticator: &VirtualAuthenticator,
-) -> (
-    SignerCeremonyService,
-    Arc<SignerEngine>,
-    Arc<BackendRegistry>,
-) {
-    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
-    let engine = Arc::new(
-        SignerEngine::open_in_memory(
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[9; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            audit_keys(),
-            registry.clone(),
-        )
-        .unwrap(),
-    );
-    let _ = authenticator;
-    let service = SignerCeremonyService::new(
-        engine.clone(),
-        Token::new("signer-ceremony-key").unwrap(),
-        SigningKey::from_bytes(&[9; 32]),
-    )
-    .unwrap();
-    (service, engine, registry)
-}
-
-fn bip39_registration_prepare(
-    service: &SignerCeremonyService,
-    wallet_id: &Token,
-    operation_id: &OperationId,
-    now_ms: u64,
-) -> PreparedCustodyCeremony {
-    service
-        .prepare_custody(
-            CustodyPrepareRequest {
-                surface: bloom_signer_api::legacy_local_surface(),
-                ceremony_kind: CeremonyKind::WalletRegistration,
-                custody_operation_id: operation_id.clone(),
-                wallet_id: Some(wallet_id.clone()),
-                key_ref: None,
-                exact_terms_digest: digest("a1"),
-                expected_input_class: Token::new("passkey-prf").unwrap(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-                wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
-                derivation_requests: Vec::new(),
-            },
-            now_ms,
-        )
-        .unwrap()
-}
-
-fn complete_bip39_registration(
-    service: &SignerCeremonyService,
-    authenticator: &VirtualAuthenticator,
-    wallet_id: &Token,
-    operation_id: &OperationId,
-    now_ms: u64,
-) -> CustodyResult {
-    try_complete_bip39_registration(service, authenticator, wallet_id, operation_id, now_ms)
-        .unwrap()
-}
-
-fn try_complete_bip39_registration(
-    service: &SignerCeremonyService,
-    authenticator: &VirtualAuthenticator,
-    wallet_id: &Token,
-    operation_id: &OperationId,
-    now_ms: u64,
-) -> Result<CustodyResult, ProtocolError> {
-    let prepared = bip39_registration_prepare(service, wallet_id, operation_id, now_ms);
-    let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
-    let prf_assertion =
-        authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
-    let aad = CustodyHpkeAad {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_id: prepared.contribution.ceremony_id.clone(),
-        ceremony_kind: CeremonyKind::WalletRegistration,
-        custody_operation_id: operation_id.clone(),
-        signer_nonce: prepared.contribution.signer_nonce.clone(),
-        signer_contribution_digest: prepared.contribution.digest().unwrap(),
-        wallet_id: prepared.contribution.wallet_id.clone(),
-        key_ref: None,
-        credential_id: Some(attestation.credential_id.clone()),
-        expected_input_class: Token::new("passkey-prf").unwrap(),
-    }
-    .canonical_bytes()
-    .unwrap();
-    let encrypted_input = seal_hpke(
-        &prepared.contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
-        &authenticator.deterministic_prf(),
-    )
-    .unwrap();
-    service.complete_custody(
-        CustodyCompleteRequest {
-            ceremony_kind: CeremonyKind::WalletRegistration,
-            custody_operation_id: operation_id.clone(),
-            ceremony_id: prepared.contribution.ceremony_id,
-            proof: WebAuthnCeremonyProof::Registration {
-                attestation,
-                prf_assertion: Some(prf_assertion),
-            },
-            encrypted_input: Some(encrypted_input),
-            public_binding_digest: digest("a1"),
-        },
-        now_ms + 100,
-    )
-}
-
-fn complete_bip39_mnemonic_import(
-    service: &SignerCeremonyService,
-    authenticator: &VirtualAuthenticator,
-    wallet_id: &Token,
-    operation_id: &OperationId,
-    mnemonic: &str,
-    now_ms: u64,
-) -> CustodyResult {
-    let prepared = service
-        .prepare_custody(
-            CustodyPrepareRequest {
-                surface: bloom_signer_api::legacy_local_surface(),
-                ceremony_kind: CeremonyKind::WalletImport,
-                custody_operation_id: operation_id.clone(),
-                wallet_id: Some(wallet_id.clone()),
-                key_ref: None,
-                exact_terms_digest: digest("a2"),
-                expected_input_class: Token::new("bip39-mnemonic").unwrap(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-                wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
-                derivation_requests: Vec::new(),
-            },
-            now_ms,
-        )
-        .unwrap();
-    let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
-    let prf_assertion =
-        authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
-    let plaintext = serde_jcs::to_vec(&serde_json::json!({
-        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-        "mnemonic": mnemonic,
-    }))
-    .unwrap();
-    let aad = CustodyHpkeAad {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_id: prepared.contribution.ceremony_id.clone(),
-        ceremony_kind: CeremonyKind::WalletImport,
-        custody_operation_id: operation_id.clone(),
-        signer_nonce: prepared.contribution.signer_nonce.clone(),
-        signer_contribution_digest: prepared.contribution.digest().unwrap(),
-        wallet_id: prepared.contribution.wallet_id.clone(),
-        key_ref: None,
-        credential_id: Some(attestation.credential_id.clone()),
-        expected_input_class: Token::new("bip39-mnemonic").unwrap(),
-    }
-    .canonical_bytes()
-    .unwrap();
-    let encrypted_input = seal_hpke(
-        &prepared.contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
-        &plaintext,
-    )
-    .unwrap();
-    service
-        .complete_custody(
-            CustodyCompleteRequest {
-                ceremony_kind: CeremonyKind::WalletImport,
-                custody_operation_id: operation_id.clone(),
-                ceremony_id: prepared.contribution.ceremony_id,
-                proof: WebAuthnCeremonyProof::Registration {
-                    attestation,
-                    prf_assertion: Some(prf_assertion),
-                },
-                encrypted_input: Some(encrypted_input),
-                public_binding_digest: digest("a2"),
-            },
-            now_ms + 100,
-        )
-        .unwrap()
-}
-
-fn attempt_bip39_mnemonic_import(
-    service: &SignerCeremonyService,
-    authenticator: &VirtualAuthenticator,
-    wallet_id: &Token,
-    operation_id: &OperationId,
-    mnemonic: &str,
-    passphrase_field: Option<&str>,
-    now_ms: u64,
-) -> Result<CustodyResult, ProtocolError> {
-    let prepared = service
-        .prepare_custody(
-            CustodyPrepareRequest {
-                surface: bloom_signer_api::legacy_local_surface(),
-                ceremony_kind: CeremonyKind::WalletImport,
-                custody_operation_id: operation_id.clone(),
-                wallet_id: Some(wallet_id.clone()),
-                key_ref: None,
-                exact_terms_digest: digest("a2"),
-                expected_input_class: Token::new("bip39-mnemonic").unwrap(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-                wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
-                derivation_requests: Vec::new(),
-            },
-            now_ms,
-        )
-        .unwrap();
-    let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
-    let prf_assertion =
-        authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
-    let mut input = serde_json::json!({
-        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-        "mnemonic": mnemonic,
-    });
-    if let Some(passphrase) = passphrase_field {
-        input["passphrase"] = serde_json::json!(passphrase);
-    }
-    let plaintext = serde_jcs::to_vec(&input).unwrap();
-    let aad = CustodyHpkeAad {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_id: prepared.contribution.ceremony_id.clone(),
-        ceremony_kind: CeremonyKind::WalletImport,
-        custody_operation_id: operation_id.clone(),
-        signer_nonce: prepared.contribution.signer_nonce.clone(),
-        signer_contribution_digest: prepared.contribution.digest().unwrap(),
-        wallet_id: prepared.contribution.wallet_id.clone(),
-        key_ref: None,
-        credential_id: Some(attestation.credential_id.clone()),
-        expected_input_class: Token::new("bip39-mnemonic").unwrap(),
-    }
-    .canonical_bytes()
-    .unwrap();
-    let encrypted_input = seal_hpke(
-        &prepared.contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
-        &plaintext,
-    )
-    .unwrap();
-    service.complete_custody(
-        CustodyCompleteRequest {
-            ceremony_kind: CeremonyKind::WalletImport,
-            custody_operation_id: operation_id.clone(),
-            ceremony_id: prepared.contribution.ceremony_id,
-            proof: WebAuthnCeremonyProof::Registration {
-                attestation,
-                prf_assertion: Some(prf_assertion),
-            },
-            encrypted_input: Some(encrypted_input),
-            public_binding_digest: digest("a2"),
-        },
-        now_ms + 100,
-    )
-}
-
 fn complete_account_allocate(
     service: &SignerCeremonyService,
     authenticator: &VirtualAuthenticator,
@@ -4468,72 +3628,15 @@ fn complete_account_allocate(
     request: DerivedAccountRequest,
     now_ms: u64,
 ) -> (CustodyResult, CustodySignerContribution) {
-    let effect = serde_json::json!({ "kind": "account_allocate" });
-    let exact_terms_digest =
-        Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&effect).unwrap()).into());
-    let prepared = service
-        .prepare_custody(
-            CustodyPrepareRequest {
-                surface: bloom_signer_api::legacy_local_surface(),
-                ceremony_kind: CeremonyKind::AccountAllocate,
-                custody_operation_id: operation_id.clone(),
-                wallet_id: Some(wallet_id.clone()),
-                key_ref: None,
-                exact_terms_digest: exact_terms_digest.clone(),
-                expected_input_class: Token::new("generic-custody-v1").unwrap(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-                wallet_seed_profile: None,
-                derivation_requests: vec![request],
-            },
-            now_ms,
-        )
-        .unwrap();
-    let assertion = authenticator.assertion(
-        &prepared.challenges[0].canonical_bytes().unwrap(),
-        now_ms as u32,
-    );
-    let aad = CustodyHpkeAad {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_id: prepared.contribution.ceremony_id.clone(),
-        ceremony_kind: CeremonyKind::AccountAllocate,
-        custody_operation_id: operation_id.clone(),
-        signer_nonce: prepared.contribution.signer_nonce.clone(),
-        signer_contribution_digest: prepared.contribution.digest().unwrap(),
-        wallet_id: Some(wallet_id.clone()),
-        key_ref: None,
-        credential_id: Some(assertion.credential_id.clone()),
-        expected_input_class: Token::new("generic-custody-v1").unwrap(),
-    }
-    .canonical_bytes()
-    .unwrap();
-    let plaintext = serde_jcs::to_vec(&serde_json::json!({
-        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-        "effect": effect,
-    }))
-    .unwrap();
-    let encrypted_input = seal_hpke(
-        &prepared.contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
-        &plaintext,
+    try_complete_account_allocate(
+        service,
+        authenticator,
+        wallet_id,
+        operation_id,
+        vec![request],
+        now_ms,
     )
-    .unwrap();
-    let result = service
-        .complete_custody(
-            CustodyCompleteRequest {
-                ceremony_kind: CeremonyKind::AccountAllocate,
-                custody_operation_id: operation_id.clone(),
-                ceremony_id: prepared.contribution.ceremony_id.clone(),
-                proof: WebAuthnCeremonyProof::Assertion { assertion },
-                encrypted_input: Some(encrypted_input),
-                public_binding_digest: exact_terms_digest,
-            },
-            now_ms + 100,
-        )
-        .unwrap();
-    (result, prepared.contribution)
+    .unwrap()
 }
 
 /// The allocation prepare request for either request shape.
@@ -4541,33 +3644,21 @@ fn account_allocate_prepare(
     wallet_id: &Token,
     operation_id: &OperationId,
     many: Vec<DerivedAccountRequest>,
-) -> (CustodyPrepareRequest, Digest32, serde_json::Value) {
-    let effect = serde_json::json!({ "kind": "account_allocate" });
-    let exact_terms_digest =
-        Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&effect).unwrap()).into());
-    (
-        CustodyPrepareRequest {
-            surface: bloom_signer_api::legacy_local_surface(),
-            ceremony_kind: CeremonyKind::AccountAllocate,
-            custody_operation_id: operation_id.clone(),
-            wallet_id: Some(wallet_id.clone()),
-            key_ref: None,
-            exact_terms_digest: exact_terms_digest.clone(),
-            expected_input_class: Token::new("generic-custody-v1").unwrap(),
-            browser_output_recipient_key: None,
-            petal_key_scope: None,
-            legacy_passkey_migration: None,
-            wallet_seed_profile: None,
-            derivation_requests: many,
-        },
-        exact_terms_digest,
-        effect,
-    )
+) -> CustodyPrepareRequest {
+    CustodyPrepareRequest {
+        derivation_requests: many,
+        ..generic_prepare(
+            CeremonyKind::AccountAllocate,
+            operation_id,
+            wallet_id,
+            None,
+            &serde_json::json!({ "kind": "account_allocate" }),
+        )
+    }
 }
 
-/// One ceremony allocating several families under one Signer-chosen number.
-/// The multi-family allocation ceremony, keeping the completion error
-/// instead of unwrapping it.
+/// One ceremony allocating several families under one Signer-chosen number,
+/// keeping the completion error instead of unwrapping it.
 fn try_complete_account_allocate_many(
     service: &SignerCeremonyService,
     authenticator: &VirtualAuthenticator,
@@ -4575,51 +3666,16 @@ fn try_complete_account_allocate_many(
     operation_id: &OperationId,
     requests: Vec<DerivedAccountRequest>,
     now_ms: u64,
-) -> Result<CustodyResult, bloom_signer_api::ProtocolError> {
-    let (request, exact_terms_digest, effect) =
-        account_allocate_prepare(wallet_id, operation_id, requests);
-    let prepared = service.prepare_custody(request, now_ms).unwrap();
-    let assertion = authenticator.assertion(
-        &prepared.challenges[0].canonical_bytes().unwrap(),
-        now_ms as u32,
-    );
-    let aad = CustodyHpkeAad {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_id: prepared.contribution.ceremony_id.clone(),
-        ceremony_kind: CeremonyKind::AccountAllocate,
-        custody_operation_id: operation_id.clone(),
-        signer_nonce: prepared.contribution.signer_nonce.clone(),
-        signer_contribution_digest: prepared.contribution.digest().unwrap(),
-        wallet_id: Some(wallet_id.clone()),
-        key_ref: None,
-        credential_id: Some(assertion.credential_id.clone()),
-        expected_input_class: Token::new("generic-custody-v1").unwrap(),
-    }
-    .canonical_bytes()
-    .unwrap();
-    let plaintext = serde_jcs::to_vec(&serde_json::json!({
-        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-        "effect": effect,
-    }))
-    .unwrap();
-    let encrypted_input = seal_hpke(
-        &prepared.contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
-        &plaintext,
+) -> Result<CustodyResult, ProtocolError> {
+    try_complete_account_allocate(
+        service,
+        authenticator,
+        wallet_id,
+        operation_id,
+        requests,
+        now_ms,
     )
-    .unwrap();
-    service.complete_custody(
-        CustodyCompleteRequest {
-            ceremony_kind: CeremonyKind::AccountAllocate,
-            custody_operation_id: operation_id.clone(),
-            ceremony_id: prepared.contribution.ceremony_id.clone(),
-            proof: WebAuthnCeremonyProof::Assertion { assertion },
-            encrypted_input: Some(encrypted_input),
-            public_binding_digest: exact_terms_digest,
-        },
-        now_ms + 100,
-    )
+    .map(|(result, _)| result)
 }
 
 fn complete_account_allocate_many(
@@ -4630,68 +3686,15 @@ fn complete_account_allocate_many(
     requests: Vec<DerivedAccountRequest>,
     now_ms: u64,
 ) -> CustodyResult {
-    let (request, exact_terms_digest, effect) =
-        account_allocate_prepare(wallet_id, operation_id, requests);
-    let prepared = service.prepare_custody(request, now_ms).unwrap();
-    let assertion = authenticator.assertion(
-        &prepared.challenges[0].canonical_bytes().unwrap(),
-        now_ms as u32,
-    );
-    let aad = CustodyHpkeAad {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_id: prepared.contribution.ceremony_id.clone(),
-        ceremony_kind: CeremonyKind::AccountAllocate,
-        custody_operation_id: operation_id.clone(),
-        signer_nonce: prepared.contribution.signer_nonce.clone(),
-        signer_contribution_digest: prepared.contribution.digest().unwrap(),
-        wallet_id: Some(wallet_id.clone()),
-        key_ref: None,
-        credential_id: Some(assertion.credential_id.clone()),
-        expected_input_class: Token::new("generic-custody-v1").unwrap(),
-    }
-    .canonical_bytes()
-    .unwrap();
-    let plaintext = serde_jcs::to_vec(&serde_json::json!({
-        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-        "effect": effect,
-    }))
-    .unwrap();
-    let encrypted_input = seal_hpke(
-        &prepared.contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
-        &plaintext,
+    try_complete_account_allocate_many(
+        service,
+        authenticator,
+        wallet_id,
+        operation_id,
+        requests,
+        now_ms,
     )
-    .unwrap();
-    service
-        .complete_custody(
-            CustodyCompleteRequest {
-                ceremony_kind: CeremonyKind::AccountAllocate,
-                custody_operation_id: operation_id.clone(),
-                ceremony_id: prepared.contribution.ceremony_id.clone(),
-                proof: WebAuthnCeremonyProof::Assertion { assertion },
-                encrypted_input: Some(encrypted_input),
-                public_binding_digest: exact_terms_digest,
-            },
-            now_ms + 100,
-        )
-        .unwrap()
-}
-
-fn evm_request(account: Option<u32>) -> DerivedAccountRequest {
-    DerivedAccountRequest {
-        derivation_profile: DerivationProfile::Bip44EvmSecp256k1V1,
-        requested_role: Token::new("evm-account").unwrap(),
-        account,
-    }
-}
-
-fn solana_request(account: Option<u32>) -> DerivedAccountRequest {
-    DerivedAccountRequest {
-        derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-        requested_role: Token::new("solana-account").unwrap(),
-        account,
-    }
+    .unwrap()
 }
 
 fn paths_by_family(engine: &SignerEngine, result: &CustodyResult) -> (String, String) {
@@ -4710,7 +3713,7 @@ fn paths_by_family(engine: &SignerEngine, result: &CustodyResult) -> (String, St
 #[test]
 fn bip39_two_family_allocation_shares_one_number_chosen_by_signer() {
     let authenticator = VirtualAuthenticator::generate();
-    let (service, engine, _registry) = bip39_service(&authenticator);
+    let (service, engine, _registry) = bip39_memory_service();
     let wallet_id = Token::new("bip39-wallet-pair").unwrap();
     // Registration allocates both families at index 0.
     complete_bip39_registration(
@@ -4812,28 +3815,7 @@ fn bip39_enrollment_refresh_failure_after_allocation_rolls_back_every_sibling() 
     let temp = tempfile::tempdir().unwrap();
     let database = temp.path().join("signer.sqlite");
     let authenticator = VirtualAuthenticator::generate();
-    let broker = SigningKey::from_bytes(&[7; 32]);
-    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
-    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
-    let engine = Arc::new(
-        SignerEngine::open(
-            &database,
-            Token::new("broker-app-1").unwrap(),
-            broker.verifying_key(),
-            ceremony_key.verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            audit_keys(),
-            registry.clone(),
-        )
-        .unwrap(),
-    );
-    let service = SignerCeremonyService::new(
-        engine.clone(),
-        Token::new("signer-ceremony-key").unwrap(),
-        ceremony_key.clone(),
-    )
-    .unwrap();
+    let (service, engine, registry) = bip39_service(&database);
     let wallet_id = Token::new("bip39-wallet-refresh-failure").unwrap();
     let registration = complete_bip39_registration(
         &service,
@@ -5034,7 +4016,7 @@ fn bip39_enrollment_refresh_failure_after_allocation_rolls_back_every_sibling() 
 #[test]
 fn account_allocation_request_shapes_are_validated_at_prepare() {
     let authenticator = VirtualAuthenticator::generate();
-    let (service, _engine, _registry) = bip39_service(&authenticator);
+    let (service, _engine, _registry) = bip39_memory_service();
     let wallet_id = Token::new("bip39-wallet-shapes").unwrap();
     complete_bip39_registration(
         &service,
@@ -5045,7 +4027,7 @@ fn account_allocation_request_shapes_are_validated_at_prepare() {
     );
 
     let rejected = |requests: Vec<DerivedAccountRequest>| {
-        let (request, _, _) = account_allocate_prepare(&wallet_id, &operation("b1"), requests);
+        let request = account_allocate_prepare(&wallet_id, &operation("b1"), requests);
         service.prepare_custody(request, 10_100).unwrap_err().code
     };
     assert_eq!(rejected(vec![]), ProtocolErrorCode::MalformedFrame);
@@ -5072,7 +4054,7 @@ fn account_allocation_request_shapes_are_validated_at_prepare() {
     assert_eq!(
         service
             .prepare_custody(
-                account_allocate_prepare(&wallet_id, &operation("b2"), vec![evm_request(None)]).0,
+                account_allocate_prepare(&wallet_id, &operation("b2"), vec![evm_request(None)]),
                 10_200,
             )
             .unwrap()
@@ -5082,85 +4064,10 @@ fn account_allocation_request_shapes_are_validated_at_prepare() {
     );
 }
 
-fn complete_account_retire(
-    service: &SignerCeremonyService,
-    authenticator: &VirtualAuthenticator,
-    wallet_id: &Token,
-    child: &KeyRef,
-    operation_id: &OperationId,
-    now_ms: u64,
-) -> CustodyResult {
-    let effect = serde_json::json!({ "kind": "account_retire" });
-    let exact_terms_digest =
-        Digest32::from_bytes(sha2::Sha256::digest(serde_jcs::to_vec(&effect).unwrap()).into());
-    let prepared = service
-        .prepare_custody(
-            CustodyPrepareRequest {
-                surface: bloom_signer_api::legacy_local_surface(),
-                ceremony_kind: CeremonyKind::AccountRetire,
-                custody_operation_id: operation_id.clone(),
-                wallet_id: Some(wallet_id.clone()),
-                key_ref: Some(child.clone()),
-                exact_terms_digest: exact_terms_digest.clone(),
-                expected_input_class: Token::new("generic-custody-v1").unwrap(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-                wallet_seed_profile: None,
-                derivation_requests: Vec::new(),
-            },
-            now_ms,
-        )
-        .unwrap();
-    let assertion = authenticator.assertion(
-        &prepared.challenges[0].canonical_bytes().unwrap(),
-        now_ms as u32,
-    );
-    let aad = CustodyHpkeAad {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_id: prepared.contribution.ceremony_id.clone(),
-        ceremony_kind: CeremonyKind::AccountRetire,
-        custody_operation_id: operation_id.clone(),
-        signer_nonce: prepared.contribution.signer_nonce.clone(),
-        signer_contribution_digest: prepared.contribution.digest().unwrap(),
-        wallet_id: Some(wallet_id.clone()),
-        key_ref: Some(child.clone()),
-        credential_id: Some(assertion.credential_id.clone()),
-        expected_input_class: Token::new("generic-custody-v1").unwrap(),
-    }
-    .canonical_bytes()
-    .unwrap();
-    let plaintext = serde_jcs::to_vec(&serde_json::json!({
-        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-        "effect": effect,
-    }))
-    .unwrap();
-    let encrypted_input = seal_hpke(
-        &prepared.contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
-        &plaintext,
-    )
-    .unwrap();
-    service
-        .complete_custody(
-            CustodyCompleteRequest {
-                ceremony_kind: CeremonyKind::AccountRetire,
-                custody_operation_id: operation_id.clone(),
-                ceremony_id: prepared.contribution.ceremony_id,
-                proof: WebAuthnCeremonyProof::Assertion { assertion },
-                encrypted_input: Some(encrypted_input),
-                public_binding_digest: exact_terms_digest,
-            },
-            now_ms + 100,
-        )
-        .unwrap()
-}
-
 #[test]
 fn bip39_registration_allocates_both_initial_children_without_a_root_keyref() {
     let authenticator = VirtualAuthenticator::generate();
-    let (service, _engine, _registry) = bip39_service(&authenticator);
+    let (service, _engine, _registry) = bip39_memory_service();
     let wallet_id = Token::new("bip39-wallet-a").unwrap();
     let result = complete_bip39_registration(
         &service,
@@ -5209,26 +4116,7 @@ fn failed_bip39_registration_removes_the_provisioned_backend_before_retry() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("signer.sqlite3");
     let authenticator = VirtualAuthenticator::generate();
-    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
-    let engine = Arc::new(
-        SignerEngine::open(
-            &database,
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[9; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            audit_keys(),
-            registry.clone(),
-        )
-        .unwrap(),
-    );
-    let service = SignerCeremonyService::new(
-        engine.clone(),
-        Token::new("signer-ceremony-key").unwrap(),
-        SigningKey::from_bytes(&[9; 32]),
-    )
-    .unwrap();
+    let (service, engine, registry) = bip39_service(&database);
     let wallet_id = Token::new("bip39-registration-retry").unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
@@ -5298,7 +4186,7 @@ fn failed_bip39_registration_removes_the_provisioned_backend_before_retry() {
 #[test]
 fn bip39_solana_allocation_is_deterministic_and_advances_accounts() {
     let authenticator = VirtualAuthenticator::generate();
-    let (service, engine, _registry) = bip39_service(&authenticator);
+    let (service, engine, _registry) = bip39_memory_service();
     let wallet_id = Token::new("bip39-wallet-b").unwrap();
     complete_bip39_registration(
         &service,
@@ -5353,7 +4241,7 @@ fn bip39_solana_allocation_is_deterministic_and_advances_accounts() {
 #[test]
 fn bip39_retire_then_sign_is_refused() {
     let authenticator = VirtualAuthenticator::generate();
-    let (service, engine, registry) = bip39_service(&authenticator);
+    let (service, engine, registry) = bip39_memory_service();
     let wallet_id = Token::new("bip39-wallet-c").unwrap();
     let registration = complete_bip39_registration(
         &service,
@@ -5392,7 +4280,7 @@ fn bip39_retire_then_sign_is_refused() {
 #[test]
 fn bip39_mnemonic_export_seals_words_and_frozen_import_reproduces_vectors() {
     let authenticator = VirtualAuthenticator::generate();
-    let (service, engine, _registry) = bip39_service(&authenticator);
+    let (service, engine, _registry) = bip39_memory_service();
 
     // (f) Import the FROZEN mnemonic into a new wallet and assert the initial
     // EVM child reproduces the frozen vector fingerprint.
@@ -5500,7 +4388,7 @@ fn bip39_mnemonic_export_seals_words_and_frozen_import_reproduces_vectors() {
 #[test]
 fn bip39_import_accepts_12_to_24_words_and_records_the_entropy_bits() {
     let authenticator = VirtualAuthenticator::generate();
-    let (service, engine, _registry) = bip39_service(&authenticator);
+    let (service, engine, _registry) = bip39_memory_service();
 
     // Bad checksum: the final word is valid but flips the checksum.
     let bad = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon zebra";
@@ -5607,7 +4495,7 @@ fn bip39_import_accepts_12_to_24_words_and_records_the_entropy_bits() {
 #[test]
 fn bip39_import_rejects_nfkd_unnormalized_mnemonic() {
     let authenticator = VirtualAuthenticator::generate();
-    let (service, _engine, _registry) = bip39_service(&authenticator);
+    let (service, _engine, _registry) = bip39_memory_service();
     // A fullwidth compatibility 'a' folds to ASCII 'a' under NFKD, so the
     // phrase is otherwise valid but not in canonical form.
     let unnormalized = bloom_signer_vectors::BIP39_MNEMONIC.replace('a', "\u{ff41}");
@@ -5626,7 +4514,7 @@ fn bip39_import_rejects_nfkd_unnormalized_mnemonic() {
 #[test]
 fn bip39_import_schema_rejects_any_passphrase_field() {
     let authenticator = VirtualAuthenticator::generate();
-    let (service, _engine, _registry) = bip39_service(&authenticator);
+    let (service, _engine, _registry) = bip39_memory_service();
     for (suffix, passphrase) in [("empty", ""), ("nonempty", "TREZOR")] {
         let result = attempt_bip39_mnemonic_import(
             &service,
@@ -5649,7 +4537,7 @@ fn bip39_import_schema_rejects_any_passphrase_field() {
 #[test]
 fn bip39_solana_child_backup_restore_round_trips_derivation_registry() {
     let authenticator = VirtualAuthenticator::generate();
-    let (service, engine, registry) = bip39_service(&authenticator);
+    let (service, engine, registry) = bip39_memory_service();
     let wallet_id = Token::new("bip39-wallet-bk").unwrap();
     let registration = complete_bip39_registration(
         &service,
@@ -5698,7 +4586,7 @@ fn bip39_solana_child_backup_restore_round_trips_derivation_registry() {
     //
     // The descriptor projection is carried separately from the encrypted
     // backend registry, so its signed export binding must also survive restore.
-    let (_restored_service, restored_engine, _restored_registry) = bip39_service(&authenticator);
+    let (_restored_service, restored_engine, _restored_registry) = bip39_memory_service();
     let mut tampered = backup.clone();
     tampered.derivation_allocations[0].public_key_spki_der =
         Base64UrlBytes::from_bytes(&[0x42; 44]);
@@ -5722,7 +4610,7 @@ fn bip39_solana_child_backup_restore_round_trips_derivation_registry() {
 #[test]
 fn bip39_solana_child_export_refuses_empty_pinned_keys() {
     let authenticator = VirtualAuthenticator::generate();
-    let (service, engine, registry) = bip39_service(&authenticator);
+    let (service, engine, registry) = bip39_memory_service();
     let wallet_id = Token::new("bip39-wallet-bk2").unwrap();
     let registration = complete_bip39_registration(
         &service,
@@ -5872,7 +4760,7 @@ fn petal_subkey_reuses_a_fingerprint_whose_scope_expired_on_a_same_seed_wallet()
     // expired scope yields, a live one stays exclusive.
     let authenticator_a = VirtualAuthenticator::generate();
     let authenticator_b = VirtualAuthenticator::generate();
-    let (service, _engine, _registry) = bip39_service(&authenticator_a);
+    let (service, _engine, _registry) = bip39_memory_service();
     let wallet_a = Token::new("seed-original").unwrap();
     let wallet_b = Token::new("seed-recovered").unwrap();
     let scope = |wallet: &Token, parent: &bloom_signer_api::KeyRef, op: &str, lifetime_ms: u64| {
@@ -5982,7 +4870,7 @@ fn a_taken_over_scope_refuses_the_previous_wallets_exact_approval() {
     let authenticator_a = VirtualAuthenticator::generate();
     let authenticator_b = VirtualAuthenticator::generate();
     let broker = SigningKey::from_bytes(&[7; 32]);
-    let (service, engine, _registry) = bip39_service(&authenticator_a);
+    let (service, engine, _registry) = bip39_memory_service();
     let wallet_a = Token::new("seed-original").unwrap();
     let wallet_b = Token::new("seed-recovered").unwrap();
     let scope = |wallet: &Token, parent: &bloom_signer_api::KeyRef, op: &str| PetalKeyScope {
@@ -6184,7 +5072,7 @@ fn exact_sign_request(
 fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
     let authenticator = VirtualAuthenticator::generate();
     let broker = SigningKey::from_bytes(&[7; 32]);
-    let (service, engine, _registry) = bip39_service(&authenticator);
+    let (service, engine, _registry) = bip39_memory_service();
     let (wallet_id, _) = register_wallet(&service, &authenticator, operation("c1"), 10_000);
     // Registration allocates both families; the EVM child is the parent whose
     // suites this scope can carry.
@@ -6421,24 +5309,10 @@ fn recovered_then_deleted_wallet_name_can_be_registered_or_imported_again() {
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("signer.sqlite");
         let open = || {
-            let engine = Arc::new(
-                SignerEngine::open(
-                    &database,
-                    Token::new("broker-app-1").unwrap(),
-                    SigningKey::from_bytes(&[7; 32]).verifying_key(),
-                    SigningKey::from_bytes(&[9; 32]).verifying_key(),
-                    Token::new("signer-revocation-key").unwrap(),
-                    SigningKey::from_bytes(&[4; 32]),
-                    audit_keys(),
-                    Arc::new(BackendRegistry::from_compiled(vec![]).unwrap()),
-                )
-                .unwrap(),
-            );
-            SignerCeremonyService::new(
-                engine,
-                Token::new("signer-ceremony-key").unwrap(),
-                SigningKey::from_bytes(&[9; 32]),
-            )
+            ceremony_service(open_engine(
+                Some(&database),
+                Arc::new(BackendRegistry::from_compiled(vec![]).unwrap()),
+            ))
         };
         let original = VirtualAuthenticator::generate();
         let replacement = VirtualAuthenticator::generate();
@@ -6615,30 +5489,7 @@ fn missing_custody_without_deletion_receipt_still_fails_closed() {
 fn old_deletion_receipt_does_not_retire_a_new_wallet_incarnation() {
     let temp = tempfile::tempdir().unwrap();
     let database = temp.path().join("signer.sqlite");
-    let broker = SigningKey::from_bytes(&[7; 32]);
-    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
-    let open = || {
-        let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
-        let engine = Arc::new(
-            SignerEngine::open(
-                &database,
-                Token::new("broker-app-1").unwrap(),
-                broker.verifying_key(),
-                ceremony_key.verifying_key(),
-                Token::new("signer-revocation-key").unwrap(),
-                SigningKey::from_bytes(&[4; 32]),
-                audit_keys(),
-                registry,
-            )
-            .unwrap(),
-        );
-        SignerCeremonyService::new(
-            engine,
-            Token::new("signer-ceremony-key").unwrap(),
-            ceremony_key.clone(),
-        )
-        .unwrap()
-    };
+    let open = || bip39_service(&database).0;
     let wallet = Token::new("reused-wallet").unwrap();
     let first_authenticator = VirtualAuthenticator::generate();
     let service = open();
@@ -6706,28 +5557,11 @@ fn old_deletion_receipt_does_not_retire_a_new_wallet_incarnation() {
 fn deleted_wallet_restart(legacy: Option<&str>) {
     let temp = tempfile::tempdir().unwrap();
     let database = temp.path().join("signer.sqlite");
-    let broker = SigningKey::from_bytes(&[7; 32]);
     let ceremony_key = SigningKey::from_bytes(&[9; 32]);
     let open = || {
         let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
-        let engine = Arc::new(
-            SignerEngine::open(
-                &database,
-                Token::new("broker-app-1").unwrap(),
-                broker.verifying_key(),
-                ceremony_key.verifying_key(),
-                Token::new("signer-revocation-key").unwrap(),
-                SigningKey::from_bytes(&[4; 32]),
-                audit_keys(),
-                registry.clone(),
-            )
-            .unwrap(),
-        );
-        let service = SignerCeremonyService::new(
-            engine.clone(),
-            Token::new("signer-ceremony-key").unwrap(),
-            ceremony_key.clone(),
-        );
+        let engine = open_engine(Some(&database), registry.clone());
+        let service = ceremony_service(engine.clone());
         (engine, registry, service)
     };
     let deleted = Token::new("deleted-wallet").unwrap();

@@ -1742,12 +1742,20 @@ impl SignerEngine {
         &self,
         operation_id: &OperationId,
     ) -> Result<Option<SignerActivationReceipt>, ProtocolError> {
+        self.stored_receipt(operation_id, "sealed_approval")
+    }
+
+    fn stored_receipt<T: serde::de::DeserializeOwned>(
+        &self,
+        operation_id: &OperationId,
+        receipt_kind: &str,
+    ) -> Result<Option<T>, ProtocolError> {
         self.connection
             .lock()
             .query_row(
                 "SELECT receipt_jcs FROM ceremony_receipts
-                 WHERE operation_id = ?1 AND receipt_kind = 'sealed_approval'",
-                [operation_id.as_str()],
+                 WHERE operation_id = ?1 AND receipt_kind = ?2",
+                [operation_id.as_str(), receipt_kind],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -1781,18 +1789,7 @@ impl SignerEngine {
         &self,
         operation_id: &OperationId,
     ) -> Result<Option<CustodyResult>, ProtocolError> {
-        self.connection
-            .lock()
-            .query_row(
-                "SELECT receipt_jcs FROM ceremony_receipts
-                 WHERE operation_id = ?1 AND receipt_kind = 'custody'",
-                [operation_id.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(storage)?
-            .map(|encoded| serde_json::from_str(&encoded).map_err(malformed))
-            .transpose()
+        self.stored_receipt(operation_id, "custody")
     }
 
     pub(crate) fn recovery_result_delivery_valid(
@@ -2591,31 +2588,12 @@ impl SignerEngine {
                 "key is not registered in a compiled backend",
             ));
         }
-        let mut connection = self.connection.lock();
-        let transaction = self.mutation_transaction(&mut connection)?;
-        transaction
-            .execute(
-                "INSERT INTO enrolled_keys(
-                    key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
-                 ) VALUES (?1, ?2, 1, 'wallet_root', ?3)
-                 ON CONFLICT(key_fingerprint) DO UPDATE SET
-                    key_ref_jcs = excluded.key_ref_jcs,
-                    available = 1,
-                    authority_class = 'wallet_root',
-                    wallet_id = excluded.wallet_id",
-                params![
-                    key_ref.public_key_fingerprint.as_str(),
-                    serde_jcs::to_string(key_ref).map_err(malformed)?,
-                    wallet_id.as_str(),
-                ],
-            )
-            .map_err(storage)?;
-        self.append_audit(
-            &transaction,
+        self.enroll_wallet_key(
+            wallet_id,
+            key_ref,
+            "wallet_root",
             "key.wallet_root_enrolled",
-            &serde_json::json!({ "wallet_id": wallet_id, "key_ref": key_ref }),
-        )?;
-        transaction.commit().map_err(storage)
+        )
     }
 
     /// Enroll a BIP-39 derived child as a wallet-scoped derived key. The root
@@ -2627,28 +2605,40 @@ impl SignerEngine {
         key_ref: &KeyRef,
     ) -> Result<(), ProtocolError> {
         key_ref.validate()?;
+        self.enroll_wallet_key(wallet_id, key_ref, "derived", "key.derived_enrolled")
+    }
+
+    /// Upsert `key_ref` as an available wallet key of `authority_class`.
+    fn enroll_wallet_key(
+        &self,
+        wallet_id: &Token,
+        key_ref: &KeyRef,
+        authority_class: &str,
+        audit_event: &str,
+    ) -> Result<(), ProtocolError> {
         let mut connection = self.connection.lock();
         let transaction = self.mutation_transaction(&mut connection)?;
         transaction
             .execute(
                 "INSERT INTO enrolled_keys(
                     key_fingerprint, key_ref_jcs, available, authority_class, wallet_id
-                 ) VALUES (?1, ?2, 1, 'derived', ?3)
+                 ) VALUES (?1, ?2, 1, ?4, ?3)
                  ON CONFLICT(key_fingerprint) DO UPDATE SET
                     key_ref_jcs = excluded.key_ref_jcs,
                     available = 1,
-                    authority_class = 'derived',
+                    authority_class = excluded.authority_class,
                     wallet_id = excluded.wallet_id",
                 params![
                     key_ref.public_key_fingerprint.as_str(),
                     serde_jcs::to_string(key_ref).map_err(malformed)?,
                     wallet_id.as_str(),
+                    authority_class,
                 ],
             )
             .map_err(storage)?;
         self.append_audit(
             &transaction,
-            "key.derived_enrolled",
+            audit_event,
             &serde_json::json!({ "wallet_id": wallet_id, "key_ref": key_ref }),
         )?;
         transaction.commit().map_err(storage)
@@ -7488,7 +7478,7 @@ fn ceremony_mutation_kind(kind: bloom_signer_api::CeremonyKind) -> &'static str 
     }
 }
 
-fn ceremony_state_code(state: bloom_signer_api::CeremonyState) -> &'static str {
+pub(crate) fn ceremony_state_code(state: bloom_signer_api::CeremonyState) -> &'static str {
     use bloom_signer_api::CeremonyState;
     match state {
         CeremonyState::Prepared => "prepared",
