@@ -35,7 +35,6 @@ use crate::{
     hpke::{
         CUSTODY_INPUT_INFO, CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO, seal_to_recipient,
     },
-    legacy_passkey::{LEGACY_PASSKEY_INPUT_CLASS, LegacyMigrationStore, PreparedLegacyMigration},
     webauthn::{
         ceremony_origin_for_port, resolve_ceremony_port, verify_webauthn_assertion_for_origin,
         verify_webauthn_attestation_for_origin,
@@ -148,7 +147,6 @@ struct PendingCeremony {
     hpke_recipient: Option<HpkeRecipient>,
     registration: Option<RegistrationSecrets>,
     credential_creation: Option<CredentialCreation>,
-    legacy_migration: Option<PreparedLegacyMigration>,
     /// Recovery publishes a fixed generation to unauthenticated browsers;
     /// the actual epoch remains private until its factor is proven.
     private_recovery_generation: Option<u64>,
@@ -204,7 +202,6 @@ struct CustodyApplyContext {
     recipient: Option<HpkeRecipient>,
     registration: Option<RegistrationSecrets>,
     credential_creation: Option<CredentialCreation>,
-    legacy_migration: Option<PreparedLegacyMigration>,
 }
 
 type SensitiveCustodyOutput = Zeroizing<Vec<u8>>;
@@ -227,7 +224,6 @@ struct CustodyApplyOutcome {
     derived_keys: Vec<DerivedKeyCommit>,
     rollback_provisioned_backend: Option<bloom_signer_api::KeyRef>,
     public_key_refs: Vec<bloom_signer_api::KeyRef>,
-    consume_legacy_migration: bool,
 }
 
 struct GenericCustodyOutcome {
@@ -290,7 +286,6 @@ pub struct SignerCeremonyService {
     cross_surface: Mutex<HashMap<Digest32, CrossSurfacePairState>>,
     credentials: Mutex<BTreeMap<String, BoundCredential>>,
     wallets: Mutex<BTreeMap<Token, Arc<WalletCustody>>>,
-    legacy_migrations: Option<Arc<LegacyMigrationStore>>,
     ceremony_ttl_ms: u64,
     approval_completion_barrier: AsyncMutex<()>,
     custody_completion_barrier: Mutex<()>,
@@ -487,7 +482,6 @@ impl SignerCeremonyService {
             cross_surface: Mutex::new(HashMap::new()),
             credentials: Mutex::new(credentials),
             wallets: Mutex::new(wallets),
-            legacy_migrations: None,
             ceremony_ttl_ms: CEREMONY_TTL_MS,
             approval_completion_barrier: AsyncMutex::new(()),
             custody_completion_barrier: Mutex::new(()),
@@ -508,11 +502,6 @@ impl SignerCeremonyService {
             })?;
         }
         Ok(service)
-    }
-
-    pub fn with_legacy_migrations(mut self, store: Arc<LegacyMigrationStore>) -> Self {
-        self.legacy_migrations = Some(store);
-        self
     }
 
     pub fn surface_status(&self) -> Result<SurfaceStatus, ProtocolError> {
@@ -1515,7 +1504,6 @@ impl SignerCeremonyService {
                 hpke_recipient: recipient,
                 registration: None,
                 credential_creation: None,
-                legacy_migration: None,
                 private_recovery_generation: None,
             },
         );
@@ -1554,7 +1542,6 @@ impl SignerCeremonyService {
             ));
         }
         request.validate_wallet_creation_binding()?;
-        request.validate_legacy_passkey_migration_binding()?;
         request.validate_petal_key_scope_binding()?;
         self.validate_seed_profile_and_allocation(&request)?;
         if let Some(scope) = &request.petal_key_scope {
@@ -1599,43 +1586,6 @@ impl SignerCeremonyService {
         let ceremony_id = random_digest();
         let signer_nonce = random_digest();
         let recipient = HpkeRecipient::generate();
-        let legacy_migration =
-            if request.expected_input_class.as_str() == LEGACY_PASSKEY_INPUT_CLASS {
-                if request.ceremony_kind != CeremonyKind::WalletImport {
-                    return Err(kind_mismatch());
-                }
-                let store = self.legacy_migrations.as_ref().ok_or_else(|| {
-                    protocol(
-                        ProtocolErrorCode::ServiceUnavailable,
-                        "legacy passkey migration staging is unavailable",
-                    )
-                })?;
-                let prepared = store.load(&request.custody_operation_id)?;
-                if prepared.receipt.exact_terms_digest != request.exact_terms_digest
-                    || request.legacy_passkey_migration.as_ref()
-                        != Some(&prepared.receipt.public_terms()?)
-                {
-                    return Err(operation_conflict());
-                }
-                self.require_no_live_wallet_session(&prepared.receipt.wallet_name)?;
-                if self
-                    .wallets
-                    .lock()
-                    .contains_key(&prepared.receipt.wallet_name)
-                    || self
-                        .credentials
-                        .lock()
-                        .contains_key(prepared.credential.credential_id.encoded())
-                {
-                    return Err(protocol(
-                        ProtocolErrorCode::OperationIdConflict,
-                        "legacy wallet or passkey credential is already enrolled",
-                    ));
-                }
-                Some(prepared)
-            } else {
-                None
-            };
         let registration = if matches!(
             request.ceremony_kind,
             CeremonyKind::WalletRegistration | CeremonyKind::WalletImport
@@ -1646,16 +1596,12 @@ impl SignerCeremonyService {
                     "registration and wallet import derive their root KeyRef inside Signer",
                 ));
             }
-            let wallet_id = legacy_migration
-                .as_ref()
-                .map(|legacy| legacy.receipt.wallet_name.clone())
-                .or_else(|| request.wallet_id.clone())
-                .ok_or_else(|| {
-                    protocol(
-                        ProtocolErrorCode::MalformedFrame,
-                        "registration and wallet import require an authoritative wallet ID",
-                    )
-                })?;
+            let wallet_id = request.wallet_id.clone().ok_or_else(|| {
+                protocol(
+                    ProtocolErrorCode::MalformedFrame,
+                    "registration and wallet import require an authoritative wallet ID",
+                )
+            })?;
             self.require_no_live_wallet_session(&wallet_id)?;
             if self.wallets.lock().contains_key(&wallet_id) {
                 return Err(protocol(
@@ -1667,13 +1613,6 @@ impl SignerCeremonyService {
         } else {
             None
         };
-        let mut registration = registration;
-        if let (Some(registration), Some(legacy)) =
-            (registration.as_mut(), legacy_migration.as_ref())
-        {
-            registration.user_handle = legacy.credential.user_handle.clone();
-            registration.prf_salt = legacy.credential.prf_salt.clone();
-        }
         let credential_creation = if matches!(
             request.ceremony_kind,
             CeremonyKind::CredentialAdd
@@ -1724,7 +1663,7 @@ impl SignerCeremonyService {
         };
         contribution.signer_signature =
             self.sign_contribution(&contribution.unsigned_canonical_bytes()?);
-        let phases = required_phases(request.ceremony_kind, legacy_migration.is_some());
+        let phases = required_phases(request.ceremony_kind);
         let challenges = phases
             .into_iter()
             .map(|phase| CeremonyChallenge {
@@ -1742,24 +1681,12 @@ impl SignerCeremonyService {
                 phase,
             })
             .collect::<Vec<_>>();
-        let webauthn_options = legacy_migration
+        let webauthn_options = registration
             .as_ref()
-            .map(|legacy| CeremonyWebAuthnOptions {
-                allowed_credentials: vec![CredentialPrfInput {
-                    credential_id: legacy.credential.credential_id.clone(),
-                    prf_salt: legacy.credential.prf_salt.clone(),
-                }],
-                registration_user_handle: None,
-                registration_prf_salt: None,
-            })
-            .or_else(|| {
-                registration
-                    .as_ref()
-                    .map(|registration| CeremonyWebAuthnOptions {
-                        allowed_credentials: Vec::new(),
-                        registration_user_handle: Some(registration.user_handle.clone()),
-                        registration_prf_salt: Some(registration.prf_salt.clone()),
-                    })
+            .map(|registration| CeremonyWebAuthnOptions {
+                allowed_credentials: Vec::new(),
+                registration_user_handle: Some(registration.user_handle.clone()),
+                registration_prf_salt: Some(registration.prf_salt.clone()),
             })
             .or_else(|| {
                 credential_creation.as_ref().map(|creation| {
@@ -1780,24 +1707,17 @@ impl SignerCeremonyService {
             .unwrap_or_else(|| {
                 self.options_for_wallet(request.wallet_id.as_ref(), &request.surface)
             });
-        let verification_credentials = legacy_migration
+        let verification_credentials = contribution
+            .wallet_id
             .as_ref()
-            .map(|legacy| vec![legacy.credential.clone()])
-            .unwrap_or_else(|| {
-                contribution
-                    .wallet_id
-                    .as_ref()
-                    .map(|wallet_id| {
-                        webauthn_options
-                            .allowed_credentials
-                            .iter()
-                            .filter_map(|allowed| {
-                                self.credential(wallet_id, &allowed.credential_id).ok()
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            });
+            .map(|wallet_id| {
+                webauthn_options
+                    .allowed_credentials
+                    .iter()
+                    .filter_map(|allowed| self.credential(wallet_id, &allowed.credential_id).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
         let prepared = PreparedCustodyCeremony {
             contribution: contribution.clone(),
             challenges: challenges.clone(),
@@ -1814,7 +1734,6 @@ impl SignerCeremonyService {
                 hpke_recipient: Some(recipient),
                 registration,
                 credential_creation,
-                legacy_migration,
                 private_recovery_generation: (prepared.contribution.ceremony_kind
                     == CeremonyKind::WalletRecovery)
                     .then_some(private_generation),
@@ -1941,23 +1860,21 @@ impl SignerCeremonyService {
         contribution.signer_signature =
             self.sign_contribution(&contribution.unsigned_canonical_bytes()?);
         let contribution_digest = contribution.digest()?;
-        pending.challenges =
-            required_phases(request.ceremony_kind, pending.legacy_migration.is_some())
-                .into_iter()
-                .map(|phase| CeremonyChallenge {
-                    surface: contribution.surface.clone(),
-                    schema: Token::new("bloom.ceremony.challenge.v1")
-                        .expect("static protocol token"),
-                    ceremony_id: contribution.ceremony_id.clone(),
-                    ceremony_kind: contribution.ceremony_kind,
-                    operation_id: operation_id.clone(),
-                    signer_nonce: contribution.signer_nonce.clone(),
-                    review_manifest_digest: contribution.review_manifest_digest.clone(),
-                    signer_contribution_digest: contribution_digest.clone(),
-                    exact_terms_digest: request.exact_terms_digest.clone(),
-                    phase,
-                })
-                .collect();
+        pending.challenges = required_phases(request.ceremony_kind)
+            .into_iter()
+            .map(|phase| CeremonyChallenge {
+                surface: contribution.surface.clone(),
+                schema: Token::new("bloom.ceremony.challenge.v1").expect("static protocol token"),
+                ceremony_id: contribution.ceremony_id.clone(),
+                ceremony_kind: contribution.ceremony_kind,
+                operation_id: operation_id.clone(),
+                signer_nonce: contribution.signer_nonce.clone(),
+                review_manifest_digest: contribution.review_manifest_digest.clone(),
+                signer_contribution_digest: contribution_digest.clone(),
+                exact_terms_digest: request.exact_terms_digest.clone(),
+                phase,
+            })
+            .collect();
         Ok(PreparedCustodyCeremony {
             contribution: contribution.clone(),
             challenges: pending.challenges.clone(),
@@ -2318,7 +2235,6 @@ impl SignerCeremonyService {
                 recipient: pending.hpke_recipient.take(),
                 registration: pending.registration.take(),
                 credential_creation: pending.credential_creation.take(),
-                legacy_migration: pending.legacy_migration.take(),
             },
         ) {
             Ok(output) => output,
@@ -2470,12 +2386,6 @@ impl SignerCeremonyService {
                 .finalize_local_derived_key(&derived.key_ref, &derived.operation_id)?;
             #[cfg(not(feature = "local"))]
             let _ = derived;
-        }
-        if apply_outcome.consume_legacy_migration {
-            self.legacy_migrations
-                .as_ref()
-                .ok_or_else(kind_mismatch)?
-                .consume(&request.custody_operation_id)?;
         }
         self.completed.lock().insert(
             request.custody_operation_id,
@@ -2834,117 +2744,73 @@ impl SignerCeremonyService {
         let mut derived_keys = Vec::new();
         let mut rollback_provisioned_backend = None;
         let mut public_key_refs = Vec::new();
-        let mut consume_legacy_migration = false;
         let effect = match prepare.ceremony_kind {
             CeremonyKind::WalletRegistration | CeremonyKind::WalletImport => {
                 let registration = context.registration.take().ok_or_else(kind_mismatch)?;
-                let (credential, root, prf) = if let Some(legacy) = context.legacy_migration.take()
-                {
-                    let assertion = assertion_only(&complete.proof)?;
+                let (attestation, prf_assertion) = match &complete.proof {
+                    WebAuthnCeremonyProof::Registration {
+                        attestation,
+                        prf_assertion,
+                    } => (attestation, prf_assertion),
+                    _ => return Err(kind_mismatch()),
+                };
+                let mut credential = verify_webauthn_attestation(
+                    attestation,
+                    &challenges[0].canonical_bytes()?,
+                    registration.user_handle.clone(),
+                    registration.prf_salt.clone(),
+                )?;
+                credential.surface = prepare.surface.clone();
+                if let Some(assertion) = prf_assertion {
                     let verified = verify_webauthn_assertion(
                         assertion,
-                        &legacy.credential,
-                        &challenges[0].canonical_bytes()?,
+                        &credential,
+                        &challenges[1].canonical_bytes()?,
                         true,
                     )?;
-                    if verified
-                        .user_handle
-                        .as_ref()
-                        .is_some_and(|handle| handle != &legacy.credential.user_handle)
-                    {
-                        return Err(protocol(
-                            ProtocolErrorCode::UnauthenticatedPeer,
-                            "legacy passkey user handle does not match the staged credential",
-                        ));
-                    }
-                    let input = self.decrypt_custody_input(
-                        prepare,
-                        contribution,
-                        complete,
-                        context.recipient.take(),
-                        Some(&legacy.credential.credential_id),
-                    )?;
-                    let input: LegacyPasskeyPrfInput =
-                        serde_json::from_slice(input.expose_to_backend()).map_err(malformed)?;
-                    let prf = SecretBytes::new(input.credential_prf.decode());
-                    let root = self
-                        .legacy_migrations
-                        .as_ref()
-                        .ok_or_else(kind_mismatch)?
-                        .decrypt_root(&prepare.custody_operation_id, &prf)?;
-                    let mut credential = legacy.credential;
                     credential.sign_count = DecimalU64::new(u64::from(verified.sign_count));
-                    consume_legacy_migration = true;
-                    (credential, root, prf)
-                } else {
-                    let (attestation, prf_assertion) = match &complete.proof {
-                        WebAuthnCeremonyProof::Registration {
-                            attestation,
-                            prf_assertion,
-                        } => (attestation, prf_assertion),
-                        _ => return Err(kind_mismatch()),
-                    };
-                    let mut credential = verify_webauthn_attestation(
-                        attestation,
-                        &challenges[0].canonical_bytes()?,
-                        registration.user_handle.clone(),
-                        registration.prf_salt.clone(),
-                    )?;
-                    credential.surface = prepare.surface.clone();
-                    if let Some(assertion) = prf_assertion {
-                        let verified = verify_webauthn_assertion(
-                            assertion,
-                            &credential,
-                            &challenges[1].canonical_bytes()?,
-                            true,
-                        )?;
-                        credential.sign_count = DecimalU64::new(u64::from(verified.sign_count));
-                    }
-                    let input = self.decrypt_custody_input(
-                        prepare,
-                        contribution,
-                        complete,
-                        context.recipient.take(),
-                        Some(&credential.credential_id),
-                    )?;
-                    let is_bip39 = prepare.wallet_seed_profile
-                        == Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1);
-                    let (root, prf) = if prepare.ceremony_kind == CeremonyKind::WalletImport {
-                        if is_bip39 {
-                            let import: Bip39MnemonicImportInput =
-                                serde_json::from_slice(input.expose_to_backend())
-                                    .map_err(malformed)?;
-                            // Strict NFKD + checksum via the reference parser;
-                            // v1 imports accept every valid English length.
-                            // The input schema has no passphrase field.
-                            let parsed = bloom_signer_derive::parse_mnemonic(&import.mnemonic)
-                                .map_err(|cause| {
-                                    protocol(ProtocolErrorCode::MalformedFrame, cause.to_string())
-                                })?;
-                            (
-                                SecretBytes::new(parsed.entropy().to_vec()),
-                                SecretBytes::new(import.credential_prf.decode()),
-                            )
-                        } else {
-                            let import: RawWalletImportInput =
-                                serde_json::from_slice(input.expose_to_backend())
-                                    .map_err(malformed)?;
-                            let raw_private_key = import.raw_private_key.decode();
-                            if raw_private_key.len() != 32 {
-                                return Err(protocol(
-                                    ProtocolErrorCode::BackendInvalidRequest,
-                                    "raw secp256k1 private key must contain exactly 32 bytes",
-                                ));
-                            }
-                            (
-                                SecretBytes::new(raw_private_key),
-                                SecretBytes::new(import.credential_prf.decode()),
-                            )
-                        }
+                }
+                let input = self.decrypt_custody_input(
+                    prepare,
+                    contribution,
+                    complete,
+                    context.recipient.take(),
+                    Some(&credential.credential_id),
+                )?;
+                let is_bip39 = prepare.wallet_seed_profile
+                    == Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1);
+                let (root, prf) = if prepare.ceremony_kind == CeremonyKind::WalletImport {
+                    if is_bip39 {
+                        let import: Bip39MnemonicImportInput =
+                            serde_json::from_slice(input.expose_to_backend()).map_err(malformed)?;
+                        // Strict NFKD + checksum via the reference parser;
+                        // v1 imports accept every valid English length.
+                        // The input schema has no passphrase field.
+                        let parsed = bloom_signer_derive::parse_mnemonic(&import.mnemonic)
+                            .map_err(|cause| {
+                                protocol(ProtocolErrorCode::MalformedFrame, cause.to_string())
+                            })?;
+                        (
+                            SecretBytes::new(parsed.entropy().to_vec()),
+                            SecretBytes::new(import.credential_prf.decode()),
+                        )
                     } else {
-                        (registration.root, input)
-                    };
-                    (credential, root, prf)
+                        let import: RawWalletImportInput =
+                            serde_json::from_slice(input.expose_to_backend()).map_err(malformed)?;
+                        let raw_private_key = import.raw_private_key.decode();
+                        if raw_private_key.len() != 32 {
+                            return Err(protocol(
+                                ProtocolErrorCode::BackendInvalidRequest,
+                                "raw secp256k1 private key must contain exactly 32 bytes",
+                            ));
+                        }
+                        (
+                            SecretBytes::new(raw_private_key),
+                            SecretBytes::new(import.credential_prf.decode()),
+                        )
+                    }
+                } else {
+                    (registration.root, input)
                 };
                 let backend_seed = root.expose_to_backend().to_vec();
                 let credential_key =
@@ -3385,7 +3251,6 @@ impl SignerCeremonyService {
             derived_keys,
             rollback_provisioned_backend,
             public_key_refs,
-            consume_legacy_migration,
         })
     }
 
@@ -3986,25 +3851,12 @@ impl SignerCeremonyService {
             };
         }
         pending
-            .legacy_migration
+            .registration
             .as_ref()
-            .map(|legacy| CeremonyWebAuthnOptions {
-                allowed_credentials: vec![CredentialPrfInput {
-                    credential_id: legacy.credential.credential_id.clone(),
-                    prf_salt: legacy.credential.prf_salt.clone(),
-                }],
-                registration_user_handle: None,
-                registration_prf_salt: None,
-            })
-            .or_else(|| {
-                pending
-                    .registration
-                    .as_ref()
-                    .map(|registration| CeremonyWebAuthnOptions {
-                        allowed_credentials: Vec::new(),
-                        registration_user_handle: Some(registration.user_handle.clone()),
-                        registration_prf_salt: Some(registration.prf_salt.clone()),
-                    })
+            .map(|registration| CeremonyWebAuthnOptions {
+                allowed_credentials: Vec::new(),
+                registration_user_handle: Some(registration.user_handle.clone()),
+                registration_prf_salt: Some(registration.prf_salt.clone()),
             })
             .or_else(|| {
                 pending.credential_creation.as_ref().map(|creation| {
@@ -4044,9 +3896,6 @@ impl SignerCeremonyService {
             if request.ceremony_kind == CeremonyKind::WalletRecovery)
         {
             return Vec::new();
-        }
-        if let Some(legacy) = &pending.legacy_migration {
-            return vec![legacy.credential.clone()];
         }
         let options = self.options_for_pending(pending);
         let wallet_id = match &pending.request {
@@ -4110,25 +3959,15 @@ impl SignerCeremonyService {
                 "wallet registration requires the bip39-multicurve-v1 seed profile",
             ));
         }
-        // An omitted profile on import is legal only for the legacy passkey
-        // migration (validated separately); an ordinary import must name its
-        // profile explicitly.
+        // An import must name its seed profile explicitly.
         if request.ceremony_kind == CeremonyKind::WalletImport
             && request.wallet_seed_profile.is_none()
-            && request.legacy_passkey_migration.is_none()
         {
             return Err(protocol(
                 ProtocolErrorCode::MalformedFrame,
                 "wallet import requires an explicit seed profile",
             ));
         }
-        // A seed profile and a legacy passkey migration are mutually exclusive:
-        // the migration decrypts a single secp256k1 scalar, while the seed
-        // profile selects a BIP-39 derivation tree. Both present would let a
-        // crafted request register the decrypted scalar as if it were BIP-39
-        // entropy under a different derivation tree than the migration receipt
-        // authorized.
-        reject_seed_profile_with_migration(request)?;
         // Derivation requests are legal only for AccountAllocate, which needs
         // exactly one shape of them plus an authoritative wallet ID.
         request.validate_derivation_requests()?;
@@ -4234,12 +4073,6 @@ struct Bip39MnemonicImportInput {
     mnemonic: Zeroizing<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyPasskeyPrfInput {
-    credential_prf: Base64UrlBytes,
-}
-
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct RegistrationRecoveryOutput {
@@ -4324,10 +4157,7 @@ struct CustodyReceiptPreimage<'a> {
     completed_at_ms: u64,
 }
 
-fn required_phases(kind: CeremonyKind, legacy_passkey_import: bool) -> Vec<CeremonyPhase> {
-    if legacy_passkey_import {
-        return vec![CeremonyPhase::Approve];
-    }
+fn required_phases(kind: CeremonyKind) -> Vec<CeremonyPhase> {
     match kind {
         CeremonyKind::WalletRegistration
         | CeremonyKind::WalletImport
@@ -4503,74 +4333,4 @@ fn malformed(error: impl std::fmt::Display) -> ProtocolError {
 
 fn protocol(code: ProtocolErrorCode, message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(code, message)
-}
-
-/// A wallet import cannot combine a seed profile with a legacy passkey
-/// migration: the former selects a BIP-39 derivation tree, the latter
-/// decrypts a single secp256k1 scalar from the legacy envelope. Treating both
-/// as present would register the scalar as if it were BIP-39 entropy under a
-/// different tree than the migration receipt authorized.
-fn reject_seed_profile_with_migration(
-    request: &CustodyPrepareRequest,
-) -> Result<(), ProtocolError> {
-    if request.wallet_seed_profile.is_some() && request.legacy_passkey_migration.is_some() {
-        return Err(protocol(
-            ProtocolErrorCode::MalformedFrame,
-            "wallet import cannot combine a seed profile with a legacy passkey migration",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bloom_signer_api::{Digest32, Token};
-
-    fn migration() -> bloom_signer_api::LegacyPasskeyMigrationPublic {
-        bloom_signer_api::LegacyPasskeyMigrationPublic {
-            schema: Token::new("bloom.legacy_passkey_migration_receipt.v1").unwrap(),
-            wallet_name: Token::new("legacy-wallet").unwrap(),
-            address: "0x0000000000000000000000000000000000000000".into(),
-            public_key_fingerprint: Digest32::from_bytes([1; 32]),
-            credential_id_fingerprint: Digest32::from_bytes([2; 32]),
-            legacy_format_version: 1,
-            bundle_digest: Digest32::from_bytes([3; 32]),
-            policy_mode: Token::new("restrictive_current_policy").unwrap(),
-        }
-    }
-
-    fn import_request() -> CustodyPrepareRequest {
-        CustodyPrepareRequest {
-            surface: bloom_signer_api::legacy_local_surface(),
-            ceremony_kind: CeremonyKind::WalletImport,
-            custody_operation_id: OperationId::from_bytes([9; 32]),
-            wallet_id: Some(Token::new("wallet").unwrap()),
-            key_ref: None,
-            exact_terms_digest: Digest32::from_bytes([4; 32]),
-            expected_input_class: Token::new("none").unwrap(),
-            browser_output_recipient_key: None,
-            petal_key_scope: None,
-            legacy_passkey_migration: None,
-            derivation_requests: Vec::new(),
-            wallet_seed_profile: None,
-        }
-    }
-
-    #[test]
-    fn seed_profile_and_legacy_migration_are_mutually_exclusive() {
-        let mut request = import_request();
-        request.legacy_passkey_migration = Some(migration());
-        assert!(reject_seed_profile_with_migration(&request).is_ok());
-
-        request.wallet_seed_profile = Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1);
-        let error = reject_seed_profile_with_migration(&request).unwrap_err();
-        assert_eq!(error.code, ProtocolErrorCode::MalformedFrame);
-
-        // A seed profile alone (no migration) is fine.
-        let mut mnemonic_only = import_request();
-        mnemonic_only.wallet_seed_profile =
-            Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1);
-        assert!(reject_seed_profile_with_migration(&mnemonic_only).is_ok());
-    }
 }

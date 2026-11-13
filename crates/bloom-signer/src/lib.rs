@@ -8,7 +8,6 @@ pub mod custody;
 pub mod derivation_registry;
 pub mod engine;
 pub mod hpke;
-pub mod legacy_passkey;
 pub mod registry;
 pub mod service;
 pub mod webauthn;
