@@ -6,7 +6,7 @@ use bloom_signer::engine::{
 };
 use bloom_signer::registry::{BackendRegistry, CompiledBackend};
 use bloom_signer_api::*;
-use bloom_signer_backend_api::{SecretBytes, SignerBackendActivation};
+use bloom_signer_backend_api::SecretBytes;
 use bloom_signer_backend_local::LocalSignerBackend;
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
@@ -411,7 +411,7 @@ fn ac11_approval_ceiling_selector_issuer_key_state_retry_and_release_are_closed(
     );
 
     let inactive_backend = local_backend();
-    futures::executor::block_on(inactive_backend.deactivate(&terms.key_ref)).unwrap();
+    inactive_backend.deactivate();
     let inactive_engine = SignerEngine::open_in_memory(
         Token::new("broker-app-1").unwrap(),
         broker.verifying_key(),
@@ -749,10 +749,9 @@ fn ac32_rotated_audit_export_restore_carries_custody_policy_registry_and_counter
             .restore_local_backend(&Token::new("local-default").unwrap())
             .unwrap(),
     );
-    futures::executor::block_on(
-        restored_backend.activate(&terms.key_ref, SecretBytes::new(vec![7; 32])),
-    )
-    .unwrap();
+    restored_backend
+        .activate_blocking(SecretBytes::new(vec![7; 32]))
+        .unwrap();
     let mut historical_audit_keys = BTreeMap::new();
     historical_audit_keys.insert(
         Token::new("signer-audit-key").unwrap(),

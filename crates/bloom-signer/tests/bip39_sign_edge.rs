@@ -3,9 +3,7 @@
 //! vectors, and prove the root is never signable.
 
 use bloom_signer_api::{DerivationProfile, DerivationRef, Digest32, KeyRef, KeySpec, Token};
-use bloom_signer_backend_api::{
-    BackendInput, BackendSignRequest, SecretBytes, SignerBackend, SignerBackendActivation,
-};
+use bloom_signer_backend_api::{BackendInput, BackendSignRequest, SecretBytes, SignerBackend};
 use bloom_signer_backend_local::LocalSignerBackend;
 use bloom_signer_vectors as vectors;
 
@@ -26,18 +24,7 @@ fn backend() -> LocalSignerBackend {
         ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]).verifying_key(),
     )
     .unwrap();
-    futures::executor::block_on(backend.activate(
-        &KeyRef {
-            backend: Token::new("local").unwrap(),
-            backend_instance: Token::new("bip39-wallet").unwrap(),
-            locator: "dummy".into(),
-            key_spec: KeySpec::Secp256k1,
-            public_key_fingerprint: Digest32::from_bytes([0u8; 32]),
-            derivation: None,
-        },
-        kek(),
-    ))
-    .unwrap();
+    backend.activate_blocking(kek()).unwrap();
     backend
 }
 

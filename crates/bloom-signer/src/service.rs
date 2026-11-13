@@ -902,9 +902,7 @@ mod tests {
         ProtocolVersion, RequestNonce, RevokeRequest, SealedApprovalTerms, SelectorKind,
         SignOperationIdentity, SignatureEncoding, UnsignedSignRequest, WalletRequest,
     };
-    use bloom_signer_backend_api::{
-        BackendError, SecretBytes, SignerBackend, SignerBackendActivation,
-    };
+    use bloom_signer_backend_api::{BackendError, SecretBytes, SignerBackend};
     use bloom_signer_backend_local::LocalSignerBackend;
     use ed25519_dalek::{Signer as _, SigningKey};
     use std::collections::BTreeMap;
@@ -933,8 +931,7 @@ mod tests {
         .unwrap();
         let key_ref = backend.root_key_ref().unwrap();
         backend
-            .activate(&key_ref, SecretBytes::new(activation_secret))
-            .await
+            .activate_blocking(SecretBytes::new(activation_secret))
             .unwrap();
         let description = backend.describe_key(&key_ref).await.unwrap();
 
@@ -989,8 +986,7 @@ mod tests {
         );
         let key_ref = backend.root_key_ref().unwrap();
         backend
-            .activate(&key_ref, SecretBytes::new(activation_secret))
-            .await
+            .activate_blocking(SecretBytes::new(activation_secret))
             .unwrap();
         let registry = Arc::new(
             crate::registry::BackendRegistry::from_compiled(vec![wrap_backend(backend)]).unwrap(),

@@ -3,8 +3,7 @@ use bloom_signer_api::{
     KeySpec, Token,
 };
 use bloom_signer_backend_api::{
-    ActivationStatus, BackendError, BackendInput, BackendSignRequest, SecretBytes, SignerBackend,
-    SignerBackendActivation, SignerBackendDerivation,
+    BackendError, BackendInput, BackendSignRequest, SecretBytes, SignerBackend,
 };
 use bloom_signer_backend_local::{
     DerivationAuthority, DerivationGrant, EncryptedLocalBackup, LocalSignerBackend,
@@ -249,11 +248,7 @@ fn imported_scalar_roots_sign_deactivate_and_restart() {
     let signature = futures::executor::block_on(backend.sign(request.clone())).unwrap();
     assert_eq!(signature.bytes.decode().len(), 65);
 
-    futures::executor::block_on(backend.deactivate(&root)).unwrap();
-    assert_eq!(
-        futures::executor::block_on(backend.activation_status(&root)).unwrap(),
-        ActivationStatus::Inactive
-    );
+    backend.deactivate();
     assert!(futures::executor::block_on(backend.sign(request.clone())).is_err());
 
     let backup: EncryptedLocalBackup = backend.encrypted_backup().unwrap();
@@ -278,11 +273,20 @@ fn imported_scalar_roots_reject_derivation_namespaces() {
     // The imported-scalar profile is a single key, not a seed: it can never
     // host a derivation namespace.
     let backend = backend([3_u8; 32]);
-    let root = backend.root_key_ref().unwrap();
-    assert!(matches!(
-        futures::executor::block_on(backend.derive_public(&root, "m/44'/60'/0'/0/0")),
-        Err(BackendError::InvalidRequest)
-    ));
+    let authority = DerivationAuthority::from_signed(
+        DerivationGrant {
+            authority_kind: Token::new("ceremony").unwrap(),
+            namespace_id: Token::new("evm-accounts").unwrap(),
+            canonical_prefix: "m/44'/60'/0'/0".into(),
+            starting_index: DecimalU64::new(0),
+            maximum_children: DecimalU64::new(8),
+        },
+        Base64UrlBytes::from_bytes(&[0; 64]),
+    );
+    assert_eq!(
+        backend.configure_namespace(&authority),
+        Err(BackendError::Unsupported)
+    );
 }
 
 #[test]
@@ -414,7 +418,9 @@ fn bip32_seed_wallet_unlocks_derives_signs_and_round_trips() {
     let root = backend.root_key_ref().unwrap();
 
     // Unlock (activate) with the KEK.
-    futures::executor::block_on(backend.activate(&root, SecretBytes::new(kek.to_vec()))).unwrap();
+    backend
+        .activate_blocking(SecretBytes::new(kek.to_vec()))
+        .unwrap();
 
     // The root and a derived child both sign.
     let root_sig = futures::executor::block_on(backend.sign(BackendSignRequest {
@@ -475,7 +481,9 @@ fn bip32_seed_wallet_unlocks_derives_signs_and_round_trips() {
         futures::executor::block_on(restored.describe_key(&child)).unwrap_err(),
         BackendError::DefinitiveRejected
     );
-    futures::executor::block_on(restored.activate(&root, SecretBytes::new(kek.to_vec()))).unwrap();
+    restored
+        .activate_blocking(SecretBytes::new(kek.to_vec()))
+        .unwrap();
     let description = futures::executor::block_on(restored.describe_key(&child)).unwrap();
     assert_eq!(
         description.public_key_fingerprint,
