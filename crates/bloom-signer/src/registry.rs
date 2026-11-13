@@ -5,132 +5,24 @@ use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Clone)]
 pub enum CompiledBackend {
-    #[cfg(feature = "local")]
     Local(Arc<bloom_signer_backend_local::LocalSignerBackend>),
     /// A fault-injecting stand-in for in-crate service tests: it wraps a real
     /// local backend and only changes what `sign` returns. It never exists in
     /// a production build, so no production path can reach it.
-    #[cfg(all(test, feature = "local"))]
+    #[cfg(test)]
     Test(Arc<test_fault::FaultSignerBackend>),
 }
 
 impl CompiledBackend {
     fn as_backend(&self) -> Arc<dyn SignerBackend> {
         match self {
-            #[cfg(feature = "local")]
             Self::Local(backend) => backend.clone(),
-            #[cfg(all(test, feature = "local"))]
+            #[cfg(test)]
             Self::Test(backend) => backend.clone(),
         }
     }
 }
 
-/// Fault injection for the signing-path tests in this crate. Lives next to
-/// [`CompiledBackend`] because only that enum can install a backend into the
-/// production registry.
-#[cfg(all(test, feature = "local"))]
-pub(crate) mod test_fault {
-    use bloom_signer_api::{
-        CryptoSuite, KeyRef, ProtocolError, ProtocolErrorCode, SignatureEncoding, Token,
-    };
-    use bloom_signer_backend_api::{
-        BackendCapabilities, BackendError, BackendFuture, BackendSignRequest, BackendSignature,
-        KeyDescription, SignerBackend,
-    };
-    use bloom_signer_backend_local::LocalSignerBackend;
-    use parking_lot::Mutex;
-    use std::collections::VecDeque;
-    use std::sync::Arc;
-
-    /// What the next backend `sign` call does. When the script runs out, every
-    /// further call delegates to the wrapped backend unchanged.
-    pub enum SignFault {
-        /// Behave like the wrapped backend.
-        Sign,
-        /// Fail the backend call itself.
-        Fail(BackendError),
-        /// Sign, then claim the signature belongs to another crypto suite.
-        ClaimSuite(CryptoSuite),
-        /// Sign, then claim the signature uses the other signature encoding.
-        ClaimEncoding(SignatureEncoding),
-    }
-
-    pub struct FaultSignerBackend {
-        inner: Arc<LocalSignerBackend>,
-        script: Mutex<VecDeque<SignFault>>,
-    }
-
-    impl FaultSignerBackend {
-        pub(crate) fn new(inner: Arc<LocalSignerBackend>, script: Vec<SignFault>) -> Self {
-            Self {
-                inner,
-                script: Mutex::new(script.into()),
-            }
-        }
-
-        pub(crate) fn key_is_available(&self, key_ref: &KeyRef) -> Result<bool, ProtocolError> {
-            self.inner.key_is_available(key_ref).map_err(|error| {
-                ProtocolError::new(
-                    ProtocolErrorCode::ServiceUnavailable,
-                    format!("local backend key availability failed: {error:?}"),
-                )
-            })
-        }
-
-        pub(crate) fn key_is_registered(&self, key_ref: &KeyRef) -> Result<bool, ProtocolError> {
-            Ok(self.inner.key_is_registered(key_ref))
-        }
-    }
-
-    impl SignerBackend for FaultSignerBackend {
-        fn backend_id(&self) -> Token {
-            SignerBackend::backend_id(self.inner.as_ref())
-        }
-
-        fn capabilities(&self) -> BackendCapabilities {
-            SignerBackend::capabilities(self.inner.as_ref())
-        }
-
-        fn describe_key<'a>(
-            &'a self,
-            key: &'a KeyRef,
-        ) -> BackendFuture<'a, Result<KeyDescription, BackendError>> {
-            Box::pin(async move { SignerBackend::describe_key(self.inner.as_ref(), key).await })
-        }
-
-        fn sign<'a>(
-            &'a self,
-            request: BackendSignRequest,
-        ) -> BackendFuture<'a, Result<BackendSignature, BackendError>> {
-            Box::pin(async move {
-                // Pop before awaiting: the guard must not be held across the
-                // backend call (it is not Send, and the backend may wait).
-                let fault = self.script.lock().pop_front();
-                match fault {
-                    Some(SignFault::Sign) => {
-                        SignerBackend::sign(self.inner.as_ref(), request).await
-                    }
-                    Some(SignFault::Fail(error)) => Err(error),
-                    Some(SignFault::ClaimSuite(suite)) => {
-                        let mut signature =
-                            SignerBackend::sign(self.inner.as_ref(), request).await?;
-                        signature.crypto_suite = suite;
-                        Ok(signature)
-                    }
-                    Some(SignFault::ClaimEncoding(encoding)) => {
-                        let mut signature =
-                            SignerBackend::sign(self.inner.as_ref(), request).await?;
-                        signature.encoding = encoding;
-                        Ok(signature)
-                    }
-                    None => SignerBackend::sign(self.inner.as_ref(), request).await,
-                }
-            })
-        }
-    }
-}
-
-#[cfg(feature = "local")]
 const DERIVED_KEY_REFUSALS: [&str; 2] = [
     "derivation backend is not compiled into this Signer",
     "the fault-injection test backend does not manage derived keys",
@@ -215,7 +107,6 @@ impl BackendRegistry {
 
     /// The local backend serving `key_ref`. `messages` are the refusals when
     /// it is missing or the fault-injection test backend.
-    #[cfg(feature = "local")]
     fn local_backend(
         &self,
         key_ref: &KeyRef,
@@ -223,7 +114,7 @@ impl BackendRegistry {
     ) -> Result<Arc<bloom_signer_backend_local::LocalSignerBackend>, ProtocolError> {
         match self.lookup(key_ref, messages[0])? {
             CompiledBackend::Local(local) => Ok(local),
-            #[cfg(all(test, feature = "local"))]
+            #[cfg(test)]
             CompiledBackend::Test(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
                 messages[1],
@@ -236,14 +127,13 @@ impl BackendRegistry {
         key_ref: &bloom_signer_api::KeyRef,
     ) -> Result<bool, ProtocolError> {
         match self.lookup_compiled(key_ref)? {
-            #[cfg(feature = "local")]
             CompiledBackend::Local(local) => local.key_is_available(key_ref).map_err(|error| {
                 ProtocolError::new(
                     ProtocolErrorCode::ServiceUnavailable,
                     format!("local backend key availability failed: {error:?}"),
                 )
             }),
-            #[cfg(all(test, feature = "local"))]
+            #[cfg(test)]
             CompiledBackend::Test(backend) => backend.key_is_available(key_ref),
         }
     }
@@ -253,9 +143,8 @@ impl BackendRegistry {
         key_ref: &bloom_signer_api::KeyRef,
     ) -> Result<bool, ProtocolError> {
         match self.lookup_compiled(key_ref)? {
-            #[cfg(feature = "local")]
             CompiledBackend::Local(local) => Ok(local.key_is_registered(key_ref)),
-            #[cfg(all(test, feature = "local"))]
+            #[cfg(test)]
             CompiledBackend::Test(backend) => backend.key_is_registered(key_ref),
         }
     }
@@ -274,14 +163,13 @@ impl BackendRegistry {
             key_ref,
             "activation backend is not compiled into this Signer",
         )? {
-            #[cfg(feature = "local")]
             CompiledBackend::Local(local) => local.activate_blocking(secret).map_err(|cause| {
                 ProtocolError::new(
                     ProtocolErrorCode::BackendInvalidRequest,
                     format!("local backend activation failed: {cause:?}"),
                 )
             }),
-            #[cfg(all(test, feature = "local"))]
+            #[cfg(test)]
             CompiledBackend::Test(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
                 "the fault-injection test backend does not manage activation",
@@ -298,7 +186,6 @@ impl BackendRegistry {
             key_ref,
             "activation backend is not compiled into this Signer",
         )? {
-            #[cfg(feature = "local")]
             CompiledBackend::Local(local) => {
                 local.activate(key_ref, secret).await.map_err(|cause| {
                     ProtocolError::new(
@@ -307,7 +194,7 @@ impl BackendRegistry {
                     )
                 })
             }
-            #[cfg(all(test, feature = "local"))]
+            #[cfg(test)]
             CompiledBackend::Test(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
                 "the fault-injection test backend does not manage activation",
@@ -323,14 +210,13 @@ impl BackendRegistry {
             key_ref,
             "activation backend is not compiled into this Signer",
         )? {
-            #[cfg(feature = "local")]
             CompiledBackend::Local(local) => local.deactivate(key_ref).await.map_err(|cause| {
                 ProtocolError::new(
                     ProtocolErrorCode::BackendInvalidRequest,
                     format!("local backend deactivation failed: {cause:?}"),
                 )
             }),
-            #[cfg(all(test, feature = "local"))]
+            #[cfg(test)]
             CompiledBackend::Test(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
                 "the fault-injection test backend does not manage activation",
@@ -338,7 +224,6 @@ impl BackendRegistry {
         }
     }
 
-    #[cfg(feature = "local")]
     pub fn provision_imported_secp256k1_wallet_backend(
         &self,
         wallet_id: &Token,
@@ -398,7 +283,6 @@ impl BackendRegistry {
     /// signable key, so this returns no root `KeyRef` — only the encrypted
     /// backend record for the backup set. Derived children are registered
     /// later via [`BackendRegistry::register_bip39_child`].
-    #[cfg(feature = "local")]
     pub fn provision_bip39_wallet_backend(
         &self,
         wallet_id: &Token,
@@ -448,24 +332,8 @@ impl BackendRegistry {
         Ok(encrypted_record)
     }
 
-    /// BIP-39 derivation requires the local backend; without it, fail closed.
-    #[cfg(not(feature = "local"))]
-    pub fn provision_bip39_wallet_backend(
-        &self,
-        _wallet_id: &Token,
-        _entropy: SecretBytes,
-        _activation_secret: SecretBytes,
-        _authority_verifying_key: ed25519_dalek::VerifyingKey,
-    ) -> Result<Base64UrlBytes, ProtocolError> {
-        Err(ProtocolError::new(
-            ProtocolErrorCode::BackendUnsupported,
-            "bip39 wallets require the local derivation backend",
-        ))
-    }
-
     /// Restore a BIP-39 wallet backend (entropy root, no signable root KeyRef)
     /// from its persisted enrollment at startup.
-    #[cfg(feature = "local")]
     pub fn restore_bip39_wallet_backend(
         &self,
         backend_instance: &Token,
@@ -570,7 +438,6 @@ impl BackendRegistry {
                 )
             })?;
         match backend {
-            #[cfg(feature = "local")]
             CompiledBackend::Local(local) => local
                 .register_bip39_child_description(description, operation_id)
                 .map_err(|error| {
@@ -579,7 +446,7 @@ impl BackendRegistry {
                         format!("local bip39 child registration failed: {error:?}"),
                     )
                 }),
-            #[cfg(all(test, feature = "local"))]
+            #[cfg(test)]
             CompiledBackend::Test(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
                 "the fault-injection test backend does not manage derivation",
@@ -602,14 +469,13 @@ impl BackendRegistry {
                 )
             })?;
         match backend {
-            #[cfg(feature = "local")]
             CompiledBackend::Local(local) => local.retire_bip39_child(key_ref).map_err(|error| {
                 ProtocolError::new(
                     ProtocolErrorCode::BackendInvalidRequest,
                     format!("local bip39 child retirement failed: {error:?}"),
                 )
             }),
-            #[cfg(all(test, feature = "local"))]
+            #[cfg(test)]
             CompiledBackend::Test(_) => Err(ProtocolError::new(
                 ProtocolErrorCode::BackendUnsupported,
                 "the fault-injection test backend does not manage derivation",
@@ -617,7 +483,6 @@ impl BackendRegistry {
         }
     }
 
-    #[cfg(feature = "local")]
     pub fn restore_local_wallet_backend(
         &self,
         backend_instance: &Token,
@@ -678,12 +543,10 @@ impl BackendRegistry {
         Ok(())
     }
 
-    #[cfg(feature = "local")]
     pub fn remove_local_wallet_backend(&self, key_ref: &KeyRef) {
         self.remove_local_wallet_backend_instance(&key_ref.backend_instance);
     }
 
-    #[cfg(feature = "local")]
     pub fn remove_local_wallet_backend_instance(&self, backend_instance: &Token) {
         let backend_id = Token::new("local").expect("static token");
         self.backends
@@ -691,7 +554,6 @@ impl BackendRegistry {
             .remove(&(backend_id, backend_instance.clone()));
     }
 
-    #[cfg(feature = "local")]
     pub fn local_encrypted_backup(&self, root: &KeyRef) -> Result<Base64UrlBytes, ProtocolError> {
         let local = self.local_backend(
             root,
@@ -713,7 +575,6 @@ impl BackendRegistry {
         ))
     }
 
-    #[cfg(feature = "local")]
     pub fn configure_local_derivation_namespace(
         &self,
         root: &bloom_signer_api::KeyRef,
@@ -732,7 +593,6 @@ impl BackendRegistry {
             })
     }
 
-    #[cfg(feature = "local")]
     pub fn allocate_local_derived_key(
         &self,
         root: &bloom_signer_api::KeyRef,
@@ -756,7 +616,6 @@ impl BackendRegistry {
             })
     }
 
-    #[cfg(feature = "local")]
     pub fn rollback_local_derived_key(
         &self,
         key_ref: &bloom_signer_api::KeyRef,
@@ -771,7 +630,6 @@ impl BackendRegistry {
             })
     }
 
-    #[cfg(feature = "local")]
     pub fn finalize_local_derived_key(
         &self,
         key_ref: &bloom_signer_api::KeyRef,
@@ -787,7 +645,6 @@ impl BackendRegistry {
             })
     }
 
-    #[cfg(feature = "local")]
     pub fn pending_local_derivations(
         &self,
     ) -> Vec<(bloom_signer_api::OperationId, bloom_signer_api::KeyRef)> {
@@ -796,9 +653,114 @@ impl BackendRegistry {
             .values()
             .flat_map(|backend| match backend {
                 CompiledBackend::Local(local) => local.pending_derivations(),
-                #[cfg(all(test, feature = "local"))]
+                #[cfg(test)]
                 CompiledBackend::Test(_) => Vec::new(),
             })
             .collect()
+    }
+}
+
+/// Fault injection for the signing-path tests in this crate. Lives next to
+/// [`CompiledBackend`] because only that enum can install a backend into the
+/// production registry.
+#[cfg(test)]
+pub(crate) mod test_fault {
+    use bloom_signer_api::{
+        CryptoSuite, KeyRef, ProtocolError, ProtocolErrorCode, SignatureEncoding, Token,
+    };
+    use bloom_signer_backend_api::{
+        BackendCapabilities, BackendError, BackendFuture, BackendSignRequest, BackendSignature,
+        KeyDescription, SignerBackend,
+    };
+    use bloom_signer_backend_local::LocalSignerBackend;
+    use parking_lot::Mutex;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    /// What the next backend `sign` call does. When the script runs out, every
+    /// further call delegates to the wrapped backend unchanged.
+    pub enum SignFault {
+        /// Behave like the wrapped backend.
+        Sign,
+        /// Fail the backend call itself.
+        Fail(BackendError),
+        /// Sign, then claim the signature belongs to another crypto suite.
+        ClaimSuite(CryptoSuite),
+        /// Sign, then claim the signature uses the other signature encoding.
+        ClaimEncoding(SignatureEncoding),
+    }
+
+    pub struct FaultSignerBackend {
+        inner: Arc<LocalSignerBackend>,
+        script: Mutex<VecDeque<SignFault>>,
+    }
+
+    impl FaultSignerBackend {
+        pub(crate) fn new(inner: Arc<LocalSignerBackend>, script: Vec<SignFault>) -> Self {
+            Self {
+                inner,
+                script: Mutex::new(script.into()),
+            }
+        }
+
+        pub(crate) fn key_is_available(&self, key_ref: &KeyRef) -> Result<bool, ProtocolError> {
+            self.inner.key_is_available(key_ref).map_err(|error| {
+                ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!("local backend key availability failed: {error:?}"),
+                )
+            })
+        }
+
+        pub(crate) fn key_is_registered(&self, key_ref: &KeyRef) -> Result<bool, ProtocolError> {
+            Ok(self.inner.key_is_registered(key_ref))
+        }
+    }
+
+    impl SignerBackend for FaultSignerBackend {
+        fn backend_id(&self) -> Token {
+            SignerBackend::backend_id(self.inner.as_ref())
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            SignerBackend::capabilities(self.inner.as_ref())
+        }
+
+        fn describe_key<'a>(
+            &'a self,
+            key: &'a KeyRef,
+        ) -> BackendFuture<'a, Result<KeyDescription, BackendError>> {
+            Box::pin(async move { SignerBackend::describe_key(self.inner.as_ref(), key).await })
+        }
+
+        fn sign<'a>(
+            &'a self,
+            request: BackendSignRequest,
+        ) -> BackendFuture<'a, Result<BackendSignature, BackendError>> {
+            Box::pin(async move {
+                // Pop before awaiting: the guard must not be held across the
+                // backend call (it is not Send, and the backend may wait).
+                let fault = self.script.lock().pop_front();
+                match fault {
+                    Some(SignFault::Sign) => {
+                        SignerBackend::sign(self.inner.as_ref(), request).await
+                    }
+                    Some(SignFault::Fail(error)) => Err(error),
+                    Some(SignFault::ClaimSuite(suite)) => {
+                        let mut signature =
+                            SignerBackend::sign(self.inner.as_ref(), request).await?;
+                        signature.crypto_suite = suite;
+                        Ok(signature)
+                    }
+                    Some(SignFault::ClaimEncoding(encoding)) => {
+                        let mut signature =
+                            SignerBackend::sign(self.inner.as_ref(), request).await?;
+                        signature.encoding = encoding;
+                        Ok(signature)
+                    }
+                    None => SignerBackend::sign(self.inner.as_ref(), request).await,
+                }
+            })
+        }
     }
 }

@@ -7,8 +7,6 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = ["local"]
-local = ["dep:bloom-signer-backend-local"]
 triad-dev-harness = ["bloom-triad-local-transport/triad-dev-harness"]
 
 [dependencies]
@@ -25,7 +23,7 @@ bloom-service-activation.workspace = true
 bloom-service-observability.workspace = true
 bloom-trusted-time.workspace = true
 bloom-signer-backend-api = { path = "../bloom-signer-backend-api" }
-bloom-signer-backend-local = { path = "../bloom-signer-backend-local", optional = true }
+bloom-signer-backend-local = { path = "../bloom-signer-backend-local" }
 bs58 = "0.5"
 chacha20poly1305.workspace = true
 clap.workspace = true

@@ -405,7 +405,6 @@ pub struct SignerBackupSet {
     pub audit_verifying_keys: Vec<AuditPublicKeyBackup>,
 }
 
-#[cfg(feature = "local")]
 impl SignerBackupSet {
     pub fn restore_local_backend(
         &self,
@@ -2362,43 +2361,39 @@ impl SignerEngine {
                             ],
                         )
                         .map_err(storage)?;
-                    #[cfg(feature = "local")]
+                    let encrypted_record = self
+                        .backend_registry
+                        .local_encrypted_backup(&scope.parent_key_ref)?;
+                    let backup: bloom_signer_backend_local::EncryptedLocalBackup =
+                        serde_json::from_slice(&encrypted_record.decode()).map_err(malformed)?;
+                    let pinned_keys = if backup.root_material_kind
+                        == bloom_signer_backend_local::LocalRootMaterialKind::Bip39Entropy
                     {
-                        let encrypted_record = self
-                            .backend_registry
-                            .local_encrypted_backup(&scope.parent_key_ref)?;
-                        let backup: bloom_signer_backend_local::EncryptedLocalBackup =
-                            serde_json::from_slice(&encrypted_record.decode())
-                                .map_err(malformed)?;
-                        let pinned_keys = if backup.root_material_kind
-                            == bloom_signer_backend_local::LocalRootMaterialKind::Bip39Entropy
-                        {
-                            backup.derivation_registry
-                        } else {
-                            vec![scope.parent_key_ref.clone()]
-                        };
-                        let enrollment = BackendEnrollmentBackup {
-                            backend: scope.parent_key_ref.backend.clone(),
-                            backend_instance: scope.parent_key_ref.backend_instance.clone(),
-                            encrypted_record,
-                            pinned_keys,
-                        };
-                        let updated = transaction
-                            .execute(
-                                "UPDATE ceremony_backend_enrollments
+                        backup.derivation_registry
+                    } else {
+                        vec![scope.parent_key_ref.clone()]
+                    };
+                    let enrollment = BackendEnrollmentBackup {
+                        backend: scope.parent_key_ref.backend.clone(),
+                        backend_instance: scope.parent_key_ref.backend_instance.clone(),
+                        encrypted_record,
+                        pinned_keys,
+                    };
+                    let updated = transaction
+                        .execute(
+                            "UPDATE ceremony_backend_enrollments
                                  SET enrollment_jcs = ?2 WHERE backend_instance = ?1",
-                                params![
-                                    scope.parent_key_ref.backend_instance.as_str(),
-                                    serde_jcs::to_string(&enrollment).map_err(malformed)?,
-                                ],
-                            )
-                            .map_err(storage)?;
-                        if updated != 1 {
-                            return Err(error(
-                                ProtocolErrorCode::KeyrefMismatch,
-                                "Petal sub-key parent lacks durable wallet custody enrollment",
-                            ));
-                        }
+                            params![
+                                scope.parent_key_ref.backend_instance.as_str(),
+                                serde_jcs::to_string(&enrollment).map_err(malformed)?,
+                            ],
+                        )
+                        .map_err(storage)?;
+                    if updated != 1 {
+                        return Err(error(
+                            ProtocolErrorCode::KeyrefMismatch,
+                            "Petal sub-key parent lacks durable wallet custody enrollment",
+                        ));
                     }
                 }
             }
@@ -2678,42 +2673,35 @@ impl SignerEngine {
         wallet_id: &Token,
         key_ref: &KeyRef,
     ) -> Result<(), ProtocolError> {
-        #[cfg(feature = "local")]
-        {
-            let encrypted_record = self.backend_registry.local_encrypted_backup(key_ref)?;
-            // The enrollment's pinned_keys must equal the backend's actual
-            // derivation registry (its derived-key subset, no root) so the
-            // export/restore cross-check in `derivation_registry_from_enrollments`
-            // matches. Record the real accumulated set, not a blank slate.
-            let backup: bloom_signer_backend_local::EncryptedLocalBackup =
-                serde_json::from_slice(&encrypted_record.decode()).map_err(malformed)?;
-            let enrollment = BackendEnrollmentBackup {
-                backend: key_ref.backend.clone(),
-                backend_instance: key_ref.backend_instance.clone(),
-                encrypted_record,
-                pinned_keys: backup.derivation_registry.clone(),
-            };
-            let connection = self.connection.lock();
-            let updated = connection
-                .execute(
-                    "UPDATE ceremony_backend_enrollments
+        let encrypted_record = self.backend_registry.local_encrypted_backup(key_ref)?;
+        // The enrollment's pinned_keys must equal the backend's actual
+        // derivation registry (its derived-key subset, no root) so the
+        // export/restore cross-check in `derivation_registry_from_enrollments`
+        // matches. Record the real accumulated set, not a blank slate.
+        let backup: bloom_signer_backend_local::EncryptedLocalBackup =
+            serde_json::from_slice(&encrypted_record.decode()).map_err(malformed)?;
+        let enrollment = BackendEnrollmentBackup {
+            backend: key_ref.backend.clone(),
+            backend_instance: key_ref.backend_instance.clone(),
+            encrypted_record,
+            pinned_keys: backup.derivation_registry.clone(),
+        };
+        let connection = self.connection.lock();
+        let updated = connection
+            .execute(
+                "UPDATE ceremony_backend_enrollments
                      SET enrollment_jcs = ?2 WHERE backend_instance = ?1",
-                    params![
-                        wallet_id.as_str(),
-                        serde_jcs::to_string(&enrollment).map_err(malformed)?,
-                    ],
-                )
-                .map_err(storage)?;
-            if updated != 1 {
-                return Err(error(
-                    ProtocolErrorCode::KeyrefMismatch,
-                    "bip39 backend lacks durable enrollment",
-                ));
-            }
-        }
-        #[cfg(not(feature = "local"))]
-        {
-            let _ = (wallet_id, key_ref);
+                params![
+                    wallet_id.as_str(),
+                    serde_jcs::to_string(&enrollment).map_err(malformed)?,
+                ],
+            )
+            .map_err(storage)?;
+        if updated != 1 {
+            return Err(error(
+                ProtocolErrorCode::KeyrefMismatch,
+                "bip39 backend lacks durable enrollment",
+            ));
         }
         Ok(())
     }
@@ -6336,7 +6324,6 @@ fn verify_policy_backup(policy: &PolicyBackup) -> Result<(), ProtocolError> {
         })
 }
 
-#[cfg(feature = "local")]
 fn derivation_registry_from_enrollments(
     enrollments: &[BackendEnrollmentBackup],
 ) -> Result<Option<DerivationRegistryBackup>, ProtocolError> {
@@ -6407,20 +6394,12 @@ fn derivation_registry_from_enrollments(
     }))
 }
 
-#[cfg(not(feature = "local"))]
-fn derivation_registry_from_enrollments(
-    _enrollments: &[BackendEnrollmentBackup],
-) -> Result<Option<DerivationRegistryBackup>, ProtocolError> {
-    Ok(None)
-}
-
 /// Normalize a restored backend enrollment: the enrolled encrypted record may
 /// still carry `pending_derivations` entries whose custody receipt was already
 /// committed but not yet reconciled at the next startup. A restore is a fully
 /// finalized snapshot — every derived child is already in `derivation_registry`
 /// — so the transient pending map is cleared rather than leaving stale
 /// operations for startup to roll back (which would tombstone live children).
-#[cfg(feature = "local")]
 fn restored_enrollment(
     enrollment: &BackendEnrollmentBackup,
 ) -> Result<BackendEnrollmentBackup, ProtocolError> {
@@ -6431,13 +6410,6 @@ fn restored_enrollment(
     normalized.encrypted_record =
         Base64UrlBytes::from_bytes(&serde_jcs::to_vec(&record).map_err(malformed)?);
     Ok(normalized)
-}
-
-#[cfg(not(feature = "local"))]
-fn restored_enrollment(
-    enrollment: &BackendEnrollmentBackup,
-) -> Result<BackendEnrollmentBackup, ProtocolError> {
-    Ok(enrollment.clone())
 }
 
 /// Read every ACTIVATED/RETIRED `derivation_allocations` row for a wallet and

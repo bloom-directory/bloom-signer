@@ -27,7 +27,6 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-#[cfg(feature = "local")]
 use crate::registry::BackendRegistry;
 use crate::{
     custody::{UnlockedWallet, WalletCustody, WalletCustodyBackup},
@@ -237,14 +236,12 @@ struct GenericCustodyOutcome {
     public_key_refs: Vec<bloom_signer_api::KeyRef>,
 }
 
-#[cfg(feature = "local")]
 struct ProvisionedLocalBackendRollback<'a> {
     registry: &'a BackendRegistry,
     backend_instance: Token,
     armed: bool,
 }
 
-#[cfg(feature = "local")]
 impl<'a> ProvisionedLocalBackendRollback<'a> {
     fn new(registry: &'a BackendRegistry, backend_instance: Token) -> Self {
         Self {
@@ -259,7 +256,6 @@ impl<'a> ProvisionedLocalBackendRollback<'a> {
     }
 }
 
-#[cfg(feature = "local")]
 impl Drop for ProvisionedLocalBackendRollback<'_> {
     fn drop(&mut self) {
         if self.armed {
@@ -379,7 +375,6 @@ impl SignerCeremonyService {
             })?;
         engine.recover_deleted_wallet_backends(&signing_key.verifying_key())?;
         engine.recover_incomplete_bip39_allocations(recovery_now_ms)?;
-        #[cfg(feature = "local")]
         for enrollment in engine.load_ceremony_backend_enrollments()? {
             if enrollment.backend.as_str() != "local" {
                 return Err(protocol(
@@ -437,7 +432,6 @@ impl SignerCeremonyService {
                 }
             }
         }
-        #[cfg(feature = "local")]
         for (operation_id, key_ref) in engine.backend_registry().pending_local_derivations() {
             // BIP-39 allocation children are committed only by the exact rows
             // named by their ceremony apply outcome. A custody receipt under
@@ -2455,7 +2449,6 @@ impl SignerCeremonyService {
                 error,
             ));
         }
-        #[cfg(feature = "local")]
         if result.ceremony_kind == CeremonyKind::WalletDelete
             && let Some(wallet_id) = &result.wallet_id
         {
@@ -2464,12 +2457,9 @@ impl SignerCeremonyService {
                 .remove_local_wallet_backend_instance(wallet_id);
         }
         for derived in &apply_outcome.derived_keys {
-            #[cfg(feature = "local")]
             self.engine
                 .backend_registry()
                 .finalize_local_derived_key(&derived.key_ref, &derived.operation_id)?;
-            #[cfg(not(feature = "local"))]
-            let _ = derived;
         }
         if apply_outcome.consume_legacy_migration {
             self.legacy_migrations
@@ -3020,118 +3010,106 @@ impl SignerCeremonyService {
                     wallets.insert(registration.wallet_id.clone(), wallet);
                 }
                 self.register_existing_credential(registration.wallet_id.clone(), credential)?;
-                #[cfg(feature = "local")]
-                {
-                    if is_bip39 {
-                        let _initial_record = self
-                            .engine
-                            .backend_registry()
-                            .provision_bip39_wallet_backend(
-                                &registration.wallet_id,
-                                SecretBytes::new(backend_seed),
-                                SecretBytes::new(backend_activation_secret),
-                                self.signing_key.verifying_key(),
-                            )?;
-                        let mut provisioned_backend = ProvisionedLocalBackendRollback::new(
-                            self.engine.backend_registry().as_ref(),
-                            registration.wallet_id.clone(),
-                        );
-                        // D1: allocate the canonical initial EVM account
-                        // m/44'/60'/0'/0/0 and the canonical Solana child
-                        // inside the same apply. The root is never a signable
-                        // KeyRef, so both public_key_refs are allocated here.
-                        let requests = [
-                            bloom_signer_api::DerivedAccountRequest {
-                                derivation_profile:
-                                    bloom_signer_api::DerivationProfile::Bip44EvmSecp256k1V1,
-                                requested_role: Token::new("primary-evm").expect("static token"),
-                                account: None,
-                            },
-                            bloom_signer_api::DerivedAccountRequest {
-                                derivation_profile:
-                                    bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-                                requested_role: Token::new("solana-account").expect("static token"),
-                                account: None,
-                            },
-                        ];
-                        let children = self.engine.allocate_bip39_accounts(
+                if is_bip39 {
+                    let _initial_record = self
+                        .engine
+                        .backend_registry()
+                        .provision_bip39_wallet_backend(
                             &registration.wallet_id,
-                            &prepare.custody_operation_id,
-                            &requests,
-                            &unlocked,
-                            now_ms,
+                            SecretBytes::new(backend_seed),
+                            SecretBytes::new(backend_activation_secret),
+                            self.signing_key.verifying_key(),
                         )?;
-                        // Capture the enrollment with the post-allocation
-                        // backend record so a restart re-registers the children.
-                        let encrypted_record = self
-                            .engine
-                            .backend_registry()
-                            .local_encrypted_backup(&children[0].key_ref)?;
-                        let backup: bloom_signer_backend_local::EncryptedLocalBackup =
-                            serde_json::from_slice(&encrypted_record.decode())
-                                .map_err(malformed)?;
-                        let enrollment = crate::engine::BackendEnrollmentBackup {
-                            backend: Token::new("local").expect("static token"),
-                            backend_instance: registration.wallet_id.clone(),
-                            encrypted_record,
-                            pinned_keys: backup.derivation_registry,
-                        };
-                        let CeremonyDatabaseEffect::InitialPolicy {
-                            backend_enrollment, ..
-                        } = &mut database_effect
-                        else {
-                            return Err(kind_mismatch());
-                        };
-                        *backend_enrollment = Some(enrollment);
-                        rollback_provisioned_backend = Some(children[0].key_ref.clone());
-                        public_key_refs = children.iter().map(|key| key.key_ref.clone()).collect();
-                        derived_keys = children
-                            .iter()
-                            .map(|key| DerivedKeyCommit {
-                                key_ref: key.key_ref.clone(),
-                                operation_id: key.operation_id.clone(),
-                            })
-                            .collect();
-                        provisioned_backend.disarm();
-                    } else {
-                        let (root_key_ref, encrypted_record) = self
-                            .engine
-                            .backend_registry()
-                            .provision_imported_secp256k1_wallet_backend(
-                                &registration.wallet_id,
-                                SecretBytes::new(backend_seed),
-                                SecretBytes::new(backend_activation_secret),
-                                self.signing_key.verifying_key(),
-                            )?;
-                        let mut provisioned_backend = ProvisionedLocalBackendRollback::new(
-                            self.engine.backend_registry().as_ref(),
-                            registration.wallet_id.clone(),
-                        );
-                        let enrollment = crate::engine::BackendEnrollmentBackup {
-                            backend: root_key_ref.backend.clone(),
-                            backend_instance: root_key_ref.backend_instance.clone(),
-                            encrypted_record,
-                            pinned_keys: vec![root_key_ref.clone()],
-                        };
-                        let CeremonyDatabaseEffect::InitialPolicy {
-                            backend_enrollment, ..
-                        } = &mut database_effect
-                        else {
-                            return Err(kind_mismatch());
-                        };
-                        *backend_enrollment = Some(enrollment);
-                        public_key_refs = vec![root_key_ref.clone()];
-                        rollback_provisioned_backend = Some(root_key_ref);
-                        provisioned_backend.disarm();
-                    }
-                }
-                #[cfg(not(feature = "local"))]
-                {
-                    let _ = (backend_seed, backend_activation_secret);
-                    return Err(protocol(
-                        ProtocolErrorCode::BackendUnsupported,
-                        "no wallet-provisioning backend is compiled",
-                    ));
+                    let mut provisioned_backend = ProvisionedLocalBackendRollback::new(
+                        self.engine.backend_registry().as_ref(),
+                        registration.wallet_id.clone(),
+                    );
+                    // D1: allocate the canonical initial EVM account
+                    // m/44'/60'/0'/0/0 and the canonical Solana child
+                    // inside the same apply. The root is never a signable
+                    // KeyRef, so both public_key_refs are allocated here.
+                    let requests = [
+                        bloom_signer_api::DerivedAccountRequest {
+                            derivation_profile:
+                                bloom_signer_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                            requested_role: Token::new("primary-evm").expect("static token"),
+                            account: None,
+                        },
+                        bloom_signer_api::DerivedAccountRequest {
+                            derivation_profile:
+                                bloom_signer_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                            requested_role: Token::new("solana-account").expect("static token"),
+                            account: None,
+                        },
+                    ];
+                    let children = self.engine.allocate_bip39_accounts(
+                        &registration.wallet_id,
+                        &prepare.custody_operation_id,
+                        &requests,
+                        &unlocked,
+                        now_ms,
+                    )?;
+                    // Capture the enrollment with the post-allocation
+                    // backend record so a restart re-registers the children.
+                    let encrypted_record = self
+                        .engine
+                        .backend_registry()
+                        .local_encrypted_backup(&children[0].key_ref)?;
+                    let backup: bloom_signer_backend_local::EncryptedLocalBackup =
+                        serde_json::from_slice(&encrypted_record.decode()).map_err(malformed)?;
+                    let enrollment = crate::engine::BackendEnrollmentBackup {
+                        backend: Token::new("local").expect("static token"),
+                        backend_instance: registration.wallet_id.clone(),
+                        encrypted_record,
+                        pinned_keys: backup.derivation_registry,
+                    };
+                    let CeremonyDatabaseEffect::InitialPolicy {
+                        backend_enrollment, ..
+                    } = &mut database_effect
+                    else {
+                        return Err(kind_mismatch());
+                    };
+                    *backend_enrollment = Some(enrollment);
+                    rollback_provisioned_backend = Some(children[0].key_ref.clone());
+                    public_key_refs = children.iter().map(|key| key.key_ref.clone()).collect();
+                    derived_keys = children
+                        .iter()
+                        .map(|key| DerivedKeyCommit {
+                            key_ref: key.key_ref.clone(),
+                            operation_id: key.operation_id.clone(),
+                        })
+                        .collect();
+                    provisioned_backend.disarm();
+                } else {
+                    let (root_key_ref, encrypted_record) = self
+                        .engine
+                        .backend_registry()
+                        .provision_imported_secp256k1_wallet_backend(
+                            &registration.wallet_id,
+                            SecretBytes::new(backend_seed),
+                            SecretBytes::new(backend_activation_secret),
+                            self.signing_key.verifying_key(),
+                        )?;
+                    let mut provisioned_backend = ProvisionedLocalBackendRollback::new(
+                        self.engine.backend_registry().as_ref(),
+                        registration.wallet_id.clone(),
+                    );
+                    let enrollment = crate::engine::BackendEnrollmentBackup {
+                        backend: root_key_ref.backend.clone(),
+                        backend_instance: root_key_ref.backend_instance.clone(),
+                        encrypted_record,
+                        pinned_keys: vec![root_key_ref.clone()],
+                    };
+                    let CeremonyDatabaseEffect::InitialPolicy {
+                        backend_enrollment, ..
+                    } = &mut database_effect
+                    else {
+                        return Err(kind_mismatch());
+                    };
+                    *backend_enrollment = Some(enrollment);
+                    public_key_refs = vec![root_key_ref.clone()];
+                    rollback_provisioned_backend = Some(root_key_ref);
+                    provisioned_backend.disarm();
                 }
                 Ok(())
             }
@@ -3476,86 +3454,71 @@ impl SignerCeremonyService {
                 },
             ) => {
                 let root = prepare.key_ref.as_ref().ok_or_else(kind_mismatch)?;
-                #[cfg(feature = "local")]
-                {
-                    if let Some(scope) = &prepare.petal_key_scope {
-                        if namespace_id.is_some()
-                            || grant.is_some()
-                            || authority_signature.is_some()
-                        {
-                            return Err(protocol(
-                                ProtocolErrorCode::BackendInvalidRequest,
-                                "Petal key derivation parameters are owned by Signer",
-                            ));
-                        }
-                        // Activate from this ceremony's own credential PRF.
-                        //
-                        // A Petal session is created by a KeyDerive followed by
-                        // a SealedApproval that registers the derived key with
-                        // the venue. Only the second activates the local
-                        // backend, and they cannot be reordered because the
-                        // approval registers the address this step mints. Every
-                        // other activating ceremony arms the backend itself;
-                        // KeyDerive was added later and never did, so on a
-                        // Signer with no owner ceremony since boot this failed
-                        // outright.
-                        //
-                        // Scoped deliberately to this branch. The enclosing
-                        // block also serves WalletExport, WalletDelete,
-                        // BackendEnrollment and PolicyUpdate; arming there would
-                        // make all of them activation vectors.
-                        self.engine.backend_registry().activate_key_blocking(
-                            root,
-                            unlocked.local_backend_activation_secret()?,
-                        )?;
-                        self.engine
-                            .record_backend_activation(&scope.wallet_id, root)?;
-                        // Still checked: activation can legitimately fail, and
-                        // the distinct error keeps that case diagnosable.
-                        self.engine
-                            .require_activated_parent_key(&scope.wallet_id, root)?;
-                        return self.apply_petal_key_derivation(root, scope);
+                if let Some(scope) = &prepare.petal_key_scope {
+                    if namespace_id.is_some() || grant.is_some() || authority_signature.is_some() {
+                        return Err(protocol(
+                            ProtocolErrorCode::BackendInvalidRequest,
+                            "Petal key derivation parameters are owned by Signer",
+                        ));
                     }
-                    let namespace_id = namespace_id.ok_or_else(kind_mismatch)?;
-                    let grant = grant.ok_or_else(kind_mismatch)?;
-                    let authority_signature = authority_signature.ok_or_else(kind_mismatch)?;
-                    let description = self.engine.backend_registry().allocate_local_derived_key(
-                        root,
-                        &namespace_id,
-                        bloom_signer_backend_local::DerivationGrant {
-                            authority_kind: grant.authority_kind,
-                            namespace_id: grant.namespace_id,
-                            canonical_prefix: grant.canonical_prefix,
-                            starting_index: grant.starting_index,
-                            maximum_children: grant.maximum_children,
-                        },
-                        authority_signature,
-                        &prepare.custody_operation_id,
-                    )?;
-                    let derived_key_ref = description.key_ref.clone();
-                    Ok(GenericCustodyOutcome {
-                        sensitive_output: Some(Zeroizing::new(
-                            serde_jcs::to_vec(&description).map_err(malformed)?,
-                        )),
-                        database_effect: CeremonyDatabaseEffect::EnrollKey {
-                            key_ref: description.key_ref.clone(),
-                            petal_scope: None,
-                        },
-                        derived_keys: vec![DerivedKeyCommit {
-                            key_ref: derived_key_ref,
-                            operation_id: prepare.custody_operation_id.clone(),
-                        }],
-                        public_key_refs: vec![description.key_ref],
-                    })
+                    // Activate from this ceremony's own credential PRF.
+                    //
+                    // A Petal session is created by a KeyDerive followed by
+                    // a SealedApproval that registers the derived key with
+                    // the venue. Only the second activates the local
+                    // backend, and they cannot be reordered because the
+                    // approval registers the address this step mints. Every
+                    // other activating ceremony arms the backend itself;
+                    // KeyDerive was added later and never did, so on a
+                    // Signer with no owner ceremony since boot this failed
+                    // outright.
+                    //
+                    // Scoped deliberately to this branch. The enclosing
+                    // block also serves WalletExport, WalletDelete,
+                    // BackendEnrollment and PolicyUpdate; arming there would
+                    // make all of them activation vectors.
+                    self.engine
+                        .backend_registry()
+                        .activate_key_blocking(root, unlocked.local_backend_activation_secret()?)?;
+                    self.engine
+                        .record_backend_activation(&scope.wallet_id, root)?;
+                    // Still checked: activation can legitimately fail, and
+                    // the distinct error keeps that case diagnosable.
+                    self.engine
+                        .require_activated_parent_key(&scope.wallet_id, root)?;
+                    return self.apply_petal_key_derivation(root, scope);
                 }
-                #[cfg(not(feature = "local"))]
-                {
-                    let _ = (root, namespace_id, grant, authority_signature);
-                    Err(protocol(
-                        ProtocolErrorCode::BackendUnsupported,
-                        "no derivation backend is compiled",
-                    ))
-                }
+                let namespace_id = namespace_id.ok_or_else(kind_mismatch)?;
+                let grant = grant.ok_or_else(kind_mismatch)?;
+                let authority_signature = authority_signature.ok_or_else(kind_mismatch)?;
+                let description = self.engine.backend_registry().allocate_local_derived_key(
+                    root,
+                    &namespace_id,
+                    bloom_signer_backend_local::DerivationGrant {
+                        authority_kind: grant.authority_kind,
+                        namespace_id: grant.namespace_id,
+                        canonical_prefix: grant.canonical_prefix,
+                        starting_index: grant.starting_index,
+                        maximum_children: grant.maximum_children,
+                    },
+                    authority_signature,
+                    &prepare.custody_operation_id,
+                )?;
+                let derived_key_ref = description.key_ref.clone();
+                Ok(GenericCustodyOutcome {
+                    sensitive_output: Some(Zeroizing::new(
+                        serde_jcs::to_vec(&description).map_err(malformed)?,
+                    )),
+                    database_effect: CeremonyDatabaseEffect::EnrollKey {
+                        key_ref: description.key_ref.clone(),
+                        petal_scope: None,
+                    },
+                    derived_keys: vec![DerivedKeyCommit {
+                        key_ref: derived_key_ref,
+                        operation_id: prepare.custody_operation_id.clone(),
+                    }],
+                    public_key_refs: vec![description.key_ref],
+                })
             }
             (CeremonyKind::PolicyUpdate, GenericCustodyEffect::PolicyUpdate) => {
                 Err(kind_mismatch())
@@ -3620,7 +3583,6 @@ impl SignerCeremonyService {
         }
     }
 
-    #[cfg(feature = "local")]
     fn apply_petal_key_derivation(
         &self,
         root: &bloom_signer_api::KeyRef,
@@ -3717,36 +3679,25 @@ impl SignerCeremonyService {
         if derived.is_empty() {
             return Ok(());
         }
-        #[cfg(feature = "local")]
-        {
-            let mut first_error = None;
-            for derived in derived {
-                if let Err(error) = self
-                    .engine
-                    .tombstone_failed_bip39_account(&derived.key_ref, now_ms)
-                {
-                    first_error.get_or_insert(error);
-                }
-                if let Err(error) = self
-                    .engine
-                    .backend_registry()
-                    .rollback_local_derived_key(&derived.key_ref)
-                {
-                    first_error.get_or_insert(error);
-                }
+        let mut first_error = None;
+        for derived in derived {
+            if let Err(error) = self
+                .engine
+                .tombstone_failed_bip39_account(&derived.key_ref, now_ms)
+            {
+                first_error.get_or_insert(error);
             }
-            match first_error {
-                Some(error) => Err(error),
-                None => Ok(()),
+            if let Err(error) = self
+                .engine
+                .backend_registry()
+                .rollback_local_derived_key(&derived.key_ref)
+            {
+                first_error.get_or_insert(error);
             }
         }
-        #[cfg(not(feature = "local"))]
-        {
-            let _ = now_ms;
-            Err(protocol(
-                ProtocolErrorCode::ServiceUnavailable,
-                "derived-key rollback backend is unavailable",
-            ))
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -3754,7 +3705,6 @@ impl SignerCeremonyService {
         let Some(key_ref) = key_ref else {
             return;
         };
-        #[cfg(feature = "local")]
         self.engine
             .backend_registry()
             .remove_local_wallet_backend(key_ref);
@@ -4137,20 +4087,6 @@ impl SignerCeremonyService {
                 ProtocolErrorCode::MalformedFrame,
                 "AccountRetire requires the derived-account KeyRef",
             ));
-        }
-        // A bip39 wallet can only be provisioned on the local derivation
-        // backend. Reject the prepare early (and cleanly) when that backend is
-        // not compiled into this Signer artifact.
-        if request.wallet_seed_profile
-            == Some(bloom_signer_api::WalletSeedProfile::Bip39MulticurveV1)
-        {
-            #[cfg(not(feature = "local"))]
-            {
-                return Err(protocol(
-                    ProtocolErrorCode::BackendUnsupported,
-                    "bip39 wallets require the local derivation backend",
-                ));
-            }
         }
         Ok(())
     }
