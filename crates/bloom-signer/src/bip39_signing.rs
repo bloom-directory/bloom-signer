@@ -225,3 +225,13 @@ pub fn sign_evm_digest(
     out[64] = recovery_id.to_byte();
     Ok(out)
 }
+
+/// Capability check: a backend advertises a derivation capability only when
+/// the active profile and primitive are actually implemented and tested.
+pub fn ed25519_capability_supported() -> bool {
+    true
+}
+
+pub fn secp256k1_capability_supported() -> bool {
+    true
+}

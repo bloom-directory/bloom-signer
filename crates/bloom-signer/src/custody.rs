@@ -11,7 +11,7 @@ use rand::{TryRng as _, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -199,6 +199,18 @@ impl UnlockedWallet {
     ) -> Result<[u8; 64], ProtocolError> {
         let seed = self.bip39_seed()?;
         crate::bip39_signing::sign_ed25519_message(&seed, account, message)
+            .map_err(|error| protocol(ProtocolErrorCode::BackendInvalidRequest, error.to_string()))
+    }
+
+    /// Sign a 32-byte EVM digest through the registered BIP-32 secp256k1
+    /// child (BIP-39 profile only), returning a 65-byte recoverable signature.
+    pub fn sign_evm(
+        &self,
+        account: &crate::bip39_signing::ActivatedAccount,
+        digest: &[u8; 32],
+    ) -> Result<[u8; 65], ProtocolError> {
+        let seed = self.bip39_seed()?;
+        crate::bip39_signing::sign_evm_digest(&seed, account, digest)
             .map_err(|error| protocol(ProtocolErrorCode::BackendInvalidRequest, error.to_string()))
     }
 }
@@ -786,6 +798,17 @@ impl WalletCustody {
             return Err(error);
         }
         Ok(())
+    }
+
+    pub fn active_credential_ids(&self) -> BTreeSet<String> {
+        self.state
+            .lock()
+            .backup
+            .credential_wraps
+            .iter()
+            .filter(|wrap| wrap.active)
+            .map(|wrap| wrap.credential_id.encoded().to_owned())
+            .collect()
     }
 }
 

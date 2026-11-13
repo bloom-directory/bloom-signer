@@ -198,6 +198,21 @@ impl BackendRegistry {
             .collect()
     }
 
+    #[cfg(feature = "aws-kms")]
+    pub fn aws_kms_audit_events(&self) -> Vec<bloom_signer_backend_aws_kms::AwsKmsAuditEvent> {
+        self.backends
+            .read()
+            .values()
+            .flat_map(|backend| match backend {
+                CompiledBackend::AwsKms(aws) => aws.audit_events(),
+                #[cfg(feature = "local")]
+                CompiledBackend::Local(_) => Vec::new(),
+                #[cfg(all(test, feature = "local"))]
+                CompiledBackend::Test(_) => Vec::new(),
+            })
+            .collect()
+    }
+
     /// The compiled backend serving `key_ref`, or `BackendUnsupported` with
     /// the caller's `missing` message.
     fn lookup(&self, key_ref: &KeyRef, missing: &str) -> Result<CompiledBackend, ProtocolError> {
