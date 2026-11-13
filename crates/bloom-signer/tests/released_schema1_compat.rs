@@ -1,17 +1,10 @@
 mod support;
 
-use std::{
-    collections::BTreeMap,
-    env, fs,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{env, fs, path::PathBuf};
 
 use bloom_signer::{
     ceremony::{SignerCeremonyService, SignerCeremonyStatus},
     custody::{WalletCustody, WalletCustodyBackup},
-    engine::{SignerAuditKeys, SignerEngine},
-    registry::BackendRegistry,
     webauthn::verify_webauthn_assertion,
 };
 use bloom_signer_api::{
@@ -23,7 +16,7 @@ use bloom_signer_backend_api::SecretBytes;
 use ed25519_dalek::{Signature, SigningKey, Verifier as _};
 use rusqlite::Connection;
 use sha2::{Digest as _, Sha256};
-use support::VirtualAuthenticator;
+use support::{VirtualAuthenticator, bip39_service};
 
 fn token(value: &str) -> Token {
     Token::new(value).unwrap()
@@ -35,30 +28,6 @@ fn digest(byte: u8) -> Digest32 {
 
 fn operation(byte: u8) -> OperationId {
     OperationId::from_bytes([byte; 32])
-}
-
-fn audit_keys() -> SignerAuditKeys {
-    SignerAuditKeys {
-        current_key_id: token("signer-audit-key"),
-        current_signing_key: SigningKey::from_bytes(&[14; 32]),
-        historical_verifying_keys: BTreeMap::new(),
-    }
-}
-
-fn engine(path: &Path) -> Arc<SignerEngine> {
-    Arc::new(
-        SignerEngine::open(
-            path,
-            token("broker-app-1"),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[9; 32]).verifying_key(),
-            token("signer-revocation-key"),
-            SigningKey::from_bytes(&[4; 32]),
-            audit_keys(),
-            Arc::new(BackendRegistry::from_compiled(Vec::new()).unwrap()),
-        )
-        .unwrap(),
-    )
 }
 
 fn fixture_path() -> (Option<tempfile::TempDir>, PathBuf) {
@@ -129,13 +98,7 @@ fn released_schema1_state_migrates_and_preserves_wallet_access() {
     assert!(!credential_json.contains("surface"));
     drop(connection);
 
-    let engine = engine(&path);
-    let service = SignerCeremonyService::new(
-        engine.clone(),
-        token("signer-ceremony-key"),
-        SigningKey::from_bytes(&[9; 32]),
-    )
-    .unwrap();
+    let (service, engine, _) = bip39_service(&path);
 
     let credential = service
         .credential(
