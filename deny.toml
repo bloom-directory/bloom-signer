@@ -8,12 +8,32 @@
 # Gate what ships, not what tests. `cargo audit` and a default `cargo deny`
 # both read Cargo.lock, which lists dev-dependencies, so a test-only crate
 # reads as production exposure.
+#
+# This is load-bearing here rather than cosmetic. The AWS KMS backend's
+# test dependency `aws-smithy-runtime/test-util` unconditionally enables
+# `legacy-test-util`, which drags in the legacy hyper-0.14 / rustls-0.21
+# stack (h2 0.3.x, rustls-webpki 0.101.x, rustls-pemfile 1.x) purely so the
+# tests can use `StaticReplayClient`. That stack carries open advisories and
+# cannot be dropped without rewriting those tests against a hand-rolled
+# transport. None of it is reachable from a Signer build: see the
+# `default-features = false` pins on aws-sdk-kms / aws-sdk-sts in the
+# workspace manifest, which select the modern `default-https-client`
+# (rustls 0.23 + aws-lc-rs) instead of the misleadingly named `rustls`
+# feature that selects the legacy one.
+#
+# Verify the claim with:
+#   cargo tree -e no-dev -i h2@0.3.27 --workspace
 exclude-dev = true
 
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+  # Transitive through aws-smithy-http 0.62.5, which declares pin-utils but
+  # does not use it in its source. This advisory concerns maintenance status,
+  # not a known vulnerability; remove the exception when upstream drops it.
+  { id = "RUSTSEC-2026-0441", reason = "pin-utils is unmaintained; aws-smithy-http declares it but does not use it" },
+]
 
 [licenses]
 version = 2

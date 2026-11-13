@@ -3,6 +3,7 @@ members = [
   "crates/bloom-signer-api",
   "crates/bloom-signer-backend-api",
   "crates/bloom-signer-backend-local",
+  "crates/bloom-signer-backend-aws-kms",
   "crates/bloom-signer-derive",
   "crates/bloom-signer-process-hardening",
   "crates/bloom-signer-vectors",
@@ -30,6 +31,24 @@ bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-ser
 bloom-service-observability = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
 bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
 bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "48b83c54c1787b4aff2456bd3adbe18856902e45" }
+aws-config = { version = "=1.8.1", default-features = false, features = ["rt-tokio", "rustls"] }
+aws-credential-types = "1"
+# Exact AWS service pins date from the old Rust 1.85 floor. Some newer
+# releases also fit the current 1.89 floor (up to aws-config 1.8.13,
+# aws-sdk-kms 1.99 and aws-sdk-sts 1.97); later ones need Rust 1.91 or newer.
+# Moving to them is a separate dependency update.
+#
+# `default-features = false` is deliberate. These SDKs default to their
+# `rustls` feature, which despite the name selects the *legacy* TLS stack
+# (aws-smithy-runtime/tls-rustls -> legacy-rustls-ring + hyper-0.14, i.e.
+# rustls 0.21 and h2 0.3). `default-https-client` selects the current one
+# (rustls 0.23 + aws-lc-rs). Both reach the same endpoints; only the second
+# is still maintained.
+aws-sdk-kms = { version = "=1.77.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sts = { version = "=1.76.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
+aws-types = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
