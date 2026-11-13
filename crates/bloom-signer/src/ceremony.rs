@@ -31,7 +31,7 @@ use zeroize::Zeroizing;
 use crate::registry::BackendRegistry;
 use crate::{
     custody::{UnlockedWallet, WalletCustody, WalletCustodyBackup},
-    engine::{CeremonyDatabaseEffect, CustodySnapshotCommit, SignerEngine},
+    engine::{CeremonyDatabaseEffect, CustodySnapshotCommit, SignerEngine, ceremony_state_code},
     hpke::{
         CUSTODY_INPUT_INFO, CUSTODY_OUTPUT_INFO, HpkeRecipient, LOCAL_PRF_INFO, seal_to_recipient,
     },
@@ -41,25 +41,6 @@ use crate::{
         verify_webauthn_attestation_for_origin,
     },
 };
-
-fn ceremony_state_name(state: CeremonyState) -> &'static str {
-    match state {
-        CeremonyState::Prepared => "prepared",
-        CeremonyState::AwaitingUser => "awaiting_user",
-        CeremonyState::Verifying => "verifying",
-        CeremonyState::WalletCommitted => "wallet_committed",
-        CeremonyState::AwaitingRecoveryAck => "awaiting_recovery_ack",
-        CeremonyState::Completed => "completed",
-        CeremonyState::ApprovingRootChange => "approving_root_change",
-        CeremonyState::CreatingCredential => "creating_credential",
-        CeremonyState::Committing => "committing",
-        CeremonyState::Succeeded => "succeeded",
-        CeremonyState::Cancelled => "cancelled",
-        CeremonyState::Expired => "expired",
-        CeremonyState::Failed => "failed",
-        CeremonyState::AlreadyRegistered => "already_registered",
-    }
-}
 
 fn ceremony_kind_name(kind: CeremonyKind) -> &'static str {
     match kind {
@@ -2508,7 +2489,7 @@ impl SignerCeremonyService {
             event = "signer.ceremony_terminal",
             operation_id = result.custody_operation_id.as_str(),
             ceremony_kind = ceremony_kind_name(result.ceremony_kind),
-            state = ceremony_state_name(result.public_status),
+            state = ceremony_state_code(result.public_status),
             "Signer committed a terminal ceremony outcome"
         );
         Ok(result)
@@ -2655,7 +2636,7 @@ impl SignerCeremonyService {
             tracing::warn!(
                 event = "signer.ceremony_terminalization_failed",
                 operation_id = operation_id.as_str(),
-                ceremony_state = ceremony_state_name(status.state),
+                ceremony_state = ceremony_state_code(status.state),
                 error_code = error.code.as_str(),
                 "Signer could not persist a rejected ceremony's terminal state"
             );
@@ -2669,7 +2650,7 @@ impl SignerCeremonyService {
                         ceremony_kind_name(contribution.ceremony_kind)
                     }
                 },
-                state = ceremony_state_name(status.state),
+                state = ceremony_state_code(status.state),
                 "Signer committed a rejected ceremony's terminal outcome"
             );
         }
