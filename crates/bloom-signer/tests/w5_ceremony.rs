@@ -3939,6 +3939,68 @@ fn generic_custody_export_policy_and_delete_apply_exact_typed_effects() {
 }
 
 #[test]
+fn wallet_deletion_discards_uncommitted_policy_authorizations() {
+    let authenticator = VirtualAuthenticator::generate();
+    let (service, _, engine, _) = service(&authenticator);
+    let (wallet_id, _) = register_wallet(&service, &authenticator, operation("e1"), 5_000);
+    let baseline = engine.policy_snapshot(&wallet_id).unwrap();
+    let mut proposed_policy: CanonicalWalletPolicy =
+        serde_json::from_slice(&baseline.canonical_policy.decode()).unwrap();
+    proposed_policy.maximum_approval_lifetime_ms += 1;
+    let proposed = Base64UrlBytes::from_bytes(&serde_jcs::to_vec(&proposed_policy).unwrap());
+    let update = PolicyUpdateRequest {
+        operation_id: operation("e2"),
+        wallet_id: wallet_id.clone(),
+        baseline_version: baseline.version.clone(),
+        baseline_digest: baseline.policy_digest.clone(),
+        proposed_canonical_policy: proposed.clone(),
+        proposed_policy_digest: Digest32::from_bytes(
+            sha2::Sha256::digest(proposed.decode()).into(),
+        ),
+        authority_diff_digest: digest("c1"),
+        assurance_level: Token::new("user_verified").unwrap(),
+    };
+    // Approve the update but never commit it.
+    let (policy_result, prepared) =
+        complete_policy_update(&service, &authenticator, &wallet_id, update, 6_000).unwrap();
+    let stale = PolicyCompareAndSwapRequest {
+        update: prepared.update,
+        ceremony_receipt: policy_result,
+        broker_validation_receipt: prepared.broker_validation_receipt,
+    };
+    complete_generic(
+        &service,
+        &authenticator,
+        &wallet_id,
+        None,
+        (
+            CeremonyKind::WalletDelete,
+            operation("e3"),
+            serde_json::json!({"kind": "wallet_delete"}),
+        ),
+        None,
+        7_000,
+    )
+    .unwrap();
+
+    // Recreate the same wallet ID with the same initial policy baseline.
+    let same_name = OperationId::new(format!("{}{}", "e1".repeat(6), "e4".repeat(26))).unwrap();
+    let (recreated, _) = register_wallet(&service, &authenticator, same_name, 8_000);
+    assert_eq!(recreated, wallet_id);
+    let fresh = engine.policy_snapshot(&wallet_id).unwrap();
+    assert_eq!(
+        (&fresh.version, &fresh.policy_digest),
+        (&baseline.version, &baseline.policy_digest),
+        "the new incarnation must share the stale update's baseline for this test to bite"
+    );
+
+    let refused = engine.compare_and_swap_policy(&stale).unwrap_err();
+    assert_eq!(refused.code, ProtocolErrorCode::PolicyBaselineStale);
+    assert_eq!(refused.message, "policy ceremony has not completed");
+    assert_eq!(engine.policy_snapshot(&wallet_id).unwrap(), fresh);
+}
+
+#[test]
 fn petal_key_ceremony_stages_without_a_previously_activated_backend() {
     // Staging a key-derive ceremony must not require an already activated
     // backend. Completing that very ceremony is what activates it, so
@@ -6351,4 +6413,496 @@ fn petal_exact_approvals_outlive_the_key_scope_and_reusable_ones_do_not() {
         )
         .unwrap();
     assert!(!prepared.challenges.is_empty());
+}
+
+#[test]
+fn recovered_then_deleted_wallet_name_can_be_registered_or_imported_again() {
+    for kind in [CeremonyKind::WalletRegistration, CeremonyKind::WalletImport] {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("signer.sqlite");
+        let open = || {
+            let engine = Arc::new(
+                SignerEngine::open(
+                    &database,
+                    Token::new("broker-app-1").unwrap(),
+                    SigningKey::from_bytes(&[7; 32]).verifying_key(),
+                    SigningKey::from_bytes(&[9; 32]).verifying_key(),
+                    Token::new("signer-revocation-key").unwrap(),
+                    SigningKey::from_bytes(&[4; 32]),
+                    audit_keys(),
+                    Arc::new(BackendRegistry::from_compiled(vec![]).unwrap()),
+                )
+                .unwrap(),
+            );
+            SignerCeremonyService::new(
+                engine,
+                Token::new("signer-ceremony-key").unwrap(),
+                SigningKey::from_bytes(&[9; 32]),
+            )
+        };
+        let original = VirtualAuthenticator::generate();
+        let replacement = VirtualAuthenticator::generate();
+        let service = open().unwrap();
+        let output_recipient = HpkeRecipient::generate();
+        let registration_operation = operation("a1");
+        let (registration, contribution) = complete_new_wallet(
+            &service,
+            &original,
+            CeremonyKind::WalletRegistration,
+            registration_operation.clone(),
+            None,
+            Some(&output_recipient),
+            10_000,
+        );
+        let wallet_id = registration.wallet_id.clone().unwrap();
+        let recovery: serde_json::Value = serde_json::from_slice(
+            output_recipient
+                .open(
+                    registration.encrypted_browser_result.as_ref().unwrap(),
+                    CUSTODY_OUTPUT_INFO,
+                    &CustodyOutputHpkeAad {
+                        surface: bloom_signer_api::legacy_local_surface(),
+                        ceremony_id: contribution.ceremony_id.clone(),
+                        ceremony_kind: CeremonyKind::WalletRegistration,
+                        custody_operation_id: registration_operation,
+                        signer_contribution_digest: contribution.digest().unwrap(),
+                        public_binding_digest: digest("d1"),
+                    }
+                    .canonical_bytes()
+                    .unwrap(),
+                )
+                .unwrap()
+                .expose_to_backend(),
+        )
+        .unwrap();
+
+        let recovery_operation = operation("a2");
+        service
+            .prepare_custody(
+                CustodyPrepareRequest {
+                    surface: bloom_signer_api::legacy_local_surface(),
+                    ceremony_kind: CeremonyKind::WalletRecovery,
+                    custody_operation_id: recovery_operation.clone(),
+                    wallet_id: Some(wallet_id.clone()),
+                    key_ref: None,
+                    exact_terms_digest: digest("d2"),
+                    expected_input_class: Token::new("recovery-factor-v1").unwrap(),
+                    browser_output_recipient_key: None,
+                    petal_key_scope: None,
+                    legacy_passkey_migration: None,
+                    derivation_requests: Vec::new(),
+                    wallet_seed_profile: None,
+                },
+                11_000,
+            )
+            .unwrap();
+        let prepared = service
+            .bind_custody_output_recipient(
+                &recovery_operation,
+                HpkeRecipient::generate().public_key().clone(),
+                11_001,
+            )
+            .unwrap();
+        let attestation =
+            replacement.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
+        let prf_assertion =
+            replacement.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
+        let aad = CustodyHpkeAad {
+            surface: bloom_signer_api::legacy_local_surface(),
+            ceremony_id: prepared.contribution.ceremony_id.clone(),
+            ceremony_kind: CeremonyKind::WalletRecovery,
+            custody_operation_id: recovery_operation.clone(),
+            signer_nonce: prepared.contribution.signer_nonce.clone(),
+            signer_contribution_digest: prepared.contribution.digest().unwrap(),
+            wallet_id: Some(wallet_id.clone()),
+            key_ref: None,
+            credential_id: Some(attestation.credential_id.clone()),
+            expected_input_class: Token::new("recovery-factor-v1").unwrap(),
+        }
+        .canonical_bytes()
+        .unwrap();
+        let recovery_input = serde_jcs::to_vec(&serde_json::json!({
+            "recovery_id": recovery["recovery_id"],
+            "recovery_secret": recovery["recovery_secret"],
+            "new_credential_prf": Base64UrlBytes::from_bytes(&replacement.deterministic_prf()),
+        }))
+        .unwrap();
+        let recovered = service
+            .complete_custody(
+                CustodyCompleteRequest {
+                    ceremony_kind: CeremonyKind::WalletRecovery,
+                    custody_operation_id: recovery_operation,
+                    ceremony_id: prepared.contribution.ceremony_id.clone(),
+                    proof: WebAuthnCeremonyProof::RecoveryCredentialChange {
+                        new_credential_attestation: attestation,
+                        new_credential_prf_assertion: Some(prf_assertion),
+                    },
+                    encrypted_input: Some(
+                        seal_hpke(
+                            &prepared.contribution.hpke_recipient_key,
+                            b"bloom-custody-input/v1",
+                            &aad,
+                            &recovery_input,
+                        )
+                        .unwrap(),
+                    ),
+                    public_binding_digest: digest("d2"),
+                },
+                11_100,
+            )
+            .unwrap();
+        assert_eq!(recovered.credential_authority_generation.unwrap().get(), 1);
+        let (deletion, _) = complete_generic(
+            &service,
+            &replacement,
+            &wallet_id,
+            None,
+            (
+                CeremonyKind::WalletDelete,
+                operation("a3"),
+                serde_json::json!({"kind":"wallet_delete"}),
+            ),
+            None,
+            12_000,
+        )
+        .unwrap();
+        assert_eq!(deletion.public_status, CeremonyState::Succeeded);
+
+        // `complete_new_wallet` names the wallet from the operation prefix.
+        let same_name = OperationId::new(format!("{}{}", "a1".repeat(6), "b4".repeat(26))).unwrap();
+        let (recreated, _) = complete_new_wallet(
+            &service,
+            &VirtualAuthenticator::generate(),
+            kind,
+            same_name,
+            Some(&[7; 32]),
+            None,
+            13_000,
+        );
+        assert_eq!(recreated.wallet_id.as_ref(), Some(&wallet_id));
+        assert_eq!(recreated.credential_authority_generation.unwrap().get(), 0);
+        drop(service);
+        open().expect("a new same-name incarnation must survive a Signer restart");
+    }
+}
+
+#[test]
+fn deleting_bip39_wallet_does_not_prevent_signer_restart() {
+    deleted_wallet_restart(None);
+}
+
+#[test]
+fn legacy_deleted_bip39_backend_is_recovered_from_signed_receipt() {
+    deleted_wallet_restart(Some("SUCCEEDED"));
+}
+
+#[test]
+fn legacy_completed_wallet_deletion_is_recovered_from_signed_receipt() {
+    deleted_wallet_restart(Some("COMPLETED"));
+}
+
+#[test]
+fn deleted_backend_recovery_rejects_tampered_receipt() {
+    deleted_wallet_restart(Some("tampered"));
+}
+
+#[test]
+fn missing_custody_without_deletion_receipt_still_fails_closed() {
+    deleted_wallet_restart(Some("no_receipt"));
+}
+
+#[test]
+fn old_deletion_receipt_does_not_retire_a_new_wallet_incarnation() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
+    let open = || {
+        let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+        let engine = Arc::new(
+            SignerEngine::open(
+                &database,
+                Token::new("broker-app-1").unwrap(),
+                broker.verifying_key(),
+                ceremony_key.verifying_key(),
+                Token::new("signer-revocation-key").unwrap(),
+                SigningKey::from_bytes(&[4; 32]),
+                audit_keys(),
+                registry,
+            )
+            .unwrap(),
+        );
+        SignerCeremonyService::new(
+            engine,
+            Token::new("signer-ceremony-key").unwrap(),
+            ceremony_key.clone(),
+        )
+        .unwrap()
+    };
+    let wallet = Token::new("reused-wallet").unwrap();
+    let first_authenticator = VirtualAuthenticator::generate();
+    let service = open();
+    complete_bip39_registration(
+        &service,
+        &first_authenticator,
+        &wallet,
+        &operation("e1"),
+        10_000,
+    );
+    complete_generic(
+        &service,
+        &first_authenticator,
+        &wallet,
+        None,
+        (
+            CeremonyKind::WalletDelete,
+            operation("e2"),
+            serde_json::json!({"kind":"wallet_delete"}),
+        ),
+        None,
+        11_000,
+    )
+    .unwrap();
+    drop(service);
+
+    let second_authenticator = VirtualAuthenticator::generate();
+    let service = open();
+    complete_bip39_registration(
+        &service,
+        &second_authenticator,
+        &wallet,
+        &operation("e3"),
+        12_000,
+    );
+    drop(service);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "DELETE FROM ceremony_wallets WHERE wallet_id = ?1",
+            [wallet.as_str()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let restarted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(open));
+    assert!(
+        restarted.is_err(),
+        "missing custody for a new incarnation must fail closed despite an old receipt"
+    );
+    assert_eq!(
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM ceremony_backend_enrollments WHERE backend_instance = ?1",
+                [wallet.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "startup must preserve the new encrypted enrollment"
+    );
+}
+
+fn deleted_wallet_restart(legacy: Option<&str>) {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("signer.sqlite");
+    let broker = SigningKey::from_bytes(&[7; 32]);
+    let ceremony_key = SigningKey::from_bytes(&[9; 32]);
+    let open = || {
+        let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
+        let engine = Arc::new(
+            SignerEngine::open(
+                &database,
+                Token::new("broker-app-1").unwrap(),
+                broker.verifying_key(),
+                ceremony_key.verifying_key(),
+                Token::new("signer-revocation-key").unwrap(),
+                SigningKey::from_bytes(&[4; 32]),
+                audit_keys(),
+                registry.clone(),
+            )
+            .unwrap(),
+        );
+        let service = SignerCeremonyService::new(
+            engine.clone(),
+            Token::new("signer-ceremony-key").unwrap(),
+            ceremony_key.clone(),
+        );
+        (engine, registry, service)
+    };
+    let deleted = Token::new("deleted-wallet").unwrap();
+    let live = Token::new("live-wallet").unwrap();
+    let deleted_authenticator = VirtualAuthenticator::generate();
+    let live_authenticator = VirtualAuthenticator::generate();
+    let (engine, registry, service) = open();
+    let service = service.unwrap();
+    let deleted_registration = complete_bip39_registration(
+        &service,
+        &deleted_authenticator,
+        &deleted,
+        &operation("d1"),
+        10_000,
+    );
+    let live_registration = complete_bip39_registration(
+        &service,
+        &live_authenticator,
+        &live,
+        &operation("d2"),
+        11_000,
+    );
+    let stale_enrollment: String = rusqlite::Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT enrollment_jcs FROM ceremony_backend_enrollments WHERE backend_instance = ?1",
+            [deleted.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (receipt, _) = complete_generic(
+        &service,
+        &deleted_authenticator,
+        &deleted,
+        None,
+        (
+            CeremonyKind::WalletDelete,
+            operation("d3"),
+            serde_json::json!({"kind":"wallet_delete"}),
+        ),
+        None,
+        12_000,
+    )
+    .unwrap();
+    assert_eq!(receipt.public_status, CeremonyState::Succeeded);
+    assert!(
+        engine
+            .derived_account_descriptors(&deleted)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(engine.policy_snapshot(&deleted).is_err());
+    for key in &deleted_registration.public_key_refs {
+        assert!(registry.get(&key.backend, &key.backend_instance).is_err());
+    }
+    drop(service);
+    drop(engine);
+    drop(registry);
+    let genuine_receipt: Vec<rusqlite::types::Value> = rusqlite::Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT * FROM ceremony_receipts WHERE operation_id = ?1",
+            [operation("d3").as_str()],
+            |row| {
+                (0..row.as_ref().column_count())
+                    .map(|i| row.get(i))
+                    .collect()
+            },
+        )
+        .unwrap();
+    if let Some(legacy) = legacy {
+        // Reproduce the durable leftovers written by the released deletion
+        // path, using only this test's disposable database.
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO ceremony_backend_enrollments VALUES (?1, ?2)",
+                rusqlite::params![deleted.as_str(), stale_enrollment],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE enrolled_keys SET available = 1 WHERE wallet_id = ?1",
+                [deleted.as_str()],
+            )
+            .unwrap();
+        if legacy == "no_receipt" {
+            connection
+                .execute(
+                    "DELETE FROM ceremony_receipts WHERE operation_id = ?1",
+                    [operation("d3").as_str()],
+                )
+                .unwrap();
+        } else if legacy != "SUCCEEDED" {
+            let mut historical = receipt.clone();
+            if legacy == "COMPLETED" {
+                historical.public_status = CeremonyState::Completed;
+                historical.signer_signature = Base64UrlBytes::from_bytes(
+                    &ceremony_key
+                        .sign(
+                            &[
+                                b"bloom-signer-ceremony-receipt/v1".as_slice(),
+                                historical.unsigned_canonical_bytes().unwrap().as_slice(),
+                            ]
+                            .concat(),
+                        )
+                        .to_bytes(),
+                );
+            } else {
+                historical.signer_signature = Base64UrlBytes::from_bytes(&[0; 64]);
+            }
+            connection
+                .execute(
+                    "UPDATE ceremony_receipts SET receipt_jcs = ?2 WHERE operation_id = ?1",
+                    rusqlite::params![
+                        operation("d3").as_str(),
+                        serde_jcs::to_string(&historical).unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+    }
+    let (mut engine, mut registry, mut restarted) = open();
+    if let Some(unproven @ ("tampered" | "no_receipt")) = legacy {
+        let failure = restarted
+            .err()
+            .expect("unproven deletion must not be recovered");
+        let expected = if unproven == "tampered" {
+            (
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "wallet deletion receipt signature is invalid",
+            )
+        } else {
+            (
+                ProtocolErrorCode::KeyrefMismatch,
+                "no custody record for this BIP-39 wallet",
+            )
+        };
+        assert_eq!((failure.code, failure.message.as_str()), expected);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM ceremony_backend_enrollments WHERE backend_instance = ?1",
+                    [deleted.as_str()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        // Control: the same leftovers recover once the genuine receipt is back,
+        // so the failure above is the receipt check, not missing recovery.
+        let placeholders = vec!["?"; genuine_receipt.len()].join(",");
+        connection
+            .execute(
+                &format!("INSERT OR REPLACE INTO ceremony_receipts VALUES ({placeholders})"),
+                rusqlite::params_from_iter(&genuine_receipt),
+            )
+            .unwrap();
+        drop((engine, registry));
+        (engine, registry, restarted) = open();
+    }
+    let restarted = restarted.expect("a completed wallet deletion must survive a process restart");
+    assert!(
+        engine
+            .derived_account_descriptors(&deleted)
+            .unwrap()
+            .is_empty()
+    );
+    for key in &deleted_registration.public_key_refs {
+        assert!(registry.get(&key.backend, &key.backend_instance).is_err());
+    }
+    assert_eq!(engine.derived_account_descriptors(&live).unwrap().len(), 2);
+    for key in &live_registration.public_key_refs {
+        assert!(registry.key_is_registered(key).unwrap());
+    }
+    assert!(restarted.surface_status().is_ok());
 }

@@ -29,7 +29,10 @@ exclude-dev = true
 version = 2
 yanked = "deny"
 ignore = [
-  { id = "RUSTSEC-2026-0441", reason = "pin-utils is unmaintained, no known vulnerability; aws-smithy-http declares it but its source does not use it" },
+  # Transitive through aws-smithy-http 0.62.5, which declares pin-utils but
+  # does not use it in its source. This advisory concerns maintenance status,
+  # not a known vulnerability; remove the exception when upstream drops it.
+  { id = "RUSTSEC-2026-0441", reason = "pin-utils is unmaintained; aws-smithy-http declares it but does not use it" },
 ]
 
 [licenses]
