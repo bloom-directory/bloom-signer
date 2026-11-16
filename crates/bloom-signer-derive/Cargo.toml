@@ -22,5 +22,5 @@ zeroize.workspace = true
 [dev-dependencies]
 bip32.workspace = true
 bloom-signer-vectors = { path = "../bloom-signer-vectors" }
-ows-signer = "=1.4.5"
+ows-signer = "=1.4.2"
 rand.workspace = true
