@@ -134,6 +134,13 @@ pub(crate) mod test_fault {
     }
 }
 
+#[cfg(feature = "local")]
+const DERIVED_KEY_REFUSALS: [&str; 3] = [
+    "derivation backend is not compiled into this Signer",
+    "AWS KMS does not support derived keys",
+    "the fault-injection test backend does not manage derived keys",
+];
+
 pub struct BackendRegistry {
     backends: RwLock<BTreeMap<(Token, Token), CompiledBackend>>,
 }
@@ -206,25 +213,54 @@ impl BackendRegistry {
             .collect()
     }
 
+    /// The compiled backend serving `key_ref`, or `BackendUnsupported` with
+    /// the caller's `missing` message.
+    fn lookup(&self, key_ref: &KeyRef, missing: &str) -> Result<CompiledBackend, ProtocolError> {
+        self.backends
+            .read()
+            .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
+            .cloned()
+            .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::BackendUnsupported, missing))
+    }
+
+    fn lookup_compiled(&self, key_ref: &KeyRef) -> Result<CompiledBackend, ProtocolError> {
+        self.lookup(
+            key_ref,
+            &format!(
+                "backend instance {}/{} is not compiled into this Signer",
+                key_ref.backend, key_ref.backend_instance
+            ),
+        )
+    }
+
+    /// The local backend serving `key_ref`. `messages` are the refusals when
+    /// it is missing, AWS KMS, or the fault-injection test backend.
+    #[cfg(feature = "local")]
+    fn local_backend(
+        &self,
+        key_ref: &KeyRef,
+        messages: [&str; 3],
+    ) -> Result<Arc<bloom_signer_backend_local::LocalSignerBackend>, ProtocolError> {
+        match self.lookup(key_ref, messages[0])? {
+            CompiledBackend::Local(local) => Ok(local),
+            #[cfg(feature = "aws-kms")]
+            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                messages[1],
+            )),
+            #[cfg(all(test, feature = "local"))]
+            CompiledBackend::Test(_) => Err(ProtocolError::new(
+                ProtocolErrorCode::BackendUnsupported,
+                messages[2],
+            )),
+        }
+    }
+
     pub fn key_is_available(
         &self,
         key_ref: &bloom_signer_api::KeyRef,
     ) -> Result<bool, ProtocolError> {
-        let backend = self
-            .backends
-            .read()
-            .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
-            .cloned()
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorCode::BackendUnsupported,
-                    format!(
-                        "backend instance {}/{} is not compiled into this Signer",
-                        key_ref.backend, key_ref.backend_instance
-                    ),
-                )
-            })?;
-        match backend {
+        match self.lookup_compiled(key_ref)? {
             #[cfg(feature = "local")]
             CompiledBackend::Local(local) => local.key_is_available(key_ref).map_err(|error| {
                 ProtocolError::new(
@@ -243,21 +279,7 @@ impl BackendRegistry {
         &self,
         key_ref: &bloom_signer_api::KeyRef,
     ) -> Result<bool, ProtocolError> {
-        let backend = self
-            .backends
-            .read()
-            .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
-            .cloned()
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorCode::BackendUnsupported,
-                    format!(
-                        "backend instance {}/{} is not compiled into this Signer",
-                        key_ref.backend, key_ref.backend_instance
-                    ),
-                )
-            })?;
-        match backend {
+        match self.lookup_compiled(key_ref)? {
             #[cfg(feature = "local")]
             CompiledBackend::Local(local) => Ok(local.key_is_registered(key_ref)),
             #[cfg(feature = "aws-kms")]
@@ -278,18 +300,10 @@ impl BackendRegistry {
         key_ref: &bloom_signer_api::KeyRef,
         secret: SecretBytes,
     ) -> Result<(), ProtocolError> {
-        let backend = self
-            .backends
-            .read()
-            .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
-            .cloned()
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorCode::BackendUnsupported,
-                    "activation backend is not compiled into this Signer",
-                )
-            })?;
-        match backend {
+        match self.lookup(
+            key_ref,
+            "activation backend is not compiled into this Signer",
+        )? {
             #[cfg(feature = "local")]
             CompiledBackend::Local(local) => local.activate_blocking(secret).map_err(|cause| {
                 ProtocolError::new(
@@ -315,18 +329,10 @@ impl BackendRegistry {
         key_ref: &bloom_signer_api::KeyRef,
         secret: SecretBytes,
     ) -> Result<(), ProtocolError> {
-        let backend = self
-            .backends
-            .read()
-            .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
-            .cloned()
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorCode::BackendUnsupported,
-                    "activation backend is not compiled into this Signer",
-                )
-            })?;
-        match backend {
+        match self.lookup(
+            key_ref,
+            "activation backend is not compiled into this Signer",
+        )? {
             #[cfg(feature = "local")]
             CompiledBackend::Local(local) => {
                 local.activate(key_ref, secret).await.map_err(|cause| {
@@ -353,18 +359,10 @@ impl BackendRegistry {
         &self,
         key_ref: &bloom_signer_api::KeyRef,
     ) -> Result<(), ProtocolError> {
-        let backend = self
-            .backends
-            .read()
-            .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
-            .cloned()
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorCode::BackendUnsupported,
-                    "activation backend is not compiled into this Signer",
-                )
-            })?;
-        match backend {
+        match self.lookup(
+            key_ref,
+            "activation backend is not compiled into this Signer",
+        )? {
             #[cfg(feature = "local")]
             CompiledBackend::Local(local) => local.deactivate(key_ref).await.map_err(|cause| {
                 ProtocolError::new(
@@ -750,40 +748,25 @@ impl BackendRegistry {
 
     #[cfg(feature = "local")]
     pub fn local_encrypted_backup(&self, root: &KeyRef) -> Result<Base64UrlBytes, ProtocolError> {
-        let backend = self
-            .backends
-            .read()
-            .get(&(root.backend.clone(), root.backend_instance.clone()))
-            .cloned()
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorCode::BackendUnsupported,
-                    "local derivation backend is not compiled into this Signer",
-                )
-            })?;
-        match backend {
-            CompiledBackend::Local(local) => Ok(Base64UrlBytes::from_bytes(
-                &serde_jcs::to_vec(&local.encrypted_backup().map_err(|error| {
-                    ProtocolError::new(
-                        ProtocolErrorCode::ServiceUnavailable,
-                        format!("local wallet backup failed: {error:?}"),
-                    )
-                })?)
-                .map_err(|error| {
-                    ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
-                })?,
-            )),
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
+        let local = self.local_backend(
+            root,
+            [
+                "local derivation backend is not compiled into this Signer",
                 "AWS KMS does not expose local custody backups",
-            )),
-            #[cfg(all(test, feature = "local"))]
-            CompiledBackend::Test(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
                 "the fault-injection test backend does not expose custody backups",
-            )),
-        }
+            ],
+        )?;
+        let backup = local.encrypted_backup().map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                format!("local wallet backup failed: {error:?}"),
+            )
+        })?;
+        Ok(Base64UrlBytes::from_bytes(
+            &serde_jcs::to_vec(&backup).map_err(|error| {
+                ProtocolError::new(ProtocolErrorCode::MalformedFrame, error.to_string())
+            })?,
+        ))
     }
 
     #[cfg(feature = "local")]
@@ -793,39 +776,16 @@ impl BackendRegistry {
         grant: bloom_signer_backend_local::DerivationGrant,
         signature: bloom_signer_api::Base64UrlBytes,
     ) -> Result<(), ProtocolError> {
-        let backend = self
-            .backends
-            .read()
-            .get(&(root.backend.clone(), root.backend_instance.clone()))
-            .cloned()
-            .ok_or_else(|| {
+        self.local_backend(root, DERIVED_KEY_REFUSALS)?
+            .configure_namespace(
+                &bloom_signer_backend_local::DerivationAuthority::from_signed(grant, signature),
+            )
+            .map_err(|error| {
                 ProtocolError::new(
-                    ProtocolErrorCode::BackendUnsupported,
-                    "derivation backend is not compiled into this Signer",
+                    ProtocolErrorCode::BackendInvalidRequest,
+                    format!("local derivation namespace configuration failed: {error:?}"),
                 )
-            })?;
-        match backend {
-            CompiledBackend::Local(local) => local
-                .configure_namespace(
-                    &bloom_signer_backend_local::DerivationAuthority::from_signed(grant, signature),
-                )
-                .map_err(|error| {
-                    ProtocolError::new(
-                        ProtocolErrorCode::BackendInvalidRequest,
-                        format!("local derivation namespace configuration failed: {error:?}"),
-                    )
-                }),
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "AWS KMS does not support derived keys",
-            )),
-            #[cfg(all(test, feature = "local"))]
-            CompiledBackend::Test(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "the fault-injection test backend does not manage derived keys",
-            )),
-        }
+            })
     }
 
     #[cfg(feature = "local")]
@@ -837,42 +797,19 @@ impl BackendRegistry {
         signature: bloom_signer_api::Base64UrlBytes,
         operation_id: &bloom_signer_api::OperationId,
     ) -> Result<bloom_signer_backend_api::KeyDescription, ProtocolError> {
-        let backend = self
-            .backends
-            .read()
-            .get(&(root.backend.clone(), root.backend_instance.clone()))
-            .cloned()
-            .ok_or_else(|| {
+        self.local_backend(root, DERIVED_KEY_REFUSALS)?
+            .allocate_derived_key_for_operation(
+                root,
+                namespace_id,
+                &bloom_signer_backend_local::DerivationAuthority::from_signed(grant, signature),
+                operation_id,
+            )
+            .map_err(|error| {
                 ProtocolError::new(
-                    ProtocolErrorCode::BackendUnsupported,
-                    "derivation backend is not compiled into this Signer",
+                    ProtocolErrorCode::BackendInvalidRequest,
+                    format!("local key derivation failed: {error:?}"),
                 )
-            })?;
-        match backend {
-            CompiledBackend::Local(local) => local
-                .allocate_derived_key_for_operation(
-                    root,
-                    namespace_id,
-                    &bloom_signer_backend_local::DerivationAuthority::from_signed(grant, signature),
-                    operation_id,
-                )
-                .map_err(|error| {
-                    ProtocolError::new(
-                        ProtocolErrorCode::BackendInvalidRequest,
-                        format!("local key derivation failed: {error:?}"),
-                    )
-                }),
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "AWS KMS does not support derived keys",
-            )),
-            #[cfg(all(test, feature = "local"))]
-            CompiledBackend::Test(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "the fault-injection test backend does not manage derived keys",
-            )),
-        }
+            })
     }
 
     #[cfg(feature = "local")]
@@ -880,37 +817,14 @@ impl BackendRegistry {
         &self,
         key_ref: &bloom_signer_api::KeyRef,
     ) -> Result<(), ProtocolError> {
-        let backend = self
-            .backends
-            .read()
-            .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
-            .cloned()
-            .ok_or_else(|| {
+        self.local_backend(key_ref, DERIVED_KEY_REFUSALS)?
+            .tombstone_derived_key(key_ref)
+            .map_err(|error| {
                 ProtocolError::new(
-                    ProtocolErrorCode::BackendUnsupported,
-                    "derivation backend is not compiled into this Signer",
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!("derived-key rollback failed closed: {error:?}"),
                 )
-            })?;
-        match backend {
-            CompiledBackend::Local(local) => {
-                local.tombstone_derived_key(key_ref).map_err(|error| {
-                    ProtocolError::new(
-                        ProtocolErrorCode::ServiceUnavailable,
-                        format!("derived-key rollback failed closed: {error:?}"),
-                    )
-                })
-            }
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "AWS KMS does not support derived keys",
-            )),
-            #[cfg(all(test, feature = "local"))]
-            CompiledBackend::Test(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "the fault-injection test backend does not manage derived keys",
-            )),
-        }
+            })
     }
 
     #[cfg(feature = "local")]
@@ -919,37 +833,14 @@ impl BackendRegistry {
         key_ref: &bloom_signer_api::KeyRef,
         operation_id: &bloom_signer_api::OperationId,
     ) -> Result<(), ProtocolError> {
-        let backend = self
-            .backends
-            .read()
-            .get(&(key_ref.backend.clone(), key_ref.backend_instance.clone()))
-            .cloned()
-            .ok_or_else(|| {
+        self.local_backend(key_ref, DERIVED_KEY_REFUSALS)?
+            .finalize_derived_key(operation_id)
+            .map_err(|error| {
                 ProtocolError::new(
-                    ProtocolErrorCode::BackendUnsupported,
-                    "derivation backend is not compiled into this Signer",
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!("derived-key finalization failed: {error:?}"),
                 )
-            })?;
-        match backend {
-            CompiledBackend::Local(local) => {
-                local.finalize_derived_key(operation_id).map_err(|error| {
-                    ProtocolError::new(
-                        ProtocolErrorCode::ServiceUnavailable,
-                        format!("derived-key finalization failed: {error:?}"),
-                    )
-                })
-            }
-            #[cfg(feature = "aws-kms")]
-            CompiledBackend::AwsKms(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "AWS KMS does not support derived keys",
-            )),
-            #[cfg(all(test, feature = "local"))]
-            CompiledBackend::Test(_) => Err(ProtocolError::new(
-                ProtocolErrorCode::BackendUnsupported,
-                "the fault-injection test backend does not manage derived keys",
-            )),
-        }
+            })
     }
 
     #[cfg(feature = "local")]
