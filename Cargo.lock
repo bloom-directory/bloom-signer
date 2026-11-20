@@ -759,7 +759,7 @@ dependencies = [
 [[package]]
 name = "bloom-audit-checkpoint"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=48b83c54c1787b4aff2456bd3adbe18856902e45#48b83c54c1787b4aff2456bd3adbe18856902e45"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=49fbea461b9a58889b8b08be0c0c851f31fdafd2#49fbea461b9a58889b8b08be0c0c851f31fdafd2"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek 3.0.0",
@@ -775,7 +775,7 @@ dependencies = [
 [[package]]
 name = "bloom-platform-containment"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=48b83c54c1787b4aff2456bd3adbe18856902e45#48b83c54c1787b4aff2456bd3adbe18856902e45"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=49fbea461b9a58889b8b08be0c0c851f31fdafd2#49fbea461b9a58889b8b08be0c0c851f31fdafd2"
 dependencies = [
  "bloom-rpc-wire",
  "serde",
@@ -817,7 +817,7 @@ dependencies = [
 [[package]]
 name = "bloom-rpc-wire"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=48b83c54c1787b4aff2456bd3adbe18856902e45#48b83c54c1787b4aff2456bd3adbe18856902e45"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=49fbea461b9a58889b8b08be0c0c851f31fdafd2#49fbea461b9a58889b8b08be0c0c851f31fdafd2"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek 3.0.0",
@@ -832,7 +832,7 @@ dependencies = [
 [[package]]
 name = "bloom-service-activation"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=48b83c54c1787b4aff2456bd3adbe18856902e45#48b83c54c1787b4aff2456bd3adbe18856902e45"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=49fbea461b9a58889b8b08be0c0c851f31fdafd2#49fbea461b9a58889b8b08be0c0c851f31fdafd2"
 dependencies = [
  "bloom-rpc-wire",
  "libc",
@@ -842,7 +842,7 @@ dependencies = [
 [[package]]
 name = "bloom-service-observability"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=48b83c54c1787b4aff2456bd3adbe18856902e45#48b83c54c1787b4aff2456bd3adbe18856902e45"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=49fbea461b9a58889b8b08be0c0c851f31fdafd2#49fbea461b9a58889b8b08be0c0c851f31fdafd2"
 dependencies = [
  "libc",
  "rustix",
@@ -1021,7 +1021,7 @@ version = "0.1.0"
 [[package]]
 name = "bloom-triad-local-transport"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=48b83c54c1787b4aff2456bd3adbe18856902e45#48b83c54c1787b4aff2456bd3adbe18856902e45"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=49fbea461b9a58889b8b08be0c0c851f31fdafd2#49fbea461b9a58889b8b08be0c0c851f31fdafd2"
 dependencies = [
  "bloom-rpc-wire",
  "bloom-trusted-time",
@@ -1040,7 +1040,7 @@ dependencies = [
 [[package]]
 name = "bloom-trusted-time"
 version = "0.1.3"
-source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=48b83c54c1787b4aff2456bd3adbe18856902e45#48b83c54c1787b4aff2456bd3adbe18856902e45"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=49fbea461b9a58889b8b08be0c0c851f31fdafd2#49fbea461b9a58889b8b08be0c0c851f31fdafd2"
 dependencies = [
  "libc",
  "thiserror 2.0.21",
@@ -1851,7 +1851,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2474,7 +2474,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3393,7 +3393,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3991,10 +3991,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
