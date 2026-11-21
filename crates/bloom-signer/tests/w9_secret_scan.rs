@@ -1,131 +1,12 @@
 mod support;
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use bloom_signer::{
-    ceremony::SignerCeremonyService,
-    engine::{SignerAuditKeys, SignerEngine},
-    hpke::HpkeRecipient,
-    registry::BackendRegistry,
-};
+use bloom_signer::hpke::HpkeRecipient;
 use bloom_signer_api::*;
 use bloom_signer_backend_api::{BackendInput, BackendSignRequest};
-use ed25519_dalek::SigningKey;
 use sha2::Digest as _;
-use support::{VirtualAuthenticator, seal_hpke};
-
-fn audit_keys() -> SignerAuditKeys {
-    SignerAuditKeys {
-        current_key_id: Token::new("signer-audit-key").unwrap(),
-        current_signing_key: SigningKey::from_bytes(&[14; 32]),
-        historical_verifying_keys: BTreeMap::new(),
-    }
-}
-
-fn bip39_service(
-    path: &std::path::Path,
-) -> (
-    SignerCeremonyService,
-    Arc<SignerEngine>,
-    Arc<BackendRegistry>,
-) {
-    let registry = Arc::new(BackendRegistry::from_compiled(vec![]).unwrap());
-    let engine = Arc::new(
-        SignerEngine::open(
-            path,
-            Token::new("broker-app-1").unwrap(),
-            SigningKey::from_bytes(&[7; 32]).verifying_key(),
-            SigningKey::from_bytes(&[9; 32]).verifying_key(),
-            Token::new("signer-revocation-key").unwrap(),
-            SigningKey::from_bytes(&[4; 32]),
-            audit_keys(),
-            registry.clone(),
-        )
-        .unwrap(),
-    );
-    let service = SignerCeremonyService::new(
-        engine.clone(),
-        Token::new("signer-ceremony-key").unwrap(),
-        SigningKey::from_bytes(&[9; 32]),
-    )
-    .unwrap();
-    (service, engine, registry)
-}
-
-fn import_mnemonic(
-    service: &SignerCeremonyService,
-    authenticator: &VirtualAuthenticator,
-    wallet_id: &Token,
-    operation_id: &OperationId,
-    mnemonic: &str,
-    now_ms: u64,
-) -> CustodyResult {
-    let prepared = service
-        .prepare_custody(
-            CustodyPrepareRequest {
-                surface: bloom_signer_api::legacy_local_surface(),
-                ceremony_kind: CeremonyKind::WalletImport,
-                custody_operation_id: operation_id.clone(),
-                wallet_id: Some(wallet_id.clone()),
-                key_ref: None,
-                exact_terms_digest: Digest32::new("a2".repeat(32)).unwrap(),
-                expected_input_class: Token::new("bip39-mnemonic").unwrap(),
-                browser_output_recipient_key: None,
-                petal_key_scope: None,
-                legacy_passkey_migration: None,
-                wallet_seed_profile: Some(WalletSeedProfile::Bip39MulticurveV1),
-                derivation_requests: Vec::new(),
-            },
-            now_ms,
-        )
-        .unwrap();
-    let attestation = authenticator.attestation(&prepared.challenges[0].canonical_bytes().unwrap());
-    let prf_assertion =
-        authenticator.assertion(&prepared.challenges[1].canonical_bytes().unwrap(), 1);
-    let plaintext = serde_jcs::to_vec(&serde_json::json!({
-        "credential_prf": Base64UrlBytes::from_bytes(&authenticator.deterministic_prf()),
-        "mnemonic": mnemonic,
-    }))
-    .unwrap();
-    let aad = CustodyHpkeAad {
-        surface: bloom_signer_api::legacy_local_surface(),
-        ceremony_id: prepared.contribution.ceremony_id.clone(),
-        ceremony_kind: CeremonyKind::WalletImport,
-        custody_operation_id: operation_id.clone(),
-        signer_nonce: prepared.contribution.signer_nonce.clone(),
-        signer_contribution_digest: prepared.contribution.digest().unwrap(),
-        wallet_id: prepared.contribution.wallet_id.clone(),
-        key_ref: None,
-        credential_id: Some(attestation.credential_id.clone()),
-        expected_input_class: Token::new("bip39-mnemonic").unwrap(),
-    }
-    .canonical_bytes()
-    .unwrap();
-    let encrypted_input = seal_hpke(
-        &prepared.contribution.hpke_recipient_key,
-        b"bloom-custody-input/v1",
-        &aad,
-        &plaintext,
-    )
-    .unwrap();
-    service
-        .complete_custody(
-            CustodyCompleteRequest {
-                ceremony_kind: CeremonyKind::WalletImport,
-                custody_operation_id: operation_id.clone(),
-                ceremony_id: prepared.contribution.ceremony_id,
-                proof: WebAuthnCeremonyProof::Registration {
-                    attestation,
-                    prf_assertion: Some(prf_assertion),
-                },
-                encrypted_input: Some(encrypted_input),
-                public_binding_digest: Digest32::new("a2".repeat(32)).unwrap(),
-            },
-            now_ms + 100,
-        )
-        .unwrap()
-}
+use support::*;
 
 /// A tracing `MakeWriter` that appends every line to a shared buffer.
 struct SharedWriter {
@@ -207,7 +88,7 @@ fn bip39_secret_scan_is_empty_across_logs_audit_sqlite_and_responses() {
     // Solana sibling, sign both curves, and export the words.
     let (service, engine, registry) = bip39_service(&db_path);
     let wallet_id = Token::new("bip39-secret-scan").unwrap();
-    let import_result = import_mnemonic(
+    let import_result = complete_bip39_mnemonic_import(
         &service,
         &authenticator,
         &wallet_id,

@@ -913,7 +913,6 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2 0.11.0",
- "thiserror 2.0.21",
  "url",
 ]
 
@@ -983,7 +982,6 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2 0.11.0",
- "sha3 0.12.0",
  "zeroize",
 ]
 
