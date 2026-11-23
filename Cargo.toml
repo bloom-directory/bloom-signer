@@ -31,7 +31,7 @@ bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-ser
 bloom-service-observability = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "49fbea461b9a58889b8b08be0c0c851f31fdafd2" }
 bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "49fbea461b9a58889b8b08be0c0c851f31fdafd2" }
 bloom-platform-containment = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "49fbea461b9a58889b8b08be0c0c851f31fdafd2" }
-aws-config = { version = "=1.8.1", default-features = false, features = ["rt-tokio", "rustls"] }
+aws-config = { version = "=1.8.11", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-credential-types = "1"
 # Exact AWS service pins date from the old Rust 1.85 floor. Some newer
 # releases also fit the current 1.89 floor (up to aws-config 1.8.13,
