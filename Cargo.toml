@@ -63,7 +63,7 @@ ciborium = "0.2"
 ed25519-dalek = "3"
 hex = "0.4"
 libc = "0.2"
-hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
+hpke = { version = "0.15", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
 hkdf = "0.13"
 hmac = "0.13"
 k256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
